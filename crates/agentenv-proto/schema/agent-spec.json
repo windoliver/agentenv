@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentSpec",
+  "type": "object",
+  "properties": {
+    "config": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

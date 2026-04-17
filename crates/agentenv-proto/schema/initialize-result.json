@@ -1,0 +1,155 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InitializeResult",
+  "type": "object",
+  "required": [
+    "capabilities",
+    "driver"
+  ],
+  "properties": {
+    "capabilities": {
+      "$ref": "#/definitions/Capabilities"
+    },
+    "driver": {
+      "$ref": "#/definitions/DriverInfo"
+    }
+  },
+  "definitions": {
+    "AgentCapabilities": {
+      "type": "object",
+      "required": [
+        "supports_headless",
+        "supports_mcp",
+        "supports_slash_commands",
+        "supports_tui"
+      ],
+      "properties": {
+        "supports_headless": {
+          "type": "boolean"
+        },
+        "supports_mcp": {
+          "type": "boolean"
+        },
+        "supports_slash_commands": {
+          "type": "boolean"
+        },
+        "supports_tui": {
+          "type": "boolean"
+        }
+      }
+    },
+    "Capabilities": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SandboxCapabilities"
+        },
+        {
+          "$ref": "#/definitions/AgentCapabilities"
+        },
+        {
+          "$ref": "#/definitions/ContextCapabilities"
+        },
+        {
+          "$ref": "#/definitions/InferenceCapabilities"
+        }
+      ]
+    },
+    "ContextCapabilities": {
+      "type": "object",
+      "required": [
+        "is_remote",
+        "is_shared",
+        "supports_snapshots",
+        "supports_zones"
+      ],
+      "properties": {
+        "is_remote": {
+          "type": "boolean"
+        },
+        "is_shared": {
+          "type": "boolean"
+        },
+        "supports_snapshots": {
+          "type": "boolean"
+        },
+        "supports_zones": {
+          "type": "boolean"
+        }
+      }
+    },
+    "DriverInfo": {
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "protocol_version",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/DriverKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "DriverKind": {
+      "type": "string",
+      "enum": [
+        "sandbox",
+        "agent",
+        "context",
+        "inference"
+      ]
+    },
+    "InferenceCapabilities": {
+      "type": "object",
+      "required": [
+        "strips_caller_credentials",
+        "supports_model_switching"
+      ],
+      "properties": {
+        "strips_caller_credentials": {
+          "type": "boolean"
+        },
+        "supports_model_switching": {
+          "type": "boolean"
+        }
+      }
+    },
+    "SandboxCapabilities": {
+      "type": "object",
+      "required": [
+        "supports_filesystem_lockdown",
+        "supports_hot_reload_policy",
+        "supports_native_inference_routing",
+        "supports_remote_host",
+        "supports_syscall_filter"
+      ],
+      "properties": {
+        "supports_filesystem_lockdown": {
+          "type": "boolean"
+        },
+        "supports_hot_reload_policy": {
+          "type": "boolean"
+        },
+        "supports_native_inference_routing": {
+          "type": "boolean"
+        },
+        "supports_remote_host": {
+          "type": "boolean"
+        },
+        "supports_syscall_filter": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

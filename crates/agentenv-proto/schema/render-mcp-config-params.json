@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RenderMcpConfigParams",
+  "type": "object",
+  "properties": {
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/McpEndpoint"
+      }
+    }
+  },
+  "definitions": {
+    "McpEndpoint": {
+      "type": "object",
+      "required": [
+        "transport",
+        "url"
+      ],
+      "properties": {
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "transport": {
+          "$ref": "#/definitions/McpTransport"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "McpTransport": {
+      "type": "string",
+      "enum": [
+        "stdio",
+        "http",
+        "http+sse",
+        "ssh+http"
+      ]
+    }
+  }
+}

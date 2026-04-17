@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LogsParams",
+  "type": "object",
+  "required": [
+    "follow",
+    "handle"
+  ],
+  "properties": {
+    "follow": {
+      "type": "boolean"
+    },
+    "handle": {
+      "type": "string"
+    },
+    "since": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

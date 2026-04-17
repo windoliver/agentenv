@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ShellHandle",
+  "type": "object",
+  "required": [
+    "session_id",
+    "tty"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "tty": {
+      "type": "boolean"
+    },
+    "working_dir": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

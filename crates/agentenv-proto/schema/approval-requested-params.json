@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ApprovalRequestedParams",
+  "type": "object",
+  "required": [
+    "kind",
+    "reason",
+    "request_id",
+    "subject"
+  ],
+  "properties": {
+    "context": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "default_ttl": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "$ref": "#/definitions/ApprovalKind"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "ApprovalKind": {
+      "type": "string",
+      "enum": [
+        "egress_host",
+        "mcp_tool",
+        "zone_access"
+      ]
+    }
+  }
+}

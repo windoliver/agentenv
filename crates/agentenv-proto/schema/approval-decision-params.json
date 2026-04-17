@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ApprovalDecisionParams",
+  "type": "object",
+  "required": [
+    "decided_at",
+    "decided_by",
+    "decision",
+    "request_id",
+    "scope"
+  ],
+  "properties": {
+    "decided_at": {
+      "type": "string"
+    },
+    "decided_by": {
+      "type": "string"
+    },
+    "decision": {
+      "$ref": "#/definitions/ApprovalDecision"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "scope": {
+      "$ref": "#/definitions/ApprovalScope"
+    }
+  },
+  "definitions": {
+    "ApprovalDecision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "ApprovalScope": {
+      "type": "string",
+      "enum": [
+        "once",
+        "session",
+        "persist-sandbox",
+        "propose-for-baseline"
+      ]
+    }
+  }
+}
