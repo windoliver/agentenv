@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PreflightResult",
+  "type": "object",
+  "required": [
+    "ok"
+  ],
+  "properties": {
+    "issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PreflightIssue"
+      }
+    },
+    "ok": {
+      "type": "boolean"
+    }
+  },
+  "definitions": {
+    "IssueSeverity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "PreflightIssue": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "severity"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "remediation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "$ref": "#/definitions/IssueSeverity"
+        }
+      }
+    }
+  }
+}
