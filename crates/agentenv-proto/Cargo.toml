@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+readme = "README.md"
+description = "Protocol scaffolding for agentenv drivers"
 build = "build.rs"
 
 [dependencies]

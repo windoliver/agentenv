@@ -7,5 +7,5 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-
-[dependencies]
+readme = "README.md"
+description = "Plugin host scaffolding for agentenv"

@@ -7,5 +7,5 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-
-[dependencies]
+readme = "README.md"
+description = "Filesystem context driver scaffold for agentenv"

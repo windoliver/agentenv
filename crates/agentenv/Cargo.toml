@@ -7,5 +7,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+readme = "README.md"
+description = "Declarative environment manager for AI coding agents"
 
 [dependencies]
+clap.workspace = true
