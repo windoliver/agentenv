@@ -1,0 +1,37 @@
+# Reference blueprint — Claude Code in OpenShell with a local filesystem context.
+# The simplest viable agentenv composition. No remote context backend, no hub.
+#
+# Usage:
+#   agentenv create myapp --blueprint blueprints/claude+filesystem+openshell.yaml
+#   agentenv enter myapp
+
+version: 0.1.0
+min_agentenv_version: 0.0.1
+
+sandbox:
+  driver: openshell
+  # Pin the OpenShell version range for reproducibility.
+  version: ">=0.0.30,<0.1"
+
+agent:
+  driver: claude
+  credentials:
+    ANTHROPIC_API_KEY:
+      source: env              # read from the invoking shell; never written to disk
+      required: true
+
+context:
+  driver: filesystem
+  mount: ~/projects            # mounted read-write into the sandbox; exposed as MCP
+
+inference:
+  driver: passthrough          # agent uses its own key directly; no in-sandbox proxy
+
+policy:
+  tier: balanced
+  presets:
+    - github_read
+    - npm_read
+
+state:
+  persist_home: true           # keep ~/.claude in a per-env persistent volume

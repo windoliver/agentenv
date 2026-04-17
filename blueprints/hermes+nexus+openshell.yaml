@@ -1,0 +1,40 @@
+# Reference blueprint — Nous Research Hermes agent in OpenShell with a shared Nexus hub.
+# Uses two subprocess (Python) drivers: agent-hermes and context-nexus.
+#
+# Usage:
+#   export NEXUS_HUB_URL=https://nexus.company.com
+#   export NEXUS_TOKEN=...
+#   agentenv create research --blueprint blueprints/hermes+nexus+openshell.yaml
+
+version: 0.1.0
+min_agentenv_version: 0.0.1
+
+sandbox:
+  driver: openshell
+  version: ">=0.0.30,<0.1"
+
+agent:
+  driver: hermes                 # external subprocess (Python)
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+
+context:
+  driver: nexus                  # external subprocess (Python)
+  mode: hub
+  hub_url: ${NEXUS_HUB_URL}
+  credentials:
+    NEXUS_TOKEN:
+      source: env
+      required: true
+
+inference:
+  driver: passthrough
+
+policy:
+  tier: balanced
+  presets:
+    - github_read
+  overrides:
+    - allow: "${NEXUS_HUB_URL}"

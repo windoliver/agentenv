@@ -1,0 +1,40 @@
+# Reference blueprint — OpenAI Codex in OpenShell with a generic MCP context server.
+# Good for: connecting any MCP-compatible knowledge service without a bespoke driver.
+#
+# Usage:
+#   export MCP_URL=https://mcp.internal.company.com
+#   export MCP_TOKEN=...
+#   agentenv create legal --blueprint blueprints/codex+mcp-generic+openshell.yaml
+
+version: 0.1.0
+min_agentenv_version: 0.0.1
+
+sandbox:
+  driver: openshell
+  version: ">=0.0.30,<0.1"
+
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+
+context:
+  driver: mcp-generic
+  endpoint:
+    url: ${MCP_URL}
+    transport: http+sse
+  credentials:
+    MCP_TOKEN:
+      source: env
+      required: true
+
+inference:
+  driver: passthrough
+
+policy:
+  tier: restricted              # legal work — tight default
+  presets: []
+  overrides:
+    - allow: "${MCP_URL}"

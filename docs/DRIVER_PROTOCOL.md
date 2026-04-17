@@ -1,0 +1,294 @@
+# agentenv Driver Protocol (v0.1 draft)
+
+> JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
+
+## Status
+
+**Draft.** This document is the north star; the actual schemas live in the `agentenv-proto` crate with `serde` types and auto-generated JSON Schema. When in doubt, the crate wins.
+
+## Wire format
+
+- JSON-RPC 2.0 over stdio
+- Messages framed LSP-style:
+
+  ```text
+  Content-Length: <N>\r\n
+  \r\n
+  <JSON payload of length N>
+  ```
+
+- `stderr` is treated as driver-side logs and captured into the core event stream with driver provenance tags. Drivers should emit structured JSON lines on stderr when possible (the core tolerates plain text).
+
+## Lifecycle
+
+```text
+spawn ──▶ initialize ──▶ <one or more method calls and notifications> ──▶ shutdown ──▶ exit
+                                        │
+                                        ▼
+                              kind-specific methods
+```
+
+## Driver manifest
+
+Every subprocess driver ships with a `manifest.json` at the root of its install directory:
+
+```json
+{
+  "schema_version": "0.1",
+  "name": "nexus",
+  "kind": "context",
+  "version": "0.1.0",
+  "description": "Nexus context backend driver",
+  "binary": "./bin/agentenv-driver-nexus",
+  "args": [],
+  "env": {},
+  "capabilities_preview": {
+    "is_remote": true,
+    "is_shared": true,
+    "supports_zones": true,
+    "supports_snapshots": true
+  }
+}
+```
+
+Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it at startup and consults the manifest for the binary path and pre-declared capabilities (for fast listing without spawning every driver). The authoritative capability set is still what `initialize` returns.
+
+## Core → Driver requests
+
+### `initialize` (required, first)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "schema_version": "0.1",
+    "core_version": "0.1.0",
+    "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
+    "log_level": "info"
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "driver": {
+      "name": "openshell",
+      "kind": "sandbox",
+      "version": "0.1.0",
+      "protocol_version": "0.1"
+    },
+    "capabilities": {
+      "supports_hot_reload_policy": true,
+      "supports_filesystem_lockdown": true,
+      "supports_syscall_filter": true,
+      "supports_native_inference_routing": true,
+      "supports_remote_host": true
+    }
+  }
+}
+```
+
+If `schema_version` incompatible, driver responds with a JSON-RPC error and exits. Core surfaces actionable guidance.
+
+### `preflight`
+
+Check host-side prerequisites for this driver (runtime installed, version matches, etc).
+
+```json
+{"method": "preflight", "params": {}}
+→ {"result": {"ok": true, "issues": []}}
+→ {"result": {"ok": false, "issues": [
+    {"severity": "error", "code": "openshell_missing",
+     "message": "OpenShell binary not found",
+     "remediation": "curl ... | sh"}
+  ]}}
+```
+
+### Kind-specific methods
+
+Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set. The shape is sketched below; the authoritative types live in `agentenv-proto`.
+
+#### `SandboxDriver`
+
+| Method | Params | Result |
+|---|---|---|
+| `create` | `SandboxSpec` | `SandboxHandle` |
+| `connect` | `{handle}` | `ShellHandle` (session info) |
+| `exec` | `{handle, cmd, tty, env}` | `ExecResult` |
+| `copy_in` | `{handle, src_host_path, dst_sandbox_path}` | `{}` |
+| `copy_out` | `{handle, src_sandbox_path, dst_host_path}` | `{}` |
+| `apply_policy` | `{handle, policy: NetworkPolicy}` | `{hot_reloaded: bool}` |
+| `status` | `{handle}` | `SandboxStatus` |
+| `logs` | `{handle, since, follow: false}` | `[LogEntry]` |
+| `logs_stream` | `{handle, since}` | streamed via notifications |
+| `stop` | `{handle}` | `{}` |
+| `destroy` | `{handle}` | `{}` |
+
+#### `AgentDriver`
+
+| Method | Params | Result |
+|---|---|---|
+| `install_steps` | `AgentSpec` | `[DockerfileFragment]` |
+| `mcp_config_path` | `{}` | `{path: string}` |
+| `render_mcp_config` | `{endpoints: [MCPEndpoint]}` | `{content: string}` |
+| `render_entrypoint` | `AgentSpec` | `{content: string}` |
+| `credential_requirements` | `{}` | `[CredentialRequirement]` |
+| `health_check` | `{handle}` | `{healthy: bool, detail: string?}` |
+
+#### `ContextDriver`
+
+| Method | Params | Result |
+|---|---|---|
+| `provision` | `ContextSpec` | `ContextHandle` |
+| `mcp_endpoint` | `{handle}` | `MCPEndpoint` |
+| `required_network_rules` | `{handle}` | `[NetworkRule]` |
+| `credential_requirements` | `{}` | `[CredentialRequirement]` |
+| `status` | `{handle}` | `ContextStatus` |
+| `teardown` | `{handle}` | `{}` |
+
+#### `InferenceDriver`
+
+| Method | Params | Result |
+|---|---|---|
+| `provision` | `InferenceSpec` | `InferenceHandle` |
+| `endpoint_in_sandbox` | `{handle}` | `{url: string}` |
+| `credential_requirements` | `{}` | `[CredentialRequirement]` |
+| `teardown` | `{handle}` | `{}` |
+
+### `shutdown` (required, last)
+
+Graceful shutdown. The driver should flush any buffered events, tear down in-flight resources it owns, and exit.
+
+```json
+{"method": "shutdown", "params": {}}
+→ {"result": {}}
+```
+
+The core gives the driver a grace period (default 5s) then sends SIGTERM, then SIGKILL.
+
+## Driver → Core notifications
+
+Push-only messages (no `id`). Drivers use these for events, logs, and approval requests.
+
+### `event/log`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event/log",
+  "params": {
+    "level": "info",
+    "ts": "2026-04-16T14:22:00Z",
+    "msg": "policy applied (hot reload)",
+    "kv": {"handle": "sb-01HXY", "rule_count": 42}
+  }
+}
+```
+
+### `event/activity`
+
+Structured activity events for the audit log and TUI.
+
+```json
+{
+  "method": "event/activity",
+  "params": {
+    "kind": "egress_denied",
+    "subject": "api.example.com:443",
+    "reason": "not in policy",
+    "ts": "2026-04-16T14:22:00Z",
+    "handle": "sb-01HXY"
+  }
+}
+```
+
+### `event/approval_requested`
+
+```json
+{
+  "method": "event/approval_requested",
+  "params": {
+    "request_id": "req_01HXYZ",
+    "kind": "egress_host",
+    "subject": "api.stripe.com:443",
+    "reason": "agent fetch_url tool call",
+    "context": {"url": "https://api.stripe.com/v1/charges"},
+    "default_ttl": "session"
+  }
+}
+```
+
+Core resolves the request (via TUI, webhook, or CLI) and replies via:
+
+### `approval/decision` (core → driver)
+
+```json
+{
+  "method": "approval/decision",
+  "params": {
+    "request_id": "req_01HXYZ",
+    "decision": "allow",
+    "scope": "session",
+    "decided_by": "alice",
+    "decided_at": "2026-04-16T14:22:08Z"
+  }
+}
+```
+
+## Errors
+
+JSON-RPC error codes (reserved ranges follow JSON-RPC 2.0):
+
+| Code | Meaning |
+|---|---|
+| `-32700` | Parse error |
+| `-32600` | Invalid request |
+| `-32601` | Method not found |
+| `-32602` | Invalid params |
+| `-32603` | Internal error |
+| `-32000` | `CapabilityMissing` — requested operation needs a capability the driver doesn't have |
+| `-32001` | `PreflightFailed` |
+| `-32002` | `SchemaVersionIncompatible` |
+| `-32003` | `ResourceNotFound` (bad handle) |
+| `-32004` | `CredentialMissing` |
+| `-32005` | `PolicyTranslationFailed` |
+
+Errors include `data` with machine-readable context when relevant (e.g., which capability was missing, which credential name).
+
+## Versioning
+
+- **Schema version** (`schema_version` in `initialize`) uses semver-ish `major.minor`. Breaking changes bump major; additive changes bump minor.
+- **Driver version** is the driver's own versioning; independent of schema version.
+- **Core version** is agentenv's version.
+- Core refuses to run a driver whose `schema_version` major doesn't match its own.
+
+## Built-in drivers
+
+Built-in Rust drivers implement the `Driver` trait family directly — no subprocess, no JSON serialization. They are bound through the same `agentenv-proto` types (serde structs), so the trait method signature is identical to the RPC method signature.
+
+```rust
+#[async_trait]
+pub trait SandboxDriver: Send + Sync {
+    async fn initialize(&mut self, p: InitializeParams) -> Result<InitializeResult>;
+    async fn preflight(&self) -> Result<PreflightResult>;
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxHandle>;
+    async fn connect(&self, handle: &SandboxHandle) -> Result<ShellHandle>;
+    // ...
+}
+```
+
+The subprocess plugin host implements the same trait, marshalling calls to JSON-RPC and awaiting responses. This means **the rest of the core never knows whether a driver is built-in or subprocess.**
+
+## Security
+
+- Drivers run as the invoking user by default. No setuid behavior from the core.
+- Stdin/stdout are the only trusted channels. Anything on stderr is logs (may be structured, may be noise).
+- Credentials are injected into driver processes as environment variables at spawn time, never written to disk, never sent over the RPC channel after spawn.
+- A driver that crashes does not take down the core; it's restarted once, then marked degraded.
