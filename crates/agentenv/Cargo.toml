@@ -11,4 +11,14 @@ readme = "README.md"
 description = "Declarative environment manager for AI coding agents"
 
 [dependencies]
+agentenv-credstore = { path = "../agentenv-credstore" }
+anyhow.workspace = true
 clap.workspace = true
+rpassword = "7"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
