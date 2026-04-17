@@ -12,3 +12,6 @@ description = "Declarative environment manager for AI coding agents"
 
 [dependencies]
 clap.workspace = true
+anyhow.workspace = true
+serde_yaml.workspace = true
+agentenv-core = { path = "../agentenv-core" }
