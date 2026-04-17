@@ -108,6 +108,21 @@ test_verify_sha256_value() {
     pass
 }
 
+test_archive_name_candidates_cover_legacy_and_dist_formats() {
+    RESOLVED_VERSION="v0.1.0"
+    RESOLVED_VERSION_NOPREFIX="0.1.0"
+    TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+
+    candidates=$(archive_name_candidates)
+    tmp_file=$(mktemp)
+    printf '%s\n' "${candidates}" > "${tmp_file}"
+    assert_contains "agentenv-0.1.0-x86_64-unknown-linux-gnu.tar.gz" "${tmp_file}" "legacy tar.gz candidate"
+    assert_contains "agentenv-v0.1.0-x86_64-unknown-linux-gnu.tar.gz" "${tmp_file}" "v-prefixed tar.gz candidate"
+    assert_contains "agentenv-x86_64-unknown-linux-gnu.tar.xz" "${tmp_file}" "cargo-dist tar.xz candidate"
+    rm -f "${tmp_file}"
+    pass
+}
+
 test_write_path_exports_is_idempotent() {
     tmp_root=$(mktemp -d)
 
@@ -208,6 +223,7 @@ main() {
     test_detect_target_linux_musl
     test_detect_target_macos
     test_verify_sha256_value
+    test_archive_name_candidates_cover_legacy_and_dist_formats
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
     test_install_python_drivers_preserves_existing_driver_on_extract_failure

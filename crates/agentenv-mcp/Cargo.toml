@@ -1,0 +1,11 @@
+[package]
+name = "agentenv-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+description = "MCP integration scaffolding for agentenv"

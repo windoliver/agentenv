@@ -5,7 +5,7 @@ set -eu
 APP_NAME="agentenv"
 REPO_OWNER="windoliver"
 REPO_NAME="agentenv"
-REPO_FULL_NAME="${REPO_OWNER}/${REPO_NAME}"
+REPO_FULL_NAME="${AGENTENV_REPO:-${REPO_OWNER}/${REPO_NAME}}"
 INSTALLER_SENTINEL="# agentenv installer"
 
 : "${HOME:?HOME must be set}"
@@ -45,6 +45,7 @@ Options:
 
 Environment:
   AGENTENV_VERSION                 Install a specific tag, for example v0.1.0.
+  AGENTENV_TARGET                  Override auto-detected target triple.
   AGENTENV_INSTALL_DIR             Destination for the ${APP_NAME} binary.
   AGENTENV_HOME                    Root directory for agentenv state (default: ~/.agentenv).
   AGENTENV_RELEASES_API_URL        Override the GitHub Releases API endpoint.
@@ -251,6 +252,11 @@ detect_linux_libc() {
 }
 
 detect_target_triple() {
+    if [ -n "${AGENTENV_TARGET:-}" ]; then
+        TARGET_TRIPLE=${AGENTENV_TARGET}
+        return 0
+    fi
+
     os_name=$(uname -s)
     arch_name=$(uname -m)
 
@@ -296,15 +302,19 @@ resolve_version() {
 }
 
 archive_name_candidates() {
-    printf '%s\n' "${APP_NAME}-${RESOLVED_VERSION_NOPREFIX}-${TARGET_TRIPLE}.tar.gz"
-    if [ "${RESOLVED_VERSION}" != "${RESOLVED_VERSION_NOPREFIX}" ]; then
-        printf '%s\n' "${APP_NAME}-${RESOLVED_VERSION}-${TARGET_TRIPLE}.tar.gz"
-    fi
+    # Support both legacy versioned archives and cargo-dist naming.
+    for extension in tar.gz tar.xz; do
+        printf '%s\n' "${APP_NAME}-${RESOLVED_VERSION_NOPREFIX}-${TARGET_TRIPLE}.${extension}"
+        if [ "${RESOLVED_VERSION}" != "${RESOLVED_VERSION_NOPREFIX}" ]; then
+            printf '%s\n' "${APP_NAME}-${RESOLVED_VERSION}-${TARGET_TRIPLE}.${extension}"
+        fi
+        printf '%s\n' "${APP_NAME}-${TARGET_TRIPLE}.${extension}"
+    done
 }
 
 download_release_bundle() {
-    archive_dest="${TMP_ROOT}/release.tar.gz"
-    checksum_dest="${TMP_ROOT}/release.tar.gz.sha256"
+    archive_dest="${TMP_ROOT}/release-archive"
+    checksum_dest="${TMP_ROOT}/release-archive.sha256"
     archive_log="${TMP_ROOT}/release-download.log"
     checksum_log="${TMP_ROOT}/checksum-download.log"
 
@@ -355,19 +365,38 @@ verify_sha256_value() {
 }
 
 verify_download_checksum() {
-    archive_dest="${TMP_ROOT}/release.tar.gz"
-    checksum_dest="${TMP_ROOT}/release.tar.gz.sha256"
+    archive_dest="${TMP_ROOT}/release-archive"
+    checksum_dest="${TMP_ROOT}/release-archive.sha256"
     expected_hash=$(awk 'NR == 1 { print $1 }' "${checksum_dest}")
 
     [ -n "${expected_hash}" ] || die "Downloaded checksum file is empty"
     verify_sha256_value "${archive_dest}" "${expected_hash}"
 }
 
+extract_release_archive() {
+    archive_dest=$1
+    extract_dir=$2
+
+    case "${DOWNLOADED_ARCHIVE_BASENAME}" in
+        *.tar.gz)
+            tar -xzf "${archive_dest}" -C "${extract_dir}" || die "Could not extract ${DOWNLOADED_ARCHIVE_BASENAME}"
+            ;;
+        *.tar.xz)
+            if ! tar -xJf "${archive_dest}" -C "${extract_dir}" 2>/dev/null; then
+                tar -xf "${archive_dest}" -C "${extract_dir}" || die "Could not extract ${DOWNLOADED_ARCHIVE_BASENAME}"
+            fi
+            ;;
+        *)
+            tar -xf "${archive_dest}" -C "${extract_dir}" || die "Could not extract ${DOWNLOADED_ARCHIVE_BASENAME}"
+            ;;
+    esac
+}
+
 install_binary() {
-    archive_dest="${TMP_ROOT}/release.tar.gz"
+    archive_dest="${TMP_ROOT}/release-archive"
     extract_dir="${TMP_ROOT}/extract"
     mkdir -p "${extract_dir}"
-    tar -xzf "${archive_dest}" -C "${extract_dir}"
+    extract_release_archive "${archive_dest}" "${extract_dir}"
 
     binary_path=$(find "${extract_dir}" -type f -name "${APP_NAME}" | head -n 1 || true)
     [ -n "${binary_path}" ] || die "Release archive ${DOWNLOADED_ARCHIVE_BASENAME} does not contain ${APP_NAME}"
