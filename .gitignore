@@ -1,5 +1,4 @@
 /target
-/Cargo.lock
 **/*.rs.bk
 *.pdb
 .DS_Store
@@ -8,3 +7,4 @@
 *.log
 /dist/
 /.agentenv-dev/
+/.claude/worktrees/
