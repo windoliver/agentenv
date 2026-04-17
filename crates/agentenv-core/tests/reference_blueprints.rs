@@ -1,6 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
-use agentenv_core::blueprint::Blueprint;
+use agentenv_core::{blueprint::Blueprint, error::BlueprintError};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -20,15 +20,106 @@ fn all_reference_blueprints_parse() {
     std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
     std::env::set_var("NEXUS_HUB_URL", "https://nexus.internal.example.com");
 
-    for path in [
-        "blueprints/claude+filesystem+openshell.yaml",
-        "blueprints/codex+mcp-generic+openshell.yaml",
-        "blueprints/hermes+nexus+openshell.yaml",
-        "blueprints/openclaw+nexus+openshell.yaml",
+    for (path, agent_driver, context_driver, tier, persists_home) in [
+        (
+            "blueprints/claude+filesystem+openshell.yaml",
+            "claude",
+            "filesystem",
+            "balanced",
+            Some(true),
+        ),
+        (
+            "blueprints/codex+mcp-generic+openshell.yaml",
+            "codex",
+            "mcp-generic",
+            "restricted",
+            None,
+        ),
+        (
+            "blueprints/hermes+nexus+openshell.yaml",
+            "hermes",
+            "nexus",
+            "balanced",
+            None,
+        ),
+        (
+            "blueprints/openclaw+nexus+openshell.yaml",
+            "openclaw",
+            "nexus",
+            "balanced",
+            Some(true),
+        ),
     ] {
         let doc = std::fs::read_to_string(workspace_path(path)).unwrap();
-        let blueprint = Blueprint::from_yaml(&doc);
-        assert!(blueprint.is_ok(), "failed to parse {path}: {blueprint:?}");
+        let blueprint = Blueprint::from_yaml(&doc).unwrap();
+
+        assert_eq!(blueprint.version, "0.1.0", "{path}");
+        assert_eq!(blueprint.min_agentenv_version, "0.0.1", "{path}");
+        assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
+        assert_eq!(blueprint.agent.driver, agent_driver, "{path}");
+        assert_eq!(blueprint.context.driver, context_driver, "{path}");
+        assert_eq!(blueprint.policy.tier, tier, "{path}");
+        assert_eq!(
+            blueprint
+                .inference
+                .as_ref()
+                .map(|section| section.driver.as_str()),
+            Some("passthrough"),
+            "{path}"
+        );
+        assert_eq!(
+            blueprint
+                .state
+                .as_ref()
+                .and_then(|state| state.persist_home),
+            persists_home,
+            "{path}"
+        );
+
+        match context_driver {
+            "filesystem" => {
+                let mount = blueprint
+                    .context
+                    .extra
+                    .get("mount")
+                    .unwrap()
+                    .as_str()
+                    .unwrap();
+                assert_eq!(mount, "~/projects", "{path}");
+            }
+            "mcp-generic" => {
+                let endpoint = blueprint.context.extra.get("endpoint").unwrap();
+                let url = yaml_string_field(endpoint, "url");
+                let transport = yaml_string_field(endpoint, "transport");
+                assert_eq!(url, "https://mcp.internal.example.com", "{path}");
+                assert_eq!(transport, "http+sse", "{path}");
+            }
+            "nexus" => {
+                assert_eq!(
+                    blueprint
+                        .context
+                        .extra
+                        .get("mode")
+                        .unwrap()
+                        .as_str()
+                        .unwrap(),
+                    "hub",
+                    "{path}"
+                );
+                assert_eq!(
+                    blueprint
+                        .context
+                        .extra
+                        .get("hub_url")
+                        .unwrap()
+                        .as_str()
+                        .unwrap(),
+                    "https://nexus.internal.example.com",
+                    "{path}"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -58,10 +149,7 @@ policy:
 
     let blueprint = Blueprint::from_yaml(yaml).unwrap();
     let endpoint = blueprint.context.extra.get("endpoint").unwrap();
-    let url = endpoint
-        .get("url")
-        .and_then(|value| value.as_str())
-        .unwrap();
+    let url = yaml_string_field(endpoint, "url");
 
     assert_eq!(url, "https://mcp.internal.example.com");
 }
@@ -123,4 +211,70 @@ policy:
         .unwrap();
 
     assert_eq!(token, "resolved-token");
+}
+
+#[test]
+fn blueprint_allows_missing_inference_section() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: claude
+context:
+  driver: filesystem
+  mount: ~/projects
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let blueprint = Blueprint::from_yaml(yaml).unwrap();
+
+    assert!(blueprint.inference.is_none());
+}
+
+#[test]
+fn interpolation_reports_path_for_unresolved_placeholder() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::remove_var("MISSING_URL");
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: mcp-generic
+  endpoint:
+    url: ${MISSING_URL}
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#;
+
+    let err = Blueprint::from_yaml(yaml).unwrap_err();
+
+    match err {
+        BlueprintError::Interpolation { path, source } => {
+            assert_eq!(path, "context.endpoint.url");
+            match *source {
+                BlueprintError::UnresolvedEnvVar { name } => assert_eq!(name, "MISSING_URL"),
+                other => panic!("expected unresolved env var, got {other:?}"),
+            }
+        }
+        other => panic!("expected interpolation error, got {other:?}"),
+    }
+}
+
+fn yaml_string_field<'a>(value: &'a serde_yaml::Value, key: &str) -> &'a str {
+    value
+        .get(serde_yaml::Value::String(key.to_string()))
+        .and_then(|item| item.as_str())
+        .unwrap()
 }

@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, env};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_yaml::Value;
 
 use crate::error::BlueprintError;
 
@@ -13,7 +13,8 @@ pub struct Blueprint {
     pub sandbox: ComponentSection,
     pub agent: ComponentSection,
     pub context: ComponentSection,
-    pub inference: ComponentSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<ComponentSection>,
     pub policy: PolicySection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<StateSection>,
@@ -26,6 +27,7 @@ pub struct ComponentSection {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<BTreeMap<String, CredentialRef>>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -37,6 +39,7 @@ pub struct CredentialRef {
     pub required: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -48,6 +51,7 @@ pub struct PolicySection {
     pub presets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overrides: Vec<PolicyOverride>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -60,6 +64,7 @@ pub struct PolicyOverride {
     pub deny: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -68,6 +73,7 @@ pub struct PolicyOverride {
 pub struct StateSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_home: Option<bool>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -103,9 +109,9 @@ impl Blueprint {
         yaml: &str,
         resolver: &dyn InterpolationResolver,
     ) -> Result<Self, BlueprintError> {
-        let mut value: Value = serde_yaml::from_str(yaml)?;
+        let mut value: Value = serde_yaml::from_str(yaml).map_err(BlueprintError::ParseYaml)?;
         interpolate_value(&mut value, resolver, "$")?;
-        serde_json::from_value(value).map_err(BlueprintError::from)
+        serde_yaml::from_value(value).map_err(BlueprintError::Deserialize)
     }
 }
 
@@ -121,23 +127,24 @@ fn interpolate_value(
             *string = updated;
             Ok(())
         }
-        Value::Array(items) => {
+        Value::Sequence(items) => {
             for (index, item) in items.iter_mut().enumerate() {
                 interpolate_value(item, resolver, &format!("{path}[{index}]"))?;
             }
             Ok(())
         }
-        Value::Object(map) => {
+        Value::Mapping(map) => {
             for (key, item) in map.iter_mut() {
                 let child_path = if path == "$" {
-                    key.to_string()
+                    yaml_path_segment(key)
                 } else {
-                    format!("{path}.{key}")
+                    format!("{path}.{}", yaml_path_segment(key))
                 };
                 interpolate_value(item, resolver, &child_path)?;
             }
             Ok(())
         }
+        Value::Tagged(tagged) => interpolate_value(&mut tagged.value, resolver, path),
         Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
     }
 }
@@ -180,4 +187,14 @@ fn interpolate_string(
 
     output.push_str(remaining);
     Ok(output)
+}
+
+fn yaml_path_segment(value: &Value) -> String {
+    match value {
+        Value::String(key) => key.clone(),
+        other => match serde_yaml::to_string(other) {
+            Ok(rendered) => rendered.trim().to_string(),
+            Err(_) => "<non-string-key>".to_string(),
+        },
+    }
 }
