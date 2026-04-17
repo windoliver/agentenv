@@ -1,1 +1,2 @@
-pub struct RegistryStub;
+#[allow(dead_code)]
+struct Placeholder;

@@ -1,1 +1,2 @@
-pub struct BlueprintStub;
+#[allow(dead_code)]
+struct Placeholder;

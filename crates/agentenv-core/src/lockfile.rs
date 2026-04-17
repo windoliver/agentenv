@@ -1,1 +1,2 @@
-pub struct LockfileStub;
+#[allow(dead_code)]
+struct Placeholder;

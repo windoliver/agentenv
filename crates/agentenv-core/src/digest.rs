@@ -1,1 +1,2 @@
-pub struct DigestStub;
+#[allow(dead_code)]
+struct Placeholder;

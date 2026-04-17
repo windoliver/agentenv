@@ -1,1 +1,2 @@
-pub struct LifecycleStub;
+#[allow(dead_code)]
+struct Placeholder;

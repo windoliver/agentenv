@@ -1,1 +1,2 @@
-pub struct ErrorStub;
+#[allow(dead_code)]
+struct Placeholder;
