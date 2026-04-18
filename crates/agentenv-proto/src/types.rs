@@ -409,6 +409,23 @@ pub struct AgentSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentHealthCheckProbe {
+    pub cmd: String,
+    pub tty: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(
+        default = "default_success_exit_codes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub success_exit_codes: Vec<i32>,
+}
+
+fn default_success_exit_codes() -> Vec<i32> {
+    vec![0]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct DockerfileFragment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

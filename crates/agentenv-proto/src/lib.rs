@@ -8,8 +8,11 @@ pub use types::*;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        assert_compatible_schema_version, is_compatible_schema_version, SchemaVersionError,
+        assert_compatible_schema_version, is_compatible_schema_version, AgentHealthCheckProbe,
+        SchemaVersionError, SCHEMA_VERSION,
     };
 
     #[test]
@@ -33,5 +36,22 @@ mod tests {
             assert!(matches!(err, SchemaVersionError::InvalidFormat { .. }));
             assert!(!is_compatible_schema_version(version));
         }
+    }
+
+    #[test]
+    fn schema_version_is_0_2() {
+        assert_eq!(SCHEMA_VERSION, "0.2");
+    }
+
+    #[test]
+    fn agent_health_check_probe_defaults_to_zero_exit_code() {
+        let probe = AgentHealthCheckProbe {
+            cmd: "codex --version".to_owned(),
+            tty: false,
+            env: BTreeMap::new(),
+            success_exit_codes: vec![0],
+        };
+
+        assert_eq!(probe.success_exit_codes, vec![0]);
     }
 }

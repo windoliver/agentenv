@@ -47,16 +47,12 @@ fn main() {
     write_schema::<types::RenderMcpConfigParams>(&schema_dir, "render-mcp-config-params");
     write_schema::<types::RenderMcpConfigResult>(&schema_dir, "render-mcp-config-result");
     write_schema::<types::RenderEntrypointResult>(&schema_dir, "render-entrypoint-result");
-    write_schema::<types::CredentialRequirementsParams>(
-        &schema_dir,
-        "credential-requirements-params",
-    );
+    write_schema::<types::AgentSpec>(&schema_dir, "credential-requirements-params");
     write_schema::<types::CredentialRequirementsResult>(
         &schema_dir,
         "credential-requirements-result",
     );
-    write_schema::<types::HealthCheckParams>(&schema_dir, "health-check-params");
-    write_schema::<types::HealthCheckResult>(&schema_dir, "health-check-result");
+    write_schema::<types::AgentHealthCheckProbe>(&schema_dir, "agent-health-check-probe");
     write_schema::<types::ContextSpec>(&schema_dir, "context-spec");
     write_schema::<types::ContextHandle>(&schema_dir, "context-handle");
     write_schema::<types::ContextHandleRequest>(&schema_dir, "context-handle-request");

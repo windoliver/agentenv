@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: &str = "0.1";
+pub const SCHEMA_VERSION: &str = "0.2";
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
