@@ -65,7 +65,7 @@ ed25519-dalek = "2"
 hex = "0.4"
 
 # HTTP / networking
-reqwest = { version = "=0.11.27", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
 # Keyring / credential store
 keyring = "2"
