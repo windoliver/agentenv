@@ -32,8 +32,6 @@ pub struct CredentialRef {
     pub reference: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -57,8 +55,6 @@ pub enum LockfileError {
         #[source]
         source: DigestError,
     },
-    #[error("lockfile credential values are not allowed for `{name}`")]
-    CredentialValueNotAllowed { name: String },
     #[error("lockfile credential field `{field}` for `{name}` appears to contain an inline secret; credential values are not allowed")]
     CredentialFieldNotAllowed { name: String, field: String },
     #[error("lockfile credential field `{field}` for `{name}` uses a complex YAML key; credential extra keys must be strings")]
@@ -108,10 +104,6 @@ fn validate_credentials(
     credentials: &BTreeMap<String, CredentialRef>,
 ) -> Result<(), LockfileError> {
     for (name, credential) in credentials {
-        if credential.value.is_some() {
-            return Err(LockfileError::CredentialValueNotAllowed { name: name.clone() });
-        }
-
         for (field, value) in &credential.extra {
             if let Some(field_path) =
                 find_secret_like_field(field, value, field).map_err(|field_path| {

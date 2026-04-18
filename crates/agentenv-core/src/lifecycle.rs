@@ -408,7 +408,6 @@ fn freeze_credential(name: &str, credential: &BlueprintCredentialRef) -> Lockfil
         source: credential.source.clone(),
         reference: inferred_reference(name, credential),
         required: credential.required,
-        value: None,
         extra: credential.extra.clone(),
     }
 }

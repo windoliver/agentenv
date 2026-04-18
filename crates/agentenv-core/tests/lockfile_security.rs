@@ -60,6 +60,7 @@ credentials:
 
     assert_eq!(reparsed, lockfile);
     assert_eq!(rendered, reparsed.to_yaml_deterministic().unwrap());
+    assert!(!rendered.contains("\n    value:"));
 }
 
 #[test]
