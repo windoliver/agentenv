@@ -28,7 +28,7 @@ members = [
 [workspace.package]
 version = "0.0.1-alpha0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/windoliver/agentenv"
 homepage = "https://github.com/windoliver/agentenv"
@@ -65,7 +65,7 @@ ed25519-dalek = "2"
 hex = "0.4"
 
 # HTTP / networking
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "=0.11.27", default-features = false, features = ["rustls-tls"] }
 
 # Keyring / credential store
 keyring = "2"

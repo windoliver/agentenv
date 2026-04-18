@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use agentenv_proto::{
     FilesystemPolicy, InferencePolicy, NetworkAccessPolicy, NetworkPolicy, NetworkRule,
     NetworkTarget, PolicyReloadability, ProcessPolicy,
@@ -109,6 +111,7 @@ fn baseline_policy(tier: Tier) -> NetworkPolicy {
                     host: "*".to_owned(),
                     port: Some(443),
                     scheme: Some("https".to_owned()),
+                    http_access: None,
                 },
             });
             policy
@@ -203,11 +206,7 @@ fn normalize(policy: &mut NetworkPolicy) {
     sort_and_dedup_rules(&mut policy.network.deny);
     sort_and_dedup_rules(&mut policy.network.approval_required);
 
-    policy
-        .inference
-        .routes
-        .sort_by_key(inference_route_sort_key);
-    policy.inference.routes.dedup();
+    dedup_inference_routes_preserving_order(&mut policy.inference.routes);
 }
 
 fn sort_and_dedup_strings(values: &mut Vec<String>) {
@@ -220,9 +219,16 @@ fn sort_and_dedup_rules(rules: &mut Vec<NetworkRule>) {
     rules.dedup();
 }
 
+fn dedup_inference_routes_preserving_order(routes: &mut Vec<agentenv_proto::InferenceRoute>) {
+    let mut seen = BTreeSet::new();
+    routes.retain(|route| seen.insert(inference_route_sort_key(route)));
+}
+
 fn rule_sort_key(rule: &NetworkRule) -> String {
     match &rule.target {
-        NetworkTarget::Host { host, port, scheme } => format!(
+        NetworkTarget::Host {
+            host, port, scheme, ..
+        } => format!(
             "host|{}|{}|{}",
             scheme.as_deref().unwrap_or_default(),
             host,

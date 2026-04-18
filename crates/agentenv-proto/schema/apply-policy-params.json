@@ -38,6 +38,14 @@
         }
       }
     },
+    "HttpAccessLevel": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "read_write",
+        "full"
+      ]
+    },
     "InferencePolicy": {
       "type": "object",
       "required": [
@@ -162,6 +170,16 @@
           "properties": {
             "host": {
               "type": "string"
+            },
+            "http_access": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HttpAccessLevel"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "kind": {
               "type": "string",

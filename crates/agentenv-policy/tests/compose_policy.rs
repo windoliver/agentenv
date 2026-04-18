@@ -166,6 +166,7 @@ fn host_rule(host: &str) -> NetworkRule {
             host: host.to_owned(),
             port: Some(443),
             scheme: Some("https".to_owned()),
+            http_access: None,
         },
     }
 }

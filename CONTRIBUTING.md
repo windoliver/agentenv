@@ -5,7 +5,7 @@
 ## Development setup
 
 Requires:
-- Rust (MSRV `1.80`, enforced in `Cargo.toml`)
+- Rust (`1.95+`, with `1.95.0` pinned in `rust-toolchain.toml` and enforced in `Cargo.toml`)
 - `just` (optional, recommended)
 - Docker (for running integration tests against sandbox drivers)
 - A recent `openshell` CLI on `PATH` (for `sandbox-openshell` tests)

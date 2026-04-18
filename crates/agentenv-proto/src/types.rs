@@ -194,6 +194,14 @@ pub enum PolicyReloadability {
     LockedAtCreate,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAccessLevel {
+    ReadOnly,
+    ReadWrite,
+    Full,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NetworkTarget {
@@ -203,6 +211,8 @@ pub enum NetworkTarget {
         port: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scheme: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_access: Option<HttpAccessLevel>,
     },
     Cidr {
         cidr: String,
@@ -286,12 +296,33 @@ pub struct NetworkPolicy {
     pub inference: InferencePolicy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    #[default]
+    ApiKey,
+    Token,
+    Certificate,
+    File,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValidatorSpec {
+    Regex { pattern: String },
+    CurlProbe { url: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CredentialRequirement {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: CredentialKind,
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator: Option<ValidatorSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]

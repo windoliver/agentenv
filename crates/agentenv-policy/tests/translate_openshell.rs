@@ -138,6 +138,7 @@ fn host_rule_without_scheme_is_rejected() {
             host: "api.github.com".to_owned(),
             port: Some(443),
             scheme: None,
+            http_access: None,
         },
     });
 
@@ -156,6 +157,7 @@ fn host_rule_with_non_443_port_is_rejected() {
             host: "api.github.com".to_owned(),
             port: Some(8443),
             scheme: Some("https".to_owned()),
+            http_access: None,
         },
     });
 
@@ -174,6 +176,7 @@ fn wildcard_host_rules_are_rejected() {
             host: "*".to_owned(),
             port: Some(443),
             scheme: Some("https".to_owned()),
+            http_access: None,
         },
     });
 
@@ -213,6 +216,69 @@ fn inference_update_comes_from_the_first_route() {
             model: "gpt-5".to_owned(),
             timeout_seconds: Some(30),
         })
+    );
+}
+
+#[test]
+fn compose_policy_preserves_inference_route_precedence_for_translation() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let overrides = NetworkPolicy {
+        inference: InferencePolicy {
+            reloadability: PolicyReloadability::HotReload,
+            routes: vec![
+                InferenceRoute {
+                    matcher: "z-default".to_owned(),
+                    provider: "openai".to_owned(),
+                    model: "gpt-5".to_owned(),
+                    base_url: Some("https://api.openai.com/v1".to_owned()),
+                    timeout_seconds: Some(30),
+                },
+                InferenceRoute {
+                    matcher: "a-fallback".to_owned(),
+                    provider: "anthropic".to_owned(),
+                    model: "claude-sonnet-4".to_owned(),
+                    base_url: None,
+                    timeout_seconds: Some(60),
+                },
+            ],
+        },
+        ..supported_policy()
+    };
+
+    let policy =
+        compose_policy(Tier::Restricted, &[], Some(overrides), &registry).expect("compose");
+    let translated = translator().translate(&policy).expect("translate policy");
+
+    assert_eq!(
+        translated.inference_update,
+        Some(InferenceUpdate {
+            provider: "openai".to_owned(),
+            model: "gpt-5".to_owned(),
+            timeout_seconds: Some(30),
+        })
+    );
+}
+
+#[test]
+fn readwrite_presets_translate_to_read_write_access() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let policy = compose_policy(
+        Tier::Restricted,
+        &[agentenv_policy::PresetSelection::from_slug("github_readwrite").expect("parse preset")],
+        None,
+        &registry,
+    )
+    .expect("compose");
+
+    let translated = translator().translate(&policy).expect("translate policy");
+
+    assert_eq!(
+        endpoint_access(&translated.policy_yaml, "api.github.com"),
+        Some("read-write".to_owned())
+    );
+    assert_eq!(
+        endpoint_access(&translated.policy_yaml, "github.com"),
+        Some("read-write".to_owned())
     );
 }
 
@@ -269,8 +335,29 @@ fn host_rule(host: &str) -> NetworkRule {
             host: host.to_owned(),
             port: Some(443),
             scheme: Some("https".to_owned()),
+            http_access: None,
         },
     }
+}
+
+fn endpoint_access(policy_yaml: &str, host: &str) -> Option<String> {
+    let document: serde_yaml::Value = serde_yaml::from_str(policy_yaml).expect("parse yaml");
+    let policies = document["network_policies"]
+        .as_mapping()
+        .expect("network_policies mapping");
+
+    for policy in policies.values() {
+        let endpoints = policy["endpoints"]
+            .as_sequence()
+            .expect("endpoints sequence");
+        for endpoint in endpoints {
+            if endpoint["host"].as_str() == Some(host) {
+                return endpoint["access"].as_str().map(ToOwned::to_owned);
+            }
+        }
+    }
+
+    None
 }
 
 fn assert_translation_unsupported(err: PolicyError, expected_fragment: &str) {

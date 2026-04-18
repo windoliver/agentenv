@@ -9,3 +9,17 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Credential store scaffolding for agentenv"
+
+[dependencies]
+agentenv-proto = { path = "../agentenv-proto" }
+dirs.workspace = true
+keyring.workspace = true
+regex = "1"
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "=3.16.0"

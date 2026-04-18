@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use agentenv_proto::{NetworkRule, NetworkTarget};
+use agentenv_proto::{HttpAccessLevel, NetworkRule, NetworkTarget};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 
@@ -61,9 +61,17 @@ enum PresetRule {
 }
 
 impl PresetRule {
-    fn into_network_rule(self) -> NetworkRule {
+    fn into_network_rule(self, access: PresetAccess) -> NetworkRule {
         let target = match self {
-            Self::Host { host, port, scheme } => NetworkTarget::Host { host, port, scheme },
+            Self::Host { host, port, scheme } => NetworkTarget::Host {
+                host,
+                port,
+                scheme,
+                http_access: Some(match access {
+                    PresetAccess::Read => HttpAccessLevel::ReadOnly,
+                    PresetAccess::ReadWrite => HttpAccessLevel::ReadWrite,
+                }),
+            },
             Self::Cidr { cidr } => NetworkTarget::Cidr { cidr },
             Self::Port { port, protocol } => NetworkTarget::Port { port, protocol },
             Self::UrlPattern { pattern } => NetworkTarget::UrlPattern { pattern },
@@ -123,18 +131,21 @@ impl PresetRegistry {
             &mut policy.network.approval_required,
             &mut policy.network.deny,
             &block.allow,
+            preset.access,
         );
         merge_rules(
             &mut policy.network.approval_required,
             &mut policy.network.allow,
             &mut policy.network.deny,
             &block.approval_required,
+            preset.access,
         );
         merge_rules(
             &mut policy.network.deny,
             &mut policy.network.allow,
             &mut policy.network.approval_required,
             &block.deny,
+            preset.access,
         );
 
         Ok(())
@@ -146,8 +157,13 @@ fn merge_rules(
     other_a: &mut Vec<NetworkRule>,
     other_b: &mut Vec<NetworkRule>,
     new_rules: &[PresetRule],
+    access: PresetAccess,
 ) {
-    for rule in new_rules.iter().cloned().map(PresetRule::into_network_rule) {
+    for rule in new_rules
+        .iter()
+        .cloned()
+        .map(|rule| rule.into_network_rule(access))
+    {
         remove_conflicting_rule(other_a, &rule);
         remove_conflicting_rule(other_b, &rule);
         remove_conflicting_rule(target, &rule);
@@ -162,7 +178,9 @@ fn remove_conflicting_rule(rules: &mut Vec<NetworkRule>, incoming: &NetworkRule)
 
 fn rule_sort_key(rule: &NetworkRule) -> String {
     match &rule.target {
-        NetworkTarget::Host { host, port, scheme } => format!(
+        NetworkTarget::Host {
+            host, port, scheme, ..
+        } => format!(
             "host|{}|{}|{}",
             scheme.as_deref().unwrap_or_default(),
             host,

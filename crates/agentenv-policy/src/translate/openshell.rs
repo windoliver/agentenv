@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use agentenv_proto::{NetworkPolicy, NetworkRule, NetworkTarget};
+use agentenv_proto::{HttpAccessLevel, NetworkPolicy, NetworkRule, NetworkTarget};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,7 +168,12 @@ fn build_network_policies(
 
 fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<(String, EndpointDocument)> {
     match &rule.target {
-        NetworkTarget::Host { host, port, scheme } => {
+        NetworkTarget::Host {
+            host,
+            port,
+            scheme,
+            http_access,
+        } => {
             if host == "*" {
                 return Err(crate::PolicyError::TranslationUnsupported {
                     translator: "openshell",
@@ -197,7 +202,7 @@ fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<(String, EndpointDo
                     port: 443,
                     protocol: "rest",
                     enforcement: "enforce",
-                    access: "read-only",
+                    access: openshell_access(http_access.unwrap_or(HttpAccessLevel::ReadOnly)),
                     deny_rules: Vec::new(),
                 },
             ))
@@ -243,6 +248,14 @@ fn build_binaries(binary_paths: &[String]) -> Vec<BinaryDocument> {
         .cloned()
         .map(|path| BinaryDocument { path })
         .collect()
+}
+
+fn openshell_access(access: HttpAccessLevel) -> &'static str {
+    match access {
+        HttpAccessLevel::ReadOnly => "read-only",
+        HttpAccessLevel::ReadWrite => "read-write",
+        HttpAccessLevel::Full => "full",
+    }
 }
 
 #[derive(Debug, Serialize)]

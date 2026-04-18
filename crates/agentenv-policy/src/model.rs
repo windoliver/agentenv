@@ -1,6 +1,6 @@
 pub use agentenv_proto::{
-    FilesystemPolicy, InferencePolicy, InferenceRoute, NetworkAccessPolicy, NetworkPolicy,
-    NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy,
+    FilesystemPolicy, HttpAccessLevel, InferencePolicy, InferenceRoute, NetworkAccessPolicy,
+    NetworkPolicy, NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,7 @@
 use agentenv_proto::{
-    ApplyPolicyParams, FilesystemPolicy, InferencePolicy, InferenceRoute, NetworkAccessPolicy,
-    NetworkPolicy, NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy, SandboxSpec,
+    ApplyPolicyParams, FilesystemPolicy, HttpAccessLevel, InferencePolicy, InferenceRoute,
+    NetworkAccessPolicy, NetworkPolicy, NetworkRule, NetworkTarget, PolicyReloadability,
+    ProcessPolicy, SandboxSpec,
 };
 
 #[test]
@@ -13,6 +14,7 @@ fn expanded_policy_round_trips_all_domains() {
                     host: "api.github.com".to_owned(),
                     port: Some(443),
                     scheme: Some("https".to_owned()),
+                    http_access: Some(HttpAccessLevel::ReadWrite),
                 },
             }],
             deny: vec![NetworkRule {
@@ -55,6 +57,10 @@ fn expanded_policy_round_trips_all_domains() {
 
     let policy_json = serde_json::to_value(&policy).expect("serialize policy");
     assert_eq!(policy_json["network"]["allow"][0]["target"]["kind"], "host");
+    assert_eq!(
+        policy_json["network"]["allow"][0]["target"]["http_access"],
+        "read_write"
+    );
     assert_eq!(
         policy_json["filesystem"]["reloadability"],
         "locked_at_create"
