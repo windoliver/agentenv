@@ -4,13 +4,15 @@ pub mod engine;
 pub mod error;
 pub mod model;
 pub mod presets;
-
-pub mod translate {}
+pub mod translate;
 
 pub use crate::engine::{compose_policy, Tier};
 pub use crate::error::{PolicyError, PolicyResult};
 pub use crate::model::{PresetAccess, PresetSelection};
 pub use crate::presets::PresetRegistry;
+pub use crate::translate::{
+    DockerTranslator, InferenceUpdate, OpenShellTranslator, PolicyTranslator, TranslatedPolicy,
+};
 
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "agentenv-policy";

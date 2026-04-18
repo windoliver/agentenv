@@ -1,0 +1,125 @@
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+  - /etc
+  - /lib
+  - /usr
+  - /var/log
+  read_write:
+  - /sandbox
+  - /tmp
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+network_policies:
+  rule_0:
+    name: rule-0
+    endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_1:
+    name: rule-1
+    endpoints:
+    - host: crates.io
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_2:
+    name: rule-2
+    endpoints:
+    - host: files.pythonhosted.org
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_3:
+    name: rule-3
+    endpoints:
+    - host: github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_4:
+    name: rule-4
+    endpoints:
+    - host: index.crates.io
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_5:
+    name: rule-5
+    endpoints:
+    - host: pypi.org
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_6:
+    name: rule-6
+    endpoints:
+    - host: registry-1.docker.io
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_7:
+    name: rule-7
+    endpoints:
+    - host: registry.npmjs.org
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
+  rule_8:
+    name: rule-8
+    endpoints:
+    - host: static.crates.io
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+    binaries:
+    - path: /usr/local/bin/claude
+    - path: /usr/local/bin/codex
+    - path: /usr/bin/curl
