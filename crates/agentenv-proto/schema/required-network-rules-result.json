@@ -14,27 +14,139 @@
     "NetworkRule": {
       "type": "object",
       "required": [
-        "host"
+        "target"
       ],
       "properties": {
-        "host": {
-          "type": "string"
-        },
-        "port": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint16",
-          "minimum": 0.0
-        },
-        "scheme": {
-          "type": [
-            "string",
-            "null"
-          ]
+        "target": {
+          "$ref": "#/definitions/NetworkTarget"
         }
       }
+    },
+    "NetworkTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "host",
+            "kind"
+          ],
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "host"
+              ]
+            },
+            "port": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "scheme": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cidr",
+            "kind"
+          ],
+          "properties": {
+            "cidr": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "cidr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "port"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "port"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "protocol": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "url_pattern"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "method",
+            "path"
+          ],
+          "properties": {
+            "host": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "http_method_path"
+              ]
+            },
+            "method": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
     }
   }
 }

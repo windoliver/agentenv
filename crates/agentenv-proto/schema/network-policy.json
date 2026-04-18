@@ -2,49 +2,305 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "NetworkPolicy",
   "type": "object",
+  "required": [
+    "filesystem",
+    "inference",
+    "network",
+    "process"
+  ],
   "properties": {
-    "allow": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/NetworkRule"
-      }
+    "filesystem": {
+      "$ref": "#/definitions/FilesystemPolicy"
     },
-    "approval": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/NetworkRule"
-      }
+    "inference": {
+      "$ref": "#/definitions/InferencePolicy"
     },
-    "deny": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/NetworkRule"
-      }
+    "network": {
+      "$ref": "#/definitions/NetworkAccessPolicy"
+    },
+    "process": {
+      "$ref": "#/definitions/ProcessPolicy"
     }
   },
   "definitions": {
-    "NetworkRule": {
+    "FilesystemPolicy": {
       "type": "object",
       "required": [
-        "host"
+        "reloadability"
       ],
       "properties": {
-        "host": {
-          "type": "string"
+        "read_only": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
-        "port": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint16",
-          "minimum": 0.0
+        "read_write": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
-        "scheme": {
+        "reloadability": {
+          "$ref": "#/definitions/PolicyReloadability"
+        }
+      }
+    },
+    "InferencePolicy": {
+      "type": "object",
+      "required": [
+        "reloadability"
+      ],
+      "properties": {
+        "reloadability": {
+          "$ref": "#/definitions/PolicyReloadability"
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InferenceRoute"
+          }
+        }
+      }
+    },
+    "InferenceRoute": {
+      "type": "object",
+      "required": [
+        "matcher",
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "base_url": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "matcher": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "NetworkAccessPolicy": {
+      "type": "object",
+      "required": [
+        "reloadability"
+      ],
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NetworkRule"
+          }
+        },
+        "approval_required": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NetworkRule"
+          }
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NetworkRule"
+          }
+        },
+        "reloadability": {
+          "$ref": "#/definitions/PolicyReloadability"
+        }
+      }
+    },
+    "NetworkRule": {
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/definitions/NetworkTarget"
+        }
+      }
+    },
+    "NetworkTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "host",
+            "kind"
+          ],
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "host"
+              ]
+            },
+            "port": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "scheme": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "cidr",
+            "kind"
+          ],
+          "properties": {
+            "cidr": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "cidr"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "port"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "port"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "protocol": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "url_pattern"
+              ]
+            },
+            "pattern": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "method",
+            "path"
+          ],
+          "properties": {
+            "host": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "http_method_path"
+              ]
+            },
+            "method": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "PolicyReloadability": {
+      "type": "string",
+      "enum": [
+        "hot_reload",
+        "locked_at_create"
+      ]
+    },
+    "ProcessPolicy": {
+      "type": "object",
+      "required": [
+        "profile",
+        "reloadability",
+        "run_as_group",
+        "run_as_user"
+      ],
+      "properties": {
+        "allow_syscalls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny_syscalls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "profile": {
+          "type": "string"
+        },
+        "reloadability": {
+          "$ref": "#/definitions/PolicyReloadability"
+        },
+        "run_as_group": {
+          "type": "string"
+        },
+        "run_as_user": {
+          "type": "string"
         }
       }
     }
