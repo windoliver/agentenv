@@ -122,6 +122,9 @@ fn interpolate_value(
 ) -> Result<(), BlueprintError> {
     match value {
         Value::String(string) => {
+            if is_credential_reference_path(path) {
+                return Ok(());
+            }
             let updated =
                 interpolate_string(string, resolver).map_err(|error| error.at_path(path))?;
             *string = updated;
@@ -187,6 +190,20 @@ fn interpolate_string(
 
     output.push_str(remaining);
     Ok(output)
+}
+
+fn is_credential_reference_path(path: &str) -> bool {
+    let mut segments = path.split('.');
+    while let Some(segment) = segments.next() {
+        if segment == "credentials" {
+            let Some(_credential_name) = segments.next() else {
+                return false;
+            };
+            return matches!(segments.next(), Some("value")) && segments.next().is_none();
+        }
+    }
+
+    false
 }
 
 fn yaml_path_segment(value: &Value) -> String {

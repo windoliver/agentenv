@@ -243,7 +243,7 @@ policy:
         } => {
             assert_eq!(path, "agent.credentials.OPENAI_API_KEY");
             assert_eq!(credential_source, "env");
-            assert_eq!(reference, "sk-secret-value");
+            assert_eq!(reference, "${OPENAI_API_KEY}");
         }
         other => panic!("unexpected error: {other:?}"),
     }

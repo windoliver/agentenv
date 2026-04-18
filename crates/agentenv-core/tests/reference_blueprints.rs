@@ -155,7 +155,7 @@ policy:
 }
 
 #[test]
-fn interpolation_resolves_credstore_reference() {
+fn interpolation_does_not_resolve_credential_reference_values() {
     struct StaticResolver;
 
     impl agentenv_core::blueprint::InterpolationResolver for StaticResolver {
@@ -210,7 +210,7 @@ policy:
         .as_deref()
         .unwrap();
 
-    assert_eq!(token, "resolved-token");
+    assert_eq!(token, "${credstore:NEXUS_TOKEN}");
 }
 
 #[test]
