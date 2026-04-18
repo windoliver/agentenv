@@ -8,8 +8,6 @@ pub use types::*;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::{
         assert_compatible_schema_version, is_compatible_schema_version, AgentHealthCheckProbe,
         SchemaVersionError, SCHEMA_VERSION,
@@ -45,12 +43,11 @@ mod tests {
 
     #[test]
     fn agent_health_check_probe_defaults_to_zero_exit_code() {
-        let probe = AgentHealthCheckProbe {
-            cmd: "codex --version".to_owned(),
-            tty: false,
-            env: BTreeMap::new(),
-            success_exit_codes: vec![0],
-        };
+        let probe: AgentHealthCheckProbe = serde_json::from_value(serde_json::json!({
+            "cmd": "codex --version",
+            "tty": false
+        }))
+        .expect("probe without success_exit_codes should deserialize");
 
         assert_eq!(probe.success_exit_codes, vec![0]);
     }

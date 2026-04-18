@@ -52,6 +52,8 @@ fn main() {
         &schema_dir,
         "credential-requirements-result",
     );
+    write_schema::<types::HealthCheckParams>(&schema_dir, "health-check-params");
+    write_schema::<types::HealthCheckResult>(&schema_dir, "health-check-result");
     write_schema::<types::AgentHealthCheckProbe>(&schema_dir, "agent-health-check-probe");
     write_schema::<types::ContextSpec>(&schema_dir, "context-spec");
     write_schema::<types::ContextHandle>(&schema_dir, "context-handle");
