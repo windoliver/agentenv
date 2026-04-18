@@ -7,7 +7,10 @@ use crate::{
     blueprint::{Blueprint, ComponentSection, CredentialRef as BlueprintCredentialRef},
     digest::{parse_sha256_digest, sha256_hex, DigestError},
     error::BlueprintError,
-    lockfile::{CredentialRef as LockfileCredentialRef, DriverPin, Lockfile, LockfileError},
+    lockfile::{
+        CredentialRef as LockfileCredentialRef, DriverPin, LockedBlueprint, LockedComponent,
+        Lockfile, LockfileError,
+    },
     registry::{DriverKind, DriverRegistry, RegistryError},
 };
 
@@ -37,6 +40,7 @@ pub struct EnvDescription {
     pub drivers: BTreeMap<String, DriverPin>,
     pub artifacts: BTreeMap<String, String>,
     pub credentials: BTreeMap<String, LockfileCredentialRef>,
+    pub resolved_blueprint: Option<LockedBlueprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +57,7 @@ impl EnvState {
             drivers: self.lockfile.drivers.clone(),
             artifacts: self.lockfile.artifacts.clone(),
             credentials: self.lockfile.credentials.clone(),
+            resolved_blueprint: self.lockfile.resolved_blueprint.clone(),
         }
     }
 }
@@ -78,6 +83,14 @@ pub enum LifecycleError {
         path: String,
         #[source]
         source: DigestError,
+    },
+    #[error(
+        "conflicting credential reference `{name}` between `{first_path}` and `{second_path}`"
+    )]
+    ConflictingCredential {
+        name: String,
+        first_path: String,
+        second_path: String,
     },
 }
 
@@ -111,7 +124,7 @@ pub fn resolve_blueprint_with_registry(
 
 pub fn verify_blueprint_yaml(yaml: &str) -> Result<ResolvedBlueprint, LifecycleError> {
     let resolved = resolve_blueprint(yaml)?;
-    verify_blueprint(&resolved.blueprint)?;
+    validate_and_lock_blueprint(&resolved)?;
     Ok(resolved)
 }
 
@@ -144,15 +157,19 @@ pub fn reproduce_from_lockfile(
 }
 
 fn build_lockfile_from_blueprint_yaml(yaml: &str) -> Result<Lockfile, LifecycleError> {
-    let resolved = verify_blueprint_yaml(yaml)?;
+    let resolved = resolve_blueprint(yaml)?;
+    let locked_blueprint = validate_and_lock_blueprint(&resolved)?;
+    let drivers = driver_pins(&resolved);
+    let credentials = collect_credentials(&locked_blueprint)?;
 
     Ok(Lockfile {
         version: LOCKFILE_VERSION.to_string(),
         protocol_version: LOCKFILE_PROTOCOL_VERSION.to_string(),
         blueprint_hash: sha256_hex(yaml.as_bytes()),
-        drivers: driver_pins(&resolved),
-        artifacts: collect_artifacts(&resolved.blueprint, &driver_pins(&resolved))?,
-        credentials: collect_credentials(&resolved.blueprint),
+        drivers,
+        artifacts: collect_artifacts(&locked_blueprint)?,
+        credentials,
+        resolved_blueprint: Some(locked_blueprint),
     })
 }
 
@@ -170,7 +187,10 @@ fn resolve_component(
     })
 }
 
-fn verify_blueprint(blueprint: &Blueprint) -> Result<(), LifecycleError> {
+fn validate_and_lock_blueprint(
+    resolved: &ResolvedBlueprint,
+) -> Result<LockedBlueprint, LifecycleError> {
+    let blueprint = &resolved.blueprint;
     verify_component_digest("sandbox", &blueprint.sandbox)?;
     verify_component_digest("agent", &blueprint.agent)?;
     verify_component_digest("context", &blueprint.context)?;
@@ -179,7 +199,28 @@ fn verify_blueprint(blueprint: &Blueprint) -> Result<(), LifecycleError> {
         verify_component_digest("inference", inference)?;
     }
 
-    Ok(())
+    let sandbox = lock_component(&resolved.sandbox, &blueprint.sandbox);
+    let agent = lock_component(&resolved.agent, &blueprint.agent);
+    let context = lock_component(&resolved.context, &blueprint.context);
+    let inference = resolved
+        .inference
+        .as_ref()
+        .zip(blueprint.inference.as_ref())
+        .map(|(resolved_component, component)| lock_component(resolved_component, component));
+
+    let locked_blueprint = LockedBlueprint {
+        version: blueprint.version.clone(),
+        min_agentenv_version: blueprint.min_agentenv_version.clone(),
+        sandbox,
+        agent,
+        context,
+        inference,
+        policy: blueprint.policy.clone(),
+        state: blueprint.state.clone(),
+    };
+
+    collect_credentials(&locked_blueprint)?;
+    Ok(locked_blueprint)
 }
 
 fn verify_component_digest(path: &str, component: &ComponentSection) -> Result<(), LifecycleError> {
@@ -227,16 +268,9 @@ fn driver_pin(component: &ResolvedComponent) -> DriverPin {
 }
 
 fn collect_artifacts(
-    blueprint: &Blueprint,
-    drivers: &BTreeMap<String, DriverPin>,
+    blueprint: &LockedBlueprint,
 ) -> Result<BTreeMap<String, String>, LifecycleError> {
-    let mut artifacts = drivers
-        .iter()
-        .map(|(role, pin)| {
-            let digest = sha256_hex(format!("{role}:{}@{}", pin.name, pin.version).as_bytes());
-            (format!("{role}-driver"), format!("sha256:{digest}"))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut artifacts = BTreeMap::new();
 
     if let Some((name, digest)) = explicit_image_artifact("sandbox", &blueprint.sandbox)? {
         artifacts.insert(name, digest);
@@ -258,7 +292,7 @@ fn collect_artifacts(
 
 fn explicit_image_artifact(
     role: &str,
-    component: &ComponentSection,
+    component: &LockedComponent,
 ) -> Result<Option<(String, String)>, LifecycleError> {
     if !component.extra.contains_key("image") {
         return Ok(None);
@@ -280,33 +314,65 @@ fn explicit_image_artifact(
     Ok(Some((format!("{role}-image"), digest.to_string())))
 }
 
-fn collect_credentials(blueprint: &Blueprint) -> BTreeMap<String, LockfileCredentialRef> {
-    let mut credentials = BTreeMap::new();
+fn lock_component(resolved: &ResolvedComponent, component: &ComponentSection) -> LockedComponent {
+    LockedComponent {
+        driver: resolved.driver.clone(),
+        version: resolved.version.to_string(),
+        credentials: component
+            .credentials
+            .as_ref()
+            .map(|credentials| {
+                credentials
+                    .iter()
+                    .map(|(name, credential)| (name.clone(), freeze_credential(name, credential)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        extra: component.extra.clone(),
+    }
+}
 
-    extend_credentials(&mut credentials, &blueprint.sandbox);
-    extend_credentials(&mut credentials, &blueprint.agent);
-    extend_credentials(&mut credentials, &blueprint.context);
+fn collect_credentials(
+    blueprint: &LockedBlueprint,
+) -> Result<BTreeMap<String, LockfileCredentialRef>, LifecycleError> {
+    let mut deduped = BTreeMap::new();
+
+    extend_credentials(&mut deduped, "sandbox", &blueprint.sandbox.credentials)?;
+    extend_credentials(&mut deduped, "agent", &blueprint.agent.credentials)?;
+    extend_credentials(&mut deduped, "context", &blueprint.context.credentials)?;
 
     if let Some(inference) = blueprint.inference.as_ref() {
-        extend_credentials(&mut credentials, inference);
+        extend_credentials(&mut deduped, "inference", &inference.credentials)?;
     }
 
-    credentials
+    Ok(deduped
+        .into_iter()
+        .map(|(name, (credential, _path))| (name, credential))
+        .collect())
 }
 
 fn extend_credentials(
-    credentials: &mut BTreeMap<String, LockfileCredentialRef>,
-    component: &ComponentSection,
-) {
-    let Some(component_credentials) = component.credentials.as_ref() else {
-        return;
-    };
-
+    credentials: &mut BTreeMap<String, (LockfileCredentialRef, String)>,
+    component_name: &str,
+    component_credentials: &BTreeMap<String, LockfileCredentialRef>,
+) -> Result<(), LifecycleError> {
     for (name, credential) in component_credentials {
-        credentials
-            .entry(name.clone())
-            .or_insert_with(|| freeze_credential(name, credential));
+        let path = format!("{component_name}.credentials.{name}");
+        if let Some((existing, first_path)) = credentials.get(name) {
+            if existing != credential {
+                return Err(LifecycleError::ConflictingCredential {
+                    name: name.clone(),
+                    first_path: first_path.clone(),
+                    second_path: path,
+                });
+            }
+            continue;
+        }
+
+        credentials.insert(name.clone(), (credential.clone(), path));
     }
+
+    Ok(())
 }
 
 fn freeze_credential(name: &str, credential: &BlueprintCredentialRef) -> LockfileCredentialRef {

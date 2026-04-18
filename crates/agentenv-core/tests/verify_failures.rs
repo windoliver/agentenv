@@ -119,3 +119,47 @@ fn verify_failures_public_verify_api_reports_missing_digest_path() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn verify_failures_rejects_conflicting_duplicate_credentials() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    SHARED_TOKEN:
+      source: env
+      required: true
+context:
+  driver: mcp-generic
+  credentials:
+    SHARED_TOKEN:
+      source: credstore
+      required: true
+  endpoint:
+    url: https://mcp.internal.example.com
+    transport: http+sse
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#;
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::ConflictingCredential {
+            name,
+            first_path,
+            second_path,
+        } => {
+            assert_eq!(name, "SHARED_TOKEN");
+            assert_eq!(first_path, "agent.credentials.SHARED_TOKEN");
+            assert_eq!(second_path, "context.credentials.SHARED_TOKEN");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}

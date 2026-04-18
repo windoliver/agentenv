@@ -44,7 +44,7 @@ pub struct CredentialRef {
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PolicySection {
     pub tier: String,
     #[serde(default)]
@@ -56,7 +56,7 @@ pub struct PolicySection {
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow: Option<String>,
@@ -69,7 +69,7 @@ pub struct PolicyOverride {
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StateSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_home: Option<bool>,

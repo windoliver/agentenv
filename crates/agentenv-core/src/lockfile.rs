@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
+use crate::blueprint::{PolicyOverride, PolicySection, StateSection};
 use crate::digest::{parse_sha256_digest, parse_sha256_hex, DigestError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +18,8 @@ pub struct Lockfile {
     pub artifacts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credentials: BTreeMap<String, CredentialRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_blueprint: Option<LockedBlueprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +37,30 @@ pub struct CredentialRef {
     pub required: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedBlueprint {
+    pub version: String,
+    pub min_agentenv_version: String,
+    pub sandbox: LockedComponent,
+    pub agent: LockedComponent,
+    pub context: LockedComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<LockedComponent>,
+    pub policy: PolicySection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedComponent {
+    pub driver: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, CredentialRef>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
 }
@@ -80,23 +107,14 @@ impl Lockfile {
     }
 
     pub fn validate_no_secret_values(&self) -> Result<(), LockfileError> {
-        for (name, credential) in &self.credentials {
-            if credential.value.is_some() {
-                return Err(LockfileError::CredentialValueNotAllowed { name: name.clone() });
-            }
+        validate_credentials(&self.credentials)?;
 
-            for (field, value) in &credential.extra {
-                if let Some(field_path) = find_secret_like_field(field, value, field).map_err(
-                    |field_path| LockfileError::InvalidCredentialExtraKey {
-                        name: name.clone(),
-                        field: field_path,
-                    },
-                )? {
-                    return Err(LockfileError::CredentialFieldNotAllowed {
-                        name: name.clone(),
-                        field: field_path,
-                    });
-                }
+        if let Some(resolved_blueprint) = self.resolved_blueprint.as_ref() {
+            validate_credentials(&resolved_blueprint.sandbox.credentials)?;
+            validate_credentials(&resolved_blueprint.agent.credentials)?;
+            validate_credentials(&resolved_blueprint.context.credentials)?;
+            if let Some(inference) = resolved_blueprint.inference.as_ref() {
+                validate_credentials(&inference.credentials)?;
             }
         }
 
@@ -120,13 +138,86 @@ impl Lockfile {
     fn canonicalized(&self) -> Self {
         let mut lockfile = self.clone();
 
-        for credential in lockfile.credentials.values_mut() {
-            for value in credential.extra.values_mut() {
-                *value = canonicalize_yaml_value(value.clone());
+        canonicalize_credentials(&mut lockfile.credentials);
+        if let Some(resolved_blueprint) = lockfile.resolved_blueprint.as_mut() {
+            canonicalize_component(&mut resolved_blueprint.sandbox);
+            canonicalize_component(&mut resolved_blueprint.agent);
+            canonicalize_component(&mut resolved_blueprint.context);
+            if let Some(inference) = resolved_blueprint.inference.as_mut() {
+                canonicalize_component(inference);
+            }
+            canonicalize_policy(&mut resolved_blueprint.policy);
+            if let Some(state) = resolved_blueprint.state.as_mut() {
+                canonicalize_state(state);
             }
         }
 
         lockfile
+    }
+}
+
+fn validate_credentials(
+    credentials: &BTreeMap<String, CredentialRef>,
+) -> Result<(), LockfileError> {
+    for (name, credential) in credentials {
+        if credential.value.is_some() {
+            return Err(LockfileError::CredentialValueNotAllowed { name: name.clone() });
+        }
+
+        for (field, value) in &credential.extra {
+            if let Some(field_path) =
+                find_secret_like_field(field, value, field).map_err(|field_path| {
+                    LockfileError::InvalidCredentialExtraKey {
+                        name: name.clone(),
+                        field: field_path,
+                    }
+                })?
+            {
+                return Err(LockfileError::CredentialFieldNotAllowed {
+                    name: name.clone(),
+                    field: field_path,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn canonicalize_credentials(credentials: &mut BTreeMap<String, CredentialRef>) {
+    for credential in credentials.values_mut() {
+        for value in credential.extra.values_mut() {
+            *value = canonicalize_yaml_value(value.clone());
+        }
+    }
+}
+
+fn canonicalize_component(component: &mut LockedComponent) {
+    canonicalize_credentials(&mut component.credentials);
+    for value in component.extra.values_mut() {
+        *value = canonicalize_yaml_value(value.clone());
+    }
+}
+
+fn canonicalize_policy(policy: &mut PolicySection) {
+    for value in policy.extra.values_mut() {
+        *value = canonicalize_yaml_value(value.clone());
+    }
+
+    for override_rule in &mut policy.overrides {
+        canonicalize_policy_override(override_rule);
+    }
+}
+
+fn canonicalize_policy_override(override_rule: &mut PolicyOverride) {
+    for value in override_rule.extra.values_mut() {
+        *value = canonicalize_yaml_value(value.clone());
+    }
+}
+
+fn canonicalize_state(state: &mut StateSection) {
+    for value in state.extra.values_mut() {
+        *value = canonicalize_yaml_value(value.clone());
     }
 }
 
@@ -154,7 +245,11 @@ fn normalize_secret_field(field: &str) -> String {
         .collect()
 }
 
-fn find_secret_like_field(field: &str, value: &Value, path: &str) -> Result<Option<String>, String> {
+fn find_secret_like_field(
+    field: &str,
+    value: &Value,
+    path: &str,
+) -> Result<Option<String>, String> {
     if is_inline_secret_field(field) {
         return Ok(Some(path.to_string()));
     }
@@ -164,14 +259,19 @@ fn find_secret_like_field(field: &str, value: &Value, path: &str) -> Result<Opti
 
 fn find_secret_like_field_in_value(value: &Value, path: &str) -> Result<Option<String>, String> {
     match value {
-        Value::Sequence(items) => items.iter().enumerate().try_fold(None, |found, (index, item)| {
-            if found.is_some() {
-                return Ok(found);
-            }
+        Value::Sequence(items) => {
+            items
+                .iter()
+                .enumerate()
+                .try_fold(None, |found, (index, item)| {
+                    if found.is_some() {
+                        return Ok(found);
+                    }
 
-            let item_path = format!("{path}[{index}]");
-            find_secret_like_field_in_value(item, &item_path)
-        }),
+                    let item_path = format!("{path}[{index}]");
+                    find_secret_like_field_in_value(item, &item_path)
+                })
+        }
         Value::Mapping(map) => map.iter().try_fold(None, |found, (key, value)| {
             if found.is_some() {
                 return Ok(found);
@@ -205,7 +305,8 @@ fn yaml_key_name(key: &Value) -> Option<String> {
 fn canonicalize_yaml_value(value: Value) -> Value {
     match value {
         Value::Sequence(items) => Value::Sequence(
-            items.into_iter()
+            items
+                .into_iter()
                 .map(canonicalize_yaml_value)
                 .collect::<Vec<_>>(),
         ),
