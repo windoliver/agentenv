@@ -11,6 +11,7 @@ readme = "README.md"
 description = "Declarative environment manager for AI coding agents"
 
 [dependencies]
+agentenv-core = { path = "../agentenv-core" }
 agentenv-credstore = { path = "../agentenv-credstore" }
 anyhow.workspace = true
 clap.workspace = true
