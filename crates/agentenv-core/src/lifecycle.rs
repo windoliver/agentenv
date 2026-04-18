@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 
 use semver::Version;
+use serde::Serialize;
+use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
 use crate::{
-    blueprint::{Blueprint, ComponentSection, CredentialRef as BlueprintCredentialRef},
+    blueprint::{
+        Blueprint, ComponentSection, CredentialRef as BlueprintCredentialRef, PolicySection,
+        StateSection,
+    },
     digest::{parse_sha256_digest, sha256_hex, DigestError},
     error::BlueprintError,
-    lockfile::{
-        CredentialRef as LockfileCredentialRef, DriverPin, LockedBlueprint, LockedComponent,
-        Lockfile, LockfileError,
-    },
+    lockfile::{CredentialRef as LockfileCredentialRef, DriverPin, Lockfile, LockfileError},
     registry::{DriverKind, DriverRegistry, RegistryError},
 };
 
@@ -40,7 +42,6 @@ pub struct EnvDescription {
     pub drivers: BTreeMap<String, DriverPin>,
     pub artifacts: BTreeMap<String, String>,
     pub credentials: BTreeMap<String, LockfileCredentialRef>,
-    pub resolved_blueprint: Option<LockedBlueprint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +58,32 @@ impl EnvState {
             drivers: self.lockfile.drivers.clone(),
             artifacts: self.lockfile.artifacts.clone(),
             credentials: self.lockfile.credentials.clone(),
-            resolved_blueprint: self.lockfile.resolved_blueprint.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CanonicalBlueprint {
+    version: String,
+    min_agentenv_version: String,
+    sandbox: CanonicalComponent,
+    agent: CanonicalComponent,
+    context: CanonicalComponent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inference: Option<CanonicalComponent>,
+    policy: PolicySection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<StateSection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CanonicalComponent {
+    driver: String,
+    version: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credentials: BTreeMap<String, LockfileCredentialRef>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +116,8 @@ pub enum LifecycleError {
         first_path: String,
         second_path: String,
     },
+    #[error("failed to serialize canonical resolved blueprint: {0}")]
+    CanonicalBlueprintSerialize(serde_yaml::Error),
 }
 
 pub fn resolve_blueprint(yaml: &str) -> Result<ResolvedBlueprint, ResolveError> {
@@ -124,7 +150,8 @@ pub fn resolve_blueprint_with_registry(
 
 pub fn verify_blueprint_yaml(yaml: &str) -> Result<ResolvedBlueprint, LifecycleError> {
     let resolved = resolve_blueprint(yaml)?;
-    validate_and_lock_blueprint(&resolved)?;
+    let canonical = canonical_blueprint(&resolved)?;
+    collect_credentials(&canonical)?;
     Ok(resolved)
 }
 
@@ -158,18 +185,16 @@ pub fn reproduce_from_lockfile(
 
 fn build_lockfile_from_blueprint_yaml(yaml: &str) -> Result<Lockfile, LifecycleError> {
     let resolved = resolve_blueprint(yaml)?;
-    let locked_blueprint = validate_and_lock_blueprint(&resolved)?;
-    let drivers = driver_pins(&resolved);
-    let credentials = collect_credentials(&locked_blueprint)?;
+    let canonical = canonical_blueprint(&resolved)?;
+    let credentials = collect_credentials(&canonical)?;
 
     Ok(Lockfile {
         version: LOCKFILE_VERSION.to_string(),
         protocol_version: LOCKFILE_PROTOCOL_VERSION.to_string(),
-        blueprint_hash: sha256_hex(yaml.as_bytes()),
-        drivers,
-        artifacts: collect_artifacts(&locked_blueprint)?,
+        blueprint_hash: canonical_blueprint_hash(&canonical)?,
+        drivers: driver_pins(&resolved),
+        artifacts: collect_artifacts(&canonical)?,
         credentials,
-        resolved_blueprint: Some(locked_blueprint),
     })
 }
 
@@ -187,9 +212,7 @@ fn resolve_component(
     })
 }
 
-fn validate_and_lock_blueprint(
-    resolved: &ResolvedBlueprint,
-) -> Result<LockedBlueprint, LifecycleError> {
+fn canonical_blueprint(resolved: &ResolvedBlueprint) -> Result<CanonicalBlueprint, LifecycleError> {
     let blueprint = &resolved.blueprint;
     verify_component_digest("sandbox", &blueprint.sandbox)?;
     verify_component_digest("agent", &blueprint.agent)?;
@@ -199,28 +222,51 @@ fn validate_and_lock_blueprint(
         verify_component_digest("inference", inference)?;
     }
 
-    let sandbox = lock_component(&resolved.sandbox, &blueprint.sandbox);
-    let agent = lock_component(&resolved.agent, &blueprint.agent);
-    let context = lock_component(&resolved.context, &blueprint.context);
-    let inference = resolved
-        .inference
-        .as_ref()
-        .zip(blueprint.inference.as_ref())
-        .map(|(resolved_component, component)| lock_component(resolved_component, component));
-
-    let locked_blueprint = LockedBlueprint {
+    Ok(CanonicalBlueprint {
         version: blueprint.version.clone(),
         min_agentenv_version: blueprint.min_agentenv_version.clone(),
-        sandbox,
-        agent,
-        context,
-        inference,
+        sandbox: canonical_component(&resolved.sandbox, &blueprint.sandbox),
+        agent: canonical_component(&resolved.agent, &blueprint.agent),
+        context: canonical_component(&resolved.context, &blueprint.context),
+        inference: resolved
+            .inference
+            .as_ref()
+            .zip(blueprint.inference.as_ref())
+            .map(|(resolved_component, component)| {
+                canonical_component(resolved_component, component)
+            }),
         policy: blueprint.policy.clone(),
         state: blueprint.state.clone(),
-    };
+    })
+}
 
-    collect_credentials(&locked_blueprint)?;
-    Ok(locked_blueprint)
+fn canonical_component(
+    resolved: &ResolvedComponent,
+    component: &ComponentSection,
+) -> CanonicalComponent {
+    CanonicalComponent {
+        driver: resolved.driver.clone(),
+        version: resolved.version.to_string(),
+        credentials: component
+            .credentials
+            .as_ref()
+            .map(|credentials| {
+                credentials
+                    .iter()
+                    .map(|(name, credential)| (name.clone(), freeze_credential(name, credential)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        extra: component.extra.clone(),
+    }
+}
+
+fn canonical_blueprint_hash(blueprint: &CanonicalBlueprint) -> Result<String, LifecycleError> {
+    let value =
+        serde_yaml::to_value(blueprint).map_err(LifecycleError::CanonicalBlueprintSerialize)?;
+    let rendered = serde_yaml::to_string(&canonicalize_yaml_value(value))
+        .map_err(LifecycleError::CanonicalBlueprintSerialize)?;
+    Ok(sha256_hex(rendered.as_bytes()))
 }
 
 fn verify_component_digest(path: &str, component: &ComponentSection) -> Result<(), LifecycleError> {
@@ -268,7 +314,7 @@ fn driver_pin(component: &ResolvedComponent) -> DriverPin {
 }
 
 fn collect_artifacts(
-    blueprint: &LockedBlueprint,
+    blueprint: &CanonicalBlueprint,
 ) -> Result<BTreeMap<String, String>, LifecycleError> {
     let mut artifacts = BTreeMap::new();
 
@@ -292,7 +338,7 @@ fn collect_artifacts(
 
 fn explicit_image_artifact(
     role: &str,
-    component: &LockedComponent,
+    component: &CanonicalComponent,
 ) -> Result<Option<(String, String)>, LifecycleError> {
     if !component.extra.contains_key("image") {
         return Ok(None);
@@ -314,26 +360,8 @@ fn explicit_image_artifact(
     Ok(Some((format!("{role}-image"), digest.to_string())))
 }
 
-fn lock_component(resolved: &ResolvedComponent, component: &ComponentSection) -> LockedComponent {
-    LockedComponent {
-        driver: resolved.driver.clone(),
-        version: resolved.version.to_string(),
-        credentials: component
-            .credentials
-            .as_ref()
-            .map(|credentials| {
-                credentials
-                    .iter()
-                    .map(|(name, credential)| (name.clone(), freeze_credential(name, credential)))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        extra: component.extra.clone(),
-    }
-}
-
 fn collect_credentials(
-    blueprint: &LockedBlueprint,
+    blueprint: &CanonicalBlueprint,
 ) -> Result<BTreeMap<String, LockfileCredentialRef>, LifecycleError> {
     let mut deduped = BTreeMap::new();
 
@@ -389,5 +417,77 @@ fn inferred_reference(name: &str, credential: &BlueprintCredentialRef) -> Option
     match credential.source.as_str() {
         "env" | "credstore" => Some(name.to_string()),
         _ => None,
+    }
+}
+
+fn canonicalize_yaml_value(value: Value) -> Value {
+    match value {
+        Value::Sequence(items) => Value::Sequence(
+            items
+                .into_iter()
+                .map(canonicalize_yaml_value)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Mapping(map) => {
+            let mut entries = map
+                .into_iter()
+                .map(|(key, value)| {
+                    let canonical_key = canonicalize_yaml_value(key);
+                    let canonical_value = canonicalize_yaml_value(value);
+                    (canonical_key, canonical_value)
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|(left_key, _), (right_key, _)| {
+                canonical_yaml_sort_key(left_key).cmp(&canonical_yaml_sort_key(right_key))
+            });
+
+            let mut canonical = Mapping::new();
+            for (key, value) in entries {
+                canonical.insert(key, value);
+            }
+
+            Value::Mapping(canonical)
+        }
+        Value::Tagged(tagged) => Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+            tag: tagged.tag,
+            value: canonicalize_yaml_value(tagged.value),
+        })),
+        other => other,
+    }
+}
+
+fn canonical_yaml_sort_key(value: &Value) -> String {
+    match value {
+        Value::Null => "n:null".to_string(),
+        Value::Bool(boolean) => format!("b:{boolean}"),
+        Value::Number(number) => format!("d:{number}"),
+        Value::String(string) => format!("s:{string}"),
+        Value::Sequence(items) => {
+            let mut rendered = String::from("q:[");
+            for item in items {
+                rendered.push_str(&canonical_yaml_sort_key(item));
+                rendered.push(',');
+            }
+            rendered.push(']');
+            rendered
+        }
+        Value::Mapping(map) => {
+            let mut rendered = String::from("m:{");
+            for (key, value) in map {
+                rendered.push_str(&canonical_yaml_sort_key(key));
+                rendered.push('=');
+                rendered.push_str(&canonical_yaml_sort_key(value));
+                rendered.push(',');
+            }
+            rendered.push('}');
+            rendered
+        }
+        Value::Tagged(tagged) => {
+            format!(
+                "t:{}:{}",
+                tagged.tag,
+                canonical_yaml_sort_key(&tagged.value)
+            )
+        }
     }
 }

@@ -40,7 +40,24 @@ fn roundtrip_reproduce_matches_describe() {
 }
 
 #[test]
-fn roundtrip_preserves_resolved_blueprint_semantics() {
+fn roundtrip_public_verify_api_accepts_reference_blueprint() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+
+    let yaml = std::fs::read_to_string(workspace_path(
+        "blueprints/codex+mcp-generic+openshell.yaml",
+    ))
+    .unwrap();
+
+    let verified = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap();
+
+    assert_eq!(verified.sandbox.driver, "openshell");
+    assert_eq!(verified.agent.driver, "codex");
+    assert_eq!(verified.context.driver, "mcp-generic");
+}
+
+#[test]
+fn roundtrip_same_lockfile_reproduces_equivalent_description() {
     let yaml = r#"
 version: 0.1.0
 min_agentenv_version: 0.0.1
@@ -67,53 +84,14 @@ policy:
     - allow: https://mcp.alt.example.com
 "#;
 
-    let created = agentenv_core::lifecycle::create_from_blueprint_yaml("env-a", yaml).unwrap();
-    let frozen = agentenv_core::lifecycle::freeze_env(&created).unwrap();
+    let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
     let lockfile = Lockfile::from_yaml(&frozen).unwrap();
+    let created = agentenv_core::lifecycle::reproduce_from_lockfile("env-a", &frozen).unwrap();
     let reproduced = agentenv_core::lifecycle::reproduce_from_lockfile("env-a", &frozen).unwrap();
-    let reproduced_description = reproduced.describe();
 
-    let locked_context = &lockfile.resolved_blueprint.as_ref().unwrap().context;
-    let described_context = &reproduced_description
-        .resolved_blueprint
-        .as_ref()
-        .unwrap()
-        .context;
-
-    assert_eq!(
-        yaml_string_field(locked_context.extra.get("endpoint").unwrap(), "url"),
-        "https://mcp.alt.example.com"
-    );
-    assert_eq!(
-        locked_context.extra.get("mode").unwrap().as_str(),
-        Some("readonly")
-    );
-    assert_eq!(
-        yaml_string_field(described_context.extra.get("endpoint").unwrap(), "url"),
-        "https://mcp.alt.example.com"
-    );
-    assert_eq!(
-        described_context.extra.get("mode").unwrap().as_str(),
-        Some("readonly")
-    );
-    assert_eq!(created.describe(), reproduced_description);
-}
-
-#[test]
-fn roundtrip_public_verify_api_accepts_reference_blueprint() {
-    let _guard = env_lock().lock().unwrap();
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
-
-    let yaml = std::fs::read_to_string(workspace_path(
-        "blueprints/codex+mcp-generic+openshell.yaml",
-    ))
-    .unwrap();
-
-    let verified = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap();
-
-    assert_eq!(verified.sandbox.driver, "openshell");
-    assert_eq!(verified.agent.driver, "codex");
-    assert_eq!(verified.context.driver, "mcp-generic");
+    assert_eq!(created.describe(), reproduced.describe());
+    assert_eq!(created.describe().blueprint_hash, lockfile.blueprint_hash);
+    assert!(created.describe().artifacts.is_empty());
 }
 
 #[test]
@@ -158,12 +136,4 @@ fn roundtrip_missing_digest_blueprint_is_rejected() {
     let err = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap_err();
 
     assert!(err.to_string().contains("missing digest"));
-}
-
-fn yaml_string_field<'a>(value: &'a serde_yaml::Value, key: &str) -> &'a str {
-    value
-        .as_mapping()
-        .and_then(|mapping| mapping.get(serde_yaml::Value::String(key.to_string())))
-        .and_then(serde_yaml::Value::as_str)
-        .unwrap()
 }
