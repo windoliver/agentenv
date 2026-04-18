@@ -135,6 +135,28 @@ credentials:
 }
 
 #[test]
+fn lockfile_security_complex_yaml_keys_in_credential_extras_are_rejected() {
+    let yaml = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+credentials:
+  OPENAI_API_KEY:
+    source: credstore
+    reference: OPENAI_API_KEY
+    metadata:
+      ? [clientSecret]
+      : inline-secret
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("credential extra keys must be strings"));
+}
+
+#[test]
 fn lockfile_security_nested_map_order_serializes_identically() {
     let yaml_a = r#"
 version: "0.1.0"

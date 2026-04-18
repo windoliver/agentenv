@@ -61,6 +61,8 @@ pub enum LockfileError {
     CredentialValueNotAllowed { name: String },
     #[error("lockfile credential field `{field}` for `{name}` appears to contain an inline secret; credential values are not allowed")]
     CredentialFieldNotAllowed { name: String, field: String },
+    #[error("lockfile credential field `{field}` for `{name}` uses a complex YAML key; credential extra keys must be strings")]
+    InvalidCredentialExtraKey { name: String, field: String },
 }
 
 impl Lockfile {
@@ -84,7 +86,12 @@ impl Lockfile {
             }
 
             for (field, value) in &credential.extra {
-                if let Some(field_path) = find_secret_like_field(field, value, field) {
+                if let Some(field_path) = find_secret_like_field(field, value, field).map_err(
+                    |field_path| LockfileError::InvalidCredentialExtraKey {
+                        name: name.clone(),
+                        field: field_path,
+                    },
+                )? {
                     return Err(LockfileError::CredentialFieldNotAllowed {
                         name: name.clone(),
                         field: field_path,
@@ -147,38 +154,50 @@ fn normalize_secret_field(field: &str) -> String {
         .collect()
 }
 
-fn find_secret_like_field(field: &str, value: &Value, path: &str) -> Option<String> {
+fn find_secret_like_field(field: &str, value: &Value, path: &str) -> Result<Option<String>, String> {
     if is_inline_secret_field(field) {
-        return Some(path.to_string());
+        return Ok(Some(path.to_string()));
     }
 
     find_secret_like_field_in_value(value, path)
 }
 
-fn find_secret_like_field_in_value(value: &Value, path: &str) -> Option<String> {
+fn find_secret_like_field_in_value(value: &Value, path: &str) -> Result<Option<String>, String> {
     match value {
-        Value::Sequence(items) => items.iter().enumerate().find_map(|(index, item)| {
+        Value::Sequence(items) => items.iter().enumerate().try_fold(None, |found, (index, item)| {
+            if found.is_some() {
+                return Ok(found);
+            }
+
             let item_path = format!("{path}[{index}]");
             find_secret_like_field_in_value(item, &item_path)
         }),
-        Value::Mapping(map) => map.iter().find_map(|(key, value)| {
-            let key_name = yaml_key_name(key)?;
+        Value::Mapping(map) => map.iter().try_fold(None, |found, (key, value)| {
+            if found.is_some() {
+                return Ok(found);
+            }
+
+            let key_name = yaml_key_name(key).ok_or_else(|| format!("{path}.<complex-key>"))?;
             let key_path = format!("{path}.{key_name}");
 
             if is_inline_secret_field(&key_name) {
-                return Some(key_path);
+                return Ok(Some(key_path));
             }
 
             find_secret_like_field_in_value(value, &key_path)
         }),
         Value::Tagged(tagged) => find_secret_like_field_in_value(&tagged.value, path),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(None),
     }
 }
 
 fn yaml_key_name(key: &Value) -> Option<String> {
     match key {
         Value::String(string) => Some(string.clone()),
+        Value::Tagged(tagged) => match &tagged.value {
+            Value::String(string) => Some(string.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
