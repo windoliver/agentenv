@@ -108,7 +108,7 @@ impl PresetRegistry {
 
         let block = match preset.access {
             PresetAccess::Read => definition.read.as_ref(),
-            PresetAccess::ReadWrite => definition.read_write.as_ref().or(definition.read.as_ref()),
+            PresetAccess::ReadWrite => definition.read_write.as_ref(),
         }
         .ok_or_else(|| PolicyError::UnsupportedPresetAccess {
             name: preset.name.clone(),
@@ -118,28 +118,68 @@ impl PresetRegistry {
             },
         })?;
 
-        policy.network.allow.extend(
-            block
-                .allow
-                .iter()
-                .cloned()
-                .map(PresetRule::into_network_rule),
+        merge_rules(
+            &mut policy.network.allow,
+            &mut policy.network.approval_required,
+            &mut policy.network.deny,
+            &block.allow,
         );
-        policy.network.deny.extend(
-            block
-                .deny
-                .iter()
-                .cloned()
-                .map(PresetRule::into_network_rule),
+        merge_rules(
+            &mut policy.network.approval_required,
+            &mut policy.network.allow,
+            &mut policy.network.deny,
+            &block.approval_required,
         );
-        policy.network.approval_required.extend(
-            block
-                .approval_required
-                .iter()
-                .cloned()
-                .map(PresetRule::into_network_rule),
+        merge_rules(
+            &mut policy.network.deny,
+            &mut policy.network.allow,
+            &mut policy.network.approval_required,
+            &block.deny,
         );
 
         Ok(())
+    }
+}
+
+fn merge_rules(
+    target: &mut Vec<NetworkRule>,
+    other_a: &mut Vec<NetworkRule>,
+    other_b: &mut Vec<NetworkRule>,
+    new_rules: &[PresetRule],
+) {
+    for rule in new_rules.iter().cloned().map(PresetRule::into_network_rule) {
+        remove_conflicting_rule(other_a, &rule);
+        remove_conflicting_rule(other_b, &rule);
+        remove_conflicting_rule(target, &rule);
+        target.push(rule);
+    }
+}
+
+fn remove_conflicting_rule(rules: &mut Vec<NetworkRule>, incoming: &NetworkRule) {
+    let incoming_key = rule_sort_key(incoming);
+    rules.retain(|rule| rule_sort_key(rule) != incoming_key);
+}
+
+fn rule_sort_key(rule: &NetworkRule) -> String {
+    match &rule.target {
+        NetworkTarget::Host { host, port, scheme } => format!(
+            "host|{}|{}|{}",
+            scheme.as_deref().unwrap_or_default(),
+            host,
+            port.map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or_default()
+        ),
+        NetworkTarget::Cidr { cidr } => format!("cidr|{cidr}"),
+        NetworkTarget::Port { port, protocol } => {
+            format!("port|{}|{port}", protocol.as_deref().unwrap_or_default())
+        }
+        NetworkTarget::UrlPattern { pattern } => format!("url_pattern|{pattern}"),
+        NetworkTarget::HttpMethodPath { host, method, path } => format!(
+            "http_method_path|{}|{}|{}",
+            host.as_deref().unwrap_or_default(),
+            method,
+            path
+        ),
     }
 }

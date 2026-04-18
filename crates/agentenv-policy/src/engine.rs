@@ -19,6 +19,7 @@ pub fn compose_policy(
     registry: &PresetRegistry,
 ) -> PolicyResult<NetworkPolicy> {
     let mut policy = baseline_policy(tier);
+    apply_tier_defaults(tier, registry, &mut policy)?;
 
     for preset in presets {
         registry.merge_into(&mut policy, preset)?;
@@ -30,6 +31,30 @@ pub fn compose_policy(
 
     normalize(&mut policy);
     Ok(policy)
+}
+
+fn apply_tier_defaults(
+    tier: Tier,
+    registry: &PresetRegistry,
+    policy: &mut NetworkPolicy,
+) -> PolicyResult<()> {
+    let default_presets = match tier {
+        Tier::Restricted => &[][..],
+        Tier::Balanced | Tier::Open => &[
+            "github_read",
+            "npm_read",
+            "pypi_read",
+            "crates_read",
+            "docker_hub_read",
+        ][..],
+    };
+
+    for slug in default_presets {
+        let preset = PresetSelection::from_slug(slug)?;
+        registry.merge_into(policy, &preset)?;
+    }
+
+    Ok(())
 }
 
 fn baseline_policy(tier: Tier) -> NetworkPolicy {
@@ -81,18 +106,35 @@ fn baseline_policy(tier: Tier) -> NetworkPolicy {
 }
 
 fn merge_policy(base: &mut NetworkPolicy, overrides: NetworkPolicy) {
-    base.network.allow.extend(overrides.network.allow);
-    base.network.deny.extend(overrides.network.deny);
-    base.network
-        .approval_required
-        .extend(overrides.network.approval_required);
+    merge_network_rules(
+        &mut base.network.allow,
+        &mut base.network.approval_required,
+        &mut base.network.deny,
+        overrides.network.allow,
+    );
+    merge_network_rules(
+        &mut base.network.approval_required,
+        &mut base.network.allow,
+        &mut base.network.deny,
+        overrides.network.approval_required,
+    );
+    merge_network_rules(
+        &mut base.network.deny,
+        &mut base.network.allow,
+        &mut base.network.approval_required,
+        overrides.network.deny,
+    );
 
-    base.filesystem
-        .read_only
-        .extend(overrides.filesystem.read_only);
-    base.filesystem
-        .read_write
-        .extend(overrides.filesystem.read_write);
+    merge_paths(
+        &mut base.filesystem.read_write,
+        &mut base.filesystem.read_only,
+        overrides.filesystem.read_write,
+    );
+    merge_paths(
+        &mut base.filesystem.read_only,
+        &mut base.filesystem.read_write,
+        overrides.filesystem.read_only,
+    );
 
     if !overrides.process.run_as_user.is_empty() {
         base.process.run_as_user = overrides.process.run_as_user;
@@ -111,6 +153,33 @@ fn merge_policy(base: &mut NetworkPolicy, overrides: NetworkPolicy) {
         .deny_syscalls
         .extend(overrides.process.deny_syscalls);
     base.inference.routes.extend(overrides.inference.routes);
+}
+
+fn merge_network_rules(
+    target: &mut Vec<NetworkRule>,
+    other_a: &mut Vec<NetworkRule>,
+    other_b: &mut Vec<NetworkRule>,
+    incoming: Vec<NetworkRule>,
+) {
+    for rule in incoming {
+        remove_conflicting_rule(target, &rule);
+        remove_conflicting_rule(other_a, &rule);
+        remove_conflicting_rule(other_b, &rule);
+        target.push(rule);
+    }
+}
+
+fn merge_paths(target: &mut Vec<String>, other: &mut Vec<String>, incoming: Vec<String>) {
+    for path in incoming {
+        target.retain(|existing| existing != &path);
+        other.retain(|existing| existing != &path);
+        target.push(path);
+    }
+}
+
+fn remove_conflicting_rule(rules: &mut Vec<NetworkRule>, incoming: &NetworkRule) {
+    let incoming_key = rule_sort_key(incoming);
+    rules.retain(|rule| rule_sort_key(rule) != incoming_key);
 }
 
 fn normalize(policy: &mut NetworkPolicy) {
