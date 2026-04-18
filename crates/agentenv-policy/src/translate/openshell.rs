@@ -3,12 +3,27 @@ use std::collections::BTreeMap;
 use agentenv_proto::{NetworkPolicy, NetworkRule, NetworkTarget};
 use serde::Serialize;
 
-#[derive(Debug, Default)]
-pub struct OpenShellTranslator;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenShellTranslator {
+    binary_paths: Vec<String>,
+}
+
+impl OpenShellTranslator {
+    pub fn new<I, S>(binary_paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            binary_paths: binary_paths.into_iter().map(Into::into).collect(),
+        }
+    }
+}
 
 impl super::PolicyTranslator for OpenShellTranslator {
     fn translate(&self, policy: &NetworkPolicy) -> crate::PolicyResult<super::TranslatedPolicy> {
-        reject_unsupported_rules(policy)?;
+        reject_unsupported_process(policy)?;
+        reject_unsupported_network_rules(policy)?;
 
         let document = OpenShellDocument {
             version: 1,
@@ -24,7 +39,7 @@ impl super::PolicyTranslator for OpenShellTranslator {
                 run_as_user: policy.process.run_as_user.clone(),
                 run_as_group: policy.process.run_as_group.clone(),
             },
-            network_policies: build_network_policies(&policy.network.allow)?,
+            network_policies: build_network_policies(&policy.network.allow, &self.binary_paths)?,
         };
 
         let policy_yaml = serde_yaml::to_string(&document).map_err(|err| {
@@ -50,7 +65,41 @@ impl super::PolicyTranslator for OpenShellTranslator {
     }
 }
 
-fn reject_unsupported_rules(policy: &NetworkPolicy) -> crate::PolicyResult<()> {
+fn reject_unsupported_process(policy: &NetworkPolicy) -> crate::PolicyResult<()> {
+    if !policy.process.profile.is_empty() {
+        return Err(crate::PolicyError::TranslationUnsupported {
+            translator: "openshell",
+            message: format!(
+                "unsupported process.profile value: {}",
+                policy.process.profile
+            ),
+        });
+    }
+
+    if !policy.process.allow_syscalls.is_empty() {
+        return Err(crate::PolicyError::TranslationUnsupported {
+            translator: "openshell",
+            message: format!(
+                "unsupported process.allow_syscalls values: {:?}",
+                policy.process.allow_syscalls
+            ),
+        });
+    }
+
+    if !policy.process.deny_syscalls.is_empty() {
+        return Err(crate::PolicyError::TranslationUnsupported {
+            translator: "openshell",
+            message: format!(
+                "unsupported process.deny_syscalls values: {:?}",
+                policy.process.deny_syscalls
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn reject_unsupported_network_rules(policy: &NetworkPolicy) -> crate::PolicyResult<()> {
     if let Some(rule) = policy.network.deny.first() {
         return Err(unsupported_rule("deny", rule));
     }
@@ -71,8 +120,10 @@ fn unsupported_rule(kind: &str, rule: &NetworkRule) -> crate::PolicyError {
 
 fn build_network_policies(
     allow_rules: &[NetworkRule],
+    binary_paths: &[String],
 ) -> crate::PolicyResult<BTreeMap<String, OpenShellNetworkPolicy>> {
     let mut entries = BTreeMap::new();
+    let binaries = build_binaries(binary_paths);
 
     for (index, rule) in allow_rules.iter().enumerate() {
         let endpoint = build_endpoint(rule)?;
@@ -81,7 +132,7 @@ fn build_network_policies(
             OpenShellNetworkPolicy {
                 name: format!("rule-{index}"),
                 endpoints: vec![endpoint],
-                binaries: supported_binaries(),
+                binaries: binaries.clone(),
             },
         );
     }
@@ -92,6 +143,13 @@ fn build_network_policies(
 fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<EndpointDocument> {
     match &rule.target {
         NetworkTarget::Host { host, port, scheme } => {
+            if host == "*" {
+                return Err(crate::PolicyError::TranslationUnsupported {
+                    translator: "openshell",
+                    message: format!("unsupported wildcard host: {:?}", rule.target),
+                });
+            }
+
             if matches!(scheme.as_deref(), Some(value) if value != "https") {
                 return Err(crate::PolicyError::TranslationUnsupported {
                     translator: "openshell",
@@ -114,18 +172,12 @@ fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<EndpointDocument> {
     }
 }
 
-fn supported_binaries() -> Vec<BinaryDocument> {
-    vec![
-        BinaryDocument {
-            path: "/usr/local/bin/claude",
-        },
-        BinaryDocument {
-            path: "/usr/local/bin/codex",
-        },
-        BinaryDocument {
-            path: "/usr/bin/curl",
-        },
-    ]
+fn build_binaries(binary_paths: &[String]) -> Vec<BinaryDocument> {
+    binary_paths
+        .iter()
+        .cloned()
+        .map(|path| BinaryDocument { path })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -155,14 +207,14 @@ struct ProcessDocument {
     run_as_group: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OpenShellNetworkPolicy {
     name: String,
     endpoints: Vec<EndpointDocument>,
     binaries: Vec<BinaryDocument>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct EndpointDocument {
     host: String,
     port: u16,
@@ -171,7 +223,7 @@ struct EndpointDocument {
     access: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct BinaryDocument {
-    path: &'static str,
+    path: String,
 }
