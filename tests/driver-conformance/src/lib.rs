@@ -3,9 +3,9 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use agentenv_proto::{
-    assert_compatible_schema_version, EmptyResult, InitializeParams, InitializeResult,
-    PreflightParams, PreflightResult, ERROR_SCHEMA_VERSION_INCOMPATIBLE, JSON_RPC_METHOD_NOT_FOUND,
-    SCHEMA_VERSION,
+    assert_compatible_schema_version, schema_version_major, EmptyResult, InitializeParams,
+    InitializeResult, PreflightParams, PreflightResult, ERROR_SCHEMA_VERSION_INCOMPATIBLE,
+    JSON_RPC_METHOD_NOT_FOUND, SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -263,12 +263,16 @@ pub fn run_standard_suite(driver_path: &Path) -> Result<()> {
 }
 
 pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
+    let mismatched_schema_version = format!(
+        "{}.0",
+        schema_version_major(SCHEMA_VERSION).expect("schema version should parse") + 1
+    );
     let mut client = RpcClient::spawn(driver_path)?;
     let error = client.call_error(
         1,
         "initialize",
         &InitializeParams {
-            schema_version: "1.0".to_owned(),
+            schema_version: mismatched_schema_version,
             core_version: "0.0.1".to_owned(),
             workdir: "/tmp/agentenv".to_owned(),
             log_level: agentenv_proto::LogLevel::Info,
