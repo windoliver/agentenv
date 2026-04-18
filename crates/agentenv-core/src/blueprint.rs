@@ -120,11 +120,12 @@ fn interpolate_value(
     resolver: &dyn InterpolationResolver,
     path: &str,
 ) -> Result<(), BlueprintError> {
+    if is_credentials_object_path(path) {
+        return Ok(());
+    }
+
     match value {
         Value::String(string) => {
-            if is_credential_reference_path(path) {
-                return Ok(());
-            }
             let updated =
                 interpolate_string(string, resolver).map_err(|error| error.at_path(path))?;
             *string = updated;
@@ -192,14 +193,11 @@ fn interpolate_string(
     Ok(output)
 }
 
-fn is_credential_reference_path(path: &str) -> bool {
+fn is_credentials_object_path(path: &str) -> bool {
     let mut segments = path.split('.');
     while let Some(segment) = segments.next() {
         if segment == "credentials" {
-            let Some(_credential_name) = segments.next() else {
-                return false;
-            };
-            return matches!(segments.next(), Some("value")) && segments.next().is_none();
+            return segments.next().is_some();
         }
     }
 

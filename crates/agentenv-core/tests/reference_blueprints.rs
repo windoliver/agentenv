@@ -214,6 +214,52 @@ policy:
 }
 
 #[test]
+fn interpolation_skips_credential_objects_but_still_resolves_other_fields() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::set_var("OPENAI_API_KEY", "sk-secret-value");
+    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+      note: ${OPENAI_API_KEY}
+context:
+  driver: mcp-generic
+  endpoint:
+    url: ${MCP_URL}
+    transport: http+sse
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#;
+
+    let blueprint = Blueprint::from_yaml(yaml).unwrap();
+    let credential = blueprint
+        .agent
+        .credentials
+        .as_ref()
+        .unwrap()
+        .get("OPENAI_API_KEY")
+        .unwrap();
+    let note = credential.extra.get("note").unwrap().as_str().unwrap();
+    let endpoint = blueprint.context.extra.get("endpoint").unwrap();
+    let url = yaml_string_field(endpoint, "url");
+
+    assert_eq!(note, "${OPENAI_API_KEY}");
+    assert_eq!(url, "https://mcp.internal.example.com");
+}
+
+#[test]
 fn blueprint_allows_missing_inference_section() {
     let yaml = r#"
 version: 0.1.0

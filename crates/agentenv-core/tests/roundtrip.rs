@@ -171,6 +171,46 @@ policy:
 }
 
 #[test]
+fn roundtrip_freeze_preserves_literal_credential_extras() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::set_var("OPENAI_API_KEY", "sk-secret-value");
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+      note: ${OPENAI_API_KEY}
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
+    let lockfile = Lockfile::from_yaml(&frozen).unwrap();
+    let rendered_note = lockfile.credentials["OPENAI_API_KEY"]
+        .extra
+        .get("note")
+        .unwrap()
+        .as_str()
+        .unwrap();
+
+    assert_eq!(rendered_note, "${OPENAI_API_KEY}");
+    assert!(!frozen.contains("sk-secret-value"));
+}
+
+#[test]
 fn roundtrip_missing_digest_blueprint_is_rejected() {
     let yaml = fixture("missing-digest.yaml");
     let err = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap_err();
