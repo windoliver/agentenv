@@ -83,11 +83,11 @@ impl Lockfile {
                 return Err(LockfileError::CredentialValueNotAllowed { name: name.clone() });
             }
 
-            for field in credential.extra.keys() {
-                if is_inline_secret_field(field) {
+            for (field, value) in &credential.extra {
+                if let Some(field_path) = find_secret_like_field(field, value, field) {
                     return Err(LockfileError::CredentialFieldNotAllowed {
                         name: name.clone(),
-                        field: field.clone(),
+                        field: field_path,
                     });
                 }
             }
@@ -145,6 +145,42 @@ fn normalize_secret_field(field: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(|ch| ch.to_lowercase())
         .collect()
+}
+
+fn find_secret_like_field(field: &str, value: &Value, path: &str) -> Option<String> {
+    if is_inline_secret_field(field) {
+        return Some(path.to_string());
+    }
+
+    find_secret_like_field_in_value(value, path)
+}
+
+fn find_secret_like_field_in_value(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::Sequence(items) => items.iter().enumerate().find_map(|(index, item)| {
+            let item_path = format!("{path}[{index}]");
+            find_secret_like_field_in_value(item, &item_path)
+        }),
+        Value::Mapping(map) => map.iter().find_map(|(key, value)| {
+            let key_name = yaml_key_name(key)?;
+            let key_path = format!("{path}.{key_name}");
+
+            if is_inline_secret_field(&key_name) {
+                return Some(key_path);
+            }
+
+            find_secret_like_field_in_value(value, &key_path)
+        }),
+        Value::Tagged(tagged) => find_secret_like_field_in_value(&tagged.value, path),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
+}
+
+fn yaml_key_name(key: &Value) -> Option<String> {
+    match key {
+        Value::String(string) => Some(string.clone()),
+        _ => None,
+    }
 }
 
 fn canonicalize_yaml_value(value: Value) -> Value {
