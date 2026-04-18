@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
+pub mod engine;
 pub mod error;
 pub mod model;
+pub mod presets;
 
-pub mod engine {}
-pub mod presets {}
 pub mod translate {}
 
+pub use crate::engine::{compose_policy, Tier};
 pub use crate::error::{PolicyError, PolicyResult};
 pub use crate::model::{PresetAccess, PresetSelection};
+pub use crate::presets::PresetRegistry;
 
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "agentenv-policy";
