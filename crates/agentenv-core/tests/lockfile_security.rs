@@ -64,6 +64,30 @@ credentials:
 }
 
 #[test]
+fn lockfile_security_rejects_unknown_top_level_fields() {
+    let yaml = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
+unexpected: true
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err.to_string().contains("unknown field `unexpected`"));
+}
+
+#[test]
 fn lockfile_security_rejects_unsupported_lockfile_version() {
     let yaml = r#"
 version: "9.9.9"
@@ -135,74 +159,11 @@ fn lockfile_security_lockfile_with_inline_credential_value_is_rejected() {
     let text = fixture("lockfile-with-secret.yaml");
     let err = Lockfile::from_yaml(&text).unwrap_err();
 
-    assert!(err
-        .to_string()
-        .contains("credential values are not allowed"));
+    assert!(err.to_string().contains("unknown field `value`"));
 }
 
 #[test]
-fn lockfile_security_camel_case_secret_keys_are_rejected() {
-    let yaml = r#"
-version: "0.1.0"
-protocol_version: "0.1"
-blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
-drivers:
-  agent:
-    name: codex
-    version: 0.0.2
-  context:
-    name: filesystem
-    version: 0.0.2
-  sandbox:
-    name: openshell
-    version: 0.0.31
-credentials:
-  OPENAI_API_KEY:
-    source: credstore
-    reference: OPENAI_API_KEY
-    apiKey: inline-secret
-"#;
-
-    let err = Lockfile::from_yaml(yaml).unwrap_err();
-
-    assert!(err
-        .to_string()
-        .contains("credential values are not allowed"));
-}
-
-#[test]
-fn lockfile_security_nested_secret_payloads_are_rejected() {
-    let yaml = r#"
-version: "0.1.0"
-protocol_version: "0.1"
-blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
-drivers:
-  agent:
-    name: codex
-    version: 0.0.2
-  context:
-    name: filesystem
-    version: 0.0.2
-  sandbox:
-    name: openshell
-    version: 0.0.31
-credentials:
-  OPENAI_API_KEY:
-    source: credstore
-    reference: OPENAI_API_KEY
-    clientSecret:
-      wrapped: secret-payload
-"#;
-
-    let err = Lockfile::from_yaml(yaml).unwrap_err();
-
-    assert!(err
-        .to_string()
-        .contains("credential values are not allowed"));
-}
-
-#[test]
-fn lockfile_security_nested_metadata_secret_key_bypass_is_rejected() {
+fn lockfile_security_rejects_unknown_credential_metadata_fields() {
     let yaml = r#"
 version: "0.1.0"
 protocol_version: "0.1"
@@ -222,76 +183,40 @@ credentials:
     source: credstore
     reference: OPENAI_API_KEY
     metadata:
-      clientSecret: inline-secret
+      owner: platform
 "#;
 
     let err = Lockfile::from_yaml(yaml).unwrap_err();
 
-    assert!(err
-        .to_string()
-        .contains("credential values are not allowed"));
+    assert!(err.to_string().contains("unknown field `metadata`"));
 }
 
 #[test]
-fn lockfile_security_complex_yaml_keys_in_credential_extras_are_rejected() {
-    let yaml = r#"
-version: "0.1.0"
-protocol_version: "0.1"
-blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
-drivers:
-  agent:
-    name: codex
-    version: 0.0.2
-  context:
-    name: filesystem
-    version: 0.0.2
-  sandbox:
-    name: openshell
-    version: 0.0.31
-credentials:
-  OPENAI_API_KEY:
-    source: credstore
-    reference: OPENAI_API_KEY
-    metadata:
-      ? [clientSecret]
-      : inline-secret
-"#;
-
-    let err = Lockfile::from_yaml(yaml).unwrap_err();
-
-    assert!(err
-        .to_string()
-        .contains("credential extra keys must be strings"));
-}
-
-#[test]
-fn lockfile_security_nested_map_order_serializes_identically() {
+fn lockfile_security_map_order_serializes_identically() {
     let yaml_a = r#"
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
 drivers:
-  agent:
-    name: codex
-    version: 0.0.2
-  context:
-    name: filesystem
-    version: 0.0.2
   sandbox:
     name: openshell
     version: 0.0.31
+  context:
+    name: filesystem
+    version: 0.0.2
+  agent:
+    name: codex
+    version: 0.0.2
+artifacts:
+  sandbox-image: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  agent-image: sha256:1111111111111111111111111111111111111111111111111111111111111111
 credentials:
   OPENAI_API_KEY:
     source: credstore
     reference: OPENAI_API_KEY
-    metadata:
-      region: us
-      nested:
-        beta: true
-        alpha: first
-      scopes:
-        write: true
-        read: true
+  MCP_TOKEN:
+    source: env
+    reference: MCP_TOKEN
 "#;
 
     let yaml_b = r#"
@@ -302,24 +227,22 @@ drivers:
   agent:
     name: codex
     version: 0.0.2
-  context:
-    name: filesystem
-    version: 0.0.2
   sandbox:
     name: openshell
     version: 0.0.31
+  context:
+    name: filesystem
+    version: 0.0.2
+artifacts:
+  agent-image: sha256:1111111111111111111111111111111111111111111111111111111111111111
+  sandbox-image: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 credentials:
+  MCP_TOKEN:
+    source: env
+    reference: MCP_TOKEN
   OPENAI_API_KEY:
     source: credstore
     reference: OPENAI_API_KEY
-    metadata:
-      scopes:
-        read: true
-        write: true
-      nested:
-        alpha: first
-        beta: true
-      region: us
 "#;
 
     let rendered_a = Lockfile::from_yaml(yaml_a)

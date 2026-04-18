@@ -18,6 +18,8 @@ use crate::{
 
 const LOCKFILE_VERSION: &str = "0.1.0";
 const LOCKFILE_PROTOCOL_VERSION: &str = "0.1";
+const SUPPORTED_BLUEPRINT_VERSION: &str = "0.1.0";
+const CURRENT_CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedComponent {
@@ -92,6 +94,25 @@ pub enum ResolveError {
     Blueprint(#[from] BlueprintError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    #[error("invalid blueprint {field} `{value}`: {source}")]
+    InvalidBlueprintVersion {
+        field: &'static str,
+        value: String,
+        #[source]
+        source: semver::Error,
+    },
+    #[error(
+        "unsupported blueprint version `{version}`; supported blueprint version is `{supported_version}`"
+    )]
+    UnsupportedBlueprintVersion {
+        version: String,
+        supported_version: &'static str,
+    },
+    #[error("blueprint requires agentenv `{min_version}` but this build is `{current_version}`")]
+    IncompatibleMinAgentenvVersion {
+        min_version: String,
+        current_version: &'static str,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -143,6 +164,7 @@ pub fn resolve_blueprint_with_registry(
     registry: &DriverRegistry,
 ) -> Result<ResolvedBlueprint, ResolveError> {
     let blueprint = Blueprint::from_yaml(yaml)?;
+    validate_blueprint_version_gates(&blueprint)?;
     let sandbox = resolve_component(registry, DriverKind::Sandbox, &blueprint.sandbox)?;
     let agent = resolve_component(registry, DriverKind::Agent, &blueprint.agent)?;
     let context = resolve_component(registry, DriverKind::Context, &blueprint.context)?;
@@ -223,6 +245,44 @@ fn resolve_component(
         driver: component.driver.clone(),
         version,
     })
+}
+
+fn validate_blueprint_version_gates(blueprint: &Blueprint) -> Result<(), ResolveError> {
+    let blueprint_version = Version::parse(&blueprint.version).map_err(|source| {
+        ResolveError::InvalidBlueprintVersion {
+            field: "version",
+            value: blueprint.version.clone(),
+            source,
+        }
+    })?;
+    let min_agentenv_version =
+        Version::parse(&blueprint.min_agentenv_version).map_err(|source| {
+            ResolveError::InvalidBlueprintVersion {
+                field: "min_agentenv_version",
+                value: blueprint.min_agentenv_version.clone(),
+                source,
+            }
+        })?;
+    let supported_blueprint_version = Version::parse(SUPPORTED_BLUEPRINT_VERSION)
+        .expect("supported blueprint version must be valid semver");
+    let current_core_version =
+        Version::parse(CURRENT_CORE_VERSION).expect("crate version must be valid semver");
+
+    if blueprint_version != supported_blueprint_version {
+        return Err(ResolveError::UnsupportedBlueprintVersion {
+            version: blueprint.version.clone(),
+            supported_version: SUPPORTED_BLUEPRINT_VERSION,
+        });
+    }
+
+    if min_agentenv_version > current_core_version {
+        return Err(ResolveError::IncompatibleMinAgentenvVersion {
+            min_version: blueprint.min_agentenv_version.clone(),
+            current_version: CURRENT_CORE_VERSION,
+        });
+    }
+
+    Ok(())
 }
 
 fn canonical_blueprint(resolved: &ResolvedBlueprint) -> Result<CanonicalBlueprint, LifecycleError> {
@@ -414,7 +474,6 @@ fn freeze_credential(credential: &BlueprintCredentialRef) -> LockfileCredentialR
         source: credential.source.clone(),
         reference: None,
         required: credential.required,
-        extra: credential.extra.clone(),
     }
 }
 

@@ -7,11 +7,11 @@
 #   agentenv create assistant --blueprint blueprints/openclaw+nexus+openshell.yaml
 
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 
 sandbox:
   driver: openshell
-  version: ">=0.0.30,<0.1"
+  version: ">=0.0.1-alpha0,<0.1"
 
 agent:
   driver: openclaw

@@ -54,7 +54,11 @@ fn all_reference_blueprints_parse() {
         let blueprint = Blueprint::from_yaml(&doc).unwrap();
 
         assert_eq!(blueprint.version, "0.1.0", "{path}");
-        assert_eq!(blueprint.min_agentenv_version, "0.0.1", "{path}");
+        assert_eq!(
+            blueprint.min_agentenv_version,
+            env!("CARGO_PKG_VERSION"),
+            "{path}"
+        );
         assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
         assert_eq!(blueprint.agent.driver, agent_driver, "{path}");
         assert_eq!(blueprint.context.driver, context_driver, "{path}");
@@ -130,7 +134,7 @@ fn interpolation_resolves_env_variable() {
 
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -180,7 +184,7 @@ fn interpolation_does_not_resolve_credential_reference_values() {
 
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -221,7 +225,7 @@ fn interpolation_skips_credential_objects_but_still_resolves_other_fields() {
 
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -263,7 +267,7 @@ policy:
 fn blueprint_allows_missing_inference_section() {
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -288,7 +292,7 @@ fn interpolation_reports_path_for_unresolved_placeholder() {
 
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:

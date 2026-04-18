@@ -21,12 +21,13 @@ fn fixture(path: &str) -> String {
 
 #[test]
 fn verify_failures_resolve_blueprint_pins_highest_satisfying_driver_versions() {
+    let current_version = env!("CARGO_PKG_VERSION");
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
-  version: ">=0.0.30,<0.1"
+  version: ">=0.0.1-alpha0,<0.1"
 agent:
   driver: codex
 context:
@@ -41,10 +42,13 @@ policy:
 
     let resolved = resolve_blueprint(yaml).unwrap();
 
-    assert_eq!(resolved.sandbox.version.to_string(), "0.0.31");
-    assert_eq!(resolved.agent.version.to_string(), "0.0.2");
-    assert_eq!(resolved.context.version.to_string(), "0.0.2");
-    assert_eq!(resolved.inference.unwrap().version.to_string(), "0.0.2");
+    assert_eq!(resolved.sandbox.version.to_string(), current_version);
+    assert_eq!(resolved.agent.version.to_string(), current_version);
+    assert_eq!(resolved.context.version.to_string(), current_version);
+    assert_eq!(
+        resolved.inference.unwrap().version.to_string(),
+        current_version
+    );
 }
 
 #[test]
@@ -57,7 +61,7 @@ fn verify_failures_resolve_blueprint_supports_shipped_driver_aliases() {
         let yaml = format!(
             r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -75,8 +79,107 @@ policy:
         let resolved = resolve_blueprint(&yaml).unwrap();
 
         assert_eq!(resolved.context.driver, "context-none");
-        assert_eq!(resolved.context.version.to_string(), "0.0.2");
+        assert_eq!(
+            resolved.context.version.to_string(),
+            env!("CARGO_PKG_VERSION")
+        );
         assert_eq!(resolved.inference.unwrap().driver, inference_driver);
+    }
+}
+
+#[test]
+fn verify_failures_invalid_blueprint_version_returns_typed_error() {
+    let yaml = r#"
+version: not-semver
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let err = resolve_blueprint(yaml).unwrap_err();
+
+    match err {
+        ResolveError::InvalidBlueprintVersion { field, value, .. } => {
+            assert_eq!(field, "version");
+            assert_eq!(value, "not-semver");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_failures_rejects_unsupported_blueprint_schema_version() {
+    let yaml = r#"
+version: 0.2.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let err = resolve_blueprint(yaml).unwrap_err();
+
+    match err {
+        ResolveError::UnsupportedBlueprintVersion {
+            version,
+            supported_version,
+        } => {
+            assert_eq!(version, "0.2.0");
+            assert_eq!(supported_version, "0.1.0");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_failures_rejects_incompatible_min_agentenv_version() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 9.9.9
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let err = resolve_blueprint(yaml).unwrap_err();
+
+    match err {
+        ResolveError::IncompatibleMinAgentenvVersion {
+            min_version,
+            current_version,
+        } => {
+            assert_eq!(min_version, "9.9.9");
+            assert_eq!(current_version, env!("CARGO_PKG_VERSION"));
+        }
+        other => panic!("unexpected error: {other:?}"),
     }
 }
 
@@ -131,7 +234,7 @@ fn verify_failures_public_verify_api_reports_missing_digest_path() {
 fn verify_failures_rejects_conflicting_duplicate_credentials() {
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -175,7 +278,7 @@ policy:
 fn verify_failures_rejects_unsupported_literal_credential_sources() {
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -214,7 +317,7 @@ fn verify_failures_rejects_secret_like_interpolated_env_reference_values() {
 
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:

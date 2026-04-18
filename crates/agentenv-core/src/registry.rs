@@ -144,100 +144,100 @@ impl Default for DriverRegistry {
         let mut registry = Self {
             entries: BTreeMap::new(),
         };
+        let current_version =
+            Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be valid semver");
 
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Sandbox,
             &["openshell", "sandbox-openshell"],
-            &[(0, 0, 30), (0, 0, 31)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Agent,
             &["claude", "agent-claude"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Agent,
             &["codex", "agent-codex"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Agent,
             &["hermes"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Agent,
             &["openclaw", "agent-openclaw"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Context,
             &["filesystem", "context-filesystem"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Context,
             &["mcp-generic", "context-mcp-generic"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Context,
             &["nexus"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Context,
             &["none", "context-none"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Inference,
             &["passthrough", "inference-passthrough"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Inference,
             &["openai", "inference-openai"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Inference,
             &["anthropic", "inference-anthropic"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
-        register_versions(
+        register_current_version(
             &mut registry,
             DriverKind::Inference,
             &["ollama", "inference-ollama"],
-            &[(0, 0, 1), (0, 0, 2)],
+            &current_version,
         );
 
         registry
     }
 }
 
-fn register_versions(
+fn register_current_version(
     registry: &mut DriverRegistry,
     kind: DriverKind,
     names: &[&str],
-    versions: &[(u64, u64, u64)],
+    version: &Version,
 ) {
     for name in names {
-        for (major, minor, patch) in versions {
-            registry.register_version(kind, *name, Version::new(*major, *minor, *patch));
-        }
+        registry.register_version(kind, *name, version.clone());
     }
 }
 

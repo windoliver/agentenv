@@ -60,7 +60,7 @@ fn roundtrip_public_verify_api_accepts_reference_blueprint() {
 fn roundtrip_same_lockfile_reproduces_equivalent_description() {
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -98,7 +98,7 @@ policy:
 fn roundtrip_allows_byte_identical_duplicate_credentials() {
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -134,7 +134,7 @@ policy:
 fn roundtrip_preserves_explicit_credential_reference_provenance() {
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -171,13 +171,13 @@ policy:
 }
 
 #[test]
-fn roundtrip_freeze_preserves_literal_credential_extras() {
+fn roundtrip_freeze_strips_credential_metadata_fields_from_lockfile() {
     let _guard = env_lock().lock().unwrap();
     std::env::set_var("OPENAI_API_KEY", "sk-secret-value");
 
     let yaml = r#"
 version: 0.1.0
-min_agentenv_version: 0.0.1
+min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
 agent:
@@ -199,14 +199,12 @@ policy:
 
     let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
     let lockfile = Lockfile::from_yaml(&frozen).unwrap();
-    let rendered_note = lockfile.credentials["OPENAI_API_KEY"]
-        .extra
-        .get("note")
-        .unwrap()
-        .as_str()
-        .unwrap();
 
-    assert_eq!(rendered_note, "${OPENAI_API_KEY}");
+    assert_eq!(
+        lockfile.credentials["OPENAI_API_KEY"].reference.as_deref(),
+        Some("OPENAI_API_KEY")
+    );
+    assert!(!frozen.contains("note:"));
     assert!(!frozen.contains("sk-secret-value"));
 }
 
