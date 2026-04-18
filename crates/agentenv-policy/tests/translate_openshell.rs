@@ -23,6 +23,18 @@ fn openshell_translation_matches_the_golden_file_for_balanced_default_policy() {
 }
 
 #[test]
+fn open_tier_policy_is_rejected_by_current_openshell_subset() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let policy = compose_policy(Tier::Open, &[], None, &registry).expect("compose");
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("open tier should not translate");
+
+    assert_translation_unsupported(err, "unsupported wildcard host");
+}
+
+#[test]
 fn known_profile_labels_are_accepted_when_syscall_lists_are_empty() {
     for profile in ["restricted", "balanced", "open"] {
         let mut policy = supported_policy();
