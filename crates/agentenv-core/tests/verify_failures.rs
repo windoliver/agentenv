@@ -1,7 +1,14 @@
+use std::sync::{Mutex, OnceLock};
+
 use agentenv_core::{
     lifecycle::{resolve_blueprint, verify_blueprint_yaml, LifecycleError, ResolveError},
     registry::{DriverKind, RegistryError},
 };
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn fixture(path: &str) -> String {
     std::fs::read_to_string(
@@ -195,6 +202,48 @@ policy:
         } => {
             assert_eq!(path, "agent.credentials.OPENAI_API_KEY");
             assert_eq!(credential_source, "literal");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_failures_rejects_secret_like_interpolated_env_reference_values() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::set_var("OPENAI_API_KEY", "sk-secret-value");
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      value: ${OPENAI_API_KEY}
+      required: true
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::InvalidCredentialReference {
+            path,
+            credential_source,
+            reference,
+        } => {
+            assert_eq!(path, "agent.credentials.OPENAI_API_KEY");
+            assert_eq!(credential_source, "env");
+            assert_eq!(reference, "sk-secret-value");
         }
         other => panic!("unexpected error: {other:?}"),
     }

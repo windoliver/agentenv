@@ -121,6 +121,14 @@ pub enum LifecycleError {
         path: String,
         credential_source: String,
     },
+    #[error(
+        "invalid credential reference `{reference}` for source `{credential_source}` at `{path}`"
+    )]
+    InvalidCredentialReference {
+        path: String,
+        credential_source: String,
+        reference: String,
+    },
     #[error("failed to serialize canonical resolved blueprint: {0}")]
     CanonicalBlueprintSerialize(serde_yaml::Error),
 }
@@ -401,19 +409,35 @@ fn extend_credentials(
     Ok(())
 }
 
-fn freeze_credential(name: &str, credential: &BlueprintCredentialRef) -> LockfileCredentialRef {
+fn freeze_credential(credential: &BlueprintCredentialRef) -> LockfileCredentialRef {
     LockfileCredentialRef {
         source: credential.source.clone(),
-        reference: inferred_reference(name, credential),
+        reference: None,
         required: credential.required,
         extra: credential.extra.clone(),
     }
 }
 
-fn inferred_reference(name: &str, credential: &BlueprintCredentialRef) -> Option<String> {
+fn inferred_reference(
+    path: &str,
+    name: &str,
+    credential: &BlueprintCredentialRef,
+) -> Result<Option<String>, LifecycleError> {
     match credential.source.as_str() {
-        "env" | "credstore" => credential.value.clone().or_else(|| Some(name.to_string())),
-        _ => None,
+        "env" => match credential.value.as_deref() {
+            Some(reference) => {
+                validate_reference(path, "env", reference, is_valid_env_reference).map(Some)
+            }
+            None => Ok(Some(name.to_string())),
+        },
+        "credstore" => match credential.value.as_deref() {
+            Some(reference) => {
+                validate_reference(path, "credstore", reference, is_valid_credstore_reference)
+                    .map(Some)
+            }
+            None => Ok(Some(name.to_string())),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -430,7 +454,9 @@ fn freeze_credentials(
         let path = format!("{component_name}.credentials.{name}");
         match credential.source.as_str() {
             "env" | "credstore" => {
-                frozen.insert(name.clone(), freeze_credential(name, credential));
+                let mut frozen_credential = freeze_credential(credential);
+                frozen_credential.reference = inferred_reference(&path, name, credential)?;
+                frozen.insert(name.clone(), frozen_credential);
             }
             source => {
                 return Err(LifecycleError::UnsupportedCredentialSource {
@@ -442,6 +468,40 @@ fn freeze_credentials(
     }
 
     Ok(frozen)
+}
+
+fn validate_reference(
+    path: &str,
+    credential_source: &str,
+    reference: &str,
+    is_valid: impl Fn(&str) -> bool,
+) -> Result<String, LifecycleError> {
+    if is_valid(reference) {
+        return Ok(reference.to_string());
+    }
+
+    Err(LifecycleError::InvalidCredentialReference {
+        path: path.to_string(),
+        credential_source: credential_source.to_string(),
+        reference: reference.to_string(),
+    })
+}
+
+fn is_valid_env_reference(reference: &str) -> bool {
+    let mut chars = reference.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+
+    chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn is_valid_credstore_reference(reference: &str) -> bool {
+    !reference.is_empty()
+        && reference
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 fn canonicalize_yaml_value(value: Value) -> Value {
