@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandboxSpec",
+  "type": "object",
+  "properties": {
+    "env": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "image": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "policy": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/NetworkPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "NetworkPolicy": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NetworkRule"
+          }
+        },
+        "approval": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NetworkRule"
+          }
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NetworkRule"
+          }
+        }
+      }
+    },
+    "NetworkRule": {
+      "type": "object",
+      "required": [
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "scheme": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@
 
 pub mod blueprint;
 pub mod digest;
+pub mod driver;
 pub mod error;
 pub mod lifecycle;
 pub mod lockfile;

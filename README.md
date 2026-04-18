@@ -74,6 +74,22 @@ MCP is the only agent↔context protocol. Everything plugs in around it.
 curl -LsSf https://raw.githubusercontent.com/windoliver/agentenv/main/install.sh | sh
 ```
 
+Pinned version:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/windoliver/agentenv/main/install.sh | AGENTENV_VERSION=v0.1.0 sh
+```
+
+Binary-only, non-interactive install:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/windoliver/agentenv/main/install.sh | sh -s -- --binary-only --non-interactive
+```
+
+The installer resolves a GitHub release for the current OS/arch, verifies the downloaded tarball against a published SHA256 file before install, installs into `~/.agentenv/bin` by default, and can update shell startup files so a fresh login shell can find `agentenv`.
+
+External Python drivers are wired behind `--with-python-drivers`, but they require published driver bundles or an explicit `AGENTENV_PYTHON_DRIVERS_INDEX_URL`. Until those bundles exist, the installer skips them with a warning instead of failing a binary install.
+
 Or with Cargo:
 
 ```bash

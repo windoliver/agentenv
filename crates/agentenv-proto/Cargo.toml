@@ -9,3 +9,16 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Protocol scaffolding for agentenv drivers"
+build = "build.rs"
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NetworkPolicy",
+  "type": "object",
+  "properties": {
+    "allow": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/NetworkRule"
+      }
+    },
+    "approval": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/NetworkRule"
+      }
+    },
+    "deny": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/NetworkRule"
+      }
+    }
+  },
+  "definitions": {
+    "NetworkRule": {
+      "type": "object",
+      "required": [
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "scheme": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

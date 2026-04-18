@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LogsResult",
+  "type": "object",
+  "properties": {
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/LogEntry"
+      }
+    }
+  },
+  "definitions": {
+    "LogEntry": {
+      "type": "object",
+      "required": [
+        "level",
+        "msg",
+        "ts"
+      ],
+      "properties": {
+        "kv": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "level": {
+          "$ref": "#/definitions/LogLevel"
+        },
+        "msg": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "string"
+        }
+      }
+    },
+    "LogLevel": {
+      "type": "string",
+      "enum": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ContextStatus",
+  "type": "object",
+  "required": [
+    "healthy"
+  ],
+  "properties": {
+    "detail": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "healthy": {
+      "type": "boolean"
+    }
+  }
+}

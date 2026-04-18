@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CopyInParams",
+  "type": "object",
+  "required": [
+    "dst_sandbox_path",
+    "handle",
+    "src_host_path"
+  ],
+  "properties": {
+    "dst_sandbox_path": {
+      "type": "string"
+    },
+    "handle": {
+      "type": "string"
+    },
+    "src_host_path": {
+      "type": "string"
+    }
+  }
+}

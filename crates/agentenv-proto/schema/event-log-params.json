@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EventLogParams",
+  "type": "object",
+  "required": [
+    "level",
+    "msg",
+    "ts"
+  ],
+  "properties": {
+    "kv": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "level": {
+      "$ref": "#/definitions/LogLevel"
+    },
+    "msg": {
+      "type": "string"
+    },
+    "ts": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "LogLevel": {
+      "type": "string",
+      "enum": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ]
+    }
+  }
+}
