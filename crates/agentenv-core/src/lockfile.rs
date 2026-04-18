@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
 use crate::digest::{parse_sha256_digest, parse_sha256_hex, DigestError};
@@ -73,7 +73,8 @@ impl Lockfile {
 
     pub fn to_yaml_deterministic(&self) -> Result<String, LockfileError> {
         self.validate()?;
-        serde_yaml::to_string(self).map_err(LockfileError::Serialize)
+        let canonical = self.canonicalized();
+        serde_yaml::to_string(&canonical).map_err(LockfileError::Serialize)
     }
 
     pub fn validate_no_secret_values(&self) -> Result<(), LockfileError> {
@@ -82,10 +83,8 @@ impl Lockfile {
                 return Err(LockfileError::CredentialValueNotAllowed { name: name.clone() });
             }
 
-            for (field, value) in &credential.extra {
-                if is_inline_secret_field(field)
-                    && matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_))
-                {
+            for field in credential.extra.keys() {
+                if is_inline_secret_field(field) {
                     return Err(LockfileError::CredentialFieldNotAllowed {
                         name: name.clone(),
                         field: field.clone(),
@@ -110,18 +109,111 @@ impl Lockfile {
 
         self.validate_no_secret_values()
     }
+
+    fn canonicalized(&self) -> Self {
+        let mut lockfile = self.clone();
+
+        for credential in lockfile.credentials.values_mut() {
+            for value in credential.extra.values_mut() {
+                *value = canonicalize_yaml_value(value.clone());
+            }
+        }
+
+        lockfile
+    }
 }
 
 fn is_inline_secret_field(field: &str) -> bool {
+    let normalized = normalize_secret_field(field);
+
     matches!(
-        field.to_ascii_lowercase().as_str(),
+        normalized.as_str(),
         "value"
             | "secret"
             | "token"
             | "password"
-            | "api_key"
-            | "client_secret"
-            | "access_token"
-            | "refresh_token"
+            | "apikey"
+            | "clientsecret"
+            | "accesstoken"
+            | "refreshtoken"
     )
+}
+
+fn normalize_secret_field(field: &str) -> String {
+    field
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn canonicalize_yaml_value(value: Value) -> Value {
+    match value {
+        Value::Sequence(items) => Value::Sequence(
+            items.into_iter()
+                .map(canonicalize_yaml_value)
+                .collect::<Vec<_>>(),
+        ),
+        Value::Mapping(map) => {
+            let mut entries = map
+                .into_iter()
+                .map(|(key, value)| {
+                    let canonical_key = canonicalize_yaml_value(key);
+                    let canonical_value = canonicalize_yaml_value(value);
+                    (canonical_key, canonical_value)
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|(left_key, _), (right_key, _)| {
+                canonical_yaml_sort_key(left_key).cmp(&canonical_yaml_sort_key(right_key))
+            });
+
+            let mut canonical = Mapping::new();
+            for (key, value) in entries {
+                canonical.insert(key, value);
+            }
+
+            Value::Mapping(canonical)
+        }
+        Value::Tagged(tagged) => Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+            tag: tagged.tag,
+            value: canonicalize_yaml_value(tagged.value),
+        })),
+        other => other,
+    }
+}
+
+fn canonical_yaml_sort_key(value: &Value) -> String {
+    match value {
+        Value::Null => "n:null".to_string(),
+        Value::Bool(boolean) => format!("b:{boolean}"),
+        Value::Number(number) => format!("d:{number}"),
+        Value::String(string) => format!("s:{string}"),
+        Value::Sequence(items) => {
+            let mut rendered = String::from("q:[");
+            for item in items {
+                rendered.push_str(&canonical_yaml_sort_key(item));
+                rendered.push(',');
+            }
+            rendered.push(']');
+            rendered
+        }
+        Value::Mapping(map) => {
+            let mut rendered = String::from("m:{");
+            for (key, value) in map {
+                rendered.push_str(&canonical_yaml_sort_key(key));
+                rendered.push('=');
+                rendered.push_str(&canonical_yaml_sort_key(value));
+                rendered.push(',');
+            }
+            rendered.push('}');
+            rendered
+        }
+        Value::Tagged(tagged) => {
+            format!(
+                "t:{}:{}",
+                tagged.tag,
+                canonical_yaml_sort_key(&tagged.value)
+            )
+        }
+    }
 }

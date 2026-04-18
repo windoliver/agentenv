@@ -71,3 +71,94 @@ fn lockfile_security_lockfile_with_inline_credential_value_is_rejected() {
         .to_string()
         .contains("credential values are not allowed"));
 }
+
+#[test]
+fn lockfile_security_camel_case_secret_keys_are_rejected() {
+    let yaml = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+credentials:
+  OPENAI_API_KEY:
+    source: credstore
+    reference: OPENAI_API_KEY
+    apiKey: inline-secret
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("credential values are not allowed"));
+}
+
+#[test]
+fn lockfile_security_nested_secret_payloads_are_rejected() {
+    let yaml = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+credentials:
+  OPENAI_API_KEY:
+    source: credstore
+    reference: OPENAI_API_KEY
+    clientSecret:
+      wrapped: secret-payload
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("credential values are not allowed"));
+}
+
+#[test]
+fn lockfile_security_nested_map_order_serializes_identically() {
+    let yaml_a = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+credentials:
+  OPENAI_API_KEY:
+    source: credstore
+    reference: OPENAI_API_KEY
+    metadata:
+      region: us
+      nested:
+        beta: true
+        alpha: first
+      scopes:
+        write: true
+        read: true
+"#;
+
+    let yaml_b = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+credentials:
+  OPENAI_API_KEY:
+    source: credstore
+    reference: OPENAI_API_KEY
+    metadata:
+      scopes:
+        read: true
+        write: true
+      nested:
+        alpha: first
+        beta: true
+      region: us
+"#;
+
+    let rendered_a = Lockfile::from_yaml(yaml_a)
+        .unwrap()
+        .to_yaml_deterministic()
+        .unwrap();
+    let rendered_b = Lockfile::from_yaml(yaml_b)
+        .unwrap()
+        .to_yaml_deterministic()
+        .unwrap();
+
+    assert_eq!(rendered_a, rendered_b);
+}
