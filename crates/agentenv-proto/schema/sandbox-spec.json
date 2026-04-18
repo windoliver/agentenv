@@ -9,6 +9,12 @@
         "type": "string"
       }
     },
+    "env_at_start": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
     "image": {
       "type": [
         "string",

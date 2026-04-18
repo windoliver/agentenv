@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -206,12 +207,71 @@ pub struct NetworkPolicy {
     pub approval: Vec<NetworkRule>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    #[default]
+    ApiKey,
+    Token,
+    Certificate,
+    File,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValidatorSpec {
+    Regex { pattern: String },
+    CurlProbe { url: String },
+}
+
+#[derive(Clone, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SecretValue(String);
+
+impl SecretValue {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretValue([REDACTED])")
+    }
+}
+
+impl fmt::Display for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl From<String> for SecretValue {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CredentialRequirement {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    #[serde(default)]
+    pub kind: CredentialKind,
     pub required: bool,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator: Option<ValidatorSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -220,6 +280,8 @@ pub struct SandboxSpec {
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_at_start: BTreeMap<String, SecretValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
