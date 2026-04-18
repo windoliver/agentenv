@@ -5,9 +5,10 @@ use agentenv_policy::{OpenShellTranslator, PolicyError, PolicyTranslator, Transl
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "sandbox-openshell";
 
-const DEFAULT_OPEN_SHELL_BINARY_PATHS: [&str; 3] = [
+const DEFAULT_OPEN_SHELL_BINARY_PATHS: [&str; 4] = [
     "/usr/local/bin/claude",
     "/usr/local/bin/codex",
+    "/usr/local/bin/openclaw",
     "/usr/bin/curl",
 ];
 
@@ -40,5 +41,16 @@ pub fn classify_policy_update(
 pub fn translate_for_openshell(
     policy: &agentenv_proto::NetworkPolicy,
 ) -> Result<TranslatedPolicy, PolicyError> {
-    OpenShellTranslator::new(DEFAULT_OPEN_SHELL_BINARY_PATHS).translate(policy)
+    translate_for_openshell_with_binaries(policy, DEFAULT_OPEN_SHELL_BINARY_PATHS)
+}
+
+pub fn translate_for_openshell_with_binaries<I, S>(
+    policy: &agentenv_proto::NetworkPolicy,
+    binaries: I,
+) -> Result<TranslatedPolicy, PolicyError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    OpenShellTranslator::new(binaries).translate(policy)
 }

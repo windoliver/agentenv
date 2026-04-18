@@ -1,5 +1,8 @@
 use agentenv_policy::{compose_policy, PresetRegistry, Tier};
-use sandbox_openshell::{classify_policy_update, translate_for_openshell, UpdateDisposition};
+use sandbox_openshell::{
+    classify_policy_update, translate_for_openshell, translate_for_openshell_with_binaries,
+    UpdateDisposition,
+};
 
 #[test]
 fn filesystem_or_process_changes_require_recreate() {
@@ -14,7 +17,18 @@ fn filesystem_or_process_changes_require_recreate() {
 }
 
 #[test]
-fn network_and_inference_changes_hot_reload() {
+fn process_changes_require_recreate() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let current = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
+    let mut next = current.clone();
+    next.process.run_as_user = "agent".to_owned();
+
+    let err = classify_policy_update(&current, &next).expect_err("process changes must recreate");
+    assert!(err.to_string().contains("process"));
+}
+
+#[test]
+fn network_changes_hot_reload() {
     let registry = PresetRegistry::load_builtin().expect("load presets");
     let current = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
     let mut next = current.clone();
@@ -31,6 +45,37 @@ fn network_and_inference_changes_hot_reload() {
         UpdateDisposition::HotReload
     );
     assert_eq!(translate_for_openshell(&next).unwrap().format, "openshell");
+}
+
+#[test]
+fn inference_changes_hot_reload() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let current = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
+    let mut next = current.clone();
+    next.inference.routes.push(agentenv_proto::InferenceRoute {
+        matcher: "default".to_owned(),
+        provider: "openai".to_owned(),
+        model: "gpt-5".to_owned(),
+        base_url: Some("https://api.openai.com/v1".to_owned()),
+        timeout_seconds: Some(30),
+    });
+
+    assert_eq!(
+        classify_policy_update(&current, &next).unwrap(),
+        UpdateDisposition::HotReload
+    );
+}
+
+#[test]
+fn translation_accepts_explicit_binary_overrides() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+
+    let translated = translate_for_openshell_with_binaries(&policy, ["/custom/bin/openclaw"])
+        .expect("translate policy");
+
+    assert!(translated.policy_yaml.contains("/custom/bin/openclaw"));
+    assert!(!translated.policy_yaml.contains("/usr/local/bin/claude"));
 }
 
 #[test]
