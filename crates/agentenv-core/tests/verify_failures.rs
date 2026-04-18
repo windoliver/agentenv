@@ -1,4 +1,7 @@
-use agentenv_core::lifecycle::resolve_blueprint;
+use agentenv_core::{
+    lifecycle::{resolve_blueprint, ResolveError},
+    registry::{DriverKind, RegistryError},
+};
 
 fn fixture(path: &str) -> String {
     std::fs::read_to_string(
@@ -38,23 +41,68 @@ policy:
 }
 
 #[test]
-fn verify_failures_invalid_semver_range_is_rejected() {
-    let yaml = fixture("invalid-semver.yaml");
-    let err = resolve_blueprint(&yaml).unwrap_err();
+fn verify_failures_resolve_blueprint_supports_shipped_driver_aliases() {
+    for inference_driver in [
+        "inference-openai",
+        "inference-anthropic",
+        "inference-ollama",
+    ] {
+        let yaml = format!(
+            r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: context-none
+inference:
+  driver: {inference_driver}
+policy:
+  tier: balanced
+  presets: []
+"#
+        );
 
-    assert!(
-        err.to_string().contains("invalid semver"),
-        "unexpected error: {err}"
-    );
+        let resolved = resolve_blueprint(&yaml).unwrap();
+
+        assert_eq!(resolved.context.driver, "context-none");
+        assert_eq!(resolved.context.version.to_string(), "0.0.2");
+        assert_eq!(resolved.inference.unwrap().driver, inference_driver);
+    }
 }
 
 #[test]
-fn verify_failures_unknown_driver_is_rejected() {
+fn verify_failures_invalid_semver_range_returns_typed_error() {
+    let yaml = fixture("invalid-semver.yaml");
+    let err = resolve_blueprint(&yaml).unwrap_err();
+
+    match err {
+        ResolveError::Registry(RegistryError::InvalidSemverRequirement {
+            kind,
+            name,
+            requirement,
+            ..
+        }) => {
+            assert_eq!(kind, DriverKind::Sandbox);
+            assert_eq!(name, "openshell");
+            assert_eq!(requirement, "definitely-not-semver");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_failures_unknown_driver_returns_typed_error() {
     let yaml = fixture("unknown-driver.yaml");
     let err = resolve_blueprint(&yaml).unwrap_err();
 
-    assert!(
-        err.to_string().contains("unknown driver"),
-        "unexpected error: {err}"
-    );
+    match err {
+        ResolveError::Registry(RegistryError::UnknownDriver { kind, name }) => {
+            assert_eq!(kind, DriverKind::Sandbox);
+            assert_eq!(name, "mysterybox");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
