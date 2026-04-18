@@ -53,16 +53,22 @@ fn expanded_policy_round_trips_all_domains() {
         },
     };
 
-    let json = serde_json::to_value(&policy).expect("serialize policy");
-    assert_eq!(json["network"]["allow"][0]["target"]["kind"], "host");
-    assert_eq!(json["filesystem"]["reloadability"], "locked_at_create");
-    assert_eq!(json["process"]["reloadability"], "locked_at_create");
-    assert_eq!(json["inference"]["routes"][0]["matcher"], "default");
+    let policy_json = serde_json::to_value(&policy).expect("serialize policy");
+    assert_eq!(policy_json["network"]["allow"][0]["target"]["kind"], "host");
+    assert_eq!(
+        policy_json["filesystem"]["reloadability"],
+        "locked_at_create"
+    );
+    assert_eq!(policy_json["process"]["reloadability"], "locked_at_create");
+    assert_eq!(policy_json["inference"]["routes"][0]["matcher"], "default");
+
+    let policy_round_trip: NetworkPolicy =
+        serde_json::from_value(policy_json).expect("round-trip policy");
+    assert_eq!(policy_round_trip, policy);
 
     let spec = SandboxSpec {
         image: Some("ghcr.io/example/sandbox:latest".to_owned()),
         env: Default::default(),
-        env_at_start: Default::default(),
         policy: Some(policy.clone()),
         metadata: Default::default(),
     };
@@ -71,10 +77,13 @@ fn expanded_policy_round_trips_all_domains() {
         policy,
     };
 
-    assert!(serde_json::to_string(&spec)
-        .unwrap()
-        .contains("\"filesystem\""));
-    assert!(serde_json::to_string(&params)
-        .unwrap()
-        .contains("\"inference\""));
+    let spec_round_trip: SandboxSpec =
+        serde_json::from_value(serde_json::to_value(&spec).expect("serialize sandbox spec"))
+            .expect("round-trip sandbox spec");
+    assert_eq!(spec_round_trip, spec);
+
+    let params_round_trip: ApplyPolicyParams =
+        serde_json::from_value(serde_json::to_value(&params).expect("serialize params"))
+            .expect("round-trip apply policy params");
+    assert_eq!(params_round_trip, params);
 }

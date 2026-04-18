@@ -300,8 +300,6 @@ pub struct SandboxSpec {
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env_at_start: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
