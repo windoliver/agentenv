@@ -207,19 +207,14 @@ pub struct NetworkPolicy {
     pub approval: Vec<NetworkRule>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
+    #[default]
     ApiKey,
     Token,
     Certificate,
     File,
-}
-
-impl Default for CredentialKind {
-    fn default() -> Self {
-        Self::ApiKey
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
