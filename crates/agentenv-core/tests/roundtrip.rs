@@ -38,9 +38,26 @@ fn roundtrip_reproduce_matches_describe() {
 }
 
 #[test]
+fn roundtrip_public_verify_api_accepts_reference_blueprint() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+
+    let yaml = std::fs::read_to_string(workspace_path(
+        "blueprints/codex+mcp-generic+openshell.yaml",
+    ))
+    .unwrap();
+
+    let verified = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap();
+
+    assert_eq!(verified.sandbox.driver, "openshell");
+    assert_eq!(verified.agent.driver, "codex");
+    assert_eq!(verified.context.driver, "mcp-generic");
+}
+
+#[test]
 fn roundtrip_missing_digest_blueprint_is_rejected() {
     let yaml = fixture("missing-digest.yaml");
-    let err = agentenv_core::lifecycle::freeze_from_blueprint_yaml(&yaml).unwrap_err();
+    let err = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap_err();
 
     assert!(err.to_string().contains("missing digest"));
 }

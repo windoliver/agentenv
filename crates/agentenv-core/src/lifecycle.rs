@@ -109,6 +109,12 @@ pub fn resolve_blueprint_with_registry(
     })
 }
 
+pub fn verify_blueprint_yaml(yaml: &str) -> Result<ResolvedBlueprint, LifecycleError> {
+    let resolved = resolve_blueprint(yaml)?;
+    verify_blueprint(&resolved.blueprint)?;
+    Ok(resolved)
+}
+
 pub fn freeze_from_blueprint_yaml(yaml: &str) -> Result<String, LifecycleError> {
     let lockfile = build_lockfile_from_blueprint_yaml(yaml)?;
     lockfile.to_yaml_deterministic().map_err(Into::into)
@@ -138,8 +144,7 @@ pub fn reproduce_from_lockfile(
 }
 
 fn build_lockfile_from_blueprint_yaml(yaml: &str) -> Result<Lockfile, LifecycleError> {
-    let resolved = resolve_blueprint(yaml)?;
-    verify_blueprint(&resolved.blueprint)?;
+    let resolved = verify_blueprint_yaml(yaml)?;
 
     Ok(Lockfile {
         version: LOCKFILE_VERSION.to_string(),

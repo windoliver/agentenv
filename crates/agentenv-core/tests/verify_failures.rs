@@ -1,5 +1,5 @@
 use agentenv_core::{
-    lifecycle::{resolve_blueprint, ResolveError},
+    lifecycle::{resolve_blueprint, verify_blueprint_yaml, LifecycleError, ResolveError},
     registry::{DriverKind, RegistryError},
 };
 
@@ -102,6 +102,19 @@ fn verify_failures_unknown_driver_returns_typed_error() {
         ResolveError::Registry(RegistryError::UnknownDriver { kind, name }) => {
             assert_eq!(kind, DriverKind::Sandbox);
             assert_eq!(name, "mysterybox");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn verify_failures_public_verify_api_reports_missing_digest_path() {
+    let yaml = fixture("missing-digest.yaml");
+    let err = verify_blueprint_yaml(&yaml).unwrap_err();
+
+    match err {
+        LifecycleError::MissingDigest { path } => {
+            assert_eq!(path, "sandbox.digest");
         }
         other => panic!("unexpected error: {other:?}"),
     }
