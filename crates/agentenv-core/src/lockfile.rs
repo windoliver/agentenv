@@ -6,6 +6,9 @@ use thiserror::Error;
 
 use crate::digest::{parse_sha256_digest, parse_sha256_hex, DigestError};
 
+const SUPPORTED_LOCKFILE_VERSION: &str = "0.1.0";
+const SUPPORTED_PROTOCOL_VERSION: &str = "0.1";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lockfile {
     pub version: String,
@@ -55,6 +58,12 @@ pub enum LockfileError {
         #[source]
         source: DigestError,
     },
+    #[error("unsupported lockfile version `{version}`")]
+    UnsupportedVersion { version: String },
+    #[error("unsupported protocol version `{version}`")]
+    UnsupportedProtocolVersion { version: String },
+    #[error("missing required driver pin `{role}`")]
+    MissingRequiredDriverPin { role: String },
     #[error("lockfile credential field `{field}` for `{name}` appears to contain an inline secret; credential values are not allowed")]
     CredentialFieldNotAllowed { name: String, field: String },
     #[error("lockfile credential field `{field}` for `{name}` uses a complex YAML key; credential extra keys must be strings")]
@@ -80,8 +89,28 @@ impl Lockfile {
     }
 
     fn validate(&self) -> Result<(), LockfileError> {
+        if self.version != SUPPORTED_LOCKFILE_VERSION {
+            return Err(LockfileError::UnsupportedVersion {
+                version: self.version.clone(),
+            });
+        }
+
+        if self.protocol_version != SUPPORTED_PROTOCOL_VERSION {
+            return Err(LockfileError::UnsupportedProtocolVersion {
+                version: self.protocol_version.clone(),
+            });
+        }
+
         parse_sha256_hex(&self.blueprint_hash)
             .map_err(|source| LockfileError::InvalidBlueprintHash { source })?;
+
+        for role in ["sandbox", "agent", "context"] {
+            if !self.drivers.contains_key(role) {
+                return Err(LockfileError::MissingRequiredDriverPin {
+                    role: role.to_string(),
+                });
+            }
+        }
 
         for (name, digest) in &self.artifacts {
             parse_sha256_digest(digest).map_err(|source| LockfileError::InvalidArtifactDigest {

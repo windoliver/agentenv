@@ -64,6 +64,73 @@ credentials:
 }
 
 #[test]
+fn lockfile_security_rejects_unsupported_lockfile_version() {
+    let yaml = r#"
+version: "9.9.9"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err.to_string().contains("unsupported lockfile version"));
+}
+
+#[test]
+fn lockfile_security_rejects_unsupported_protocol_version() {
+    let yaml = r#"
+version: "0.1.0"
+protocol_version: "9.9"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err.to_string().contains("unsupported protocol version"));
+}
+
+#[test]
+fn lockfile_security_requires_sandbox_agent_and_context_driver_pins() {
+    let yaml = r#"
+version: "0.1.0"
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
+"#;
+
+    let err = Lockfile::from_yaml(yaml).unwrap_err();
+
+    assert!(err.to_string().contains("missing required driver pin"));
+    assert!(err.to_string().contains("context"));
+}
+
+#[test]
 fn lockfile_security_lockfile_with_inline_credential_value_is_rejected() {
     let text = fixture("lockfile-with-secret.yaml");
     let err = Lockfile::from_yaml(&text).unwrap_err();
@@ -79,6 +146,16 @@ fn lockfile_security_camel_case_secret_keys_are_rejected() {
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
 credentials:
   OPENAI_API_KEY:
     source: credstore
@@ -99,6 +176,16 @@ fn lockfile_security_nested_secret_payloads_are_rejected() {
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
 credentials:
   OPENAI_API_KEY:
     source: credstore
@@ -120,6 +207,16 @@ fn lockfile_security_nested_metadata_secret_key_bypass_is_rejected() {
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
 credentials:
   OPENAI_API_KEY:
     source: credstore
@@ -141,6 +238,16 @@ fn lockfile_security_complex_yaml_keys_in_credential_extras_are_rejected() {
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
 credentials:
   OPENAI_API_KEY:
     source: credstore
@@ -163,6 +270,16 @@ fn lockfile_security_nested_map_order_serializes_identically() {
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
 credentials:
   OPENAI_API_KEY:
     source: credstore
@@ -181,6 +298,16 @@ credentials:
 version: "0.1.0"
 protocol_version: "0.1"
 blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  agent:
+    name: codex
+    version: 0.0.2
+  context:
+    name: filesystem
+    version: 0.0.2
+  sandbox:
+    name: openshell
+    version: 0.0.31
 credentials:
   OPENAI_API_KEY:
     source: credstore

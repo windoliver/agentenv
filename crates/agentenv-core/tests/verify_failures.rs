@@ -163,3 +163,39 @@ policy:
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn verify_failures_rejects_unsupported_literal_credential_sources() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: literal
+      value: hard-coded-secret
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::UnsupportedCredentialSource {
+            path,
+            credential_source,
+        } => {
+            assert_eq!(path, "agent.credentials.OPENAI_API_KEY");
+            assert_eq!(credential_source, "literal");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}

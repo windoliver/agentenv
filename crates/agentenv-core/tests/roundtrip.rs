@@ -131,6 +131,46 @@ policy:
 }
 
 #[test]
+fn roundtrip_preserves_explicit_credential_reference_provenance() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      value: ACTUAL_OPENAI_KEY
+      required: true
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
+    let lockfile = Lockfile::from_yaml(&frozen).unwrap();
+    let reproduced = agentenv_core::lifecycle::reproduce_from_lockfile("env-a", &frozen).unwrap();
+
+    assert_eq!(
+        lockfile.credentials["OPENAI_API_KEY"].reference.as_deref(),
+        Some("ACTUAL_OPENAI_KEY")
+    );
+    assert_eq!(
+        reproduced.describe().credentials["OPENAI_API_KEY"]
+            .reference
+            .as_deref(),
+        Some("ACTUAL_OPENAI_KEY")
+    );
+}
+
+#[test]
 fn roundtrip_missing_digest_blueprint_is_rejected() {
     let yaml = fixture("missing-digest.yaml");
     let err = agentenv_core::lifecycle::verify_blueprint_yaml(&yaml).unwrap_err();

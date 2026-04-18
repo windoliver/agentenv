@@ -116,6 +116,11 @@ pub enum LifecycleError {
         first_path: String,
         second_path: String,
     },
+    #[error("unsupported credential source `{credential_source}` at `{path}`")]
+    UnsupportedCredentialSource {
+        path: String,
+        credential_source: String,
+    },
     #[error("failed to serialize canonical resolved blueprint: {0}")]
     CanonicalBlueprintSerialize(serde_yaml::Error),
 }
@@ -225,16 +230,17 @@ fn canonical_blueprint(resolved: &ResolvedBlueprint) -> Result<CanonicalBlueprin
     Ok(CanonicalBlueprint {
         version: blueprint.version.clone(),
         min_agentenv_version: blueprint.min_agentenv_version.clone(),
-        sandbox: canonical_component(&resolved.sandbox, &blueprint.sandbox),
-        agent: canonical_component(&resolved.agent, &blueprint.agent),
-        context: canonical_component(&resolved.context, &blueprint.context),
+        sandbox: canonical_component(&resolved.sandbox, "sandbox", &blueprint.sandbox)?,
+        agent: canonical_component(&resolved.agent, "agent", &blueprint.agent)?,
+        context: canonical_component(&resolved.context, "context", &blueprint.context)?,
         inference: resolved
             .inference
             .as_ref()
             .zip(blueprint.inference.as_ref())
             .map(|(resolved_component, component)| {
-                canonical_component(resolved_component, component)
-            }),
+                canonical_component(resolved_component, "inference", component)
+            })
+            .transpose()?,
         policy: blueprint.policy.clone(),
         state: blueprint.state.clone(),
     })
@@ -242,23 +248,15 @@ fn canonical_blueprint(resolved: &ResolvedBlueprint) -> Result<CanonicalBlueprin
 
 fn canonical_component(
     resolved: &ResolvedComponent,
+    component_name: &str,
     component: &ComponentSection,
-) -> CanonicalComponent {
-    CanonicalComponent {
+) -> Result<CanonicalComponent, LifecycleError> {
+    Ok(CanonicalComponent {
         driver: resolved.driver.clone(),
         version: resolved.version.to_string(),
-        credentials: component
-            .credentials
-            .as_ref()
-            .map(|credentials| {
-                credentials
-                    .iter()
-                    .map(|(name, credential)| (name.clone(), freeze_credential(name, credential)))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        credentials: freeze_credentials(component_name, component.credentials.as_ref())?,
         extra: component.extra.clone(),
-    }
+    })
 }
 
 fn canonical_blueprint_hash(blueprint: &CanonicalBlueprint) -> Result<String, LifecycleError> {
@@ -414,9 +412,36 @@ fn freeze_credential(name: &str, credential: &BlueprintCredentialRef) -> Lockfil
 
 fn inferred_reference(name: &str, credential: &BlueprintCredentialRef) -> Option<String> {
     match credential.source.as_str() {
-        "env" | "credstore" => Some(name.to_string()),
+        "env" | "credstore" => credential.value.clone().or_else(|| Some(name.to_string())),
         _ => None,
     }
+}
+
+fn freeze_credentials(
+    component_name: &str,
+    credentials: Option<&BTreeMap<String, BlueprintCredentialRef>>,
+) -> Result<BTreeMap<String, LockfileCredentialRef>, LifecycleError> {
+    let Some(credentials) = credentials else {
+        return Ok(BTreeMap::new());
+    };
+
+    let mut frozen = BTreeMap::new();
+    for (name, credential) in credentials {
+        let path = format!("{component_name}.credentials.{name}");
+        match credential.source.as_str() {
+            "env" | "credstore" => {
+                frozen.insert(name.clone(), freeze_credential(name, credential));
+            }
+            source => {
+                return Err(LifecycleError::UnsupportedCredentialSource {
+                    path,
+                    credential_source: source.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(frozen)
 }
 
 fn canonicalize_yaml_value(value: Value) -> Value {
