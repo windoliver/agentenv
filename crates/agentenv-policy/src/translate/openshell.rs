@@ -39,7 +39,11 @@ impl super::PolicyTranslator for OpenShellTranslator {
                 run_as_user: policy.process.run_as_user.clone(),
                 run_as_group: policy.process.run_as_group.clone(),
             },
-            network_policies: build_network_policies(&policy.network.allow, &self.binary_paths)?,
+            network_policies: build_network_policies(
+                &policy.network.allow,
+                &policy.network.approval_required,
+                &self.binary_paths,
+            )?,
         };
 
         let policy_yaml = serde_yaml::to_string(&document).map_err(|err| {
@@ -66,7 +70,12 @@ impl super::PolicyTranslator for OpenShellTranslator {
 }
 
 fn reject_unsupported_process(policy: &NetworkPolicy) -> crate::PolicyResult<()> {
-    if !policy.process.profile.is_empty() {
+    if !policy.process.profile.is_empty()
+        && !matches!(
+            policy.process.profile.as_str(),
+            "restricted" | "balanced" | "open"
+        )
+    {
         return Err(crate::PolicyError::TranslationUnsupported {
             translator: "openshell",
             message: format!(
@@ -104,10 +113,6 @@ fn reject_unsupported_network_rules(policy: &NetworkPolicy) -> crate::PolicyResu
         return Err(unsupported_rule("deny", rule));
     }
 
-    if let Some(rule) = policy.network.approval_required.first() {
-        return Err(unsupported_rule("approval_required", rule));
-    }
-
     Ok(())
 }
 
@@ -120,27 +125,48 @@ fn unsupported_rule(kind: &str, rule: &NetworkRule) -> crate::PolicyError {
 
 fn build_network_policies(
     allow_rules: &[NetworkRule],
+    approval_required_rules: &[NetworkRule],
     binary_paths: &[String],
 ) -> crate::PolicyResult<BTreeMap<String, OpenShellNetworkPolicy>> {
     let mut entries = BTreeMap::new();
     let binaries = build_binaries(binary_paths);
+    let mut host_to_key = BTreeMap::new();
 
     for (index, rule) in allow_rules.iter().enumerate() {
-        let endpoint = build_endpoint(rule)?;
+        let (host, endpoint) = build_endpoint(rule)?;
+        let key = format!("rule_{index}");
         entries.insert(
-            format!("rule_{index}"),
+            key.clone(),
             OpenShellNetworkPolicy {
                 name: format!("rule-{index}"),
                 endpoints: vec![endpoint],
                 binaries: binaries.clone(),
             },
         );
+        host_to_key.insert(host, key);
+    }
+
+    for rule in approval_required_rules {
+        let (host, deny_rule) = build_deny_rule(rule)?;
+        let entry = entries
+            .get_mut(host_to_key.get(&host).ok_or_else(|| {
+                crate::PolicyError::TranslationUnsupported {
+                    translator: "openshell",
+                    message: format!("approval_required rule has no matching allow host: {host}"),
+                }
+            })?)
+            .ok_or_else(|| crate::PolicyError::TranslationUnsupported {
+                translator: "openshell",
+                message: format!("approval_required rule has no matching network policy: {host}"),
+            })?;
+
+        entry.endpoints[0].deny_rules.push(deny_rule);
     }
 
     Ok(entries)
 }
 
-fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<EndpointDocument> {
+fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<(String, EndpointDocument)> {
     match &rule.target {
         NetworkTarget::Host { host, port, scheme } => {
             if host == "*" {
@@ -150,24 +176,63 @@ fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<EndpointDocument> {
                 });
             }
 
-            if matches!(scheme.as_deref(), Some(value) if value != "https") {
+            if scheme.as_deref() != Some("https") {
                 return Err(crate::PolicyError::TranslationUnsupported {
                     translator: "openshell",
                     message: format!("unsupported host scheme: {:?}", rule.target),
                 });
             }
 
-            Ok(EndpointDocument {
-                host: host.clone(),
-                port: port.unwrap_or(443),
-                protocol: "rest",
-                enforcement: "enforce",
-                access: "read-only",
-            })
+            if port != &Some(443) {
+                return Err(crate::PolicyError::TranslationUnsupported {
+                    translator: "openshell",
+                    message: format!("unsupported host port: {:?}", rule.target),
+                });
+            }
+
+            Ok((
+                host.clone(),
+                EndpointDocument {
+                    host: host.clone(),
+                    port: 443,
+                    protocol: "rest",
+                    enforcement: "enforce",
+                    access: "read-only",
+                    deny_rules: Vec::new(),
+                },
+            ))
         }
         _ => Err(crate::PolicyError::TranslationUnsupported {
             translator: "openshell",
             message: format!("unsupported allow rule: {:?}", rule.target),
+        }),
+    }
+}
+
+fn build_deny_rule(rule: &NetworkRule) -> crate::PolicyResult<(String, DenyRuleDocument)> {
+    match &rule.target {
+        NetworkTarget::HttpMethodPath { host, method, path } => {
+            let host = host
+                .as_ref()
+                .ok_or_else(|| crate::PolicyError::TranslationUnsupported {
+                    translator: "openshell",
+                    message: format!(
+                        "approval_required host is required for openshell translation: {:?}",
+                        rule.target
+                    ),
+                })?;
+
+            Ok((
+                host.clone(),
+                DenyRuleDocument {
+                    method: method.clone(),
+                    path: path.clone(),
+                },
+            ))
+        }
+        _ => Err(crate::PolicyError::TranslationUnsupported {
+            translator: "openshell",
+            message: format!("unsupported approval_required rule: {:?}", rule.target),
         }),
     }
 }
@@ -221,6 +286,14 @@ struct EndpointDocument {
     protocol: &'static str,
     enforcement: &'static str,
     access: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deny_rules: Vec<DenyRuleDocument>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DenyRuleDocument {
+    method: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

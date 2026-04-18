@@ -8,89 +8,42 @@ use agentenv_proto::{
 };
 
 #[test]
-fn openshell_translation_matches_the_golden_file_for_supported_subset() {
-    let translated = translator()
-        .translate(&supported_policy())
-        .expect("translate policy");
+fn openshell_translation_matches_the_golden_file_for_balanced_default_policy() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+
+    let translated = translator().translate(&policy).expect("translate policy");
 
     assert_eq!(translated.format, "openshell");
     assert_eq!(
         translated.policy_yaml,
-        include_str!("golden/openshell_supported_subset.yaml")
+        include_str!("golden/openshell_balanced_default.yaml")
     );
     assert!(translated.inference_update.is_none());
 }
 
 #[test]
-fn balanced_default_policy_is_rejected_by_current_openshell_subset() {
-    let registry = PresetRegistry::load_builtin().expect("load presets");
-    let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+fn known_profile_labels_are_accepted_when_syscall_lists_are_empty() {
+    for profile in ["restricted", "balanced", "open"] {
+        let mut policy = supported_policy();
+        policy.process.profile = profile.to_owned();
 
-    let err = translator()
-        .translate(&policy)
-        .expect_err("balanced baseline should not translate");
-
-    assert_translation_unsupported(err, "process.profile");
+        translator()
+            .translate(&policy)
+            .unwrap_or_else(|err| panic!("profile {profile} should translate: {err}"));
+    }
 }
 
 #[test]
-fn approval_required_rules_are_rejected() {
+fn unknown_process_profile_is_rejected() {
     let mut policy = supported_policy();
-    policy.network.approval_required.push(NetworkRule {
-        target: NetworkTarget::HttpMethodPath {
-            host: Some("api.github.com".to_owned()),
-            method: "POST".to_owned(),
-            path: "/repos/*".to_owned(),
-        },
-    });
+    policy.process.profile = "custom".to_owned();
 
     let err = translator()
         .translate(&policy)
-        .expect_err("approval-required rules should be rejected");
+        .expect_err("unknown process.profile should be rejected");
 
-    assert_translation_unsupported(err, "approval_required");
-}
-
-#[test]
-fn deny_rules_are_rejected() {
-    let mut policy = supported_policy();
-    policy.network.deny.push(host_rule("api.github.com"));
-
-    let err = translator()
-        .translate(&policy)
-        .expect_err("deny rules should be rejected");
-
-    assert_translation_unsupported(err, "deny");
-}
-
-#[test]
-fn unsupported_host_forms_are_rejected() {
-    let mut policy = supported_policy();
-    policy.network.allow.push(NetworkRule {
-        target: NetworkTarget::Host {
-            host: "*".to_owned(),
-            port: Some(443),
-            scheme: Some("https".to_owned()),
-        },
-    });
-
-    let err = translator()
-        .translate(&policy)
-        .expect_err("wildcard host rules should be rejected");
-
-    assert_translation_unsupported(err, "wildcard host");
-}
-
-#[test]
-fn non_default_process_profile_is_rejected() {
-    let mut policy = supported_policy();
-    policy.process.profile = "balanced".to_owned();
-
-    let err = translator()
-        .translate(&policy)
-        .expect_err("process.profile should be rejected");
-
-    assert_translation_unsupported(err, "process.profile");
+    assert_translation_unsupported(err, "unsupported process.profile");
 }
 
 #[test]
@@ -115,6 +68,108 @@ fn deny_syscalls_are_rejected() {
         .expect_err("deny_syscalls should be rejected");
 
     assert_translation_unsupported(err, "process.deny_syscalls");
+}
+
+#[test]
+fn deny_rules_are_rejected() {
+    let mut policy = supported_policy();
+    policy.network.deny.push(host_rule("api.github.com"));
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("deny rules should be rejected");
+
+    assert_translation_unsupported(err, "deny");
+}
+
+#[test]
+fn approval_required_rule_without_host_is_rejected() {
+    let mut policy = supported_policy();
+    policy.network.approval_required.push(NetworkRule {
+        target: NetworkTarget::HttpMethodPath {
+            host: None,
+            method: "POST".to_owned(),
+            path: "/repos/*".to_owned(),
+        },
+    });
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("hostless approval rule should be rejected");
+
+    assert_translation_unsupported(err, "approval_required host");
+}
+
+#[test]
+fn approval_required_rule_for_unknown_host_is_rejected() {
+    let mut policy = supported_policy();
+    policy.network.approval_required.push(NetworkRule {
+        target: NetworkTarget::HttpMethodPath {
+            host: Some("example.com".to_owned()),
+            method: "POST".to_owned(),
+            path: "/repos/*".to_owned(),
+        },
+    });
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("approval rule for unknown host should be rejected");
+
+    assert_translation_unsupported(err, "no matching allow host");
+}
+
+#[test]
+fn host_rule_without_scheme_is_rejected() {
+    let mut policy = supported_policy();
+    policy.network.allow.push(NetworkRule {
+        target: NetworkTarget::Host {
+            host: "api.github.com".to_owned(),
+            port: Some(443),
+            scheme: None,
+        },
+    });
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("scheme-less host should be rejected");
+
+    assert_translation_unsupported(err, "unsupported host scheme");
+}
+
+#[test]
+fn host_rule_with_non_443_port_is_rejected() {
+    let mut policy = supported_policy();
+    policy.network.allow.push(NetworkRule {
+        target: NetworkTarget::Host {
+            host: "api.github.com".to_owned(),
+            port: Some(8443),
+            scheme: Some("https".to_owned()),
+        },
+    });
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("non-443 host should be rejected");
+
+    assert_translation_unsupported(err, "unsupported host port");
+}
+
+#[test]
+fn wildcard_host_rules_are_rejected() {
+    let mut policy = supported_policy();
+    policy.network.allow.push(NetworkRule {
+        target: NetworkTarget::Host {
+            host: "*".to_owned(),
+            port: Some(443),
+            scheme: Some("https".to_owned()),
+        },
+    });
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("wildcard host rules should be rejected");
+
+    assert_translation_unsupported(err, "unsupported wildcard host");
 }
 
 #[test]
@@ -163,7 +218,13 @@ fn supported_policy() -> NetworkPolicy {
             reloadability: PolicyReloadability::HotReload,
             allow: vec![host_rule("api.github.com"), host_rule("github.com")],
             deny: Vec::new(),
-            approval_required: Vec::new(),
+            approval_required: vec![NetworkRule {
+                target: NetworkTarget::HttpMethodPath {
+                    host: Some("api.github.com".to_owned()),
+                    method: "POST".to_owned(),
+                    path: "/repos/*".to_owned(),
+                },
+            }],
         },
         filesystem: FilesystemPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,
@@ -179,7 +240,7 @@ fn supported_policy() -> NetworkPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,
             run_as_user: "sandbox".to_owned(),
             run_as_group: "sandbox".to_owned(),
-            profile: String::new(),
+            profile: "balanced".to_owned(),
             allow_syscalls: Vec::new(),
             deny_syscalls: Vec::new(),
         },
