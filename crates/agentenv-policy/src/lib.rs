@@ -15,7 +15,7 @@ pub const CRATE_NAME: &str = "agentenv-policy";
 
 #[cfg(test)]
 mod tests {
-    use crate::{PolicyError, PresetAccess, PresetSelection};
+    use crate::{model::NetworkPolicy, PolicyError, PresetAccess, PresetSelection};
 
     #[test]
     fn preset_selection_parses_slug_and_requires_recreate_errors_are_readable() {
@@ -28,5 +28,11 @@ mod tests {
             err.to_string(),
             "policy update requires recreate for domains: filesystem, process"
         );
+
+        assert!(PresetSelection::from_slug("_read").is_err());
+        assert!(PresetSelection::from_slug("_readwrite").is_err());
+        assert!(PresetSelection::from_slug("github").is_err());
+
+        let _: Option<NetworkPolicy> = None;
     }
 }
