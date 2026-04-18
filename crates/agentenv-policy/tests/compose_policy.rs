@@ -68,6 +68,26 @@ fn balanced_tier_includes_dev_tooling_defaults_without_messaging() {
 }
 
 #[test]
+fn balanced_tier_explicit_github_readwrite_supersedes_default_github_read() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let policy = compose_policy(
+        Tier::Balanced,
+        &[PresetSelection::from_slug("github_readwrite").unwrap()],
+        None,
+        &registry,
+    )
+    .expect("compose");
+
+    assert!(has_host(&policy, "api.github.com"));
+    assert!(!has_http_method_path(
+        &policy,
+        Some("api.github.com"),
+        "POST",
+        "/repos/*"
+    ));
+}
+
+#[test]
 fn network_overrides_replace_conflicting_baseline_rules() {
     let registry = PresetRegistry::load_builtin().expect("load presets");
     let overrides = NetworkPolicy {
@@ -116,6 +136,26 @@ fn has_host(policy: &NetworkPolicy, host: &str) -> bool {
         matches!(
             rule.target,
             NetworkTarget::Host { host: ref rule_host, .. } if rule_host == host
+        )
+    })
+}
+
+fn has_http_method_path(
+    policy: &NetworkPolicy,
+    host: Option<&str>,
+    method: &str,
+    path: &str,
+) -> bool {
+    policy.network.approval_required.iter().any(|rule| {
+        matches!(
+            &rule.target,
+            NetworkTarget::HttpMethodPath {
+                host: rule_host,
+                method: rule_method,
+                path: rule_path,
+            } if rule_host.as_deref() == host
+                && rule_method == method
+                && rule_path == path
         )
     })
 }

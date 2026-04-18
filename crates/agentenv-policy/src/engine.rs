@@ -19,9 +19,9 @@ pub fn compose_policy(
     registry: &PresetRegistry,
 ) -> PolicyResult<NetworkPolicy> {
     let mut policy = baseline_policy(tier);
-    apply_tier_defaults(tier, registry, &mut policy)?;
+    let effective_presets = resolve_effective_presets(tier, presets)?;
 
-    for preset in presets {
+    for preset in &effective_presets {
         registry.merge_into(&mut policy, preset)?;
     }
 
@@ -33,12 +33,25 @@ pub fn compose_policy(
     Ok(policy)
 }
 
-fn apply_tier_defaults(
+fn resolve_effective_presets(
     tier: Tier,
-    registry: &PresetRegistry,
-    policy: &mut NetworkPolicy,
-) -> PolicyResult<()> {
-    let default_presets = match tier {
+    presets: &[PresetSelection],
+) -> PolicyResult<Vec<PresetSelection>> {
+    let mut effective = tier_default_presets(tier)?;
+
+    for preset in presets {
+        if let Some(existing) = effective.iter_mut().find(|entry| entry.name == preset.name) {
+            *existing = preset.clone();
+        } else {
+            effective.push(preset.clone());
+        }
+    }
+
+    Ok(effective)
+}
+
+fn tier_default_presets(tier: Tier) -> PolicyResult<Vec<PresetSelection>> {
+    let default_slugs = match tier {
         Tier::Restricted => &[][..],
         Tier::Balanced | Tier::Open => &[
             "github_read",
@@ -49,12 +62,10 @@ fn apply_tier_defaults(
         ][..],
     };
 
-    for slug in default_presets {
-        let preset = PresetSelection::from_slug(slug)?;
-        registry.merge_into(policy, &preset)?;
-    }
-
-    Ok(())
+    default_slugs
+        .iter()
+        .map(|slug| PresetSelection::from_slug(slug))
+        .collect()
 }
 
 fn baseline_policy(tier: Tier) -> NetworkPolicy {
