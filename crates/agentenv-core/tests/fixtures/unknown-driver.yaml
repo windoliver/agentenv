@@ -1,0 +1,14 @@
+version: 0.1.0
+min_agentenv_version: 0.0.1
+sandbox:
+  driver: mysterybox
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
