@@ -274,12 +274,12 @@ fn validate_context_blueprint_urls(
 ) -> Result<(), LifecycleError> {
     if let Some(endpoint) = context.extra.get("endpoint").and_then(Value::as_mapping) {
         if let Some(url) = mapping_string(endpoint, "url") {
-            validate_blueprint_url("context.endpoint.url", url, resolver, options)?;
+            validate_required_blueprint_url("context.endpoint.url", url, resolver, options)?;
         }
     }
 
     if let Some(url) = context.extra.get("hub_url").and_then(Value::as_str) {
-        validate_blueprint_url("context.hub_url", url, resolver, options)?;
+        validate_required_blueprint_url("context.hub_url", url, resolver, options)?;
     }
 
     Ok(())
@@ -292,7 +292,7 @@ fn validate_inference_blueprint_urls(
 ) -> Result<(), LifecycleError> {
     for field in ["upstream_url", "base_url", "registry_url", "blueprint_url"] {
         if let Some(url) = inference.extra.get(field).and_then(Value::as_str) {
-            validate_blueprint_url(&format!("inference.{field}"), url, resolver, options)?;
+            validate_required_blueprint_url(&format!("inference.{field}"), url, resolver, options)?;
         }
     }
 
@@ -307,20 +307,44 @@ fn validate_policy_url_overrides(
     for (index, override_spec) in policy.overrides.iter().enumerate() {
         let path_prefix = format!("policy.overrides[{index}]");
         if let Some(url) = override_spec.allow.as_deref() {
-            validate_blueprint_url(&format!("{path_prefix}.allow"), url, resolver, options)?;
+            validate_policy_override_url(
+                &format!("{path_prefix}.allow"),
+                url,
+                resolver,
+                options,
+            )?;
         }
         if let Some(url) = override_spec.deny.as_deref() {
-            validate_blueprint_url(&format!("{path_prefix}.deny"), url, resolver, options)?;
+            validate_policy_override_url(
+                &format!("{path_prefix}.deny"),
+                url,
+                resolver,
+                options,
+            )?;
         }
         if let Some(url) = override_spec.approval.as_deref() {
-            validate_blueprint_url(&format!("{path_prefix}.approval"), url, resolver, options)?;
+            validate_policy_override_url(
+                &format!("{path_prefix}.approval"),
+                url,
+                resolver,
+                options,
+            )?;
         }
     }
 
     Ok(())
 }
 
-fn validate_blueprint_url(
+fn validate_required_blueprint_url(
+    path: &str,
+    raw: &str,
+    resolver: &StaticDnsResolver,
+    options: &SsrfOptions,
+) -> Result<(), LifecycleError> {
+    validate_url_with_ssrf(path, raw, resolver, options)
+}
+
+fn validate_policy_override_url(
     path: &str,
     raw: &str,
     resolver: &StaticDnsResolver,
@@ -330,6 +354,15 @@ fn validate_blueprint_url(
         return Ok(());
     }
 
+    validate_url_with_ssrf(path, raw, resolver, options)
+}
+
+fn validate_url_with_ssrf(
+    path: &str,
+    raw: &str,
+    resolver: &StaticDnsResolver,
+    options: &SsrfOptions,
+) -> Result<(), LifecycleError> {
     let parsed = Url::parse(raw).map_err(|_| LifecycleError::SsrfBlocked {
         path: path.to_string(),
         source: Box::new(SsrfBlocked {
