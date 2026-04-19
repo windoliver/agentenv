@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, ToSocketAddrs},
+    net::{AddrParseError, IpAddr, ToSocketAddrs},
 };
 
 use ipnet::IpNet;
@@ -42,28 +42,14 @@ pub struct ValidatedUrl {
     pub pinned_ips: Vec<IpAddr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("outbound URL `{url}` was blocked")]
 pub struct SsrfBlocked {
     pub url: String,
     pub host: Option<String>,
     pub resolved_ip: Option<IpAddr>,
     pub reason: SsrfBlockReason,
 }
-
-impl std::fmt::Display for SsrfBlocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.host {
-            Some(host) => write!(
-                f,
-                "outbound URL `{}` for host `{host}` was blocked",
-                self.url
-            ),
-            None => write!(f, "outbound URL `{}` was blocked", self.url),
-        }
-    }
-}
-
-impl std::error::Error for SsrfBlocked {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SsrfBlockReason {
@@ -121,17 +107,19 @@ pub struct StaticDnsResolver {
 }
 
 impl StaticDnsResolver {
-    pub fn from_pairs<const N: usize, const M: usize>(pairs: [(&str, [&str; M]); N]) -> Self {
+    pub fn try_from_pairs<const N: usize, const M: usize>(
+        pairs: [(&str, [&str; M]); N],
+    ) -> Result<Self, AddrParseError> {
         let mut records = BTreeMap::new();
         for (host, ips) in pairs {
             records.insert(
                 host.to_owned(),
                 ips.into_iter()
-                    .map(|ip| ip.parse::<IpAddr>().expect("static test IP must parse"))
-                    .collect(),
+                    .map(|ip| ip.parse::<IpAddr>())
+                    .collect::<Result<_, _>>()?,
             );
         }
-        Self { records }
+        Ok(Self { records })
     }
 }
 
@@ -287,7 +275,12 @@ fn check_ip(url: &Url, host: &str, ip: IpAddr, opts: &SsrfOptions) -> Result<(),
 }
 
 fn is_cloud_metadata(ip: IpAddr) -> bool {
-    matches!(ip, IpAddr::V4(ip) if ip.octets() == [169, 254, 169, 254])
+    match ip {
+        IpAddr::V4(ip) => CLOUD_METADATA_IPV4_OCTETS
+            .iter()
+            .any(|octets| ip.octets() == *octets),
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn denied_category(ip: IpAddr, allow_private: bool) -> Option<IpCategory> {
@@ -353,10 +346,15 @@ const IPV6_DOCUMENTATION_NETS: &[&str] = &["2001:db8::/32"];
 const IPV6_RESERVED_NETS: &[&str] = &["::/128", "100::/64", "2001:2::/48"];
 
 fn in_any_net(ip: IpAddr, cidrs: &[&str]) -> bool {
-    cidrs
-        .iter()
-        .filter_map(|cidr| cidr.parse::<IpNet>().ok())
-        .any(|net| net.contains(&ip))
+    for cidr in cidrs {
+        let net = cidr
+            .parse::<IpNet>()
+            .unwrap_or_else(|_| panic!("invalid SSRF CIDR constant `{cidr}`"));
+        if net.contains(&ip) {
+            return true;
+        }
+    }
+    false
 }
 
 fn block(
@@ -366,9 +364,52 @@ fn block(
     reason: SsrfBlockReason,
 ) -> SsrfBlocked {
     SsrfBlocked {
-        url: url.to_string(),
+        url: sanitize_url(url),
         host,
         resolved_ip,
         reason,
     }
+}
+
+const CLOUD_METADATA_IPV4_OCTETS: &[[u8; 4]] = &[
+    [169, 254, 169, 254],
+    [168, 63, 129, 16],
+    [100, 100, 100, 200],
+];
+
+fn sanitize_url(url: &Url) -> String {
+    let host = match url.host() {
+        Some(Host::Domain(host)) => Some(host.to_string()),
+        Some(Host::Ipv4(host)) => Some(host.to_string()),
+        Some(Host::Ipv6(host)) => Some(format!("[{host}]")),
+        None => None,
+    };
+
+    if host.is_none() {
+        return url.as_str().to_string();
+    }
+
+    let mut sanitized = String::new();
+    sanitized.push_str(url.scheme());
+    sanitized.push_str("://");
+    sanitized.push_str(host.as_deref().expect("host is present"));
+
+    if let Some(port) = url.port() {
+        sanitized.push(':');
+        sanitized.push_str(&port.to_string());
+    }
+
+    sanitized.push_str(url.path());
+
+    if let Some(query) = url.query() {
+        sanitized.push('?');
+        sanitized.push_str(query);
+    }
+
+    if let Some(fragment) = url.fragment() {
+        sanitized.push('#');
+        sanitized.push_str(fragment);
+    }
+
+    sanitized
 }
