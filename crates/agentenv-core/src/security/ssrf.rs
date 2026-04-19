@@ -127,7 +127,7 @@ impl StaticDnsResolver {
             records.insert(
                 host.to_owned(),
                 ips.into_iter()
-                    .filter_map(|ip| ip.parse::<IpAddr>().ok())
+                    .map(|ip| ip.parse::<IpAddr>().expect("static test IP must parse"))
                     .collect(),
             );
         }
