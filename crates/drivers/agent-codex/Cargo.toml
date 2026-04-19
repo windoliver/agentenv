@@ -14,8 +14,7 @@ description = "Codex agent driver scaffold for agentenv"
 agentenv-core = { path = "../../agentenv-core" }
 agentenv-proto = { path = "../../agentenv-proto" }
 async-trait.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { version = "1", features = ["macros", "rt"] }
