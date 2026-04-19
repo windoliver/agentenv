@@ -213,43 +213,17 @@ fn optional_string(
 }
 
 fn validate_http_url(field: &str, value: &str) -> DriverResult<()> {
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return Err(invalid_url(field));
-    };
+    let parsed = url::Url::parse(value).map_err(|_| invalid_url(field))?;
 
-    if !matches!(scheme, "http" | "https")
-        || rest.is_empty()
-        || rest.starts_with('/')
-        || rest.starts_with('?')
-        || rest.starts_with('#')
-        || rest.contains(char::is_whitespace)
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
     {
         return Err(invalid_url(field));
     }
 
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    if !is_valid_authority(&rest[..authority_end]) {
-        return Err(invalid_url(field));
-    }
-
     Ok(())
-}
-
-fn is_valid_authority(authority: &str) -> bool {
-    if authority.is_empty() {
-        return false;
-    }
-
-    if authority.contains('@') {
-        return false;
-    }
-
-    let host = authority.split(':').next().unwrap_or_default();
-    if host.is_empty() {
-        return false;
-    }
-
-    true
 }
 
 fn invalid_url(field: &str) -> DriverError {
@@ -381,6 +355,20 @@ mod tests {
         let err =
             ProviderConfig::from_spec(DEFAULTS, &spec(vec![("base_url", json!("https://:443"))]))
                 .expect_err("malformed URL authority must be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid driver config field `base_url`: must be a valid http or https URL"
+        );
+    }
+
+    #[test]
+    fn provider_config_rejects_malformed_base_url_port() {
+        let err = ProviderConfig::from_spec(
+            DEFAULTS,
+            &spec(vec![("base_url", json!("https://api.openai.com:abc"))]),
+        )
+        .expect_err("malformed URL port must be rejected");
 
         assert_eq!(
             err.to_string(),
