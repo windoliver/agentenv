@@ -125,6 +125,7 @@ fn validator_rejects_denied_ip_categories_by_default() {
         ("loopback.example.com", "127.0.0.1", IpCategory::Loopback),
         ("link_local.example.com", "169.254.10.20", IpCategory::LinkLocal),
         ("private.example.com", "10.1.2.3", IpCategory::Private),
+        ("reserved.example.com", "100.64.0.1", IpCategory::Reserved),
         ("multicast.example.com", "224.0.0.1", IpCategory::Multicast),
         ("broadcast.example.com", "255.255.255.255", IpCategory::Broadcast),
         ("documentation.example.com", "192.0.2.10", IpCategory::Documentation),
@@ -167,10 +168,11 @@ fn validator_accepts_private_ips_when_allowed() {
         ..SsrfOptions::default()
     };
 
-    let error = validate_outbound_with_resolver(&url, options, &StaticDnsResolver::default()).unwrap();
+    let validated =
+        validate_outbound_with_resolver(&url, options, &StaticDnsResolver::default()).unwrap();
 
-    assert_eq!(error.host, "10.1.2.3");
-    assert_eq!(error.pinned_ips, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
+    assert_eq!(validated.host, "10.1.2.3");
+    assert_eq!(validated.pinned_ips, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
 }
 
 #[test]
