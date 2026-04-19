@@ -9,3 +9,7 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "OpenShell sandbox driver scaffold for agentenv"
+
+[dependencies]
+agentenv-policy = { path = "../../agentenv-policy" }
+agentenv-proto = { path = "../../agentenv-proto" }

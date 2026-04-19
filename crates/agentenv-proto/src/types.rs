@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -188,23 +187,113 @@ pub struct ShutdownParams {}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct EmptyResult {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct NetworkRule {
-    pub host: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scheme: Option<String>,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyReloadability {
+    HotReload,
+    LockedAtCreate,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
-pub struct NetworkPolicy {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAccessLevel {
+    ReadOnly,
+    ReadWrite,
+    Full,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NetworkTarget {
+    Host {
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheme: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_access: Option<HttpAccessLevel>,
+    },
+    Cidr {
+        cidr: String,
+    },
+    Port {
+        port: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+    },
+    UrlPattern {
+        pattern: String,
+    },
+    HttpMethodPath {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+        method: String,
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct NetworkRule {
+    pub target: NetworkTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct NetworkAccessPolicy {
+    pub reloadability: PolicyReloadability,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<NetworkRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<NetworkRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub approval: Vec<NetworkRule>,
+    pub approval_required: Vec<NetworkRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct FilesystemPolicy {
+    pub reloadability: PolicyReloadability,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_write: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProcessPolicy {
+    pub reloadability: PolicyReloadability,
+    pub run_as_user: String,
+    pub run_as_group: String,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_syscalls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_syscalls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct InferenceRoute {
+    pub matcher: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct InferencePolicy {
+    pub reloadability: PolicyReloadability,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<InferenceRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct NetworkPolicy {
+    pub network: NetworkAccessPolicy,
+    pub filesystem: FilesystemPolicy,
+    pub process: ProcessPolicy,
+    pub inference: InferencePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
@@ -224,52 +313,14 @@ pub enum ValidatorSpec {
     CurlProbe { url: String },
 }
 
-#[derive(Clone, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct SecretValue(String);
-
-impl SecretValue {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SecretValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SecretValue([REDACTED])")
-    }
-}
-
-impl fmt::Display for SecretValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl From<String> for SecretValue {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for SecretValue {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CredentialRequirement {
     pub name: String,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
     pub kind: CredentialKind,
     pub required: bool,
-    #[serde(default)]
-    pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator: Option<ValidatorSpec>,
 }
@@ -280,8 +331,6 @@ pub struct SandboxSpec {
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env_at_start: BTreeMap<String, SecretValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: &str = "0.2";
+pub const SCHEMA_VERSION: &str = "1.0";
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -58,18 +58,18 @@ pub fn is_compatible_schema_version(version: &str) -> bool {
 }
 
 pub fn assert_compatible_schema_version(version: &str) -> Result<(), SchemaVersionError> {
-    schema_version_major(SCHEMA_VERSION)?;
-    schema_version_major(version)?;
+    let expected_major = schema_version_major(SCHEMA_VERSION)?;
+    let actual_major = schema_version_major(version)?;
 
-    if version == SCHEMA_VERSION {
+    if expected_major == actual_major {
         Ok(())
     } else {
         Err(SchemaVersionError::IncompatibleMajor {
             expected: SCHEMA_VERSION.to_owned(),
             actual: version.to_owned(),
             remediation: format!(
-                "upgrade the driver or the core so their schema versions match (`{}`)",
-                SCHEMA_VERSION
+                "upgrade the driver or the core so their major schema versions match (`{}`)",
+                expected_major
             ),
         })
     }

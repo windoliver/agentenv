@@ -1,4 +1,4 @@
-# agentenv Driver Protocol (v0.2 draft)
+# agentenv Driver Protocol (v1.0 draft)
 
 > JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
 
@@ -34,7 +34,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 
 ```json
 {
-  "schema_version": "0.2",
+  "schema_version": "1.0",
   "name": "nexus",
   "kind": "context",
   "version": "0.1.0",
@@ -63,7 +63,7 @@ Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it a
   "id": 1,
   "method": "initialize",
   "params": {
-    "schema_version": "0.2",
+    "schema_version": "1.0",
     "core_version": "0.1.0",
     "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
     "log_level": "info"
@@ -82,7 +82,7 @@ Response:
       "name": "openshell",
       "kind": "sandbox",
       "version": "0.1.0",
-      "protocol_version": "0.2"
+      "protocol_version": "1.0"
     },
     "capabilities": {
       "supports_hot_reload_policy": true,
@@ -272,6 +272,7 @@ Errors include `data` with machine-readable context when relevant (e.g., which c
 - **Driver version** is the driver's own versioning; independent of schema version.
 - **Core version** is agentenv's version.
 - Core refuses to run a driver whose `schema_version` major doesn't match its own.
+- This `1.0` schema breaks the old flat `NetworkPolicy` / `NetworkRule` wire shape. Drivers must now speak the four-domain policy object with `network`, `filesystem`, `process`, and `inference`, and `approval_required` replaces the old `approval` field.
 
 ## Built-in drivers
 

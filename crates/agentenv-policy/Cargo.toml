@@ -9,3 +9,10 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Policy scaffolding for agentenv"
+
+[dependencies]
+agentenv-proto = { path = "../agentenv-proto" }
+once_cell.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true

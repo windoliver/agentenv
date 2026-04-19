@@ -21,6 +21,7 @@ fn main() {
     write_schema::<types::ShutdownParams>(&schema_dir, "shutdown-params");
     write_schema::<types::EmptyResult>(&schema_dir, "empty-result");
     write_schema::<types::Capabilities>(&schema_dir, "capabilities");
+    // Canonical policy model surfaces.
     write_schema::<types::NetworkPolicy>(&schema_dir, "network-policy");
     write_schema::<types::McpEndpoint>(&schema_dir, "mcp-endpoint");
     write_schema::<types::SandboxSpec>(&schema_dir, "sandbox-spec");
