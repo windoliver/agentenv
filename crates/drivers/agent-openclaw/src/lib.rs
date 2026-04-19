@@ -246,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_driver_satisfies_agent_conformance_contract() {
-        let mut driver = OpenClawDriver::default();
+        let mut driver = OpenClawDriver;
 
         driver_conformance::assert_agent_driver_contract(&mut driver, agent_spec(BTreeMap::new()))
             .await
@@ -255,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_driver_initializes_with_agent_capabilities() {
-        let mut driver = OpenClawDriver::default();
+        let mut driver = OpenClawDriver;
 
         let result = driver
             .initialize(InitializeParams {
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_driver_preflight_has_no_issues_for_now() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
 
         let result = driver.preflight(PreflightParams::default()).await.unwrap();
 
@@ -293,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_driver_reports_install_step_and_mcp_path() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::new());
 
         let install_steps = driver.install_steps(spec).await.unwrap();
@@ -312,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_defaults_to_openai_credentials() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = AgentSpec {
             version: None,
             config: BTreeMap::new(),
@@ -324,7 +324,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_uses_anthropic_credentials_for_anthropic_provider() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = AgentSpec {
             version: None,
             config: BTreeMap::from([("provider".to_owned(), serde_json::json!("anthropic"))]),
@@ -336,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_infers_anthropic_credentials_from_model_prefix() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::from([(
             "model".to_owned(),
             serde_json::json!("anthropic/claude-3-5-sonnet"),
@@ -351,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_infers_openai_credentials_from_model_prefix() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::from([(
             "model".to_owned(),
             serde_json::json!("openai/gpt-5"),
@@ -364,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_rejects_conflicting_provider_and_model_prefix() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::from([
             ("provider".to_owned(), serde_json::json!("openai")),
             (
@@ -385,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_rejects_invalid_provider_config() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::from([(
             "provider".to_owned(),
             serde_json::json!("unknown"),
@@ -401,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_renders_tui_entrypoint_by_default() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::new());
 
         let entrypoint = driver.render_entrypoint(spec).await.unwrap();
@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_renders_headless_entrypoint() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = AgentSpec {
             version: None,
             config: BTreeMap::from([("mode".to_owned(), serde_json::json!("headless"))]),
@@ -426,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_rejects_invalid_entrypoint_config() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::from([(
             "mode".to_owned(),
             serde_json::json!("headles"),
@@ -442,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_rejects_unknown_entrypoint_config() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::from([(
             "unexpected".to_owned(),
             serde_json::json!(true),
@@ -458,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_reports_probe() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
         let spec = agent_spec(BTreeMap::new());
 
         let probe = driver.health_check_probe(spec).await.unwrap();
@@ -468,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn openclaw_driver_renders_deterministic_mcp_json() {
-        let driver = OpenClawDriver::default();
+        let driver = OpenClawDriver;
 
         let rendered = driver
             .render_mcp_config(RenderMcpConfigParams {

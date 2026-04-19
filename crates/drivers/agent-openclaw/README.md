@@ -9,7 +9,7 @@ Built-in OpenClaw agent driver for `agentenv`.
 - Renders deterministic MCP JSON using the same `mcpServers` shape as the other built-in agent drivers.
 - Starts OpenClaw in TUI mode with `openclaw tui`.
 - Starts OpenClaw in headless mode with `openclaw agent --headless`.
-- Uses `openclaw --version` as the health-check probe.
+- Returns a declarative `openclaw --version` health-check probe.
 - Reports MCP, slash-command, TUI, and headless capabilities.
 
 ## Configuration
@@ -28,7 +28,7 @@ OpenClaw defaults to OpenAI credentials:
 
 ```yaml
 agent:
-  name: openclaw
+  driver: openclaw
 ```
 
 requires `OPENAI_API_KEY`.
@@ -37,7 +37,7 @@ Set `provider: anthropic` to require `ANTHROPIC_API_KEY`:
 
 ```yaml
 agent:
-  name: openclaw
+  driver: openclaw
   config:
     provider: anthropic
 ```

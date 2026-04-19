@@ -182,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_satisfies_agent_conformance_contract() {
-        let mut driver = ClaudeDriver::default();
+        let mut driver = ClaudeDriver;
 
         driver_conformance::assert_agent_driver_contract(&mut driver, agent_spec(BTreeMap::new()))
             .await
@@ -191,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_initializes_with_agent_capabilities() {
-        let mut driver = ClaudeDriver::default();
+        let mut driver = ClaudeDriver;
 
         let result = driver
             .initialize(InitializeParams {
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_preflight_has_no_issues_for_now() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
 
         let result = driver.preflight(PreflightParams::default()).await.unwrap();
 
@@ -229,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_reports_install_step_and_mcp_path() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
         let spec = agent_spec(BTreeMap::new());
 
         let install_steps = driver.install_steps(spec).await.unwrap();
@@ -248,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_reports_anthropic_credential_and_probe() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
         let spec = agent_spec(BTreeMap::new());
 
         let credentials = driver.credential_requirements(spec.clone()).await.unwrap();
@@ -263,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_renders_tui_entrypoint_by_default() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
         let spec = agent_spec(BTreeMap::new());
 
         let entrypoint = driver.render_entrypoint(spec).await.unwrap();
@@ -276,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_renders_headless_entrypoint() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
         let spec = agent_spec(BTreeMap::from([(
             "mode".to_owned(),
             serde_json::json!("headless"),
@@ -292,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_rejects_invalid_entrypoint_config() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
         let spec = agent_spec(BTreeMap::from([(
             "mode".to_owned(),
             serde_json::json!("headles"),
@@ -308,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_driver_renders_deterministic_mcp_json() {
-        let driver = ClaudeDriver::default();
+        let driver = ClaudeDriver;
 
         let rendered = driver
             .render_mcp_config(RenderMcpConfigParams {

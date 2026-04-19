@@ -182,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_driver_satisfies_agent_conformance_contract() {
-        let mut driver = CodexDriver::default();
+        let mut driver = CodexDriver;
 
         driver_conformance::assert_agent_driver_contract(&mut driver, agent_spec(BTreeMap::new()))
             .await
@@ -248,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_driver_reports_openai_credential_and_probe() {
-        let driver = CodexDriver::default();
+        let driver = CodexDriver;
         let spec = AgentSpec {
             version: None,
             config: BTreeMap::new(),
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_driver_renders_headless_entrypoint() {
-        let driver = CodexDriver::default();
+        let driver = CodexDriver;
         let spec = AgentSpec {
             version: None,
             config: BTreeMap::from([("mode".to_owned(), serde_json::json!("headless"))]),

@@ -1,4 +1,4 @@
-# agentenv Driver Protocol (v0.1 draft)
+# agentenv Driver Protocol (v0.2 draft)
 
 > JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
 
@@ -34,7 +34,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 
 ```json
 {
-  "schema_version": "0.1",
+  "schema_version": "0.2",
   "name": "nexus",
   "kind": "context",
   "version": "0.1.0",
@@ -63,7 +63,7 @@ Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it a
   "id": 1,
   "method": "initialize",
   "params": {
-    "schema_version": "0.1",
+    "schema_version": "0.2",
     "core_version": "0.1.0",
     "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
     "log_level": "info"
@@ -82,7 +82,7 @@ Response:
       "name": "openshell",
       "kind": "sandbox",
       "version": "0.1.0",
-      "protocol_version": "0.1"
+      "protocol_version": "0.2"
     },
     "capabilities": {
       "supports_hot_reload_policy": true,
@@ -139,8 +139,8 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `mcp_config_path` | `{}` | `{path: string}` |
 | `render_mcp_config` | `{endpoints: [MCPEndpoint]}` | `{content: string}` |
 | `render_entrypoint` | `AgentSpec` | `{content: string}` |
-| `credential_requirements` | `{}` | `[CredentialRequirement]` |
-| `health_check` | `{handle}` | `{healthy: bool, detail: string?}` |
+| `credential_requirements` | `AgentSpec` | `[CredentialRequirement]` |
+| `health_check_probe` | `AgentSpec` | `AgentHealthCheckProbe` |
 
 #### `ContextDriver`
 
