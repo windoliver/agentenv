@@ -86,6 +86,11 @@ version = "0.0.1-alpha0"
 [[package]]
 name = "agentenv-mcp"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "url",
+]
 
 [[package]]
 name = "agentenv-plugin"
