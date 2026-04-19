@@ -1,7 +1,8 @@
 use std::net::IpAddr;
 
 use agentenv_core::security::ssrf::{
-    validate_outbound_with_resolver, IpCategory, SsrfBlockReason, SsrfOptions, StaticDnsResolver,
+    validate_outbound_with_resolver, validate_redirect_chain_with_resolver, IpCategory,
+    SsrfBlockReason, SsrfOptions, StaticDnsResolver,
 };
 use ipnet::IpNet;
 use url::Url;
@@ -243,5 +244,113 @@ fn validator_blocks_mixed_allowed_and_denied_resolutions() {
         SsrfBlockReason::DeniedIp {
             category: IpCategory::Loopback
         }
+    ));
+}
+
+#[test]
+fn redirect_chain_revalidates_each_location() {
+    let resolver = StaticDnsResolver::try_from_pairs([
+        ("start.example.com", ["93.184.216.34"]),
+        ("next.example.com", ["93.184.216.35"]),
+    ])
+    .unwrap();
+    let start = Url::parse("https://start.example.com/download").unwrap();
+
+    let chain = validate_redirect_chain_with_resolver(
+        &start,
+        &["https://next.example.com/artifact"],
+        SsrfOptions::default(),
+        &resolver,
+    )
+    .unwrap();
+
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].host, "start.example.com");
+    assert_eq!(chain[1].host, "next.example.com");
+    assert_eq!(
+        chain[1].pinned_ips,
+        vec!["93.184.216.35".parse::<IpAddr>().unwrap()]
+    );
+}
+
+#[test]
+fn redirect_chain_blocks_metadata_location() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("start.example.com", ["93.184.216.34"])]).unwrap();
+    let start = Url::parse("https://start.example.com/download").unwrap();
+
+    let error = validate_redirect_chain_with_resolver(
+        &start,
+        &["http://169.254.169.254/latest/meta-data/"],
+        SsrfOptions::default(),
+        &resolver,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
+}
+
+#[test]
+fn redirect_chain_enforces_default_limit() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("start.example.com", ["93.184.216.34"])]).unwrap();
+    let start = Url::parse("https://start.example.com/download").unwrap();
+
+    let error = validate_redirect_chain_with_resolver(
+        &start,
+        &["/one", "/two", "/three", "/four"],
+        SsrfOptions::default(),
+        &resolver,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error.reason,
+        SsrfBlockReason::RedirectLimitExceeded { max_redirects: 3 }
+    ));
+}
+
+#[test]
+fn redirect_chain_resolves_relative_locations_against_current_url() {
+    let resolver = StaticDnsResolver::try_from_pairs([
+        ("start.example.com", ["93.184.216.34"]),
+        ("next.example.com", ["93.184.216.35"]),
+    ])
+    .unwrap();
+    let start = Url::parse("https://start.example.com/releases/latest").unwrap();
+
+    let chain = validate_redirect_chain_with_resolver(
+        &start,
+        &["../assets/pkg.tar.gz", "https://next.example.com/final"],
+        SsrfOptions::default(),
+        &resolver,
+    )
+    .unwrap();
+
+    assert_eq!(chain.len(), 3);
+    assert_eq!(
+        chain[1].url.as_str(),
+        "https://start.example.com/assets/pkg.tar.gz"
+    );
+    assert_eq!(chain[2].host, "next.example.com");
+}
+
+#[test]
+fn redirect_chain_rejects_malformed_location() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("start.example.com", ["93.184.216.34"])]).unwrap();
+    let start = Url::parse("https://start.example.com/download").unwrap();
+
+    let error = validate_redirect_chain_with_resolver(
+        &start,
+        &["http://["],
+        SsrfOptions::default(),
+        &resolver,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error.reason,
+        SsrfBlockReason::MalformedRedirect { ref location } if location == "http://["
     ));
 }

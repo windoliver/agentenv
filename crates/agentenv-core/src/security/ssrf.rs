@@ -196,6 +196,47 @@ pub fn validate_outbound_with_resolver(
     })
 }
 
+pub fn validate_redirect_chain_with_resolver(
+    start: &Url,
+    locations: &[&str],
+    opts: SsrfOptions,
+    resolver: &dyn DnsResolver,
+) -> Result<Vec<ValidatedUrl>, SsrfBlocked> {
+    let mut chain = Vec::with_capacity(locations.len() + 1);
+    let start_validated = validate_outbound_with_resolver(start, opts.clone(), resolver)?;
+    chain.push(start_validated);
+
+    if locations.len() > opts.max_redirects {
+        return Err(block(
+            start,
+            None,
+            None,
+            SsrfBlockReason::RedirectLimitExceeded {
+                max_redirects: opts.max_redirects,
+            },
+        ));
+    }
+
+    let mut current = start.clone();
+    for location in locations.iter().copied() {
+        let next = current.join(location).map_err(|_| {
+            block(
+                &current,
+                None,
+                None,
+                SsrfBlockReason::MalformedRedirect {
+                    location: location.to_owned(),
+                },
+            )
+        })?;
+        let validated = validate_outbound_with_resolver(&next, opts.clone(), resolver)?;
+        current = validated.url.clone();
+        chain.push(validated);
+    }
+
+    Ok(chain)
+}
+
 fn validate_scheme(url: &Url, opts: &SsrfOptions) -> Result<(), SsrfBlocked> {
     match url.scheme() {
         "http" | "https" => Ok(()),
