@@ -2,14 +2,14 @@
 
 use agentenv_core::driver::{DriverResult, InferenceDriver};
 use agentenv_core::inference::{
-    empty_result, ProviderConfig, ProviderDefaults, NativeRoutingPlan, ProxySidecarPlan,
-    routed_credential_requirements, routed_endpoint, routed_handle, routed_initialize,
-    successful_preflight,
+    empty_result, routed_credential_requirements, routed_endpoint, routed_handle,
+    routed_initialize, successful_preflight, NativeRoutingPlan, ProviderConfig, ProviderDefaults,
+    ProxySidecarPlan,
 };
 use agentenv_proto::{
-    CredentialRequirementsParams, CredentialRequirementsResult, EmptyResult, EndpointInSandboxResult,
-    InferenceHandle, InferenceHandleRequest, InferenceSpec, InitializeParams, InitializeResult,
-    PreflightParams, PreflightResult, ShutdownParams,
+    CredentialRequirementsParams, CredentialRequirementsResult, EmptyResult,
+    EndpointInSandboxResult, InferenceHandle, InferenceHandleRequest, InferenceSpec,
+    InitializeParams, InitializeResult, PreflightParams, PreflightResult, ShutdownParams,
 };
 use async_trait::async_trait;
 
@@ -144,9 +144,7 @@ mod tests {
     #[test]
     fn malformed_base_url_is_rejected() {
         let bad_config = spec(vec![("base_url", json!("not-a-url"))]);
-        let err = provider_config(&bad_config).expect_err(
-            "malformed base_url must fail",
-        );
+        let err = provider_config(&bad_config).expect_err("malformed base_url must fail");
 
         assert_eq!(
             err.to_string(),
