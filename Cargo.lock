@@ -84,6 +84,10 @@ dependencies = [
 [[package]]
 name = "agentenv-events"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+]
 
 [[package]]
 name = "agentenv-mcp"
