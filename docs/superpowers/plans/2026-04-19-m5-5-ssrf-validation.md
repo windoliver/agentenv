@@ -68,20 +68,25 @@ use url::Url;
 
 #[test]
 fn validator_accepts_public_https_and_pins_resolved_ip() {
-    let resolver = StaticDnsResolver::from_pairs([("api.example.com", ["93.184.216.34"])]);
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
     let url = Url::parse("https://api.example.com/v1/models").unwrap();
 
     let validated =
         validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap();
 
     assert_eq!(validated.host, "api.example.com");
-    assert_eq!(validated.pinned_ips, vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
+    assert_eq!(
+        validated.pinned_ips,
+        vec!["93.184.216.34".parse::<IpAddr>().unwrap()]
+    );
     assert_eq!(validated.url.as_str(), "https://api.example.com/v1/models");
 }
 
 #[test]
 fn validator_rejects_unsupported_scheme() {
-    let resolver = StaticDnsResolver::from_pairs([("api.example.com", ["93.184.216.34"])]);
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
     let url = Url::parse("file:///etc/passwd").unwrap();
 
     let error =
@@ -137,7 +142,7 @@ Create `crates/agentenv-core/src/security/ssrf.rs` with the public surface used 
 ```rust
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, ToSocketAddrs},
+    net::{AddrParseError, IpAddr, ToSocketAddrs},
 };
 
 use ipnet::IpNet;
@@ -254,19 +259,19 @@ pub struct StaticDnsResolver {
 }
 
 impl StaticDnsResolver {
-    pub fn from_pairs<const N: usize, const M: usize>(
+    pub fn try_from_pairs<const N: usize, const M: usize>(
         pairs: [(&str, [&str; M]); N],
-    ) -> Self {
+    ) -> Result<Self, AddrParseError> {
         let mut records = BTreeMap::new();
         for (host, ips) in pairs {
             records.insert(
                 host.to_owned(),
                 ips.into_iter()
-                    .map(|ip| ip.parse::<IpAddr>().expect("static test IP must parse"))
-                    .collect(),
+                    .map(|ip| ip.parse::<IpAddr>())
+                    .collect::<Result<_, _>>()?,
             );
         }
-        Self { records }
+        Ok(Self { records })
     }
 }
 
@@ -536,7 +541,7 @@ use ipnet::IpNet;
 
 #[test]
 fn validator_rejects_credentials_in_url() {
-    let resolver = StaticDnsResolver::from_pairs([("api.example.com", ["93.184.216.34"])]);
+    let resolver = StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
     let url = Url::parse("https://token:secret@api.example.com/data").unwrap();
 
     let error =
@@ -605,12 +610,17 @@ fn validator_allows_private_only_when_option_is_enabled() {
     let validated =
         validate_outbound_with_resolver(&url, options, &StaticDnsResolver::default()).unwrap();
 
-    assert_eq!(validated.pinned_ips, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
+    assert_eq!(
+        validated.pinned_ips,
+        vec!["10.1.2.3".parse::<IpAddr>().unwrap()]
+    );
 }
 
 #[test]
 fn validator_normalizes_ipv4_mapped_ipv6_before_checks() {
-    let resolver = StaticDnsResolver::from_pairs([("metadata.example.com", ["::ffff:169.254.169.254"])]);
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("metadata.example.com", ["::ffff:169.254.169.254"])])
+            .unwrap();
     let url = Url::parse("http://metadata.example.com/").unwrap();
 
     let error =
@@ -622,7 +632,7 @@ fn validator_normalizes_ipv4_mapped_ipv6_before_checks() {
 
 #[test]
 fn validator_rejects_extra_deny_cidr() {
-    let resolver = StaticDnsResolver::from_pairs([("api.example.com", ["93.184.216.34"])]);
+    let resolver = StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
     let url = Url::parse("https://api.example.com/").unwrap();
     let options = SsrfOptions {
         extra_deny_cidrs: vec!["93.184.216.0/24".parse::<IpNet>().unwrap()],
@@ -636,7 +646,7 @@ fn validator_rejects_extra_deny_cidr() {
 
 #[test]
 fn validator_rejects_hostname_when_any_resolved_ip_is_denied() {
-    let resolver = StaticDnsResolver::from_pairs([("mixed.example.com", ["93.184.216.34", "127.0.0.1"])]);
+    let resolver = StaticDnsResolver::try_from_pairs([("mixed.example.com", ["93.184.216.34", "127.0.0.1"])]).unwrap();
     let url = Url::parse("https://mixed.example.com/").unwrap();
 
     let error =
@@ -841,10 +851,11 @@ Add these helpers near the other private lifecycle helpers:
 
 ```rust
 fn validate_blueprint_urls(blueprint: &Blueprint) -> Result<(), LifecycleError> {
-    let resolver = StaticDnsResolver::from_pairs([
+    let resolver = StaticDnsResolver::try_from_pairs([
         ("mcp.internal.example.com", ["93.184.216.34"]),
         ("nexus.internal.example.com", ["93.184.216.35"]),
-    ]);
+    ])
+    .expect("static resolver fixture");
     validate_component_urls("context", &blueprint.context, &resolver)?;
     if let Some(inference) = blueprint.inference.as_ref() {
         validate_component_urls("inference", inference, &resolver)?;
@@ -1032,7 +1043,8 @@ mod tests {
     #[test]
     fn http_sse_endpoint_is_validated_and_pinned() {
         let endpoint = endpoint("https://mcp.example.com/sse", McpTransport::HttpSse);
-        let resolver = StaticDnsResolver::from_pairs([("mcp.example.com", ["93.184.216.34"])]);
+        let resolver =
+            StaticDnsResolver::try_from_pairs([("mcp.example.com", ["93.184.216.34"])]).unwrap();
 
         let validated =
             validate_mcp_endpoint(&endpoint, SsrfOptions::default(), &resolver).unwrap();
@@ -1046,7 +1058,8 @@ mod tests {
     #[test]
     fn ssh_http_requires_opt_in() {
         let endpoint = endpoint("ssh+http://mcp.example.com/sse", McpTransport::SshHttp);
-        let resolver = StaticDnsResolver::from_pairs([("mcp.example.com", ["93.184.216.34"])]);
+        let resolver =
+            StaticDnsResolver::try_from_pairs([("mcp.example.com", ["93.184.216.34"])]).unwrap();
 
         let blocked =
             validate_mcp_endpoint(&endpoint, SsrfOptions::default(), &resolver).unwrap_err();
@@ -1060,7 +1073,8 @@ mod tests {
     #[test]
     fn ssh_http_validates_when_opted_in() {
         let endpoint = endpoint("ssh+http://mcp.example.com/sse", McpTransport::SshHttp);
-        let resolver = StaticDnsResolver::from_pairs([("mcp.example.com", ["93.184.216.34"])]);
+        let resolver =
+            StaticDnsResolver::try_from_pairs([("mcp.example.com", ["93.184.216.34"])]).unwrap();
         let options = SsrfOptions {
             allow_ssh_http: true,
             ..SsrfOptions::default()
@@ -1287,10 +1301,11 @@ use agentenv_core::security::ssrf::validate_redirect_chain_with_resolver;
 
 #[test]
 fn redirect_chain_revalidates_each_location() {
-    let resolver = StaticDnsResolver::from_pairs([
+    let resolver = StaticDnsResolver::try_from_pairs([
         ("start.example.com", ["93.184.216.34"]),
         ("next.example.com", ["93.184.216.35"]),
-    ]);
+    ])
+    .unwrap();
     let start = Url::parse("https://start.example.com/download").unwrap();
 
     let chain = validate_redirect_chain_with_resolver(
@@ -1307,7 +1322,8 @@ fn redirect_chain_revalidates_each_location() {
 
 #[test]
 fn redirect_chain_blocks_metadata_location() {
-    let resolver = StaticDnsResolver::from_pairs([("start.example.com", ["93.184.216.34"])]);
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("start.example.com", ["93.184.216.34"])]).unwrap();
     let start = Url::parse("https://start.example.com/download").unwrap();
 
     let error = validate_redirect_chain_with_resolver(
@@ -1323,13 +1339,14 @@ fn redirect_chain_blocks_metadata_location() {
 
 #[test]
 fn redirect_chain_enforces_default_limit() {
-    let resolver = StaticDnsResolver::from_pairs([
+    let resolver = StaticDnsResolver::try_from_pairs([
         ("one.example.com", ["93.184.216.31"]),
         ("two.example.com", ["93.184.216.32"]),
         ("three.example.com", ["93.184.216.33"]),
         ("four.example.com", ["93.184.216.34"]),
         ("five.example.com", ["93.184.216.35"]),
-    ]);
+    ])
+    .unwrap();
     let start = Url::parse("https://one.example.com/").unwrap();
 
     let error = validate_redirect_chain_with_resolver(
