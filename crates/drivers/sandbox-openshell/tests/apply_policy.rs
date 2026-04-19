@@ -49,7 +49,12 @@ fn network_changes_hot_reload() {
         classify_policy_update(&current, &next).unwrap(),
         UpdateDisposition::HotReload
     );
-    assert_eq!(translate_for_openshell(&next).unwrap().format, "openshell");
+    assert_eq!(
+        translate_for_openshell_with_binaries(&next, ["/custom/bin/claude"])
+            .unwrap()
+            .format,
+        "openshell"
+    );
 }
 
 #[test]
