@@ -48,3 +48,5 @@ If `provider` is omitted, `model` prefixes are used when possible:
 - `openai/...` requires `OPENAI_API_KEY`.
 
 An explicit provider that conflicts with an inferable model prefix is rejected.
+
+OpenShell-backed install/probe tests live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.

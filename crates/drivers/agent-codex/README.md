@@ -10,3 +10,5 @@ and headless entrypoints:
 - Headless: `codex exec`
 
 It declares `OPENAI_API_KEY` as a required API key credential.
+
+OpenShell-backed install/probe tests live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
