@@ -1,7 +1,8 @@
 use std::net::IpAddr;
 
+use ipnet::IpNet;
 use agentenv_core::security::ssrf::{
-    validate_outbound_with_resolver, SsrfBlockReason, SsrfOptions, StaticDnsResolver,
+    validate_outbound_with_resolver, IpCategory, SsrfBlockReason, SsrfOptions, StaticDnsResolver,
 };
 use url::Url;
 
@@ -104,4 +105,116 @@ fn validator_rejects_aws_ipv6_metadata_even_with_private_allowed() {
     let error = validate_outbound_with_resolver(&url, options, &resolver).unwrap_err();
 
     assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
+}
+
+#[test]
+fn validator_rejects_credentials_in_url() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
+    let url = Url::parse("https://user:pass@api.example.com/v1/models").unwrap();
+
+    let error =
+        validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::CredentialsInUrl));
+}
+
+#[test]
+fn validator_rejects_denied_ip_categories_by_default() {
+    let cases = vec![
+        ("loopback.example.com", "127.0.0.1", IpCategory::Loopback),
+        ("link_local.example.com", "169.254.10.20", IpCategory::LinkLocal),
+        ("private.example.com", "10.1.2.3", IpCategory::Private),
+        ("multicast.example.com", "224.0.0.1", IpCategory::Multicast),
+        ("broadcast.example.com", "255.255.255.255", IpCategory::Broadcast),
+        ("documentation.example.com", "192.0.2.10", IpCategory::Documentation),
+        ("unspecified.example.com", "0.0.0.0", IpCategory::Unspecified),
+    ];
+
+    for (name, ip, expected_category) in cases {
+        let resolver = StaticDnsResolver::try_from_pairs([(name, [ip])]).unwrap();
+        let url = Url::parse(&format!("http://{name}/")).unwrap();
+
+        let error =
+            validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+        assert!(
+            matches!(error.reason, SsrfBlockReason::DeniedIp { category } if category == expected_category)
+        );
+        assert_eq!(error.resolved_ip, Some(ip.parse::<IpAddr>().unwrap()));
+    }
+}
+
+#[test]
+fn validator_blocks_cloud_metadata_even_if_private_allowed() {
+    let url = Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+    let options = SsrfOptions {
+        allow_private: true,
+        ..SsrfOptions::default()
+    };
+
+    let resolver = StaticDnsResolver::default();
+    let error = validate_outbound_with_resolver(&url, options, &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
+}
+
+#[test]
+fn validator_accepts_private_ips_when_allowed() {
+    let url = Url::parse("http://10.1.2.3/health").unwrap();
+    let options = SsrfOptions {
+        allow_private: true,
+        ..SsrfOptions::default()
+    };
+
+    let error = validate_outbound_with_resolver(&url, options, &StaticDnsResolver::default()).unwrap();
+
+    assert_eq!(error.host, "10.1.2.3");
+    assert_eq!(error.pinned_ips, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
+}
+
+#[test]
+fn validator_normalizes_mapped_ipv6_and_denies_cloud_metadata() {
+    let resolver = StaticDnsResolver::try_from_pairs([(
+        "metadata.example.com",
+        ["::ffff:169.254.169.254"],
+    )])
+    .unwrap();
+    let url = Url::parse("http://metadata.example.com/latest/meta-data/").unwrap();
+
+    let error =
+        validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
+    assert_eq!(error.resolved_ip, Some("169.254.169.254".parse().unwrap()));
+}
+
+#[test]
+fn validator_blocks_extra_cidr_denylist() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
+    let url = Url::parse("https://api.example.com/v1/models").unwrap();
+    let options = SsrfOptions {
+        extra_deny_cidrs: vec!["93.184.216.0/24".parse::<IpNet>().unwrap()],
+        ..SsrfOptions::default()
+    };
+
+    let error =
+        validate_outbound_with_resolver(&url, options, &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedExtraCidr { cidr } if cidr == "93.184.216.0/24"));
+}
+
+#[test]
+fn validator_blocks_mixed_allowed_and_denied_resolutions() {
+    let resolver = StaticDnsResolver::try_from_pairs([(
+        "mixed.example.com",
+        ["93.184.216.34", "127.0.0.1"],
+    )])
+    .unwrap();
+    let url = Url::parse("https://mixed.example.com/").unwrap();
+
+    let error = validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedIp { category: IpCategory::Loopback }));
 }
