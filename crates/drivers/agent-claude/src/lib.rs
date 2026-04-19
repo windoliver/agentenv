@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use agentenv_core::agent_common::{version_probe, AgentMode, SharedAgentConfig};
-use agentenv_core::driver::{AgentDriver, DriverResult};
+use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
     assert_compatible_schema_version, AgentCapabilities, AgentHealthCheckProbe, AgentSpec,
     Capabilities, CredentialKind, CredentialRequirement, CredentialRequirementsResult,
@@ -108,7 +108,7 @@ impl AgentDriver for ClaudeDriver {
     }
 
     async fn render_entrypoint(&self, spec: AgentSpec) -> DriverResult<RenderEntrypointResult> {
-        let config = shared_config(spec);
+        let config = shared_config(spec)?;
         let command = match config.mode {
             AgentMode::Tui => "claude",
             AgentMode::Headless => "claude --headless",
@@ -143,9 +143,11 @@ impl AgentDriver for ClaudeDriver {
     }
 }
 
-fn shared_config(spec: AgentSpec) -> SharedAgentConfig {
+fn shared_config(spec: AgentSpec) -> DriverResult<SharedAgentConfig> {
     let config_value = Value::Object(spec.config.into_iter().collect());
-    serde_json::from_value(config_value).unwrap_or_default()
+    serde_json::from_value(config_value).map_err(|err| DriverError::CapabilityMissing {
+        capability: format!("valid shared agent config ({err})"),
+    })
 }
 
 fn transport_name(transport: McpTransport) -> &'static str {
@@ -277,6 +279,22 @@ mod tests {
             entrypoint.content,
             "#!/usr/bin/env sh\nset -eu\nexec claude --headless \"$@\"\n"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_driver_rejects_invalid_entrypoint_config() {
+        let driver = ClaudeDriver::default();
+        let spec = agent_spec(BTreeMap::from([(
+            "mode".to_owned(),
+            serde_json::json!("headles"),
+        )]));
+
+        let err = driver
+            .render_entrypoint(spec)
+            .await
+            .expect_err("invalid mode should not fall back to TUI");
+
+        assert!(err.to_string().contains("valid shared agent config"));
     }
 
     #[tokio::test]
