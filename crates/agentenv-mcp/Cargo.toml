@@ -9,3 +9,8 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "MCP integration scaffolding for agentenv"
+
+[dependencies]
+agentenv-core = { path = "../agentenv-core" }
+agentenv-proto = { path = "../agentenv-proto" }
+url.workspace = true

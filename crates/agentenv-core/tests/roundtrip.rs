@@ -25,7 +25,7 @@ fn fixture(path: &str) -> String {
 #[test]
 fn roundtrip_reproduce_matches_describe() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.34");
 
     let yaml = std::fs::read_to_string(workspace_path(
         "blueprints/codex+mcp-generic+openshell.yaml",
@@ -42,7 +42,7 @@ fn roundtrip_reproduce_matches_describe() {
 #[test]
 fn roundtrip_public_verify_api_accepts_reference_blueprint() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.34");
 
     let yaml = std::fs::read_to_string(workspace_path(
         "blueprints/codex+mcp-generic+openshell.yaml",
@@ -72,7 +72,7 @@ agent:
 context:
   driver: mcp-generic
   endpoint:
-    url: https://mcp.alt.example.com
+    url: https://93.184.216.36
     transport: http+sse
   mode: readonly
 inference:
@@ -81,7 +81,7 @@ policy:
   tier: restricted
   presets: []
   overrides:
-    - allow: https://mcp.alt.example.com
+    - allow: https://93.184.216.36
 "#;
 
     let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
@@ -114,7 +114,7 @@ context:
       source: env
       required: true
   endpoint:
-    url: https://mcp.internal.example.com
+    url: https://93.184.216.34
     transport: http+sse
 inference:
   driver: passthrough

@@ -40,11 +40,11 @@ fn freeze_determinism_semantic_interpolation_changes_hash_and_output() {
     ))
     .unwrap();
 
-    std::env::set_var("MCP_URL", "https://mcp.one.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.37");
     let one = agentenv_core::lifecycle::freeze_from_blueprint_yaml(&yaml).unwrap();
     let one_lockfile = Lockfile::from_yaml(&one).unwrap();
 
-    std::env::set_var("MCP_URL", "https://mcp.two.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.38");
     let two = agentenv_core::lifecycle::freeze_from_blueprint_yaml(&yaml).unwrap();
     let two_lockfile = Lockfile::from_yaml(&two).unwrap();
 
