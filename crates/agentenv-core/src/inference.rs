@@ -172,9 +172,7 @@ pub fn routed_endpoint(
     })
 }
 
-pub fn routed_credential_requirements(
-    defaults: ProviderDefaults,
-) -> CredentialRequirementsResult {
+pub fn routed_credential_requirements(defaults: ProviderDefaults) -> CredentialRequirementsResult {
     let requirements = defaults
         .credential_env
         .map(|name| CredentialRequirement {
@@ -325,11 +323,9 @@ mod tests {
 
     #[test]
     fn provider_config_rejects_malformed_base_url() {
-        let err = ProviderConfig::from_spec(
-            DEFAULTS,
-            &spec(vec![("base_url", json!("not-a-url"))]),
-        )
-        .expect_err("malformed URL must be rejected");
+        let err =
+            ProviderConfig::from_spec(DEFAULTS, &spec(vec![("base_url", json!("not-a-url"))]))
+                .expect_err("malformed URL must be rejected");
 
         assert_eq!(
             err.to_string(),
@@ -382,11 +378,9 @@ mod tests {
 
     #[test]
     fn provider_config_rejects_malformed_base_url_authority() {
-        let err = ProviderConfig::from_spec(
-            DEFAULTS,
-            &spec(vec![("base_url", json!("https://:443"))]),
-        )
-        .expect_err("malformed URL authority must be rejected");
+        let err =
+            ProviderConfig::from_spec(DEFAULTS, &spec(vec![("base_url", json!("https://:443"))]))
+                .expect_err("malformed URL authority must be rejected");
 
         assert_eq!(
             err.to_string(),
