@@ -28,7 +28,7 @@ members = [
 [workspace.package]
 version = "0.0.1-alpha0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/windoliver/agentenv"
 homepage = "https://github.com/windoliver/agentenv"
