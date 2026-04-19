@@ -117,19 +117,24 @@ pub trait InferenceDriver: Send + Sync {
 #[cfg(test)]
 mod tests {
     use agentenv_proto::{
-        Capabilities, DriverInfo, DriverKind, InitializeResult, SandboxCapabilities, SCHEMA_VERSION,
+        schema_version_major, Capabilities, DriverInfo, DriverKind, InitializeResult,
+        SandboxCapabilities, SCHEMA_VERSION,
     };
 
     use super::{ensure_protocol_compatible, require_capability, DriverError};
 
     #[test]
     fn compatibility_guard_rejects_mismatched_protocol_major() {
+        let mismatched_protocol_version = format!(
+            "{}.0",
+            schema_version_major(SCHEMA_VERSION).expect("schema version should parse") + 1
+        );
         let result = InitializeResult {
             driver: DriverInfo {
                 name: "mock".to_owned(),
                 kind: DriverKind::Sandbox,
                 version: "0.0.1".to_owned(),
-                protocol_version: "1.0".to_owned(),
+                protocol_version: mismatched_protocol_version,
             },
             capabilities: Capabilities::Sandbox(SandboxCapabilities {
                 supports_hot_reload_policy: true,

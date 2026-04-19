@@ -23,10 +23,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
-        run: cargo fmt --check
+        run: cargo +${{ matrix.toolchain }} fmt --check
       - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo +${{ matrix.toolchain }} test --workspace
       - name: cargo build --workspace --all-targets --release
-        run: cargo build --workspace --all-targets --release
+        run: cargo +${{ matrix.toolchain }} build --workspace --all-targets --release

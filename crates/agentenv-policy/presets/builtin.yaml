@@ -1,0 +1,88 @@
+presets:
+  github:
+    read:
+      allow:
+        - kind: host
+          host: api.github.com
+          port: 443
+          scheme: https
+        - kind: host
+          host: github.com
+          port: 443
+          scheme: https
+      approval_required:
+        - kind: http_method_path
+          host: api.github.com
+          method: POST
+          path: /repos/*
+    readwrite:
+      allow:
+        - kind: host
+          host: api.github.com
+          port: 443
+          scheme: https
+        - kind: host
+          host: github.com
+          port: 443
+          scheme: https
+  npm:
+    read:
+      allow:
+        - kind: host
+          host: registry.npmjs.org
+          port: 443
+          scheme: https
+  pypi:
+    read:
+      allow:
+        - kind: host
+          host: pypi.org
+          port: 443
+          scheme: https
+        - kind: host
+          host: files.pythonhosted.org
+          port: 443
+          scheme: https
+  crates:
+    read:
+      allow:
+        - kind: host
+          host: crates.io
+          port: 443
+          scheme: https
+        - kind: host
+          host: index.crates.io
+          port: 443
+          scheme: https
+        - kind: host
+          host: static.crates.io
+          port: 443
+          scheme: https
+  docker_hub:
+    read:
+      allow:
+        - kind: host
+          host: registry-1.docker.io
+          port: 443
+          scheme: https
+  messaging_slack:
+    readwrite:
+      allow:
+        - kind: host
+          host: slack.com
+          port: 443
+          scheme: https
+  messaging_discord:
+    readwrite:
+      allow:
+        - kind: host
+          host: discord.com
+          port: 443
+          scheme: https
+  messaging_telegram:
+    readwrite:
+      allow:
+        - kind: host
+          host: api.telegram.org
+          port: 443
+          scheme: https
