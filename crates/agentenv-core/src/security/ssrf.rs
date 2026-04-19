@@ -374,7 +374,9 @@ fn in_any_net(ip: IpAddr, cidrs: &[&str]) -> bool {
             .any(|net| net.contains(&ip));
     }
     if std::ptr::eq(cidrs, IPV6_RESERVED_NETS) {
-        return IPV6_RESERVED_NETS_PARSED.iter().any(|net| net.contains(&ip));
+        return IPV6_RESERVED_NETS_PARSED
+            .iter()
+            .any(|net| net.contains(&ip));
     }
 
     for net in parse_cidrs(cidrs, "custom") {
@@ -383,7 +385,6 @@ fn in_any_net(ip: IpAddr, cidrs: &[&str]) -> bool {
         }
     }
     false
-
 }
 
 fn parse_cidrs(cidrs: &[&str], context: &str) -> Vec<IpNet> {

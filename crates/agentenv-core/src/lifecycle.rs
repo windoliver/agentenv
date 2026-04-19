@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::net::AddrParseError;
 
 use semver::Version;
 use serde::Serialize;
@@ -7,9 +6,7 @@ use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 use url::Url;
 
-use crate::security::ssrf::{
-    validate_outbound_with_resolver, SsrfBlockReason, SsrfBlocked, SsrfOptions, StaticDnsResolver,
-};
+use crate::security::ssrf::{validate_outbound, SsrfBlockReason, SsrfBlocked, SsrfOptions};
 use crate::{
     blueprint::{
         Blueprint, ComponentSection, CredentialRef as BlueprintCredentialRef, PolicySection,
@@ -155,11 +152,6 @@ pub enum LifecycleError {
         credential_source: String,
         reference: String,
     },
-    #[error("failed to build blueprint SSRF resolver fixture: {source}")]
-    SsrfFixtureBuild {
-        #[source]
-        source: AddrParseError,
-    },
     #[error("blueprint blocked outbound URL at `{path}`: {source}")]
     SsrfBlocked {
         path: String,
@@ -252,34 +244,32 @@ fn build_lockfile_from_blueprint_yaml(yaml: &str) -> Result<Lockfile, LifecycleE
 }
 
 fn validate_blueprint_urls(blueprint: &Blueprint) -> Result<(), LifecycleError> {
-    let resolver = blueprint_dns_resolver()?;
     let options = SsrfOptions {
         allow_ssh_http: true,
         ..SsrfOptions::default()
     };
 
-    validate_context_blueprint_urls(&blueprint.context, &resolver, &options)?;
+    validate_context_blueprint_urls(&blueprint.context, &options)?;
     if let Some(inference) = blueprint.inference.as_ref() {
-        validate_inference_blueprint_urls(inference, &resolver, &options)?;
+        validate_inference_blueprint_urls(inference, &options)?;
     }
-    validate_policy_url_overrides(&blueprint.policy, &resolver, &options)?;
+    validate_policy_url_overrides(&blueprint.policy, &options)?;
 
     Ok(())
 }
 
 fn validate_context_blueprint_urls(
     context: &ComponentSection,
-    resolver: &StaticDnsResolver,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
     if let Some(endpoint) = context.extra.get("endpoint").and_then(Value::as_mapping) {
         if let Some(url) = mapping_string(endpoint, "url") {
-            validate_required_blueprint_url("context.endpoint.url", url, resolver, options)?;
+            validate_required_blueprint_url("context.endpoint.url", url, options)?;
         }
     }
 
     if let Some(url) = context.extra.get("hub_url").and_then(Value::as_str) {
-        validate_required_blueprint_url("context.hub_url", url, resolver, options)?;
+        validate_required_blueprint_url("context.hub_url", url, options)?;
     }
 
     Ok(())
@@ -287,12 +277,11 @@ fn validate_context_blueprint_urls(
 
 fn validate_inference_blueprint_urls(
     inference: &ComponentSection,
-    resolver: &StaticDnsResolver,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
     for field in ["upstream_url", "base_url", "registry_url", "blueprint_url"] {
         if let Some(url) = inference.extra.get(field).and_then(Value::as_str) {
-            validate_required_blueprint_url(&format!("inference.{field}"), url, resolver, options)?;
+            validate_required_blueprint_url(&format!("inference.{field}"), url, options)?;
         }
     }
 
@@ -301,34 +290,18 @@ fn validate_inference_blueprint_urls(
 
 fn validate_policy_url_overrides(
     policy: &PolicySection,
-    resolver: &StaticDnsResolver,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
     for (index, override_spec) in policy.overrides.iter().enumerate() {
         let path_prefix = format!("policy.overrides[{index}]");
         if let Some(url) = override_spec.allow.as_deref() {
-            validate_policy_override_url(
-                &format!("{path_prefix}.allow"),
-                url,
-                resolver,
-                options,
-            )?;
+            validate_policy_override_url(&format!("{path_prefix}.allow"), url, options)?;
         }
         if let Some(url) = override_spec.deny.as_deref() {
-            validate_policy_override_url(
-                &format!("{path_prefix}.deny"),
-                url,
-                resolver,
-                options,
-            )?;
+            validate_policy_override_url(&format!("{path_prefix}.deny"), url, options)?;
         }
         if let Some(url) = override_spec.approval.as_deref() {
-            validate_policy_override_url(
-                &format!("{path_prefix}.approval"),
-                url,
-                resolver,
-                options,
-            )?;
+            validate_policy_override_url(&format!("{path_prefix}.approval"), url, options)?;
         }
     }
 
@@ -338,29 +311,26 @@ fn validate_policy_url_overrides(
 fn validate_required_blueprint_url(
     path: &str,
     raw: &str,
-    resolver: &StaticDnsResolver,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
-    validate_url_with_ssrf(path, raw, resolver, options)
+    validate_url_with_ssrf(path, raw, options)
 }
 
 fn validate_policy_override_url(
     path: &str,
     raw: &str,
-    resolver: &StaticDnsResolver,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
     if !looks_like_url(raw) {
         return Ok(());
     }
 
-    validate_url_with_ssrf(path, raw, resolver, options)
+    validate_url_with_ssrf(path, raw, options)
 }
 
 fn validate_url_with_ssrf(
     path: &str,
     raw: &str,
-    resolver: &StaticDnsResolver,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
     let parsed = Url::parse(raw).map_err(|_| LifecycleError::SsrfBlocked {
@@ -375,11 +345,9 @@ fn validate_url_with_ssrf(
         }),
     })?;
 
-    validate_outbound_with_resolver(&parsed, options.clone(), resolver).map_err(|source| {
-        LifecycleError::SsrfBlocked {
-            path: path.to_string(),
-            source: Box::new(source),
-        }
+    validate_outbound(&parsed, options.clone()).map_err(|source| LifecycleError::SsrfBlocked {
+        path: path.to_string(),
+        source: Box::new(source),
     })?;
 
     Ok(())
@@ -397,17 +365,6 @@ fn mapping_string<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {
     }
 
     None
-}
-
-fn blueprint_dns_resolver() -> Result<StaticDnsResolver, LifecycleError> {
-    StaticDnsResolver::try_from_pairs([
-        ("mcp.internal.example.com", ["93.184.216.34"]),
-        ("nexus.internal.example.com", ["93.184.216.35"]),
-        ("mcp.alt.example.com", ["93.184.216.36"]),
-        ("mcp.one.example.com", ["93.184.216.37"]),
-        ("mcp.two.example.com", ["93.184.216.38"]),
-    ])
-    .map_err(|source| LifecycleError::SsrfFixtureBuild { source })
 }
 
 fn resolve_component(

@@ -89,7 +89,7 @@ policy:
 fn blueprint_verification_accepts_reference_blueprint_urls() {
     let _guard = with_env_lock();
     let original = std::env::var("MCP_URL").ok();
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.34");
 
     let yaml = read_blueprint("blueprints/codex+mcp-generic+openshell.yaml");
     let verified = verify_blueprint_yaml(&yaml).unwrap();
@@ -99,6 +99,32 @@ fn blueprint_verification_accepts_reference_blueprint_urls() {
         Some(original) => std::env::set_var("MCP_URL", original),
         None => std::env::remove_var("MCP_URL"),
     }
+}
+
+#[test]
+fn blueprint_verification_accepts_public_hostname_url() {
+    let _guard = with_env_lock();
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: mcp-generic
+  endpoint:
+    url: https://example.com
+    transport: http+sse
+policy:
+  tier: restricted
+  presets: []
+"#;
+
+    // Use a public hostname to ensure production validation uses the system resolver
+    // instead of a fixture-bound hostname list.
+    verify_blueprint_yaml(yaml).unwrap();
 }
 
 #[test]
@@ -182,7 +208,7 @@ agent:
 context:
   driver: mcp-generic
   endpoint:
-    url: https://mcp.internal.example.com
+    url: https://93.184.216.34
     transport: http+sse
 policy:
   tier: restricted
@@ -220,7 +246,7 @@ agent:
 context:
   driver: mcp-generic
   endpoint:
-    url: https://mcp.internal.example.com
+    url: https://93.184.216.34
     transport: http+sse
 policy:
   tier: restricted
@@ -235,7 +261,10 @@ policy:
     match err {
         LifecycleError::SsrfBlocked { path, source, .. } => {
             assert_eq!(path, "policy.overrides[0].allow");
-            assert!(matches!(source.reason, SsrfBlockReason::MalformedRedirect { .. }));
+            assert!(matches!(
+                source.reason,
+                SsrfBlockReason::MalformedRedirect { .. }
+            ));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -255,7 +284,7 @@ agent:
 context:
   driver: mcp-generic
   endpoint:
-    url: https://mcp.internal.example.com
+    url: https://93.184.216.34
     transport: http+sse
 policy:
   tier: restricted
