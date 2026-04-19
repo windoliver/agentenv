@@ -386,7 +386,7 @@ fn validate_url_with_ssrf(
 }
 
 fn looks_like_url(raw: &str) -> bool {
-    Url::parse(raw).is_ok()
+    Url::parse(raw).is_ok() || raw.contains("://")
 }
 
 fn mapping_string<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {
