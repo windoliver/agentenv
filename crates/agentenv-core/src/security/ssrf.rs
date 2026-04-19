@@ -478,8 +478,15 @@ fn sanitize_malformed_redirect_location(location: &str) -> String {
         None => location.to_owned(),
     };
 
-    if let Some(scheme_end) = sanitized.find("://") {
-        let authority_start = scheme_end + "://".len();
+    let authority_start = if let Some(scheme_end) = sanitized.find("://") {
+        Some(scheme_end + "://".len())
+    } else if sanitized.starts_with("//") {
+        Some("//".len())
+    } else {
+        None
+    };
+
+    if let Some(authority_start) = authority_start {
         let authority_end = sanitized[authority_start..]
             .find('/')
             .map(|index| authority_start + index)
