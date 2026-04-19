@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use agentenv_core::security::ssrf::{validate_outbound, SsrfBlocked, SsrfOptions, ValidatedUrl};
 use agentenv_proto::{CredentialRequirement, ValidatorSpec};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -107,6 +109,12 @@ pub enum CredentialStoreError {
         name: String,
         #[source]
         source: reqwest::Error,
+    },
+    #[error("curl probe validator for `{name}` was blocked by SSRF policy: {source}")]
+    ValidatorProbeBlocked {
+        name: String,
+        #[source]
+        source: Box<SsrfBlocked>,
     },
     #[error("curl probe validator for `{name}` returned status {status}")]
     ValidatorProbeStatus {
@@ -429,18 +437,23 @@ impl CredentialStore {
                     }
                 }
                 ValidatorSpec::CurlProbe { url } => {
-                    let client = reqwest::blocking::Client::new();
-                    let response = client
-                        .get(url)
-                        .header(
-                            reqwest::header::AUTHORIZATION,
-                            format!("Bearer {}", secret.expose_secret()),
-                        )
-                        .send()
-                        .map_err(|source| CredentialStoreError::ValidatorProbeRequest {
+                    let parsed_url = url::Url::parse(url).map_err(|source| {
+                        CredentialStoreError::Validation {
+                            name: name.to_owned(),
+                            reason: format!("invalid curl probe URL `{url}`: {source}"),
+                        }
+                    })?;
+                    let validated = validate_outbound(&parsed_url, SsrfOptions::default())
+                        .map_err(|source| CredentialStoreError::ValidatorProbeBlocked {
+                            name: name.to_owned(),
+                            source: Box::new(source),
+                        })?;
+                    let response = send_pinned_probe(&validated, secret).map_err(|source| {
+                        CredentialStoreError::ValidatorProbeRequest {
                             name: name.to_owned(),
                             source,
-                        })?;
+                        }
+                    })?;
 
                     if !response.status().is_success() {
                         return Err(CredentialStoreError::ValidatorProbeStatus {
@@ -514,6 +527,30 @@ impl CredentialStore {
         let index = self.read_index()?;
         Ok(index.locations.get(name).copied())
     }
+}
+
+fn send_pinned_probe(
+    validated: &ValidatedUrl,
+    secret: &SecretString,
+) -> std::result::Result<reqwest::blocking::Response, reqwest::Error> {
+    let port = validated.url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<SocketAddr> = validated
+        .pinned_ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&validated.host, &addrs)
+        .build()?
+        .get(validated.url.clone())
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", secret.expose_secret()),
+        )
+        .send()
 }
 
 fn disable_keyring_from_env() -> bool {
@@ -930,6 +967,67 @@ mod tests {
             .expect_err("expected regex validation to fail");
         match error {
             CredentialStoreError::Validation { .. } => {}
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curl_probe_validator_blocks_metadata_url_before_http_send() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let keyring = MockKeyring::default();
+        let mut store = test_store(keyring, &temp_dir);
+        store
+            .write_to_file("AGENTENV_TEST_TOKEN", &SecretString::new("token"))
+            .expect("write credential");
+
+        let requirement = CredentialRequirement {
+            name: "AGENTENV_TEST_TOKEN".to_owned(),
+            kind: CredentialKind::ApiKey,
+            required: true,
+            description: "probe must be SSRF guarded".to_owned(),
+            validator: Some(ValidatorSpec::CurlProbe {
+                url: "http://169.254.169.254/latest/meta-data/".to_owned(),
+            }),
+        };
+
+        let error = store
+            .resolve("AGENTENV_TEST_TOKEN", &requirement)
+            .expect_err("expected metadata probe to be blocked");
+        match error {
+            CredentialStoreError::ValidatorProbeBlocked { name, .. } => {
+                assert_eq!(name, "AGENTENV_TEST_TOKEN");
+            }
+            other => panic!("expected validator probe block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curl_probe_validator_rejects_malformed_url() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let keyring = MockKeyring::default();
+        let mut store = test_store(keyring, &temp_dir);
+        store
+            .write_to_file("AGENTENV_TEST_TOKEN", &SecretString::new("token"))
+            .expect("write credential");
+
+        let requirement = CredentialRequirement {
+            name: "AGENTENV_TEST_TOKEN".to_owned(),
+            kind: CredentialKind::ApiKey,
+            required: true,
+            description: "probe URL must parse".to_owned(),
+            validator: Some(ValidatorSpec::CurlProbe {
+                url: "http://[".to_owned(),
+            }),
+        };
+
+        let error = store
+            .resolve("AGENTENV_TEST_TOKEN", &requirement)
+            .expect_err("expected malformed probe URL to fail validation");
+        match error {
+            CredentialStoreError::Validation { name, reason } => {
+                assert_eq!(name, "AGENTENV_TEST_TOKEN");
+                assert!(reason.contains("invalid curl probe URL"));
+            }
             other => panic!("expected validation error, got {other:?}"),
         }
     }

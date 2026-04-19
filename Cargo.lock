@@ -67,6 +67,7 @@ dependencies = [
 name = "agentenv-credstore"
 version = "0.0.1-alpha0"
 dependencies = [
+ "agentenv-core",
  "agentenv-proto",
  "dirs",
  "keyring",
@@ -77,6 +78,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "url",
 ]
 
 [[package]]
