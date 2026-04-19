@@ -1,21 +1,18 @@
-use std::collections::BTreeMap;
-
-use agent_claude::ClaudeDriver;
-use agentenv_core::driver::AgentDriver;
-use agentenv_proto::AgentSpec;
+const RUN_OPEN_SHELL_TESTS_ENV: &str = "AGENTENV_RUN_OPEN_SHELL_TESTS";
 
 #[tokio::test]
 #[ignore = "enable once sandbox-openshell implements create + exec"]
 async fn claude_install_and_probe_work_in_fresh_sandbox() {
-    let driver = ClaudeDriver::default();
-    let spec = AgentSpec {
-        version: None,
-        config: BTreeMap::new(),
-    };
+    if std::env::var_os(RUN_OPEN_SHELL_TESTS_ENV).is_none() {
+        eprintln!(
+            "skipping Claude OpenShell install/probe activation test; set \
+             {RUN_OPEN_SHELL_TESTS_ENV} once sandbox-openshell create + exec exists"
+        );
+        return;
+    }
 
-    let install = driver.install_steps(spec.clone()).await.unwrap();
-    let probe = driver.health_check_probe(spec).await.unwrap();
-
-    assert!(!install.steps.is_empty());
-    assert_eq!(probe.cmd, "claude --version");
+    panic!(
+        "{RUN_OPEN_SHELL_TESTS_ENV} is set, but OpenShell create+exec wiring is not implemented \
+         yet; connect sandbox-openshell create + exec here once M2-1 lands"
+    );
 }

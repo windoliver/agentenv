@@ -11,4 +11,5 @@ and headless entrypoints:
 
 It declares `OPENAI_API_KEY` as a required API key credential.
 
-OpenShell-backed install/probe tests live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
+OpenShell install/probe activation scaffolds live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
+They only run with `AGENTENV_RUN_OPEN_SHELL_TESTS` once sandbox execution exists.

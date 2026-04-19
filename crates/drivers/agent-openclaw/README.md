@@ -49,4 +49,5 @@ If `provider` is omitted, `model` prefixes are used when possible:
 
 An explicit provider that conflicts with an inferable model prefix is rejected.
 
-OpenShell-backed install/probe tests live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
+OpenShell install/probe activation scaffolds live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
+They only run with `AGENTENV_RUN_OPEN_SHELL_TESTS` once sandbox execution exists.
