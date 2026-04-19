@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use agentenv_core::security::ssrf::{
-    validate_outbound_with_resolver, DnsResolver, SsrfBlockReason, SsrfBlocked, SsrfOptions,
-    ValidatedUrl,
+    sanitize_untrusted_url_text, validate_outbound_with_resolver, DnsResolver, SsrfBlockReason,
+    SsrfBlocked, SsrfOptions, ValidatedUrl,
 };
 use agentenv_proto::{McpEndpoint, McpTransport};
 use url::Url;
@@ -20,7 +20,7 @@ pub fn validate_mcp_endpoint(
 ) -> Result<ValidatedMcpEndpoint, SsrfBlocked> {
     if matches!(endpoint.transport, McpTransport::SshHttp) && !opts.allow_ssh_http {
         return Err(SsrfBlocked {
-            url: endpoint.url.clone(),
+            url: sanitize_untrusted_url_text(&endpoint.url),
             host: None,
             resolved_ip: None,
             reason: SsrfBlockReason::UnsupportedScheme {
@@ -35,13 +35,16 @@ pub fn validate_mcp_endpoint(
             validated_url: None,
         }),
         McpTransport::Http | McpTransport::HttpSse | McpTransport::SshHttp => {
-            let url = Url::parse(&endpoint.url).map_err(|_| SsrfBlocked {
-                url: endpoint.url.clone(),
-                host: None,
-                resolved_ip: None,
-                reason: SsrfBlockReason::MalformedRedirect {
-                    location: endpoint.url.clone(),
-                },
+            let url = Url::parse(&endpoint.url).map_err(|_| {
+                let sanitized = sanitize_untrusted_url_text(&endpoint.url);
+                SsrfBlocked {
+                    url: sanitized.clone(),
+                    host: None,
+                    resolved_ip: None,
+                    reason: SsrfBlockReason::MalformedRedirect {
+                        location: sanitized,
+                    },
+                }
             })?;
             let validated_url = validate_outbound_with_resolver(&url, opts, resolver)?;
 
@@ -177,5 +180,20 @@ mod tests {
             blocked.reason,
             SsrfBlockReason::MalformedRedirect { ref location } if location == "http://["
         ));
+    }
+
+    #[test]
+    fn malformed_url_error_is_sanitized() {
+        let endpoint = endpoint("http://user:pass@[?token=secret#frag", McpTransport::Http);
+        let resolver = StaticDnsResolver::default();
+
+        let blocked =
+            validate_mcp_endpoint(&endpoint, SsrfOptions::default(), &resolver).unwrap_err();
+
+        assert_eq!(blocked.url, "http://[");
+        let SsrfBlockReason::MalformedRedirect { location } = blocked.reason else {
+            panic!("expected malformed redirect");
+        };
+        assert_eq!(location, "http://[");
     }
 }

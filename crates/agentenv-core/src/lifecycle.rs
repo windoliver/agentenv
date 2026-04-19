@@ -6,7 +6,9 @@ use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 use url::Url;
 
-use crate::security::ssrf::{validate_outbound, SsrfBlockReason, SsrfBlocked, SsrfOptions};
+use crate::security::ssrf::{
+    sanitize_untrusted_url_text, validate_outbound, SsrfBlockReason, SsrfBlocked, SsrfOptions,
+};
 use crate::{
     blueprint::{
         Blueprint, ComponentSection, CredentialRef as BlueprintCredentialRef, PolicySection,
@@ -333,16 +335,19 @@ fn validate_url_with_ssrf(
     raw: &str,
     options: &SsrfOptions,
 ) -> Result<(), LifecycleError> {
-    let parsed = Url::parse(raw).map_err(|_| LifecycleError::SsrfBlocked {
-        path: path.to_string(),
-        source: Box::new(SsrfBlocked {
-            url: raw.to_string(),
-            host: None,
-            resolved_ip: None,
-            reason: SsrfBlockReason::MalformedRedirect {
-                location: raw.to_string(),
-            },
-        }),
+    let parsed = Url::parse(raw).map_err(|_| {
+        let sanitized = sanitize_untrusted_url_text(raw);
+        LifecycleError::SsrfBlocked {
+            path: path.to_string(),
+            source: Box::new(SsrfBlocked {
+                url: sanitized.clone(),
+                host: None,
+                resolved_ip: None,
+                reason: SsrfBlockReason::MalformedRedirect {
+                    location: sanitized,
+                },
+            }),
+        }
     })?;
 
     validate_outbound(&parsed, options.clone()).map_err(|source| LifecycleError::SsrfBlocked {

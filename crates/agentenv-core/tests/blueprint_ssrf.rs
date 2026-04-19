@@ -271,6 +271,44 @@ policy:
 }
 
 #[test]
+fn blueprint_verification_redacts_malformed_url_error() {
+    let _guard = with_env_lock();
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: mcp-generic
+  endpoint:
+    url: http://user:pass@[?token=secret#frag
+    transport: http+sse
+policy:
+  tier: restricted
+  presets: []
+"#;
+
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::SsrfBlocked { path, source, .. } => {
+            assert_eq!(path, "context.endpoint.url");
+            let rendered = format!("{source:?}");
+            for redacted in ["user", "pass", "token", "secret", "?", "#"] {
+                assert!(
+                    !rendered.contains(redacted),
+                    "SSRF error leaked `{redacted}` in `{rendered}`"
+                );
+            }
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn blueprint_verification_allows_non_url_policy_override_string() {
     let _guard = with_env_lock();
 

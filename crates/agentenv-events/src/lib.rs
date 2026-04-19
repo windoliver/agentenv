@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agentenv_core::security::ssrf::{SsrfBlockReason, SsrfBlocked};
+use agentenv_core::security::ssrf::{sanitize_untrusted_url_text, SsrfBlockReason, SsrfBlocked};
 use agentenv_proto::{ActivityEventParams, ActivityKind};
 
 pub fn ssrf_blocked_event(
@@ -12,41 +12,12 @@ pub fn ssrf_blocked_event(
         kind: ActivityKind::EgressDenied,
         subject: match blocked.host.as_deref() {
             Some(host) => host.to_owned(),
-            None => sanitize_fallback_subject(&blocked.url),
+            None => sanitize_untrusted_url_text(&blocked.url),
         },
         reason: Some(ssrf_block_reason_label(&blocked.reason).to_owned()),
         ts: ts.into(),
         handle,
     }
-}
-
-fn sanitize_fallback_subject(subject: &str) -> String {
-    let mut sanitized = match subject.find(['?', '#']) {
-        Some(index) => subject[..index].to_owned(),
-        None => subject.to_owned(),
-    };
-
-    let authority_start = if let Some(scheme_end) = sanitized.find("://") {
-        Some(scheme_end + "://".len())
-    } else if sanitized.starts_with("//") {
-        Some("//".len())
-    } else {
-        None
-    };
-
-    if let Some(authority_start) = authority_start {
-        let authority_end = match sanitized[authority_start..].find('/') {
-            Some(index) => authority_start + index,
-            None => sanitized.len(),
-        };
-
-        if let Some(at_offset) = sanitized[authority_start..authority_end].rfind('@') {
-            let credential_end = authority_start + at_offset + 1;
-            sanitized.replace_range(authority_start..credential_end, "");
-        }
-    }
-
-    sanitized
 }
 
 fn ssrf_block_reason_label(reason: &SsrfBlockReason) -> &'static str {

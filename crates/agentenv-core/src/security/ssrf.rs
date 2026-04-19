@@ -134,6 +134,10 @@ impl DnsResolver for StaticDnsResolver {
     }
 }
 
+pub fn sanitize_untrusted_url_text(raw: &str) -> String {
+    sanitize_url_like_text(raw)
+}
+
 pub fn validate_outbound(url: &Url, opts: SsrfOptions) -> Result<ValidatedUrl, SsrfBlocked> {
     if opts.dns_resolver != DnsResolverChoice::System {
         return Err(block(
@@ -472,10 +476,10 @@ fn sanitize_url(url: &Url) -> String {
     sanitized.to_string()
 }
 
-fn sanitize_malformed_redirect_location(location: &str) -> String {
-    let mut sanitized = match location.find(['?', '#']) {
-        Some(index) => location[..index].to_owned(),
-        None => location.to_owned(),
+fn sanitize_url_like_text(raw: &str) -> String {
+    let mut sanitized = match raw.find(['?', '#']) {
+        Some(index) => raw[..index].to_owned(),
+        None => raw.to_owned(),
     };
 
     let authority_start = if let Some(scheme_end) = sanitized.find("://") {
@@ -499,4 +503,8 @@ fn sanitize_malformed_redirect_location(location: &str) -> String {
     }
 
     sanitized
+}
+
+fn sanitize_malformed_redirect_location(location: &str) -> String {
+    sanitize_untrusted_url_text(location)
 }
