@@ -18,6 +18,17 @@ pub fn validate_mcp_endpoint(
     opts: SsrfOptions,
     resolver: &dyn DnsResolver,
 ) -> Result<ValidatedMcpEndpoint, SsrfBlocked> {
+    if matches!(endpoint.transport, McpTransport::SshHttp) && !opts.allow_ssh_http {
+        return Err(SsrfBlocked {
+            url: endpoint.url.clone(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::UnsupportedScheme {
+                scheme: "ssh+http".to_owned(),
+            },
+        });
+    }
+
     match &endpoint.transport {
         McpTransport::Stdio => Ok(ValidatedMcpEndpoint {
             endpoint: endpoint.clone(),
@@ -92,6 +103,21 @@ mod tests {
     #[test]
     fn ssh_http_requires_opt_in() {
         let endpoint = endpoint("ssh+http://mcp.example.com/sse", McpTransport::SshHttp);
+        let resolver =
+            StaticDnsResolver::try_from_pairs([("mcp.example.com", ["93.184.216.34"])]).unwrap();
+
+        let blocked =
+            validate_mcp_endpoint(&endpoint, SsrfOptions::default(), &resolver).unwrap_err();
+
+        assert!(matches!(
+            blocked.reason,
+            SsrfBlockReason::UnsupportedScheme { ref scheme } if scheme == "ssh+http"
+        ));
+    }
+
+    #[test]
+    fn ssh_http_transport_requires_opt_in_for_https_url() {
+        let endpoint = endpoint("https://mcp.example.com/sse", McpTransport::SshHttp);
         let resolver =
             StaticDnsResolver::try_from_pairs([("mcp.example.com", ["93.184.216.34"])]).unwrap();
 
