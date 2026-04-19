@@ -38,6 +38,14 @@ dependencies = [
 [[package]]
 name = "agent-openclaw"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "agentenv"
