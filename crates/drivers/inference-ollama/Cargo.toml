@@ -9,3 +9,12 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Ollama inference driver scaffold for agentenv"
+
+[dependencies]
+agentenv-core = { path = "../../agentenv-core" }
+agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true

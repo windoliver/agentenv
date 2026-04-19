@@ -1192,6 +1192,13 @@ dependencies = [
 [[package]]
 name = "inference-ollama"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "inference-openai"
