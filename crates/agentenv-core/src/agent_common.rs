@@ -17,6 +17,14 @@ pub struct SharedAgentConfig {
     pub mode: AgentMode,
 }
 
+pub fn npm_package_spec(package: &str, version: Option<&str>) -> Result<String, String> {
+    match version.filter(|value| !value.is_empty()) {
+        Some(version) if is_safe_npm_version(version) => Ok(format!("{package}@{version}")),
+        Some(version) => Err(format!("safe npm package version `{version}`")),
+        None => Ok(package.to_owned()),
+    }
+}
+
 pub fn version_probe(binary: &str) -> AgentHealthCheckProbe {
     AgentHealthCheckProbe {
         cmd: format!("{binary} --version"),
@@ -26,9 +34,15 @@ pub fn version_probe(binary: &str) -> AgentHealthCheckProbe {
     }
 }
 
+fn is_safe_npm_version(version: &str) -> bool {
+    version.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+' | b'~')
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{version_probe, AgentMode, SharedAgentConfig};
+    use super::{npm_package_spec, version_probe, AgentMode, SharedAgentConfig};
 
     #[test]
     fn shared_agent_config_defaults_to_tui() {
@@ -42,5 +56,24 @@ mod tests {
         assert_eq!(probe.cmd, "claude --version");
         assert!(!probe.tty);
         assert_eq!(probe.success_exit_codes, vec![0]);
+    }
+
+    #[test]
+    fn npm_package_spec_appends_safe_versions() {
+        assert_eq!(
+            npm_package_spec("@openai/codex", Some("0.53.0-beta.1+build")).unwrap(),
+            "@openai/codex@0.53.0-beta.1+build"
+        );
+        assert_eq!(
+            npm_package_spec("@openai/codex", None).unwrap(),
+            "@openai/codex"
+        );
+    }
+
+    #[test]
+    fn npm_package_spec_rejects_shell_metacharacters() {
+        let err = npm_package_spec("@openai/codex", Some("1.2.3;curl")).unwrap_err();
+
+        assert!(err.contains("safe npm package version"));
     }
 }

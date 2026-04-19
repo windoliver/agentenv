@@ -479,18 +479,6 @@ pub struct CredentialRequirementsResult {
     pub requirements: Vec<CredentialRequirement>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct HealthCheckParams {
-    pub handle: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct HealthCheckResult {
-    pub healthy: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct ContextSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

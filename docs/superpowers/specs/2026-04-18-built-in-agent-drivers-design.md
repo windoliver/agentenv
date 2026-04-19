@@ -54,7 +54,7 @@ This keeps the architecture aligned with the repo's narrow-waist design: drivers
 Add `agentenv-core::agent_common` as the reusable layer for built-in agent drivers. It owns:
 
 - default `AgentCapabilities`
-- MCP config rendering for the common `mcp_servers.json` shape
+- MCP config rendering helpers for each upstream agent's documented MCP config shape
 - helpers for install-step rendering
 - helpers for credential requirement construction
 - helpers for declarative version probes
@@ -99,14 +99,14 @@ Although the first-cut default remains `openai`, the reference OpenClaw blueprin
 Claude:
 
 - binary: `claude`
-- MCP config path: `~/.claude/mcp_servers.json`
+- MCP config path: `~/.claude/agentenv-mcp.json`, loaded with `claude --mcp-config`
 - credential: `ANTHROPIC_API_KEY`
 - capabilities: `supports_mcp`, `supports_slash_commands`, `supports_tui`, `supports_headless`
 
 Codex:
 
 - binary: `codex`
-- MCP config path: `~/.codex/mcp_servers.json`
+- MCP config path: `~/.codex/config.toml`, using Codex `[mcp_servers.*]` TOML tables
 - credential: `OPENAI_API_KEY`
 - capabilities: same as Claude
 

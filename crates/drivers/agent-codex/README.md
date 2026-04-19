@@ -2,8 +2,9 @@
 
 Built-in `agentenv` driver for running Codex as an agent inside a sandbox.
 
-The driver installs Codex with `npm install -g @openai/codex`, renders the
-Codex MCP configuration at `~/.codex/mcp_servers.json`, and returns a
+The driver installs Codex with `npm install -g @openai/codex`, honoring
+`AgentSpec.version` when present. It renders Codex MCP configuration into
+`~/.codex/config.toml` using `[mcp_servers.*]` TOML tables and returns a
 declarative `codex --version` health probe. It supports both TUI and headless
 entrypoints:
 

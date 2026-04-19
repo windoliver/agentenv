@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agentenv_core::agent_common::{version_probe, AgentMode, SharedAgentConfig};
+use agentenv_core::agent_common::{npm_package_spec, version_probe, AgentMode, SharedAgentConfig};
 use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
     assert_compatible_schema_version, AgentCapabilities, AgentHealthCheckProbe, AgentSpec,
@@ -11,10 +11,10 @@ use agentenv_proto::{
     ShutdownParams, SCHEMA_VERSION,
 };
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 const DRIVER_NAME: &str = "codex";
-const CODEX_MCP_CONFIG_PATH: &str = "~/.codex/mcp_servers.json";
+const CODEX_MCP_CONFIG_PATH: &str = "~/.codex/config.toml";
 const CODEX_PACKAGE: &str = "@openai/codex";
 
 #[derive(Debug, Clone, Default)]
@@ -48,11 +48,14 @@ impl AgentDriver for CodexDriver {
         })
     }
 
-    async fn install_steps(&self, _spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+    async fn install_steps(&self, spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+        let package = npm_package_spec(CODEX_PACKAGE, spec.version.as_deref())
+            .map_err(|err| DriverError::CapabilityMissing { capability: err })?;
+
         Ok(InstallStepsResult {
             steps: vec![DockerfileFragment {
                 name: Some("install-codex".to_owned()),
-                content: format!("RUN npm install -g {CODEX_PACKAGE}"),
+                content: format!("RUN npm install -g {package}"),
             }],
         })
     }
@@ -70,39 +73,40 @@ impl AgentDriver for CodexDriver {
         &self,
         params: RenderMcpConfigParams,
     ) -> DriverResult<RenderMcpConfigResult> {
-        let mut mcp_servers = Map::new();
+        let mut content = String::new();
 
         for (index, endpoint) in params.endpoints.into_iter().enumerate() {
-            let mut server = Map::new();
+            if index > 0 {
+                content.push('\n');
+            }
+
+            content.push_str(&format!("[mcp_servers.endpoint_{index}]\n"));
             match endpoint.transport {
                 McpTransport::Stdio => {
-                    server.insert("command".to_owned(), Value::String(endpoint.url));
+                    content.push_str("command = ");
+                    push_toml_string(&mut content, &endpoint.url);
+                    content.push('\n');
                 }
                 McpTransport::Http | McpTransport::HttpSse | McpTransport::SshHttp => {
-                    server.insert("url".to_owned(), Value::String(endpoint.url));
-                    server.insert(
-                        "transport".to_owned(),
-                        Value::String(transport_name(endpoint.transport).to_owned()),
-                    );
+                    content.push_str("url = ");
+                    push_toml_string(&mut content, &endpoint.url);
+                    content.push('\n');
                 }
             }
 
             if !endpoint.headers.is_empty() {
-                server.insert(
-                    "headers".to_owned(),
-                    serde_json::to_value(endpoint.headers)
-                        .unwrap_or_else(|_| Value::Object(Map::new())),
-                );
+                content.push_str("http_headers = { ");
+                for (header_index, (key, value)) in endpoint.headers.iter().enumerate() {
+                    if header_index > 0 {
+                        content.push_str(", ");
+                    }
+                    push_toml_string(&mut content, key);
+                    content.push_str(" = ");
+                    push_toml_string(&mut content, value);
+                }
+                content.push_str(" }\n");
             }
-
-            mcp_servers.insert(format!("endpoint_{index}"), Value::Object(server));
         }
-
-        let mut config = Map::new();
-        config.insert("mcpServers".to_owned(), Value::Object(mcp_servers));
-
-        let content = serde_json::to_string_pretty(&Value::Object(config))
-            .unwrap_or_else(|_| "{\"mcpServers\":{}}".to_owned());
 
         Ok(RenderMcpConfigResult { content })
     }
@@ -150,13 +154,19 @@ fn shared_config(spec: AgentSpec) -> DriverResult<SharedAgentConfig> {
     })
 }
 
-fn transport_name(transport: McpTransport) -> &'static str {
-    match transport {
-        McpTransport::Stdio => "stdio",
-        McpTransport::Http => "http",
-        McpTransport::HttpSse => "http+sse",
-        McpTransport::SshHttp => "ssh+http",
+fn push_toml_string(content: &mut String, value: &str) {
+    content.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => content.push_str("\\\""),
+            '\\' => content.push_str("\\\\"),
+            '\n' => content.push_str("\\n"),
+            '\r' => content.push_str("\\r"),
+            '\t' => content.push_str("\\t"),
+            _ => content.push(ch),
+        }
     }
+    content.push('"');
 }
 
 #[cfg(test)]
@@ -243,7 +253,23 @@ mod tests {
             install_steps.steps[0].content,
             "RUN npm install -g @openai/codex"
         );
-        assert_eq!(mcp_path.path, "~/.codex/mcp_servers.json");
+        assert_eq!(mcp_path.path, "~/.codex/config.toml");
+    }
+
+    #[tokio::test]
+    async fn codex_driver_pins_requested_package_version() {
+        let driver = CodexDriver;
+        let spec = AgentSpec {
+            version: Some("0.53.0".to_owned()),
+            config: BTreeMap::new(),
+        };
+
+        let install_steps = driver.install_steps(spec).await.unwrap();
+
+        assert_eq!(
+            install_steps.steps[0].content,
+            "RUN npm install -g @openai/codex@0.53.0"
+        );
     }
 
     #[tokio::test]
@@ -326,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_driver_renders_deterministic_mcp_json() {
+    async fn codex_driver_renders_deterministic_mcp_toml() {
         let driver = CodexDriver;
 
         let rendered = driver
@@ -350,28 +376,9 @@ mod tests {
             .await
             .unwrap();
 
-        let parsed: Value = serde_json::from_str(&rendered.content).unwrap();
-        assert_eq!(
-            parsed,
-            serde_json::json!({
-                "mcpServers": {
-                    "endpoint_0": {
-                        "command": "agentenv-context"
-                    },
-                    "endpoint_1": {
-                        "headers": {
-                            "Authorization": "Bearer test",
-                            "X-Agentenv": "true"
-                        },
-                        "transport": "http+sse",
-                        "url": "https://context.example.test/mcp"
-                    }
-                }
-            })
-        );
         assert_eq!(
             rendered.content,
-            "{\n  \"mcpServers\": {\n    \"endpoint_0\": {\n      \"command\": \"agentenv-context\"\n    },\n    \"endpoint_1\": {\n      \"headers\": {\n        \"Authorization\": \"Bearer test\",\n        \"X-Agentenv\": \"true\"\n      },\n      \"transport\": \"http+sse\",\n      \"url\": \"https://context.example.test/mcp\"\n    }\n  }\n}"
+            "[mcp_servers.endpoint_0]\ncommand = \"agentenv-context\"\n\n[mcp_servers.endpoint_1]\nurl = \"https://context.example.test/mcp\"\nhttp_headers = { \"Authorization\" = \"Bearer test\", \"X-Agentenv\" = \"true\" }\n"
         );
     }
 }

@@ -4,9 +4,9 @@ Built-in OpenClaw agent driver for `agentenv`.
 
 ## Implemented behavior
 
-- Installs OpenClaw with `RUN npm install -g openclaw`.
+- Installs OpenClaw with `RUN npm install -g openclaw`, honoring `AgentSpec.version` when present.
 - Writes MCP configuration to `~/.openclaw/mcp_servers.json`.
-- Renders deterministic MCP JSON using the same `mcpServers` shape as the other built-in agent drivers.
+- Renders deterministic MCP JSON using OpenClaw's `mcpServers` shape.
 - Starts OpenClaw in TUI mode with `openclaw tui`.
 - Starts OpenClaw in headless mode with `openclaw agent --headless`.
 - Returns a declarative `openclaw --version` health-check probe.

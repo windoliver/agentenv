@@ -51,4 +51,35 @@ mod tests {
 
         assert_eq!(probe.success_exit_codes, vec![0]);
     }
+
+    #[test]
+    fn credential_requirement_schemas_are_kind_specific() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let empty_params_schema = std::fs::read_to_string(
+            manifest_dir.join("schema/credential-requirements-params.json"),
+        )
+        .expect("read static credential requirements params schema");
+        let agent_params_schema = std::fs::read_to_string(
+            manifest_dir.join("schema/agent-credential-requirements-params.json"),
+        )
+        .expect("read agent credential requirements params schema");
+
+        assert!(empty_params_schema.contains("\"title\": \"CredentialRequirementsParams\""));
+        assert!(agent_params_schema.contains("\"title\": \"AgentSpec\""));
+    }
+
+    #[test]
+    fn legacy_agent_health_check_schemas_are_not_exported() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        assert!(!manifest_dir
+            .join("schema/health-check-params.json")
+            .exists());
+        assert!(!manifest_dir
+            .join("schema/health-check-result.json")
+            .exists());
+        assert!(manifest_dir
+            .join("schema/agent-health-check-probe.json")
+            .exists());
+    }
 }

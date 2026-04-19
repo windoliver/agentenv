@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agentenv_core::agent_common::{version_probe, AgentMode, SharedAgentConfig};
+use agentenv_core::agent_common::{npm_package_spec, version_probe, AgentMode, SharedAgentConfig};
 use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
     assert_compatible_schema_version, AgentCapabilities, AgentHealthCheckProbe, AgentSpec,
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 const DRIVER_NAME: &str = "claude";
-const CLAUDE_MCP_CONFIG_PATH: &str = "~/.claude/mcp_servers.json";
+const CLAUDE_MCP_CONFIG_PATH: &str = "~/.claude/agentenv-mcp.json";
 const CLAUDE_PACKAGE: &str = "@anthropic-ai/claude-code";
 
 #[derive(Debug, Clone, Default)]
@@ -48,11 +48,14 @@ impl AgentDriver for ClaudeDriver {
         })
     }
 
-    async fn install_steps(&self, _spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+    async fn install_steps(&self, spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+        let package = npm_package_spec(CLAUDE_PACKAGE, spec.version.as_deref())
+            .map_err(|err| DriverError::CapabilityMissing { capability: err })?;
+
         Ok(InstallStepsResult {
             steps: vec![DockerfileFragment {
                 name: Some("install-claude".to_owned()),
-                content: format!("RUN npm install -g {CLAUDE_PACKAGE}"),
+                content: format!("RUN npm install -g {package}"),
             }],
         })
     }
@@ -81,8 +84,8 @@ impl AgentDriver for ClaudeDriver {
                 McpTransport::Http | McpTransport::HttpSse | McpTransport::SshHttp => {
                     server.insert("url".to_owned(), Value::String(endpoint.url));
                     server.insert(
-                        "transport".to_owned(),
-                        Value::String(transport_name(endpoint.transport).to_owned()),
+                        "type".to_owned(),
+                        Value::String(claude_transport_type(endpoint.transport)?.to_owned()),
                     );
                 }
             }
@@ -90,8 +93,7 @@ impl AgentDriver for ClaudeDriver {
             if !endpoint.headers.is_empty() {
                 server.insert(
                     "headers".to_owned(),
-                    serde_json::to_value(endpoint.headers)
-                        .unwrap_or_else(|_| Value::Object(Map::new())),
+                    serde_json::to_value(endpoint.headers).map_err(invalid_mcp_config)?,
                 );
             }
 
@@ -101,8 +103,8 @@ impl AgentDriver for ClaudeDriver {
         let mut config = Map::new();
         config.insert("mcpServers".to_owned(), Value::Object(mcp_servers));
 
-        let content = serde_json::to_string_pretty(&Value::Object(config))
-            .unwrap_or_else(|_| "{\"mcpServers\":{}}".to_owned());
+        let content =
+            serde_json::to_string_pretty(&Value::Object(config)).map_err(invalid_mcp_config)?;
 
         Ok(RenderMcpConfigResult { content })
     }
@@ -110,8 +112,8 @@ impl AgentDriver for ClaudeDriver {
     async fn render_entrypoint(&self, spec: AgentSpec) -> DriverResult<RenderEntrypointResult> {
         let config = shared_config(spec)?;
         let command = match config.mode {
-            AgentMode::Tui => "claude",
-            AgentMode::Headless => "claude --headless",
+            AgentMode::Tui => "claude --mcp-config ~/.claude/agentenv-mcp.json",
+            AgentMode::Headless => "claude --mcp-config ~/.claude/agentenv-mcp.json -p",
         };
 
         Ok(RenderEntrypointResult {
@@ -150,12 +152,20 @@ fn shared_config(spec: AgentSpec) -> DriverResult<SharedAgentConfig> {
     })
 }
 
-fn transport_name(transport: McpTransport) -> &'static str {
+fn claude_transport_type(transport: McpTransport) -> DriverResult<&'static str> {
     match transport {
-        McpTransport::Stdio => "stdio",
-        McpTransport::Http => "http",
-        McpTransport::HttpSse => "http+sse",
-        McpTransport::SshHttp => "ssh+http",
+        McpTransport::Stdio => Ok("stdio"),
+        McpTransport::Http => Ok("http"),
+        McpTransport::HttpSse => Ok("sse"),
+        McpTransport::SshHttp => Err(DriverError::CapabilityMissing {
+            capability: "claude mcp transport ssh+http".to_owned(),
+        }),
+    }
+}
+
+fn invalid_mcp_config(err: serde_json::Error) -> DriverError {
+    DriverError::CapabilityMissing {
+        capability: format!("valid claude mcp config ({err})"),
     }
 }
 
@@ -243,7 +253,23 @@ mod tests {
             install_steps.steps[0].content,
             "RUN npm install -g @anthropic-ai/claude-code"
         );
-        assert_eq!(mcp_path.path, "~/.claude/mcp_servers.json");
+        assert_eq!(mcp_path.path, "~/.claude/agentenv-mcp.json");
+    }
+
+    #[tokio::test]
+    async fn claude_driver_pins_requested_package_version() {
+        let driver = ClaudeDriver;
+        let spec = AgentSpec {
+            version: Some("1.2.3".to_owned()),
+            config: BTreeMap::new(),
+        };
+
+        let install_steps = driver.install_steps(spec).await.unwrap();
+
+        assert_eq!(
+            install_steps.steps[0].content,
+            "RUN npm install -g @anthropic-ai/claude-code@1.2.3"
+        );
     }
 
     #[tokio::test]
@@ -270,7 +296,7 @@ mod tests {
 
         assert_eq!(
             entrypoint.content,
-            "#!/usr/bin/env sh\nset -eu\nexec claude \"$@\"\n"
+            "#!/usr/bin/env sh\nset -eu\nexec claude --mcp-config ~/.claude/agentenv-mcp.json \"$@\"\n"
         );
     }
 
@@ -286,7 +312,7 @@ mod tests {
 
         assert_eq!(
             entrypoint.content,
-            "#!/usr/bin/env sh\nset -eu\nexec claude --headless \"$@\"\n"
+            "#!/usr/bin/env sh\nset -eu\nexec claude --mcp-config ~/.claude/agentenv-mcp.json -p \"$@\"\n"
         );
     }
 
@@ -344,7 +370,7 @@ mod tests {
                             "Authorization": "Bearer test",
                             "X-Agentenv": "true"
                         },
-                        "transport": "http+sse",
+                        "type": "sse",
                         "url": "https://context.example.test/mcp"
                     }
                 }
@@ -352,7 +378,7 @@ mod tests {
         );
         assert_eq!(
             rendered.content,
-            "{\n  \"mcpServers\": {\n    \"endpoint_0\": {\n      \"command\": \"agentenv-context\"\n    },\n    \"endpoint_1\": {\n      \"headers\": {\n        \"Authorization\": \"Bearer test\",\n        \"X-Agentenv\": \"true\"\n      },\n      \"transport\": \"http+sse\",\n      \"url\": \"https://context.example.test/mcp\"\n    }\n  }\n}"
+            "{\n  \"mcpServers\": {\n    \"endpoint_0\": {\n      \"command\": \"agentenv-context\"\n    },\n    \"endpoint_1\": {\n      \"headers\": {\n        \"Authorization\": \"Bearer test\",\n        \"X-Agentenv\": \"true\"\n      },\n      \"type\": \"sse\",\n      \"url\": \"https://context.example.test/mcp\"\n    }\n  }\n}"
         );
     }
 }

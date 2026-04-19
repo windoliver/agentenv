@@ -119,7 +119,8 @@ fn default_success_exit_codes() -> Vec<i32> {
 Replace the static credential params and old health-check request/response exports with the `AgentSpec` input and `AgentHealthCheckProbe` output in the generated-schema list in `crates/agentenv-proto/build.rs`:
 
 ```rust
-write_schema::<types::AgentSpec>(&schema_dir, "credential-requirements-params");
+write_schema::<types::CredentialRequirementsParams>(&schema_dir, "credential-requirements-params");
+write_schema::<types::AgentSpec>(&schema_dir, "agent-credential-requirements-params");
 write_schema::<types::AgentHealthCheckProbe>(&schema_dir, "agent-health-check-probe");
 ```
 
@@ -278,7 +279,7 @@ async fn claude_driver_renders_headless_entrypoint() {
     };
 
     let entrypoint = driver.render_entrypoint(spec).await.unwrap();
-    assert!(entrypoint.content.contains("claude --headless"));
+    assert!(entrypoint.content.contains("claude --mcp-config ~/.claude/agentenv-mcp.json -p"));
 }
 ```
 
@@ -323,7 +324,7 @@ impl AgentDriver for ClaudeDriver {
 
     async fn mcp_config_path(&self, _params: McpConfigPathParams) -> DriverResult<McpConfigPathResult> {
         Ok(McpConfigPathResult {
-            path: "~/.claude/mcp_servers.json".to_owned(),
+            path: "~/.claude/agentenv-mcp.json".to_owned(),
         })
     }
 
@@ -439,7 +440,7 @@ impl AgentDriver for CodexDriver {
 
     async fn mcp_config_path(&self, _params: McpConfigPathParams) -> DriverResult<McpConfigPathResult> {
         Ok(McpConfigPathResult {
-            path: "~/.codex/mcp_servers.json".to_owned(),
+            path: "~/.codex/config.toml".to_owned(),
         })
     }
 

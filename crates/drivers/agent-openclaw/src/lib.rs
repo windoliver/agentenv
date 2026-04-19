@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agentenv_core::agent_common::{version_probe, AgentMode};
+use agentenv_core::agent_common::{npm_package_spec, version_probe, AgentMode};
 use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
     assert_compatible_schema_version, AgentCapabilities, AgentHealthCheckProbe, AgentSpec,
@@ -49,11 +49,14 @@ impl AgentDriver for OpenClawDriver {
         })
     }
 
-    async fn install_steps(&self, _spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+    async fn install_steps(&self, spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+        let package = npm_package_spec(OPENCLAW_PACKAGE, spec.version.as_deref())
+            .map_err(|err| DriverError::CapabilityMissing { capability: err })?;
+
         Ok(InstallStepsResult {
             steps: vec![DockerfileFragment {
                 name: Some("install-openclaw".to_owned()),
-                content: format!("RUN npm install -g {OPENCLAW_PACKAGE}"),
+                content: format!("RUN npm install -g {package}"),
             }],
         })
     }
@@ -308,6 +311,22 @@ mod tests {
             "RUN npm install -g openclaw"
         );
         assert_eq!(mcp_path.path, "~/.openclaw/mcp_servers.json");
+    }
+
+    #[tokio::test]
+    async fn openclaw_driver_pins_requested_package_version() {
+        let driver = OpenClawDriver;
+        let spec = AgentSpec {
+            version: Some("0.7.1".to_owned()),
+            config: BTreeMap::new(),
+        };
+
+        let install_steps = driver.install_steps(spec).await.unwrap();
+
+        assert_eq!(
+            install_steps.steps[0].content,
+            "RUN npm install -g openclaw@0.7.1"
+        );
     }
 
     #[tokio::test]
