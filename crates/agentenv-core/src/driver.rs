@@ -2,12 +2,12 @@ use agentenv_proto::{
     assert_compatible_schema_version, AgentSpec, ApplyPolicyParams, ApplyPolicyResult,
     ConnectParams, ContextHandleRequest, ContextSpec, ContextStatus, CredentialRequirementsParams,
     CredentialRequirementsResult, DestroyParams, EmptyResult, EndpointInSandboxResult, ExecParams,
-    ExecResult, HealthCheckParams, HealthCheckResult, InferenceHandleRequest, InferenceSpec,
-    InitializeParams, InitializeResult, InstallStepsResult, LogsParams, LogsResult,
-    LogsStreamParams, McpConfigPathParams, McpConfigPathResult, McpEndpoint, PreflightParams,
-    PreflightResult, RenderEntrypointResult, RenderMcpConfigParams, RenderMcpConfigResult,
-    RequiredNetworkRulesResult, SandboxHandle, SandboxSpec, SandboxStatus, SandboxStatusParams,
-    SchemaVersionError, ShellHandle, ShutdownParams, StopParams,
+    ExecResult, InferenceHandleRequest, InferenceSpec, InitializeParams, InitializeResult,
+    InstallStepsResult, LogsParams, LogsResult, LogsStreamParams, McpConfigPathParams,
+    McpConfigPathResult, McpEndpoint, PreflightParams, PreflightResult, RenderEntrypointResult,
+    RenderMcpConfigParams, RenderMcpConfigResult, RequiredNetworkRulesResult, SandboxHandle,
+    SandboxSpec, SandboxStatus, SandboxStatusParams, SchemaVersionError, ShellHandle,
+    ShutdownParams, StopParams,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -71,9 +71,12 @@ pub trait AgentDriver: Send + Sync {
     async fn render_entrypoint(&self, spec: AgentSpec) -> DriverResult<RenderEntrypointResult>;
     async fn credential_requirements(
         &self,
-        params: CredentialRequirementsParams,
+        spec: AgentSpec,
     ) -> DriverResult<CredentialRequirementsResult>;
-    async fn health_check(&self, params: HealthCheckParams) -> DriverResult<HealthCheckResult>;
+    async fn health_check_probe(
+        &self,
+        spec: AgentSpec,
+    ) -> DriverResult<agentenv_proto::AgentHealthCheckProbe>;
     async fn shutdown(&mut self, params: ShutdownParams) -> DriverResult<EmptyResult>;
 }
 
@@ -150,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_guard_accepts_matching_protocol_major() {
+    fn compatibility_guard_accepts_matching_protocol_version() {
         let result = InitializeResult {
             driver: DriverInfo {
                 name: "mock".to_owned(),
@@ -167,7 +170,7 @@ mod tests {
             }),
         };
 
-        ensure_protocol_compatible(&result).expect("matching majors should pass");
+        ensure_protocol_compatible(&result).expect("matching schema version should pass");
     }
 
     #[test]

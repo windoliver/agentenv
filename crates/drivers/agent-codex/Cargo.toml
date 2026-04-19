@@ -9,3 +9,13 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Codex agent driver scaffold for agentenv"
+
+[dependencies]
+agentenv-core = { path = "../../agentenv-core" }
+agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+driver-conformance = { path = "../../../tests/driver-conformance" }
+tokio = { version = "1", features = ["macros", "rt"] }

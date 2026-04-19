@@ -139,8 +139,12 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `mcp_config_path` | `{}` | `{path: string}` |
 | `render_mcp_config` | `{endpoints: [MCPEndpoint]}` | `{content: string}` |
 | `render_entrypoint` | `AgentSpec` | `{content: string}` |
-| `credential_requirements` | `{}` | `[CredentialRequirement]` |
-| `health_check` | `{handle}` | `{healthy: bool, detail: string?}` |
+| `credential_requirements` | `AgentSpec` | `[CredentialRequirement]` |
+| `health_check_probe` | `AgentSpec` | `AgentHealthCheckProbe` |
+
+Agent-specific credential params are exported as `agent-credential-requirements-params.json`.
+The shared `credential-requirements-params.json` schema remains the empty params object used by context and inference drivers.
+Agent health checks are declarative probes exported as `agent-health-check-probe.json`; v0.2 does not expose a driver-owned `health_check({handle})` request/response schema.
 
 #### `ContextDriver`
 

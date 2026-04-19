@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod agent_common;
 pub mod blueprint;
 pub mod digest;
 pub mod driver;

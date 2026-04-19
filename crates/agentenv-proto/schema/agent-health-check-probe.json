@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentHealthCheckProbe",
+  "type": "object",
+  "required": [
+    "cmd",
+    "tty"
+  ],
+  "properties": {
+    "cmd": {
+      "type": "string"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "success_exit_codes": {
+      "default": [
+        0
+      ],
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "int32"
+      }
+    },
+    "tty": {
+      "type": "boolean"
+    }
+  }
+}
