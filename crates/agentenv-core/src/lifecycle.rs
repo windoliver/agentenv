@@ -386,10 +386,7 @@ fn validate_url_with_ssrf(
 }
 
 fn looks_like_url(raw: &str) -> bool {
-    let lower = raw.to_ascii_lowercase();
-    lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("ssh+http://")
+    Url::parse(raw).is_ok()
 }
 
 fn mapping_string<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {

@@ -169,6 +169,44 @@ policy:
 }
 
 #[test]
+fn blueprint_verification_rejects_unsupported_scheme_in_policy_override_allow_url() {
+    let _guard = with_env_lock();
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: mcp-generic
+  endpoint:
+    url: https://mcp.internal.example.com
+    transport: http+sse
+policy:
+  tier: restricted
+  presets: []
+  overrides:
+    - allow: ftp://169.254.169.254/
+      deny: not-a-url
+"#;
+
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::SsrfBlocked { path, source, .. } => {
+            assert_eq!(path, "policy.overrides[0].allow");
+            assert!(matches!(
+                source.reason,
+                SsrfBlockReason::UnsupportedScheme { scheme } if scheme == "ftp"
+            ));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn blueprint_verification_allows_non_url_policy_override_string() {
     let _guard = with_env_lock();
 
