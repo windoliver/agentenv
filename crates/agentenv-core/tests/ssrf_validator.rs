@@ -354,3 +354,28 @@ fn redirect_chain_rejects_malformed_location() {
         SsrfBlockReason::MalformedRedirect { ref location } if location == "http://["
     ));
 }
+
+#[test]
+fn redirect_chain_sanitizes_malformed_location_error() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("start.example.com", ["93.184.216.34"])]).unwrap();
+    let start = Url::parse("https://start.example.com/download").unwrap();
+
+    let error = validate_redirect_chain_with_resolver(
+        &start,
+        &["http://user:pass@[?token=secret#frag"],
+        SsrfOptions::default(),
+        &resolver,
+    )
+    .unwrap_err();
+
+    let SsrfBlockReason::MalformedRedirect { location } = error.reason else {
+        panic!("expected malformed redirect");
+    };
+    assert!(!location.contains("user"));
+    assert!(!location.contains("pass"));
+    assert!(!location.contains("token"));
+    assert!(!location.contains("secret"));
+    assert!(!location.contains('?'));
+    assert!(!location.contains('#'));
+}

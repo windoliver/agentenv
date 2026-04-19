@@ -225,7 +225,7 @@ pub fn validate_redirect_chain_with_resolver(
                 None,
                 None,
                 SsrfBlockReason::MalformedRedirect {
-                    location: location.to_owned(),
+                    location: sanitize_malformed_redirect_location(location),
                 },
             )
         })?;
@@ -470,4 +470,26 @@ fn sanitize_url(url: &Url) -> String {
     sanitized.set_fragment(None);
 
     sanitized.to_string()
+}
+
+fn sanitize_malformed_redirect_location(location: &str) -> String {
+    let mut sanitized = match location.find(['?', '#']) {
+        Some(index) => location[..index].to_owned(),
+        None => location.to_owned(),
+    };
+
+    if let Some(scheme_end) = sanitized.find("://") {
+        let authority_start = scheme_end + "://".len();
+        let authority_end = sanitized[authority_start..]
+            .find('/')
+            .map(|index| authority_start + index)
+            .unwrap_or(sanitized.len());
+
+        if let Some(at_offset) = sanitized[authority_start..authority_end].rfind('@') {
+            let credential_end = authority_start + at_offset + 1;
+            sanitized.replace_range(authority_start..credential_end, "");
+        }
+    }
+
+    sanitized
 }
