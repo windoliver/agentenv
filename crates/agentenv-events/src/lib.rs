@@ -10,15 +10,43 @@ pub fn ssrf_blocked_event(
 ) -> ActivityEventParams {
     ActivityEventParams {
         kind: ActivityKind::EgressDenied,
-        subject: blocked
-            .host
-            .as_deref()
-            .unwrap_or(blocked.url.as_str())
-            .to_owned(),
+        subject: match blocked.host.as_deref() {
+            Some(host) => host.to_owned(),
+            None => sanitize_fallback_subject(&blocked.url),
+        },
         reason: Some(ssrf_block_reason_label(&blocked.reason).to_owned()),
         ts: ts.into(),
         handle,
     }
+}
+
+fn sanitize_fallback_subject(subject: &str) -> String {
+    let mut sanitized = match subject.find(['?', '#']) {
+        Some(index) => subject[..index].to_owned(),
+        None => subject.to_owned(),
+    };
+
+    let authority_start = if let Some(scheme_end) = sanitized.find("://") {
+        Some(scheme_end + "://".len())
+    } else if sanitized.starts_with("//") {
+        Some("//".len())
+    } else {
+        None
+    };
+
+    if let Some(authority_start) = authority_start {
+        let authority_end = match sanitized[authority_start..].find('/') {
+            Some(index) => authority_start + index,
+            None => sanitized.len(),
+        };
+
+        if let Some(at_offset) = sanitized[authority_start..authority_end].rfind('@') {
+            let credential_end = authority_start + at_offset + 1;
+            sanitized.replace_range(authority_start..credential_end, "");
+        }
+    }
+
+    sanitized
 }
 
 fn ssrf_block_reason_label(reason: &SsrfBlockReason) -> &'static str {
@@ -96,5 +124,47 @@ mod tests {
 
         assert_eq!(event.subject, "https://example.test/private");
         assert_eq!(event.reason, Some("credentials_in_url".to_owned()));
+    }
+
+    #[test]
+    fn fallback_subject_redacts_credentials_query_and_fragment() {
+        let blocked = SsrfBlocked {
+            url: "https://user:pass@example.test/private?token=secret#frag".to_owned(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::CredentialsInUrl,
+        };
+
+        let event = ssrf_blocked_event(&blocked, "2026-04-19T12:34:59Z", None);
+
+        assert_eq!(event.subject, "https://example.test/private");
+        for redacted in ["user", "pass", "token", "secret", "?", "#"] {
+            assert!(
+                !event.subject.contains(redacted),
+                "fallback subject leaked `{redacted}` in `{}`",
+                event.subject
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_subject_redacts_scheme_relative_credentials() {
+        let blocked = SsrfBlocked {
+            url: "//user:pass@example.test/private?token=secret#frag".to_owned(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::CredentialsInUrl,
+        };
+
+        let event = ssrf_blocked_event(&blocked, "2026-04-19T12:35:00Z", None);
+
+        assert_eq!(event.subject, "//example.test/private");
+        for redacted in ["user", "pass", "token", "secret", "?", "#"] {
+            assert!(
+                !event.subject.contains(redacted),
+                "fallback subject leaked `{redacted}` in `{}`",
+                event.subject
+            );
+        }
     }
 }
