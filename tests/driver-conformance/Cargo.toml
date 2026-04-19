@@ -12,7 +12,9 @@ authors.workspace = true
 agentenv-core = { path = "../../crates/agentenv-core" }
 agentenv-proto = { path = "../../crates/agentenv-proto" }
 anyhow.workspace = true
-async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
 tokio = { version = "1", features = ["macros", "rt"] }

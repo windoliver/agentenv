@@ -3,9 +3,9 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use agentenv_proto::{
-    assert_compatible_schema_version, EmptyResult, InitializeParams, InitializeResult,
-    PreflightParams, PreflightResult, ERROR_SCHEMA_VERSION_INCOMPATIBLE, JSON_RPC_METHOD_NOT_FOUND,
-    SCHEMA_VERSION,
+    assert_compatible_schema_version, Capabilities, DriverKind, EmptyResult, InitializeParams,
+    InitializeResult, PreflightParams, PreflightResult, ERROR_SCHEMA_VERSION_INCOMPATIBLE,
+    JSON_RPC_METHOD_NOT_FOUND, SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -276,14 +276,38 @@ pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>
         .await?;
 
     agentenv_core::driver::ensure_protocol_compatible(&init)?;
+    anyhow::ensure!(
+        init.driver.kind == DriverKind::Agent,
+        "initialize must report DriverKind::Agent"
+    );
+    anyhow::ensure!(
+        matches!(init.capabilities, Capabilities::Agent(_)),
+        "initialize must report Capabilities::Agent"
+    );
 
     let preflight = driver
         .preflight(agentenv_proto::PreflightParams::default())
         .await?;
     anyhow::ensure!(preflight.ok, "preflight must pass");
 
-    let _ = driver.credential_requirements(spec.clone()).await?;
-    let _ = driver.health_check_probe(spec).await?;
+    let credentials = driver.credential_requirements(spec.clone()).await?;
+    anyhow::ensure!(
+        credentials
+            .requirements
+            .iter()
+            .all(|requirement| !requirement.name.trim().is_empty()),
+        "credential name must not be empty"
+    );
+
+    let probe = driver.health_check_probe(spec).await?;
+    anyhow::ensure!(
+        !probe.cmd.trim().is_empty(),
+        "health probe command must not be empty"
+    );
+    anyhow::ensure!(
+        !probe.success_exit_codes.is_empty(),
+        "health probe must declare at least one success exit code"
+    );
 
     Ok(())
 }
@@ -324,11 +348,12 @@ mod tests {
 
     use agentenv_core::driver::{AgentDriver, DriverResult};
     use agentenv_proto::{
-        AgentCapabilities, AgentHealthCheckProbe, AgentSpec, Capabilities,
-        CredentialRequirementsResult, DriverInfo, DriverKind, EmptyResult, InitializeParams,
-        InitializeResult, InstallStepsResult, McpConfigPathParams, McpConfigPathResult,
-        PreflightParams, PreflightResult, RenderEntrypointResult, RenderMcpConfigParams,
-        RenderMcpConfigResult, ShutdownParams, SCHEMA_VERSION,
+        AgentCapabilities, AgentHealthCheckProbe, AgentSpec, Capabilities, CredentialKind,
+        CredentialRequirement, CredentialRequirementsResult, DriverInfo, DriverKind, EmptyResult,
+        InitializeParams, InitializeResult, InstallStepsResult, McpConfigPathParams,
+        McpConfigPathResult, PreflightParams, PreflightResult, RenderEntrypointResult,
+        RenderMcpConfigParams, RenderMcpConfigResult, SandboxCapabilities, ShutdownParams,
+        SCHEMA_VERSION,
     };
     use async_trait::async_trait;
 
@@ -421,6 +446,11 @@ mod tests {
     #[derive(Default)]
     struct FakeAgentDriver {
         calls: Mutex<FakeAgentDriverCalls>,
+        init_kind: Option<DriverKind>,
+        init_capabilities: Option<Capabilities>,
+        credential_name: Option<String>,
+        health_cmd: Option<String>,
+        health_success_exit_codes: Option<Vec<i32>>,
     }
 
     #[derive(Default)]
@@ -442,15 +472,17 @@ mod tests {
             Ok(InitializeResult {
                 driver: DriverInfo {
                     name: "fake-agent".to_owned(),
-                    kind: DriverKind::Agent,
+                    kind: self.init_kind.clone().unwrap_or(DriverKind::Agent),
                     version: "0.0.1".to_owned(),
                     protocol_version: SCHEMA_VERSION.to_owned(),
                 },
-                capabilities: Capabilities::Agent(AgentCapabilities {
-                    supports_mcp: true,
-                    supports_slash_commands: false,
-                    supports_tui: true,
-                    supports_headless: true,
+                capabilities: self.init_capabilities.clone().unwrap_or_else(|| {
+                    Capabilities::Agent(AgentCapabilities {
+                        supports_mcp: true,
+                        supports_slash_commands: false,
+                        supports_tui: true,
+                        supports_headless: true,
+                    })
                 }),
             })
         }
@@ -502,7 +534,19 @@ mod tests {
             self.calls.lock().unwrap().credential_requirements_checked = true;
 
             Ok(CredentialRequirementsResult {
-                requirements: Vec::new(),
+                requirements: self
+                    .credential_name
+                    .clone()
+                    .map(|name| {
+                        vec![CredentialRequirement {
+                            name,
+                            kind: CredentialKind::ApiKey,
+                            required: true,
+                            description: "Fake credential.".to_owned(),
+                            validator: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
             })
         }
 
@@ -513,10 +557,16 @@ mod tests {
             self.calls.lock().unwrap().health_probe_checked = true;
 
             Ok(AgentHealthCheckProbe {
-                cmd: "fake-agent --version".to_owned(),
+                cmd: self
+                    .health_cmd
+                    .clone()
+                    .unwrap_or_else(|| "fake-agent --version".to_owned()),
                 tty: false,
                 env: BTreeMap::new(),
-                success_exit_codes: vec![0],
+                success_exit_codes: self
+                    .health_success_exit_codes
+                    .clone()
+                    .unwrap_or_else(|| vec![0]),
             })
         }
 
@@ -544,5 +594,111 @@ mod tests {
         assert!(calls.preflight_checked);
         assert!(calls.credential_requirements_checked);
         assert!(calls.health_probe_checked);
+    }
+
+    #[tokio::test]
+    async fn agent_driver_contract_rejects_non_agent_initialize_kind() {
+        let mut driver = FakeAgentDriver {
+            init_kind: Some(DriverKind::Sandbox),
+            ..FakeAgentDriver::default()
+        };
+
+        let err = assert_agent_driver_contract(
+            &mut driver,
+            AgentSpec {
+                version: None,
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("agent conformance should reject non-agent driver kinds");
+
+        assert!(err.to_string().contains("DriverKind::Agent"));
+    }
+
+    #[tokio::test]
+    async fn agent_driver_contract_rejects_non_agent_capabilities() {
+        let mut driver = FakeAgentDriver {
+            init_capabilities: Some(Capabilities::Sandbox(SandboxCapabilities {
+                supports_hot_reload_policy: false,
+                supports_filesystem_lockdown: false,
+                supports_syscall_filter: false,
+                supports_native_inference_routing: false,
+                supports_remote_host: false,
+            })),
+            ..FakeAgentDriver::default()
+        };
+
+        let err = assert_agent_driver_contract(
+            &mut driver,
+            AgentSpec {
+                version: None,
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("agent conformance should reject non-agent capability shapes");
+
+        assert!(err.to_string().contains("Capabilities::Agent"));
+    }
+
+    #[tokio::test]
+    async fn agent_driver_contract_rejects_empty_credential_names() {
+        let mut driver = FakeAgentDriver {
+            credential_name: Some(String::new()),
+            ..FakeAgentDriver::default()
+        };
+
+        let err = assert_agent_driver_contract(
+            &mut driver,
+            AgentSpec {
+                version: None,
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("agent conformance should reject empty credential names");
+
+        assert!(err.to_string().contains("credential name"));
+    }
+
+    #[tokio::test]
+    async fn agent_driver_contract_rejects_empty_health_probe_cmd() {
+        let mut driver = FakeAgentDriver {
+            health_cmd: Some(String::new()),
+            ..FakeAgentDriver::default()
+        };
+
+        let err = assert_agent_driver_contract(
+            &mut driver,
+            AgentSpec {
+                version: None,
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("agent conformance should reject empty health probe commands");
+
+        assert!(err.to_string().contains("health probe command"));
+    }
+
+    #[tokio::test]
+    async fn agent_driver_contract_rejects_empty_health_probe_success_codes() {
+        let mut driver = FakeAgentDriver {
+            health_success_exit_codes: Some(Vec::new()),
+            ..FakeAgentDriver::default()
+        };
+
+        let err = assert_agent_driver_contract(
+            &mut driver,
+            AgentSpec {
+                version: None,
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("agent conformance should reject empty health probe success codes");
+
+        assert!(err.to_string().contains("success exit code"));
     }
 }
