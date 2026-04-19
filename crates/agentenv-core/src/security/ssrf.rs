@@ -378,21 +378,19 @@ const CLOUD_METADATA_IPV4_OCTETS: &[[u8; 4]] = &[
 ];
 
 fn sanitize_url(url: &Url) -> String {
-    let host = match url.host() {
+    let Some(host) = (match url.host() {
         Some(Host::Domain(host)) => Some(host.to_string()),
         Some(Host::Ipv4(host)) => Some(host.to_string()),
         Some(Host::Ipv6(host)) => Some(format!("[{host}]")),
         None => None,
-    };
-
-    if host.is_none() {
+    }) else {
         return url.as_str().to_string();
-    }
+    };
 
     let mut sanitized = String::new();
     sanitized.push_str(url.scheme());
     sanitized.push_str("://");
-    sanitized.push_str(host.as_deref().expect("host is present"));
+    sanitized.push_str(&host);
 
     if let Some(port) = url.port() {
         sanitized.push(':');
