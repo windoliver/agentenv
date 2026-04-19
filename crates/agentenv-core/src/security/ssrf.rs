@@ -345,15 +345,56 @@ const IPV6_PRIVATE_NETS: &[&str] = &["fc00::/7"];
 const IPV6_DOCUMENTATION_NETS: &[&str] = &["2001:db8::/32"];
 const IPV6_RESERVED_NETS: &[&str] = &["::/128", "100::/64", "2001:2::/48"];
 
+static RESERVED_NETS_PARSED: std::sync::LazyLock<Vec<IpNet>> =
+    std::sync::LazyLock::new(|| parse_cidrs(RESERVED_NETS, "reserved"));
+static IPV6_LINK_LOCAL_NETS_PARSED: std::sync::LazyLock<Vec<IpNet>> =
+    std::sync::LazyLock::new(|| parse_cidrs(IPV6_LINK_LOCAL_NETS, "ipv6_link_local"));
+static IPV6_PRIVATE_NETS_PARSED: std::sync::LazyLock<Vec<IpNet>> =
+    std::sync::LazyLock::new(|| parse_cidrs(IPV6_PRIVATE_NETS, "ipv6_private"));
+static IPV6_DOCUMENTATION_NETS_PARSED: std::sync::LazyLock<Vec<IpNet>> =
+    std::sync::LazyLock::new(|| parse_cidrs(IPV6_DOCUMENTATION_NETS, "ipv6_documentation"));
+static IPV6_RESERVED_NETS_PARSED: std::sync::LazyLock<Vec<IpNet>> =
+    std::sync::LazyLock::new(|| parse_cidrs(IPV6_RESERVED_NETS, "ipv6_reserved"));
+
 fn in_any_net(ip: IpAddr, cidrs: &[&str]) -> bool {
-    for cidr in cidrs {
-        if let Ok(net) = cidr.parse::<IpNet>() {
-            if net.contains(&ip) {
-                return true;
-            }
+    if std::ptr::eq(cidrs, RESERVED_NETS) {
+        return RESERVED_NETS_PARSED.iter().any(|net| net.contains(&ip));
+    }
+    if std::ptr::eq(cidrs, IPV6_LINK_LOCAL_NETS) {
+        return IPV6_LINK_LOCAL_NETS_PARSED
+            .iter()
+            .any(|net| net.contains(&ip));
+    }
+    if std::ptr::eq(cidrs, IPV6_PRIVATE_NETS) {
+        return IPV6_PRIVATE_NETS_PARSED.iter().any(|net| net.contains(&ip));
+    }
+    if std::ptr::eq(cidrs, IPV6_DOCUMENTATION_NETS) {
+        return IPV6_DOCUMENTATION_NETS_PARSED
+            .iter()
+            .any(|net| net.contains(&ip));
+    }
+    if std::ptr::eq(cidrs, IPV6_RESERVED_NETS) {
+        return IPV6_RESERVED_NETS_PARSED.iter().any(|net| net.contains(&ip));
+    }
+
+    for net in parse_cidrs(cidrs, "custom") {
+        if net.contains(&ip) {
+            return true;
         }
     }
     false
+
+}
+
+fn parse_cidrs(cidrs: &[&str], context: &str) -> Vec<IpNet> {
+    let mut parsed = Vec::with_capacity(cidrs.len());
+    for cidr in cidrs {
+        match cidr.parse::<IpNet>() {
+            Ok(net) => parsed.push(net),
+            Err(error) => panic!("invalid {context} SSRF CIDR `{cidr}`: {error}"),
+        }
+    }
+    parsed
 }
 
 fn block(
@@ -377,26 +418,14 @@ const CLOUD_METADATA_IPV4_OCTETS: &[[u8; 4]] = &[
 ];
 
 fn sanitize_url(url: &Url) -> String {
-    let Some(host) = (match url.host() {
-        Some(Host::Domain(host)) => Some(host.to_string()),
-        Some(Host::Ipv4(host)) => Some(host.to_string()),
-        Some(Host::Ipv6(host)) => Some(format!("[{host}]")),
-        None => None,
-    }) else {
-        return url.as_str().to_string();
+    let mut sanitized = url.clone();
+
+    if sanitized.set_username("").is_err() {
+        // ignore; this can fail for hostless URLs and non-hierarchical schemes.
     };
+    let _ = sanitized.set_password(None);
+    sanitized.set_query(None);
+    sanitized.set_fragment(None);
 
-    let mut sanitized = String::new();
-    sanitized.push_str(url.scheme());
-    sanitized.push_str("://");
-    sanitized.push_str(&host);
-
-    if let Some(port) = url.port() {
-        sanitized.push(':');
-        sanitized.push_str(&port.to_string());
-    }
-
-    sanitized.push_str(url.path());
-
-    sanitized
+    sanitized.to_string()
 }

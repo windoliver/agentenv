@@ -38,6 +38,22 @@ fn validator_rejects_unsupported_scheme() {
 }
 
 #[test]
+fn validator_hostless_blocked_url_sanitizes_query_and_fragment() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
+    let url = Url::parse("file:///etc/passwd?token=secret#frag").unwrap();
+
+    let error =
+        validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+    assert!(matches!(
+        error.reason,
+        SsrfBlockReason::UnsupportedScheme { ref scheme } if scheme == "file"
+    ));
+    assert_eq!(error.url, "file:///etc/passwd");
+}
+
+#[test]
 fn validator_sanitizes_credentials_in_blocked_url() {
     let resolver =
         StaticDnsResolver::try_from_pairs([("api.example.com", ["93.184.216.34"])]).unwrap();
