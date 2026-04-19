@@ -20,6 +20,7 @@ dependencies = [
  "agentenv-core",
  "agentenv-proto",
  "async-trait",
+ "driver-conformance",
  "serde_json",
  "tokio",
 ]
@@ -31,6 +32,7 @@ dependencies = [
  "agentenv-core",
  "agentenv-proto",
  "async-trait",
+ "driver-conformance",
  "serde_json",
  "tokio",
 ]
@@ -42,6 +44,7 @@ dependencies = [
  "agentenv-core",
  "agentenv-proto",
  "async-trait",
+ "driver-conformance",
  "serde",
  "serde_json",
  "tokio",
@@ -661,10 +664,13 @@ checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 name = "driver-conformance"
 version = "0.0.1-alpha0"
 dependencies = [
+ "agentenv-core",
  "agentenv-proto",
  "anyhow",
+ "async-trait",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

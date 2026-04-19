@@ -245,6 +245,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openclaw_driver_satisfies_agent_conformance_contract() {
+        let mut driver = OpenClawDriver::default();
+
+        driver_conformance::assert_agent_driver_contract(&mut driver, agent_spec(BTreeMap::new()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn openclaw_driver_initializes_with_agent_capabilities() {
         let mut driver = OpenClawDriver::default();
 

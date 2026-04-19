@@ -262,6 +262,32 @@ pub fn run_standard_suite(driver_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>(
+    driver: &mut D,
+    spec: agentenv_proto::AgentSpec,
+) -> anyhow::Result<()> {
+    let init = driver
+        .initialize(agentenv_proto::InitializeParams {
+            schema_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
+            core_version: "0.0.1".to_owned(),
+            workdir: "/tmp/agentenv".to_owned(),
+            log_level: agentenv_proto::LogLevel::Info,
+        })
+        .await?;
+
+    agentenv_core::driver::ensure_protocol_compatible(&init)?;
+
+    let preflight = driver
+        .preflight(agentenv_proto::PreflightParams::default())
+        .await?;
+    anyhow::ensure!(preflight.ok, "preflight must pass");
+
+    let _ = driver.credential_requirements(spec.clone()).await?;
+    let _ = driver.health_check_probe(spec).await?;
+
+    Ok(())
+}
+
 pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
     let mut client = RpcClient::spawn(driver_path)?;
     let error = client.call_error(
@@ -292,9 +318,21 @@ pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::{BufReader, Cursor};
+    use std::sync::Mutex;
 
-    use super::{read_response_envelope, write_framed_json};
+    use agentenv_core::driver::{AgentDriver, DriverResult};
+    use agentenv_proto::{
+        AgentCapabilities, AgentHealthCheckProbe, AgentSpec, Capabilities,
+        CredentialRequirementsResult, DriverInfo, DriverKind, EmptyResult, InitializeParams,
+        InitializeResult, InstallStepsResult, McpConfigPathParams, McpConfigPathResult,
+        PreflightParams, PreflightResult, RenderEntrypointResult, RenderMcpConfigParams,
+        RenderMcpConfigResult, ShutdownParams, SCHEMA_VERSION,
+    };
+    use async_trait::async_trait;
+
+    use super::{assert_agent_driver_contract, read_response_envelope, write_framed_json};
     use serde_json::json;
 
     #[test]
@@ -378,5 +416,133 @@ mod tests {
             .expect_err("unsupported jsonrpc versions should fail");
 
         assert!(err.to_string().contains("unsupported version `1.0`"));
+    }
+
+    #[derive(Default)]
+    struct FakeAgentDriver {
+        calls: Mutex<FakeAgentDriverCalls>,
+    }
+
+    #[derive(Default)]
+    struct FakeAgentDriverCalls {
+        initialized: bool,
+        preflight_checked: bool,
+        credential_requirements_checked: bool,
+        health_probe_checked: bool,
+    }
+
+    #[async_trait]
+    impl AgentDriver for FakeAgentDriver {
+        async fn initialize(
+            &mut self,
+            _params: InitializeParams,
+        ) -> DriverResult<InitializeResult> {
+            self.calls.lock().unwrap().initialized = true;
+
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "fake-agent".to_owned(),
+                    kind: DriverKind::Agent,
+                    version: "0.0.1".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Agent(AgentCapabilities {
+                    supports_mcp: true,
+                    supports_slash_commands: false,
+                    supports_tui: true,
+                    supports_headless: true,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            self.calls.lock().unwrap().preflight_checked = true;
+
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn install_steps(&self, _spec: AgentSpec) -> DriverResult<InstallStepsResult> {
+            Ok(InstallStepsResult { steps: Vec::new() })
+        }
+
+        async fn mcp_config_path(
+            &self,
+            _params: McpConfigPathParams,
+        ) -> DriverResult<McpConfigPathResult> {
+            Ok(McpConfigPathResult {
+                path: "/tmp/mcp.json".to_owned(),
+            })
+        }
+
+        async fn render_mcp_config(
+            &self,
+            _params: RenderMcpConfigParams,
+        ) -> DriverResult<RenderMcpConfigResult> {
+            Ok(RenderMcpConfigResult {
+                content: "{}".to_owned(),
+            })
+        }
+
+        async fn render_entrypoint(
+            &self,
+            _spec: AgentSpec,
+        ) -> DriverResult<RenderEntrypointResult> {
+            Ok(RenderEntrypointResult {
+                content: "exec fake-agent".to_owned(),
+            })
+        }
+
+        async fn credential_requirements(
+            &self,
+            _spec: AgentSpec,
+        ) -> DriverResult<CredentialRequirementsResult> {
+            self.calls.lock().unwrap().credential_requirements_checked = true;
+
+            Ok(CredentialRequirementsResult {
+                requirements: Vec::new(),
+            })
+        }
+
+        async fn health_check_probe(
+            &self,
+            _spec: AgentSpec,
+        ) -> DriverResult<AgentHealthCheckProbe> {
+            self.calls.lock().unwrap().health_probe_checked = true;
+
+            Ok(AgentHealthCheckProbe {
+                cmd: "fake-agent --version".to_owned(),
+                tty: false,
+                env: BTreeMap::new(),
+                success_exit_codes: vec![0],
+            })
+        }
+
+        async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_driver_contract_exercises_lifecycle_checks() {
+        let mut driver = FakeAgentDriver::default();
+
+        assert_agent_driver_contract(
+            &mut driver,
+            AgentSpec {
+                version: None,
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("fake agent should satisfy the in-process conformance contract");
+
+        let calls = driver.calls.lock().unwrap();
+        assert!(calls.initialized);
+        assert!(calls.preflight_checked);
+        assert!(calls.credential_requirements_checked);
+        assert!(calls.health_probe_checked);
     }
 }
