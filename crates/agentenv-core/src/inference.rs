@@ -159,7 +159,13 @@ pub fn routed_endpoint(
             message: format!("expected prefix `{prefix}`"),
         })?;
 
-    validate_http_url("handle.endpoint", endpoint)?;
+    validate_http_url("handle.endpoint", endpoint).map_err(|err| match err {
+        DriverError::InvalidConfig { .. } => DriverError::InvalidHandle {
+            handle: handle.to_owned(),
+            message: "endpoint must be a valid http or https URL".to_owned(),
+        },
+        err => err,
+    })?;
 
     Ok(EndpointInSandboxResult {
         url: endpoint.to_owned(),
@@ -223,7 +229,29 @@ fn validate_http_url(field: &str, value: &str) -> DriverResult<()> {
         return Err(invalid_url(field));
     }
 
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if !is_valid_authority(&rest[..authority_end]) {
+        return Err(invalid_url(field));
+    }
+
     Ok(())
+}
+
+fn is_valid_authority(authority: &str) -> bool {
+    if authority.is_empty() {
+        return false;
+    }
+
+    if authority.contains('@') {
+        return false;
+    }
+
+    let host = authority.split(':').next().unwrap_or_default();
+    if host.is_empty() {
+        return false;
+    }
+
+    true
 }
 
 fn invalid_url(field: &str) -> DriverError {
@@ -328,5 +356,41 @@ mod tests {
         assert_eq!(plan.listen_url, "http://127.0.0.1:18080");
         assert_eq!(plan.upstream_base_url, "https://api.openai.com/v1");
         assert_eq!(plan.credential_env.as_deref(), Some("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn routed_endpoint_rejects_wrong_provider_prefix() {
+        let err = super::routed_endpoint(DEFAULTS, "anthropic|http://inference.local")
+            .expect_err("wrong provider prefix must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid inference handle `anthropic|http://inference.local`: expected prefix `openai|`"
+        );
+    }
+
+    #[test]
+    fn routed_endpoint_rejects_malformed_endpoint_as_invalid_handle() {
+        let err = super::routed_endpoint(DEFAULTS, "openai|not-a-url")
+            .expect_err("malformed endpoint must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid inference handle `openai|not-a-url`: endpoint must be a valid http or https URL"
+        );
+    }
+
+    #[test]
+    fn provider_config_rejects_malformed_base_url_authority() {
+        let err = ProviderConfig::from_spec(
+            DEFAULTS,
+            &spec(vec![("base_url", json!("https://:443"))]),
+        )
+        .expect_err("malformed URL authority must be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid driver config field `base_url`: must be a valid http or https URL"
+        );
     }
 }
