@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    net::{AddrParseError, IpAddr, ToSocketAddrs},
+    net::{AddrParseError, IpAddr, Ipv6Addr, ToSocketAddrs},
 };
 
 use ipnet::IpNet;
@@ -279,7 +279,7 @@ fn is_cloud_metadata(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => CLOUD_METADATA_IPV4_OCTETS
             .iter()
             .any(|octets| ip.octets() == *octets),
-        IpAddr::V6(_) => false,
+        IpAddr::V6(ip) => ip == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x0254),
     }
 }
 
@@ -347,11 +347,10 @@ const IPV6_RESERVED_NETS: &[&str] = &["::/128", "100::/64", "2001:2::/48"];
 
 fn in_any_net(ip: IpAddr, cidrs: &[&str]) -> bool {
     for cidr in cidrs {
-        let net = cidr
-            .parse::<IpNet>()
-            .unwrap_or_else(|_| panic!("invalid SSRF CIDR constant `{cidr}`"));
-        if net.contains(&ip) {
-            return true;
+        if let Ok(net) = cidr.parse::<IpNet>() {
+            if net.contains(&ip) {
+                return true;
+            }
         }
     }
     false
@@ -398,16 +397,6 @@ fn sanitize_url(url: &Url) -> String {
     }
 
     sanitized.push_str(url.path());
-
-    if let Some(query) = url.query() {
-        sanitized.push('?');
-        sanitized.push_str(query);
-    }
-
-    if let Some(fragment) = url.fragment() {
-        sanitized.push('#');
-        sanitized.push_str(fragment);
-    }
 
     sanitized
 }

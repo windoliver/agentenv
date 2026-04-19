@@ -47,7 +47,20 @@ fn validator_sanitizes_credentials_in_blocked_url() {
         validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
 
     assert!(matches!(error.reason, SsrfBlockReason::CredentialsInUrl));
-    assert_eq!(error.url, "https://example.com/v1/models?x=1#frag");
+    assert_eq!(error.url, "https://example.com/v1/models");
+}
+
+#[test]
+fn validator_drops_query_fragment_on_blocked_metadata_url() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("metadata.azure", ["168.63.129.16"])]).unwrap();
+    let url = Url::parse("https://metadata.azure/latest/meta-data/metadata?x=1#frag").unwrap();
+
+    let error =
+        validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
+    assert_eq!(error.url, "https://metadata.azure/latest/meta-data/metadata");
 }
 
 #[test]
@@ -58,6 +71,21 @@ fn validator_rejects_non_legacy_cloud_metadata_ip() {
 
     let error =
         validate_outbound_with_resolver(&url, SsrfOptions::default(), &resolver).unwrap_err();
+
+    assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
+}
+
+#[test]
+fn validator_rejects_aws_ipv6_metadata_even_with_private_allowed() {
+    let resolver =
+        StaticDnsResolver::try_from_pairs([("metadata.aws", ["fd00:ec2:0:0:0:0:0:254"])]).unwrap();
+    let url = Url::parse("http://metadata.aws/latest/meta-data/").unwrap();
+    let options = SsrfOptions {
+        allow_private: true,
+        ..SsrfOptions::default()
+    };
+
+    let error = validate_outbound_with_resolver(&url, options, &resolver).unwrap_err();
 
     assert!(matches!(error.reason, SsrfBlockReason::DeniedCloudMetadata));
 }
