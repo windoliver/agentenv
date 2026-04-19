@@ -87,10 +87,18 @@ impl AgentDriver for CodexDriver {
                     push_toml_string(&mut content, &endpoint.url);
                     content.push('\n');
                 }
-                McpTransport::Http | McpTransport::HttpSse | McpTransport::SshHttp => {
+                McpTransport::Http => {
                     content.push_str("url = ");
                     push_toml_string(&mut content, &endpoint.url);
                     content.push('\n');
+                }
+                transport @ (McpTransport::HttpSse | McpTransport::SshHttp) => {
+                    return Err(DriverError::CapabilityMissing {
+                        capability: format!(
+                            "codex mcp transport {}",
+                            mcp_transport_name(transport)
+                        ),
+                    });
                 }
             }
 
@@ -167,6 +175,15 @@ fn push_toml_string(content: &mut String, value: &str) {
         }
     }
     content.push('"');
+}
+
+fn mcp_transport_name(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
+        McpTransport::HttpSse => "http+sse",
+        McpTransport::SshHttp => "ssh+http",
+    }
 }
 
 #[cfg(test)]
@@ -365,7 +382,7 @@ mod tests {
                     },
                     McpEndpoint {
                         url: "https://context.example.test/mcp".to_owned(),
-                        transport: McpTransport::HttpSse,
+                        transport: McpTransport::Http,
                         headers: BTreeMap::from([
                             ("Authorization".to_owned(), "Bearer test".to_owned()),
                             ("X-Agentenv".to_owned(), "true".to_owned()),
@@ -380,5 +397,25 @@ mod tests {
             rendered.content,
             "[mcp_servers.endpoint_0]\ncommand = \"agentenv-context\"\n\n[mcp_servers.endpoint_1]\nurl = \"https://context.example.test/mcp\"\nhttp_headers = { \"Authorization\" = \"Bearer test\", \"X-Agentenv\" = \"true\" }\n"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_driver_rejects_non_streamable_remote_mcp_transports() {
+        let driver = CodexDriver;
+
+        for transport in [McpTransport::HttpSse, McpTransport::SshHttp] {
+            let err = driver
+                .render_mcp_config(RenderMcpConfigParams {
+                    endpoints: vec![McpEndpoint {
+                        url: "https://context.example.test/mcp".to_owned(),
+                        transport,
+                        headers: BTreeMap::new(),
+                    }],
+                })
+                .await
+                .expect_err("codex should reject non-streamable HTTP transports");
+
+            assert!(err.to_string().contains("codex mcp transport"));
+        }
     }
 }

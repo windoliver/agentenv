@@ -14,13 +14,17 @@ mod tests {
     };
 
     #[test]
-    fn accepts_matching_major_versions() {
-        assert!(is_compatible_schema_version("0.9"));
-        assert!(assert_compatible_schema_version("0.9").is_ok());
+    fn accepts_current_schema_version() {
+        assert!(is_compatible_schema_version(SCHEMA_VERSION));
+        assert!(assert_compatible_schema_version(SCHEMA_VERSION).is_ok());
     }
 
     #[test]
-    fn rejects_mismatched_major_versions() {
+    fn rejects_mismatched_versions() {
+        let err = assert_compatible_schema_version("0.1").expect_err("minor mismatch should fail");
+        assert!(matches!(err, SchemaVersionError::IncompatibleMajor { .. }));
+        assert!(err.to_string().contains("upgrade the driver or the core"));
+
         let err = assert_compatible_schema_version("1.0").expect_err("major mismatch should fail");
         assert!(matches!(err, SchemaVersionError::IncompatibleMajor { .. }));
         assert!(err.to_string().contains("upgrade the driver or the core"));

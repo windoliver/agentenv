@@ -113,7 +113,7 @@ Codex:
 OpenClaw:
 
 - binary: `openclaw`
-- MCP config path: `~/.openclaw/mcp_servers.json`
+- MCP config path: `~/.openclaw/openclaw.json`, using OpenClaw's `mcp.servers` config shape
 - credentials: exactly one of `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, resolved from the typed config
 - capabilities: same as Claude
 

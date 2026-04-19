@@ -333,7 +333,7 @@ pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
         );
     }
 
-    if !error.message.contains("major schema versions match") {
+    if !error.message.contains("schema versions match") {
         bail!("schema mismatch error did not include a remediation hint");
     }
 

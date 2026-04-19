@@ -112,8 +112,8 @@ impl AgentDriver for ClaudeDriver {
     async fn render_entrypoint(&self, spec: AgentSpec) -> DriverResult<RenderEntrypointResult> {
         let config = shared_config(spec)?;
         let command = match config.mode {
-            AgentMode::Tui => "claude --mcp-config ~/.claude/agentenv-mcp.json",
-            AgentMode::Headless => "claude --mcp-config ~/.claude/agentenv-mcp.json -p",
+            AgentMode::Tui => "claude --mcp-config=\"$HOME/.claude/agentenv-mcp.json\"",
+            AgentMode::Headless => "claude --mcp-config=\"$HOME/.claude/agentenv-mcp.json\" -p",
         };
 
         Ok(RenderEntrypointResult {
@@ -296,7 +296,7 @@ mod tests {
 
         assert_eq!(
             entrypoint.content,
-            "#!/usr/bin/env sh\nset -eu\nexec claude --mcp-config ~/.claude/agentenv-mcp.json \"$@\"\n"
+            "#!/usr/bin/env sh\nset -eu\nexec claude --mcp-config=\"$HOME/.claude/agentenv-mcp.json\" \"$@\"\n"
         );
     }
 
@@ -312,7 +312,7 @@ mod tests {
 
         assert_eq!(
             entrypoint.content,
-            "#!/usr/bin/env sh\nset -eu\nexec claude --mcp-config ~/.claude/agentenv-mcp.json -p \"$@\"\n"
+            "#!/usr/bin/env sh\nset -eu\nexec claude --mcp-config=\"$HOME/.claude/agentenv-mcp.json\" -p \"$@\"\n"
         );
     }
 

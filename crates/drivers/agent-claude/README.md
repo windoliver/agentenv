@@ -14,8 +14,8 @@ credential, writes an explicit MCP server configuration to
 health probe. `AgentSpec.version` pins the npm package version when present.
 
 Entrypoint rendering follows the shared agent config: TUI mode runs
-`claude --mcp-config ~/.claude/agentenv-mcp.json`, and headless mode runs
-`claude --mcp-config ~/.claude/agentenv-mcp.json -p`.
+`claude --mcp-config="$HOME/.claude/agentenv-mcp.json"`, and headless mode runs
+`claude --mcp-config="$HOME/.claude/agentenv-mcp.json" -p`.
 
 OpenShell install/probe activation scaffolds live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
 They only run with `AGENTENV_RUN_OPEN_SHELL_TESTS` once sandbox execution exists.

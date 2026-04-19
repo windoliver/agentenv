@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_guard_accepts_matching_protocol_major() {
+    fn compatibility_guard_accepts_matching_protocol_version() {
         let result = InitializeResult {
             driver: DriverInfo {
                 name: "mock".to_owned(),
@@ -165,7 +165,7 @@ mod tests {
             }),
         };
 
-        ensure_protocol_compatible(&result).expect("matching majors should pass");
+        ensure_protocol_compatible(&result).expect("matching schema version should pass");
     }
 
     #[test]

@@ -279,7 +279,7 @@ async fn claude_driver_renders_headless_entrypoint() {
     };
 
     let entrypoint = driver.render_entrypoint(spec).await.unwrap();
-    assert!(entrypoint.content.contains("claude --mcp-config ~/.claude/agentenv-mcp.json -p"));
+    assert!(entrypoint.content.contains("claude --mcp-config=\"$HOME/.claude/agentenv-mcp.json\" -p"));
 }
 ```
 
@@ -520,7 +520,7 @@ async fn openclaw_renders_headless_entrypoint() {
     };
 
     let entrypoint = driver.render_entrypoint(spec).await.unwrap();
-    assert!(entrypoint.content.contains("openclaw agent --headless"));
+    assert!(entrypoint.content.contains("openclaw agent"));
 }
 ```
 

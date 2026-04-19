@@ -58,18 +58,18 @@ pub fn is_compatible_schema_version(version: &str) -> bool {
 }
 
 pub fn assert_compatible_schema_version(version: &str) -> Result<(), SchemaVersionError> {
-    let expected_major = schema_version_major(SCHEMA_VERSION)?;
-    let actual_major = schema_version_major(version)?;
+    schema_version_major(SCHEMA_VERSION)?;
+    schema_version_major(version)?;
 
-    if expected_major == actual_major {
+    if version == SCHEMA_VERSION {
         Ok(())
     } else {
         Err(SchemaVersionError::IncompatibleMajor {
             expected: SCHEMA_VERSION.to_owned(),
             actual: version.to_owned(),
             remediation: format!(
-                "upgrade the driver or the core so their major schema versions match (`{}`)",
-                expected_major
+                "upgrade the driver or the core so their schema versions match (`{}`)",
+                SCHEMA_VERSION
             ),
         })
     }

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 const DRIVER_NAME: &str = "openclaw";
-const OPENCLAW_MCP_CONFIG_PATH: &str = "~/.openclaw/mcp_servers.json";
+const OPENCLAW_MCP_CONFIG_PATH: &str = "~/.openclaw/openclaw.json";
 const OPENCLAW_PACKAGE: &str = "openclaw";
 
 #[derive(Debug, Clone, Default)]
@@ -82,12 +82,20 @@ impl AgentDriver for OpenClawDriver {
                 McpTransport::Stdio => {
                     server.insert("command".to_owned(), Value::String(endpoint.url));
                 }
-                McpTransport::Http | McpTransport::HttpSse | McpTransport::SshHttp => {
+                McpTransport::Http => {
                     server.insert("url".to_owned(), Value::String(endpoint.url));
                     server.insert(
                         "transport".to_owned(),
-                        Value::String(transport_name(endpoint.transport).to_owned()),
+                        Value::String("streamable-http".to_owned()),
                     );
+                }
+                McpTransport::HttpSse => {
+                    server.insert("url".to_owned(), Value::String(endpoint.url));
+                }
+                McpTransport::SshHttp => {
+                    return Err(DriverError::CapabilityMissing {
+                        capability: "openclaw mcp transport ssh+http".to_owned(),
+                    });
                 }
             }
 
@@ -99,8 +107,11 @@ impl AgentDriver for OpenClawDriver {
             mcp_servers.insert(format!("endpoint_{index}"), Value::Object(server));
         }
 
+        let mut mcp = Map::new();
+        mcp.insert("servers".to_owned(), Value::Object(mcp_servers));
+
         let mut config = Map::new();
-        config.insert("mcpServers".to_owned(), Value::Object(mcp_servers));
+        config.insert("mcp".to_owned(), Value::Object(mcp));
 
         let content =
             serde_json::to_string_pretty(&Value::Object(config)).map_err(invalid_mcp_config)?;
@@ -112,7 +123,7 @@ impl AgentDriver for OpenClawDriver {
         let config = openclaw_config(spec)?;
         let command = match config.mode {
             AgentMode::Tui => "openclaw tui",
-            AgentMode::Headless => "openclaw agent --headless",
+            AgentMode::Headless => "openclaw agent",
         };
 
         Ok(RenderEntrypointResult {
@@ -211,15 +222,6 @@ fn infer_provider_from_model_prefix(model: &str) -> Option<OpenClawProvider> {
     }
 }
 
-fn transport_name(transport: McpTransport) -> &'static str {
-    match transport {
-        McpTransport::Stdio => "stdio",
-        McpTransport::Http => "http",
-        McpTransport::HttpSse => "http+sse",
-        McpTransport::SshHttp => "ssh+http",
-    }
-}
-
 fn invalid_mcp_config(err: serde_json::Error) -> DriverError {
     DriverError::CapabilityMissing {
         capability: format!("valid openclaw mcp config ({err})"),
@@ -310,7 +312,7 @@ mod tests {
             install_steps.steps[0].content,
             "RUN npm install -g openclaw"
         );
-        assert_eq!(mcp_path.path, "~/.openclaw/mcp_servers.json");
+        assert_eq!(mcp_path.path, "~/.openclaw/openclaw.json");
     }
 
     #[tokio::test]
@@ -440,7 +442,10 @@ mod tests {
         };
 
         let entrypoint = driver.render_entrypoint(spec).await.unwrap();
-        assert!(entrypoint.content.contains("openclaw agent --headless"));
+        assert_eq!(
+            entrypoint.content,
+            "#!/usr/bin/env sh\nset -eu\nexec openclaw agent \"$@\"\n"
+        );
     }
 
     #[tokio::test]
@@ -498,12 +503,17 @@ mod tests {
                         headers: BTreeMap::new(),
                     },
                     McpEndpoint {
-                        url: "https://context.example.test/mcp".to_owned(),
+                        url: "https://context.example.test/sse".to_owned(),
                         transport: McpTransport::HttpSse,
                         headers: BTreeMap::from([
                             ("Authorization".to_owned(), "Bearer test".to_owned()),
                             ("X-Agentenv".to_owned(), "true".to_owned()),
                         ]),
+                    },
+                    McpEndpoint {
+                        url: "https://context.example.test/mcp".to_owned(),
+                        transport: McpTransport::Http,
+                        headers: BTreeMap::new(),
                     },
                 ],
             })
@@ -514,24 +524,47 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "mcpServers": {
-                    "endpoint_0": {
-                        "command": "agentenv-context"
-                    },
-                    "endpoint_1": {
-                        "headers": {
-                            "Authorization": "Bearer test",
-                            "X-Agentenv": "true"
+                "mcp": {
+                    "servers": {
+                        "endpoint_0": {
+                            "command": "agentenv-context"
                         },
-                        "transport": "http+sse",
-                        "url": "https://context.example.test/mcp"
+                        "endpoint_1": {
+                            "headers": {
+                                "Authorization": "Bearer test",
+                                "X-Agentenv": "true"
+                            },
+                            "url": "https://context.example.test/sse"
+                        },
+                        "endpoint_2": {
+                            "transport": "streamable-http",
+                            "url": "https://context.example.test/mcp"
+                        }
                     }
                 }
             })
         );
         assert_eq!(
             rendered.content,
-            "{\n  \"mcpServers\": {\n    \"endpoint_0\": {\n      \"command\": \"agentenv-context\"\n    },\n    \"endpoint_1\": {\n      \"headers\": {\n        \"Authorization\": \"Bearer test\",\n        \"X-Agentenv\": \"true\"\n      },\n      \"transport\": \"http+sse\",\n      \"url\": \"https://context.example.test/mcp\"\n    }\n  }\n}"
+            "{\n  \"mcp\": {\n    \"servers\": {\n      \"endpoint_0\": {\n        \"command\": \"agentenv-context\"\n      },\n      \"endpoint_1\": {\n        \"headers\": {\n          \"Authorization\": \"Bearer test\",\n          \"X-Agentenv\": \"true\"\n        },\n        \"url\": \"https://context.example.test/sse\"\n      },\n      \"endpoint_2\": {\n        \"transport\": \"streamable-http\",\n        \"url\": \"https://context.example.test/mcp\"\n      }\n    }\n  }\n}"
         );
+    }
+
+    #[tokio::test]
+    async fn openclaw_driver_rejects_ssh_http_mcp_transport() {
+        let driver = OpenClawDriver;
+
+        let err = driver
+            .render_mcp_config(RenderMcpConfigParams {
+                endpoints: vec![McpEndpoint {
+                    url: "https://context.example.test/mcp".to_owned(),
+                    transport: McpTransport::SshHttp,
+                    headers: BTreeMap::new(),
+                }],
+            })
+            .await
+            .expect_err("openclaw should reject ssh+http until an adapter exists");
+
+        assert!(err.to_string().contains("openclaw mcp transport ssh+http"));
     }
 }
