@@ -20,6 +20,10 @@ pub enum DriverError {
     SchemaVersion(#[from] SchemaVersionError),
     #[error("driver is missing capability `{capability}`")]
     CapabilityMissing { capability: String },
+    #[error("invalid driver config field `{field}`: {message}")]
+    InvalidConfig { field: String, message: String },
+    #[error("invalid inference handle `{handle}`: {message}")]
+    InvalidHandle { handle: String, message: String },
 }
 
 pub fn ensure_protocol_compatible(result: &InitializeResult) -> DriverResult<()> {
@@ -179,5 +183,31 @@ mod tests {
             .expect_err("unsupported capability should fail");
 
         assert!(matches!(err, DriverError::CapabilityMissing { .. }));
+    }
+
+    #[test]
+    fn invalid_config_error_includes_field_and_message() {
+        let err = DriverError::InvalidConfig {
+            field: "base_url".to_owned(),
+            message: "must be a valid http or https URL".to_owned(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "invalid driver config field `base_url`: must be a valid http or https URL"
+        );
+    }
+
+    #[test]
+    fn invalid_handle_error_includes_handle_and_message() {
+        let err = DriverError::InvalidHandle {
+            handle: "openai|not-a-url".to_owned(),
+            message: "expected prefix `openai|`".to_owned(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "invalid inference handle `openai|not-a-url`: expected prefix `openai|`"
+        );
     }
 }
