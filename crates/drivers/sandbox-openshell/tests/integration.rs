@@ -37,7 +37,7 @@ async fn openshell_create_exec_policy_logs_and_destroy_flow() {
         .await
         .expect("create sandbox")
         .handle;
-    let _cleanup = DestroyOnDrop::new(Arc::clone(&driver), handle.clone());
+    let mut cleanup = DestroyOnDrop::new(Arc::clone(&driver), handle.clone());
 
     let whoami = driver
         .exec(ExecParams {
@@ -107,6 +107,14 @@ async fn openshell_create_exec_policy_logs_and_destroy_flow() {
             "expected at least one log entry to mention api.github.com"
         );
     }
+
+    driver
+        .destroy(DestroyParams {
+            handle: handle.clone(),
+        })
+        .await
+        .expect("destroy sandbox");
+    cleanup.disarm();
 }
 
 #[tokio::test]
@@ -135,14 +143,17 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
         .await
         .expect("create sandbox")
         .handle;
-    let _cleanup = DestroyOnDrop::new(Arc::clone(&driver), handle.clone());
+    let mut cleanup = DestroyOnDrop::new(Arc::clone(&driver), handle.clone());
 
     let output = driver
         .exec(ExecParams {
-            handle,
+            handle: handle.clone(),
             cmd: format!(
-                "grep -R --fixed-strings --line-number {:?} /sandbox /tmp /var/tmp /var/log /root 2>/dev/null",
-                marker
+                "sh -lc {}",
+                shell_single_quote(&format!(
+                    "grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root; status=$?; if [ $status -eq 0 ]; then exit 10; elif [ $status -eq 1 ]; then exit 0; else exit $status; fi",
+                    shell_single_quote(&marker)
+                ))
             ),
             tty: false,
             env: BTreeMap::new(),
@@ -150,9 +161,9 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
         .await
         .expect("grep for secret marker");
 
-    assert_ne!(
+    assert_eq!(
         output.status, 0,
-        "marker unexpectedly appeared in sandbox filesystem: stdout={} stderr={}",
+        "filesystem probe failed or marker was found: stdout={} stderr={}",
         output.stdout, output.stderr
     );
     assert!(
@@ -160,6 +171,14 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
         "grep output leaked the secret marker: {}",
         output.stdout
     );
+
+    driver
+        .destroy(DestroyParams {
+            handle: handle.clone(),
+        })
+        .await
+        .expect("destroy sandbox");
+    cleanup.disarm();
 }
 
 fn should_run_integration() -> bool {
@@ -204,6 +223,14 @@ fn github_read_policy() -> NetworkPolicy {
     }
 }
 
+fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 struct DestroyOnDrop {
     driver: Arc<OpenShellDriver>,
     handle: Option<String>,
@@ -215,6 +242,10 @@ impl DestroyOnDrop {
             driver,
             handle: Some(handle),
         }
+    }
+
+    fn disarm(&mut self) {
+        self.handle = None;
     }
 }
 
