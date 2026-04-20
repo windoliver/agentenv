@@ -2,6 +2,7 @@
 
 pub mod agent_common;
 pub mod blueprint;
+pub mod context_common;
 pub mod digest;
 pub mod driver;
 pub mod error;
