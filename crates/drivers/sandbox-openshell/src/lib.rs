@@ -1103,6 +1103,8 @@ mod driver_tests {
     use semver::Version;
     use serde_json::{json, Value};
 
+    use driver_conformance::assert_sandbox_driver_contract;
+
     use super::{
         command_request, command_request_with_env, extract_semver_token, CommandCall,
         CommandOutput, CommandRunner, CommandScript, CommandScriptResult, OpenShellDriver,
@@ -1807,6 +1809,31 @@ mod driver_tests {
 
         assert!(result.ok);
         assert!(result.issues.is_empty());
+        assert_eq!(
+            runner.calls(),
+            vec![
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["--version"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["gateway", "status"]),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn openshell_driver_satisfies_sandbox_conformance_contract() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::success("openshell", &["--version"], "openshell 0.0.31", ""),
+            CommandScript::success("openshell", &["gateway", "status"], "", ""),
+        ]));
+        let mut driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        assert_sandbox_driver_contract(&mut driver).await.unwrap();
+
         assert_eq!(
             runner.calls(),
             vec![

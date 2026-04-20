@@ -312,6 +312,44 @@ pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>
     Ok(())
 }
 
+pub async fn assert_sandbox_driver_contract<D: agentenv_core::driver::SandboxDriver>(
+    driver: &mut D,
+) -> anyhow::Result<()> {
+    let init = driver
+        .initialize(agentenv_proto::InitializeParams {
+            schema_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
+            core_version: "0.0.1".to_owned(),
+            workdir: "/tmp/agentenv".to_owned(),
+            log_level: agentenv_proto::LogLevel::Info,
+        })
+        .await?;
+
+    agentenv_core::driver::ensure_protocol_compatible(&init)?;
+    anyhow::ensure!(
+        init.driver.kind == DriverKind::Sandbox,
+        "initialize must report DriverKind::Sandbox"
+    );
+    anyhow::ensure!(
+        matches!(init.capabilities, Capabilities::Sandbox(_)),
+        "initialize must report Capabilities::Sandbox"
+    );
+
+    let Capabilities::Sandbox(capabilities) = &init.capabilities else {
+        unreachable!("capabilities shape was already validated")
+    };
+    anyhow::ensure!(
+        capabilities.supports_hot_reload_policy,
+        "initialize must report supports_hot_reload_policy = true"
+    );
+
+    let preflight = driver
+        .preflight(agentenv_proto::PreflightParams::default())
+        .await?;
+    anyhow::ensure!(preflight.ok, "preflight must pass");
+
+    Ok(())
+}
+
 pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
     let mismatched_schema_version = format!(
         "{}.0",
@@ -350,7 +388,7 @@ mod tests {
     use std::io::{BufReader, Cursor};
     use std::sync::Mutex;
 
-    use agentenv_core::driver::{AgentDriver, DriverResult};
+    use agentenv_core::driver::{AgentDriver, DriverResult, SandboxDriver};
     use agentenv_proto::{
         AgentCapabilities, AgentHealthCheckProbe, AgentSpec, Capabilities, CredentialKind,
         CredentialRequirement, CredentialRequirementsResult, DriverInfo, DriverKind, EmptyResult,
@@ -361,7 +399,10 @@ mod tests {
     };
     use async_trait::async_trait;
 
-    use super::{assert_agent_driver_contract, read_response_envelope, write_framed_json};
+    use super::{
+        assert_agent_driver_contract, assert_sandbox_driver_contract, read_response_envelope,
+        write_framed_json,
+    };
     use serde_json::json;
 
     #[test]
@@ -704,5 +745,245 @@ mod tests {
         .expect_err("agent conformance should reject empty health probe success codes");
 
         assert!(err.to_string().contains("success exit code"));
+    }
+
+    struct FakeSandboxDriver {
+        calls: Mutex<FakeSandboxDriverCalls>,
+        init_kind: Option<DriverKind>,
+        init_capabilities: Option<Capabilities>,
+        preflight_ok: bool,
+    }
+
+    #[derive(Default)]
+    struct FakeSandboxDriverCalls {
+        initialized: bool,
+        preflight_checked: bool,
+    }
+
+    impl Default for FakeSandboxDriver {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(FakeSandboxDriverCalls::default()),
+                init_kind: None,
+                init_capabilities: None,
+                preflight_ok: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxDriver for FakeSandboxDriver {
+        async fn initialize(
+            &mut self,
+            _params: InitializeParams,
+        ) -> DriverResult<InitializeResult> {
+            self.calls.lock().unwrap().initialized = true;
+
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "fake-sandbox".to_owned(),
+                    kind: self.init_kind.clone().unwrap_or(DriverKind::Sandbox),
+                    version: "0.0.1".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: self.init_capabilities.clone().unwrap_or_else(|| {
+                    Capabilities::Sandbox(SandboxCapabilities {
+                        supports_hot_reload_policy: true,
+                        supports_filesystem_lockdown: true,
+                        supports_syscall_filter: true,
+                        supports_native_inference_routing: true,
+                        supports_remote_host: false,
+                    })
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            self.calls.lock().unwrap().preflight_checked = true;
+
+            Ok(PreflightResult {
+                ok: self.preflight_ok,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn create(
+            &self,
+            _spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            Ok(agentenv_proto::SandboxHandle {
+                handle: "fake-sandbox".to_owned(),
+            })
+        }
+
+        async fn connect(
+            &self,
+            _params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            Ok(agentenv_proto::ShellHandle {
+                session_id: "fake-session".to_owned(),
+                tty: true,
+                working_dir: Some("/tmp".to_owned()),
+            })
+        }
+
+        async fn exec(
+            &self,
+            _params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            Ok(agentenv_proto::ExecResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn copy_in(
+            &self,
+            _params: agentenv_proto::CopyInParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn copy_out(
+            &self,
+            _params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn apply_policy(
+            &self,
+            _params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            Ok(agentenv_proto::ApplyPolicyResult { hot_reloaded: true })
+        }
+
+        async fn status(
+            &self,
+            _params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            Ok(agentenv_proto::SandboxStatus {
+                phase: agentenv_proto::SandboxPhase::Running,
+                healthy: true,
+                last_ping: None,
+            })
+        }
+
+        async fn logs(
+            &self,
+            _params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            Ok(agentenv_proto::LogsResult {
+                entries: Vec::new(),
+            })
+        }
+
+        async fn logs_stream(
+            &self,
+            _params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn stop(&self, _params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn destroy(
+            &self,
+            _params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_driver_contract_accepts_sandbox_capabilities() {
+        let mut driver = FakeSandboxDriver::default();
+
+        assert_sandbox_driver_contract(&mut driver)
+            .await
+            .expect("fake sandbox should satisfy the in-process conformance contract");
+
+        let calls = driver.calls.lock().unwrap();
+        assert!(calls.initialized);
+        assert!(calls.preflight_checked);
+    }
+
+    #[tokio::test]
+    async fn sandbox_driver_contract_rejects_non_sandbox_kind() {
+        let mut driver = FakeSandboxDriver {
+            init_kind: Some(DriverKind::Agent),
+            ..FakeSandboxDriver::default()
+        };
+
+        let err = assert_sandbox_driver_contract(&mut driver)
+            .await
+            .expect_err("sandbox conformance should reject non-sandbox driver kinds");
+
+        assert!(err.to_string().contains("DriverKind::Sandbox"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_driver_contract_rejects_non_sandbox_capabilities() {
+        let mut driver = FakeSandboxDriver {
+            init_capabilities: Some(Capabilities::Agent(AgentCapabilities {
+                supports_mcp: true,
+                supports_slash_commands: false,
+                supports_tui: true,
+                supports_headless: true,
+            })),
+            ..FakeSandboxDriver::default()
+        };
+
+        let err = assert_sandbox_driver_contract(&mut driver)
+            .await
+            .expect_err("sandbox conformance should reject non-sandbox capability shapes");
+
+        assert!(err.to_string().contains("Capabilities::Sandbox"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_driver_contract_rejects_hot_reload_disabled() {
+        let mut driver = FakeSandboxDriver {
+            init_capabilities: Some(Capabilities::Sandbox(SandboxCapabilities {
+                supports_hot_reload_policy: false,
+                supports_filesystem_lockdown: true,
+                supports_syscall_filter: true,
+                supports_native_inference_routing: true,
+                supports_remote_host: false,
+            })),
+            ..FakeSandboxDriver::default()
+        };
+
+        let err = assert_sandbox_driver_contract(&mut driver)
+            .await
+            .expect_err(
+                "sandbox conformance should reject non-hot-reloadable sandbox capabilities",
+            );
+
+        assert!(
+            err.to_string().contains("hot reload")
+                || err.to_string().contains("supports_hot_reload_policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_driver_contract_rejects_failed_preflight() {
+        let mut driver = FakeSandboxDriver {
+            preflight_ok: false,
+            ..FakeSandboxDriver::default()
+        };
+
+        let err = assert_sandbox_driver_contract(&mut driver)
+            .await
+            .expect_err("sandbox conformance should reject failed preflight");
+
+        assert!(err.to_string().contains("preflight"));
     }
 }
