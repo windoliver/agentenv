@@ -582,6 +582,18 @@ dependencies = [
 [[package]]
 name = "context-filesystem"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "driver-conformance",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "context-mcp-generic"
