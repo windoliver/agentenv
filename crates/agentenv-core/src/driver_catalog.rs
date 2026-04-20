@@ -529,17 +529,17 @@ mod tests {
         let specs = built_in_driver_specs();
 
         assert!(specs.iter().any(|spec| {
-            spec.kind == DriverKind::Sandbox && spec.names == &["openshell", "sandbox-openshell"]
+            spec.kind == DriverKind::Sandbox && spec.names == ["openshell", "sandbox-openshell"]
         }));
         assert!(specs.iter().any(|spec| {
-            spec.kind == DriverKind::Agent && spec.names == &["codex", "agent-codex"]
+            spec.kind == DriverKind::Agent && spec.names == ["codex", "agent-codex"]
         }));
         assert!(specs.iter().any(|spec| {
-            spec.kind == DriverKind::Context && spec.names == &["filesystem", "context-filesystem"]
+            spec.kind == DriverKind::Context && spec.names == ["filesystem", "context-filesystem"]
         }));
         assert!(specs.iter().any(|spec| {
             spec.kind == DriverKind::Inference
-                && spec.names == &["passthrough", "inference-passthrough"]
+                && spec.names == ["passthrough", "inference-passthrough"]
         }));
     }
 
