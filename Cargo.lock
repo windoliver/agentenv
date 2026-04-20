@@ -586,10 +586,28 @@ version = "0.0.1-alpha0"
 [[package]]
 name = "context-mcp-generic"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-mcp",
+ "agentenv-proto",
+ "async-trait",
+ "driver-conformance",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "context-none"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "driver-conformance",
+ "tokio",
+]
 
 [[package]]
 name = "core-foundation"
