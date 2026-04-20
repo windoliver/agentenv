@@ -18,6 +18,8 @@ pub enum JsonRpcError {
     MissingContentLength,
     #[error("invalid Content-Length header `{0}`")]
     InvalidContentLength(String),
+    #[error("duplicate Content-Length header")]
+    DuplicateContentLength,
     #[error("invalid JSON-RPC response: {0}")]
     InvalidResponse(String),
     #[error("JSON-RPC frame length {length} exceeds maximum {max}")]
@@ -139,6 +141,9 @@ where
         })?;
         if let Some(raw) = line.strip_prefix("Content-Length: ") {
             let trimmed = raw.trim_end_matches("\r\n").trim();
+            if content_length.is_some() {
+                return Err(JsonRpcError::DuplicateContentLength);
+            }
             content_length = Some(
                 trimmed
                     .parse::<usize>()
@@ -308,5 +313,18 @@ mod tests {
                 max: DEFAULT_MAX_HEADER_LINES
             }
         ));
+    }
+
+    #[test]
+    fn read_framed_json_rejects_duplicate_content_length_headers() {
+        let framed = concat!(
+            "Content-Length: 1\r\n",
+            "Content-Length: 2\r\n",
+            "\r\n",
+            "0"
+        );
+        let err = read_framed_json_blocking(&mut Cursor::new(framed.as_bytes())).unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::DuplicateContentLength));
     }
 }
