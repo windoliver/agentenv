@@ -1413,8 +1413,8 @@ mod driver_tests {
         assert!(capabilities.supports_remote_host);
     }
 
-    #[tokio::test]
-    async fn apply_policy_writes_temp_policy_runs_policy_set_and_removes_file() {
+    #[test]
+    fn apply_policy_writes_temp_policy_runs_policy_set_and_removes_file() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -1449,12 +1449,19 @@ mod driver_tests {
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
-        let result = driver
-            .apply_policy(agentenv_proto::ApplyPolicyParams {
-                handle: "devbox".to_owned(),
-                policy,
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
             })
-            .await
             .expect("apply_policy");
 
         assert!(result.hot_reloaded);
@@ -1468,8 +1475,8 @@ mod driver_tests {
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
-    #[tokio::test]
-    async fn apply_policy_rejects_locked_domain_change_before_running_command() {
+    #[test]
+    fn apply_policy_rejects_locked_domain_change_before_running_command() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -1489,12 +1496,19 @@ mod driver_tests {
             .expect("policies mutex")
             .insert("devbox".to_owned(), policy);
 
-        let err = driver
-            .apply_policy(agentenv_proto::ApplyPolicyParams {
-                handle: "devbox".to_owned(),
-                policy: next,
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
             })
-            .await
             .expect_err("apply_policy should reject locked-domain changes");
 
         assert!(err.to_string().contains("process"));
@@ -1502,8 +1516,8 @@ mod driver_tests {
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
-    #[tokio::test]
-    async fn apply_policy_also_applies_inference_update() {
+    #[test]
+    fn apply_policy_also_applies_inference_update() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -1569,12 +1583,19 @@ mod driver_tests {
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
-        let result = driver
-            .apply_policy(agentenv_proto::ApplyPolicyParams {
-                handle: "devbox".to_owned(),
-                policy,
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
             })
-            .await
             .expect("apply_policy");
 
         assert!(result.hot_reloaded);
@@ -1588,8 +1609,8 @@ mod driver_tests {
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
-    #[tokio::test]
-    async fn create_applies_initial_policy_after_sandbox_create() {
+    #[test]
+    fn create_applies_initial_policy_after_sandbox_create() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -1644,14 +1665,21 @@ mod driver_tests {
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
-        let result = driver
-            .create(SandboxSpec {
-                image: None,
-                env: BTreeMap::new(),
-                policy: Some(policy.clone()),
-                metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: Some(policy.clone()),
+                        metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+                    })
+                    .await
             })
-            .await
             .expect("create");
 
         assert_eq!(result.handle, "devbox");
@@ -1673,8 +1701,8 @@ mod driver_tests {
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
-    #[tokio::test]
-    async fn apply_policy_removes_temp_file_when_policy_set_fails() {
+    #[test]
+    fn apply_policy_removes_temp_file_when_policy_set_fails() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -1710,12 +1738,19 @@ mod driver_tests {
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
-        let err = driver
-            .apply_policy(agentenv_proto::ApplyPolicyParams {
-                handle: "devbox".to_owned(),
-                policy,
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
             })
-            .await
             .expect_err("apply_policy should fail");
 
         match err {
@@ -1734,8 +1769,8 @@ mod driver_tests {
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
-    #[tokio::test]
-    async fn apply_policy_maps_policy_command_spawn_error_to_command_spawn() {
+    #[test]
+    fn apply_policy_maps_policy_command_spawn_error_to_command_spawn() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -1770,12 +1805,19 @@ mod driver_tests {
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
-        let err = driver
-            .apply_policy(agentenv_proto::ApplyPolicyParams {
-                handle: "devbox".to_owned(),
-                policy,
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
             })
-            .await
             .expect_err("apply_policy should fail");
 
         match err {
