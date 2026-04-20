@@ -317,7 +317,7 @@ impl OpenShellDriver {
 
 impl Drop for OpenShellDriver {
     fn drop(&mut self) {
-        self.terminate_all_log_streams();
+        let _ = self.terminate_all_log_streams();
     }
 }
 
@@ -486,8 +486,7 @@ impl SandboxDriver for OpenShellDriver {
 
         if let Some(policy) = policy {
             if let Err(err) = self.apply_policy_to_handle(&name, policy) {
-                let _ = self.delete_sandbox(&name);
-                return Err(err);
+                return Err(self.rollback_created_sandbox(&name, err));
             }
         }
 
@@ -612,22 +611,23 @@ impl SandboxDriver for OpenShellDriver {
     async fn stop(&self, params: StopParams) -> DriverResult<EmptyResult> {
         let request = command_request(&["sandbox", "stop", &params.handle]);
         let _output = self.run_checked_command(request)?;
-        self.terminate_log_streams_for_handle(&params.handle);
+        self.terminate_log_streams_for_handle(&params.handle)?;
 
         Ok(EmptyResult::default())
     }
 
     async fn destroy(&self, params: DestroyParams) -> DriverResult<EmptyResult> {
         let _output = self.delete_sandbox(&params.handle)?;
-        self.terminate_log_streams_for_handle(&params.handle);
         self.remove_current_policy(&params.handle);
+        self.terminate_log_streams_for_handle(&params.handle)?;
 
         Ok(EmptyResult::default())
     }
 
     async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
-        self.terminate_all_log_streams();
+        let stream_cleanup = self.terminate_all_log_streams();
         self.clear_current_policies();
+        stream_cleanup?;
         Ok(EmptyResult::default())
     }
 }
@@ -721,38 +721,55 @@ impl OpenShellDriver {
         }
     }
 
-    fn terminate_log_streams_for_handle(&self, handle: &str) {
-        match self.log_streams.lock() {
-            Ok(mut streams) => {
-                terminate_matching_log_streams(&mut streams, handle);
-            }
+    fn terminate_log_streams_for_handle(&self, handle: &str) -> DriverResult<()> {
+        let result = match self.log_streams.lock() {
+            Ok(mut streams) => terminate_matching_log_streams(&mut streams, handle),
             Err(poisoned) => {
                 let mut streams = poisoned.into_inner();
-                terminate_matching_log_streams(&mut streams, handle);
+                terminate_matching_log_streams(&mut streams, handle)
             }
+        };
+
+        if let Some(message) = result {
+            Err(DriverError::CleanupFailed {
+                message: format!("failed to terminate log stream for `{handle}`: {message}"),
+            })
+        } else {
+            Ok(())
         }
     }
 
-    fn terminate_all_log_streams(&self) {
-        match self.log_streams.lock() {
-            Ok(mut streams) => {
-                for stream in streams.iter_mut() {
-                    let _ = stream.command.terminate();
-                }
-                streams.clear();
-            }
+    fn terminate_all_log_streams(&self) -> DriverResult<()> {
+        let result = match self.log_streams.lock() {
+            Ok(mut streams) => terminate_all_log_streams(&mut streams),
             Err(poisoned) => {
                 let mut streams = poisoned.into_inner();
-                for stream in streams.iter_mut() {
-                    let _ = stream.command.terminate();
-                }
-                streams.clear();
+                terminate_all_log_streams(&mut streams)
             }
+        };
+
+        if let Some(message) = result {
+            Err(DriverError::CleanupFailed {
+                message: format!("failed to terminate log stream: {message}"),
+            })
+        } else {
+            Ok(())
         }
     }
 
     fn delete_sandbox(&self, handle: &str) -> Result<CommandOutput, DriverError> {
         self.run_checked_command(command_request(&["sandbox", "delete", handle]))
+    }
+
+    fn rollback_created_sandbox(&self, handle: &str, primary: DriverError) -> DriverError {
+        match self.delete_sandbox(handle) {
+            Ok(_) => primary,
+            Err(cleanup) => DriverError::CleanupFailed {
+                message: format!(
+                    "failed to roll back sandbox `{handle}` after create failed ({primary}); rollback also failed: {cleanup}"
+                ),
+            },
+        }
     }
 
     fn apply_policy_to_handle(
@@ -834,16 +851,44 @@ impl OpenShellDriver {
     }
 }
 
-fn terminate_matching_log_streams(streams: &mut Vec<LogStream>, handle: &str) {
+fn terminate_matching_log_streams(streams: &mut Vec<LogStream>, handle: &str) -> Option<String> {
     let mut next = Vec::with_capacity(streams.len());
+    let mut first_error = None;
     for mut stream in streams.drain(..) {
         if stream.handle == handle {
-            let _ = stream.command.terminate();
+            match stream.command.terminate() {
+                Ok(()) => {}
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err.to_string());
+                    }
+                    next.push(stream);
+                }
+            }
         } else {
             next.push(stream);
         }
     }
     *streams = next;
+    first_error
+}
+
+fn terminate_all_log_streams(streams: &mut Vec<LogStream>) -> Option<String> {
+    let mut next = Vec::with_capacity(streams.len());
+    let mut first_error = None;
+    for mut stream in streams.drain(..) {
+        match stream.command.terminate() {
+            Ok(()) => {}
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err.to_string());
+                }
+                next.push(stream);
+            }
+        }
+    }
+    *streams = next;
+    first_error
 }
 
 fn driver_error_from_policy_error(err: PolicyError) -> DriverError {
@@ -1291,10 +1336,12 @@ mod driver_tests {
         calls: Mutex<Vec<CommandCall>>,
         spawn_calls: Mutex<Vec<CommandCall>>,
         terminations: Arc<Mutex<usize>>,
+        termination_failures_remaining: Arc<Mutex<usize>>,
     }
 
     struct TrackingSpawnedCommand {
         terminations: Arc<Mutex<usize>>,
+        failures_remaining: Arc<Mutex<usize>>,
     }
 
     impl CapturingCommandRunner {
@@ -1305,10 +1352,15 @@ mod driver_tests {
 
     impl StreamCleanupRunner {
         fn new() -> Self {
+            Self::new_with_termination_failures(0)
+        }
+
+        fn new_with_termination_failures(failures_remaining: usize) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 spawn_calls: Mutex::new(Vec::new()),
                 terminations: Arc::new(Mutex::new(0)),
+                termination_failures_remaining: Arc::new(Mutex::new(failures_remaining)),
             }
         }
 
@@ -1328,6 +1380,14 @@ mod driver_tests {
     impl super::SpawnedCommand for TrackingSpawnedCommand {
         fn terminate(&mut self) -> io::Result<()> {
             *self.terminations.lock().expect("terminations mutex") += 1;
+            let mut failures = self
+                .failures_remaining
+                .lock()
+                .expect("failures remaining mutex");
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(io::Error::other("terminate failed"));
+            }
             Ok(())
         }
     }
@@ -1365,6 +1425,7 @@ mod driver_tests {
 
             Ok(Box::new(TrackingSpawnedCommand {
                 terminations: self.terminations.clone(),
+                failures_remaining: self.termination_failures_remaining.clone(),
             }))
         }
     }
@@ -2031,6 +2092,94 @@ mod driver_tests {
             .as_ref()
             .expect("policy path")
             .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_reports_cleanup_failure_when_initial_policy_rollback_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--keep",
+                            "--no-auto-providers",
+                            "--from",
+                            "openclaw",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                Some(1),
+                "",
+                "policy set failed",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&["sandbox", "delete", "devbox"])
+                    );
+                },
+                Some(1),
+                "",
+                "delete failed",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: Some(policy),
+                        metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("create should fail when policy apply and rollback fail");
+
+        match err {
+            agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                assert!(message.contains("policy set failed"));
+                assert!(message.contains("delete failed"));
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls().len(), 3);
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
@@ -2749,6 +2898,47 @@ mod driver_tests {
             }]
         );
         assert_eq!(runner.terminations(), 1);
+    }
+
+    #[test]
+    fn failed_log_stream_termination_is_reported_and_retained_for_retry() {
+        let runner = Arc::new(StreamCleanupRunner::new_with_termination_failures(1));
+        let mut driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            driver
+                .logs_stream(LogsStreamParams {
+                    handle: "sb-1".to_owned(),
+                    since: None,
+                })
+                .await
+                .expect("logs_stream");
+
+            let err = driver
+                .destroy(DestroyParams {
+                    handle: "sb-1".to_owned(),
+                })
+                .await
+                .expect_err("destroy should report log stream cleanup failure");
+            match err {
+                agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                    assert!(message.contains("terminate failed"));
+                }
+                other => panic!("expected CleanupFailed, got {other:?}"),
+            }
+            assert_eq!(runner.terminations(), 1);
+
+            driver
+                .shutdown(agentenv_proto::ShutdownParams::default())
+                .await
+                .expect("shutdown should retry retained log stream");
+        });
+
+        assert_eq!(runner.terminations(), 2);
     }
 
     #[test]

@@ -39,6 +39,9 @@ pub enum DriverError {
     PolicyRequiresRecreate {
         domains: String,
     },
+    CleanupFailed {
+        message: String,
+    },
     InvalidInput {
         message: String,
     },
@@ -127,6 +130,9 @@ impl fmt::Display for DriverError {
             }
             DriverError::PolicyRequiresRecreate { domains } => {
                 write!(f, "policy update requires recreate for domains: {domains}")
+            }
+            DriverError::CleanupFailed { message } => {
+                write!(f, "driver cleanup failed: {message}")
             }
             DriverError::InvalidInput { message } => {
                 write!(f, "invalid driver input: {message}")
