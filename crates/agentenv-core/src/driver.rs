@@ -36,6 +36,9 @@ pub enum DriverError {
     PolicyTranslation {
         message: String,
     },
+    PolicyRequiresRecreate {
+        domains: String,
+    },
     InvalidInput {
         message: String,
     },
@@ -121,6 +124,9 @@ impl fmt::Display for DriverError {
             }
             DriverError::PolicyTranslation { message } => {
                 write!(f, "policy translation failed: {message}")
+            }
+            DriverError::PolicyRequiresRecreate { domains } => {
+                write!(f, "policy update requires recreate for domains: {domains}")
             }
             DriverError::InvalidInput { message } => {
                 write!(f, "invalid driver input: {message}")

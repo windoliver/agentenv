@@ -6,7 +6,7 @@ use std::{
     io,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     sync::{Arc, Mutex},
 };
 
@@ -61,11 +61,20 @@ trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput>;
 
     #[allow(dead_code)]
-    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<()>;
+    fn spawn(&self, program: &str, request: &CommandRequest)
+        -> io::Result<Box<dyn SpawnedCommand>>;
+}
+
+trait SpawnedCommand: Send {
+    fn terminate(&mut self) -> io::Result<()>;
 }
 
 #[derive(Debug, Default)]
 struct ProcessCommandRunner;
+
+struct ProcessSpawnedCommand {
+    child: Child,
+}
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput> {
@@ -81,12 +90,42 @@ impl CommandRunner for ProcessCommandRunner {
         })
     }
 
-    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<()> {
-        let _child = Command::new(program)
+    fn spawn(
+        &self,
+        program: &str,
+        request: &CommandRequest,
+    ) -> io::Result<Box<dyn SpawnedCommand>> {
+        let child = Command::new(program)
             .args(&request.args)
             .envs(&request.env)
             .spawn()?;
 
+        Ok(Box::new(ProcessSpawnedCommand { child }))
+    }
+}
+
+impl SpawnedCommand for ProcessSpawnedCommand {
+    fn terminate(&mut self) -> io::Result<()> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+
+        match self.child.kill() {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput => {}
+            Err(err) => return Err(err),
+        }
+        let _ = self.child.wait();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+struct NoopSpawnedCommand;
+
+#[cfg(test)]
+impl SpawnedCommand for NoopSpawnedCommand {
+    fn terminate(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
@@ -211,7 +250,11 @@ impl CommandRunner for RecordingCommandRunner {
         }
     }
 
-    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<()> {
+    fn spawn(
+        &self,
+        program: &str,
+        request: &CommandRequest,
+    ) -> io::Result<Box<dyn SpawnedCommand>> {
         self.spawn_calls
             .lock()
             .expect("spawn calls mutex")
@@ -231,7 +274,7 @@ impl CommandRunner for RecordingCommandRunner {
         assert_eq!(script.request, *request);
 
         match script.result {
-            CommandScriptResult::Output(_) => Ok(()),
+            CommandScriptResult::Output(_) => Ok(Box::new(NoopSpawnedCommand)),
             CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
         }
     }
@@ -241,6 +284,12 @@ pub struct OpenShellDriver {
     binary: String,
     runner: Arc<dyn CommandRunner>,
     current_policies: Mutex<BTreeMap<String, NetworkPolicy>>,
+    log_streams: Mutex<Vec<LogStream>>,
+}
+
+struct LogStream {
+    handle: String,
+    command: Box<dyn SpawnedCommand>,
 }
 
 impl Default for OpenShellDriver {
@@ -249,6 +298,7 @@ impl Default for OpenShellDriver {
             binary: OPEN_SHELL_BINARY.to_owned(),
             runner: Arc::new(ProcessCommandRunner),
             current_policies: Mutex::new(BTreeMap::new()),
+            log_streams: Mutex::new(Vec::new()),
         }
     }
 }
@@ -260,7 +310,14 @@ impl OpenShellDriver {
             binary: OPEN_SHELL_BINARY.to_owned(),
             runner,
             current_policies: Mutex::new(BTreeMap::new()),
+            log_streams: Mutex::new(Vec::new()),
         }
+    }
+}
+
+impl Drop for OpenShellDriver {
+    fn drop(&mut self) {
+        self.terminate_all_log_streams();
     }
 }
 
@@ -428,7 +485,10 @@ impl SandboxDriver for OpenShellDriver {
         let _output = self.run_checked_command(request)?;
 
         if let Some(policy) = policy {
-            self.apply_policy_to_handle(&name, policy)?;
+            if let Err(err) = self.apply_policy_to_handle(&name, policy) {
+                let _ = self.delete_sandbox(&name);
+                return Err(err);
+            }
         }
 
         Ok(SandboxHandle { handle: name })
@@ -534,15 +594,17 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn logs_stream(&self, params: LogsStreamParams) -> DriverResult<EmptyResult> {
-        let mut args = vec!["logs".to_owned(), params.handle, "--tail".to_owned()];
+        let handle = params.handle;
+        let mut args = vec!["logs".to_owned(), handle.clone(), "--tail".to_owned()];
         if let Some(since) = params.since {
             args.push("--since".to_owned());
             args.push(since);
         }
-        self.spawn_checked_command(CommandRequest {
+        let command = self.spawn_checked_command(CommandRequest {
             args,
             env: BTreeMap::new(),
         })?;
+        self.store_log_stream(handle, command);
 
         Ok(EmptyResult::default())
     }
@@ -550,31 +612,22 @@ impl SandboxDriver for OpenShellDriver {
     async fn stop(&self, params: StopParams) -> DriverResult<EmptyResult> {
         let request = command_request(&["sandbox", "stop", &params.handle]);
         let _output = self.run_checked_command(request)?;
+        self.terminate_log_streams_for_handle(&params.handle);
 
         Ok(EmptyResult::default())
     }
 
     async fn destroy(&self, params: DestroyParams) -> DriverResult<EmptyResult> {
-        let request = command_request(&["sandbox", "delete", &params.handle]);
-        let _output = self.run_checked_command(request)?;
-
-        match self.current_policies.lock() {
-            Ok(mut policies) => {
-                policies.remove(&params.handle);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove(&params.handle);
-            }
-        }
+        let _output = self.delete_sandbox(&params.handle)?;
+        self.terminate_log_streams_for_handle(&params.handle);
+        self.remove_current_policy(&params.handle);
 
         Ok(EmptyResult::default())
     }
 
     async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
-        match self.current_policies.lock() {
-            Ok(mut policies) => policies.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
+        self.terminate_all_log_streams();
+        self.clear_current_policies();
         Ok(EmptyResult::default())
     }
 }
@@ -584,7 +637,10 @@ impl OpenShellDriver {
         self.runner.run(&self.binary, &request)
     }
 
-    fn spawn_command_request(&self, request: CommandRequest) -> io::Result<()> {
+    fn spawn_command_request(
+        &self,
+        request: CommandRequest,
+    ) -> io::Result<Box<dyn SpawnedCommand>> {
         self.runner.spawn(&self.binary, &request)
     }
 
@@ -609,7 +665,10 @@ impl OpenShellDriver {
         Ok(output)
     }
 
-    fn spawn_checked_command(&self, request: CommandRequest) -> Result<(), DriverError> {
+    fn spawn_checked_command(
+        &self,
+        request: CommandRequest,
+    ) -> Result<Box<dyn SpawnedCommand>, DriverError> {
         let command = command_string(&self.binary, &request.args);
         self.spawn_command_request(request)
             .map_err(|source| DriverError::CommandSpawn { command, source })
@@ -633,17 +692,76 @@ impl OpenShellDriver {
         }
     }
 
+    fn remove_current_policy(&self, handle: &str) {
+        match self.current_policies.lock() {
+            Ok(mut policies) => {
+                policies.remove(handle);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(handle);
+            }
+        }
+    }
+
+    fn clear_current_policies(&self) {
+        match self.current_policies.lock() {
+            Ok(mut policies) => policies.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
+
+    fn store_log_stream(&self, handle: String, command: Box<dyn SpawnedCommand>) {
+        match self.log_streams.lock() {
+            Ok(mut streams) => {
+                streams.push(LogStream { handle, command });
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().push(LogStream { handle, command });
+            }
+        }
+    }
+
+    fn terminate_log_streams_for_handle(&self, handle: &str) {
+        match self.log_streams.lock() {
+            Ok(mut streams) => {
+                terminate_matching_log_streams(&mut streams, handle);
+            }
+            Err(poisoned) => {
+                let mut streams = poisoned.into_inner();
+                terminate_matching_log_streams(&mut streams, handle);
+            }
+        }
+    }
+
+    fn terminate_all_log_streams(&self) {
+        match self.log_streams.lock() {
+            Ok(mut streams) => {
+                for stream in streams.iter_mut() {
+                    let _ = stream.command.terminate();
+                }
+                streams.clear();
+            }
+            Err(poisoned) => {
+                let mut streams = poisoned.into_inner();
+                for stream in streams.iter_mut() {
+                    let _ = stream.command.terminate();
+                }
+                streams.clear();
+            }
+        }
+    }
+
+    fn delete_sandbox(&self, handle: &str) -> Result<CommandOutput, DriverError> {
+        self.run_checked_command(command_request(&["sandbox", "delete", handle]))
+    }
+
     fn apply_policy_to_handle(
         &self,
         handle: &str,
         policy: NetworkPolicy,
     ) -> DriverResult<ApplyPolicyResult> {
         if let Some(current) = self.current_policy_for_handle(handle) {
-            classify_policy_update(&current, &policy).map_err(|err| {
-                DriverError::PolicyTranslation {
-                    message: err.to_string(),
-                }
-            })?;
+            classify_policy_update(&current, &policy).map_err(driver_error_from_policy_error)?;
         }
 
         let translated =
@@ -713,6 +831,29 @@ impl OpenShellDriver {
         }
 
         Ok(output)
+    }
+}
+
+fn terminate_matching_log_streams(streams: &mut Vec<LogStream>, handle: &str) {
+    let mut next = Vec::with_capacity(streams.len());
+    for mut stream in streams.drain(..) {
+        if stream.handle == handle {
+            let _ = stream.command.terminate();
+        } else {
+            next.push(stream);
+        }
+    }
+    *streams = next;
+}
+
+fn driver_error_from_policy_error(err: PolicyError) -> DriverError {
+    match err {
+        PolicyError::RequiresRecreate { domains } => {
+            DriverError::PolicyRequiresRecreate { domains }
+        }
+        other => DriverError::PolicyTranslation {
+            message: other.to_string(),
+        },
     }
 }
 
@@ -1145,9 +1286,86 @@ mod driver_tests {
         spawn_calls: Mutex<Vec<CommandCall>>,
     }
 
+    #[derive(Debug)]
+    struct StreamCleanupRunner {
+        calls: Mutex<Vec<CommandCall>>,
+        spawn_calls: Mutex<Vec<CommandCall>>,
+        terminations: Arc<Mutex<usize>>,
+    }
+
+    struct TrackingSpawnedCommand {
+        terminations: Arc<Mutex<usize>>,
+    }
+
     impl CapturingCommandRunner {
         fn calls(&self) -> Vec<CommandCall> {
             self.calls.lock().expect("calls mutex").clone()
+        }
+    }
+
+    impl StreamCleanupRunner {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                spawn_calls: Mutex::new(Vec::new()),
+                terminations: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn calls(&self) -> Vec<CommandCall> {
+            self.calls.lock().expect("calls mutex").clone()
+        }
+
+        fn spawn_calls(&self) -> Vec<CommandCall> {
+            self.spawn_calls.lock().expect("spawn calls mutex").clone()
+        }
+
+        fn terminations(&self) -> usize {
+            *self.terminations.lock().expect("terminations mutex")
+        }
+    }
+
+    impl super::SpawnedCommand for TrackingSpawnedCommand {
+        fn terminate(&mut self) -> io::Result<()> {
+            *self.terminations.lock().expect("terminations mutex") += 1;
+            Ok(())
+        }
+    }
+
+    impl CommandRunner for StreamCleanupRunner {
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            self.calls.lock().expect("calls mutex").push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+
+            Ok(super::CommandOutput {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        fn spawn(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
+            self.spawn_calls
+                .lock()
+                .expect("spawn calls mutex")
+                .push(CommandCall {
+                    program: program.to_owned(),
+                    request: request.clone(),
+                });
+
+            Ok(Box::new(TrackingSpawnedCommand {
+                terminations: self.terminations.clone(),
+            }))
         }
     }
 
@@ -1169,7 +1387,11 @@ mod driver_tests {
             })
         }
 
-        fn spawn(&self, program: &str, request: &super::CommandRequest) -> io::Result<()> {
+        fn spawn(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
             self.spawn_calls
                 .lock()
                 .expect("spawn calls mutex")
@@ -1178,7 +1400,7 @@ mod driver_tests {
                     request: request.clone(),
                 });
 
-            Ok(())
+            Ok(Box::new(super::NoopSpawnedCommand))
         }
     }
 
@@ -1282,7 +1504,11 @@ mod driver_tests {
             }
         }
 
-        fn spawn(&self, program: &str, request: &super::CommandRequest) -> io::Result<()> {
+        fn spawn(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
             let call = CommandCall {
                 program: program.to_owned(),
                 request: request.clone(),
@@ -1303,7 +1529,7 @@ mod driver_tests {
             (expectation.verify)(&call);
 
             match expectation.result {
-                CommandScriptResult::Output(_) => Ok(()),
+                CommandScriptResult::Output(_) => Ok(Box::new(super::NoopSpawnedCommand)),
                 CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
             }
         }
@@ -1511,7 +1737,12 @@ mod driver_tests {
             })
             .expect_err("apply_policy should reject locked-domain changes");
 
-        assert!(err.to_string().contains("process"));
+        match err {
+            agentenv_core::driver::DriverError::PolicyRequiresRecreate { domains } => {
+                assert_eq!(domains, "process");
+            }
+            other => panic!("expected PolicyRequiresRecreate, got {other:?}"),
+        }
         assert!(runner.calls().is_empty());
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
@@ -1692,6 +1923,108 @@ mod driver_tests {
             .cloned()
             .expect("policy should be stored");
         assert_eq!(stored_policy, policy);
+        assert!(!capture
+            .lock()
+            .expect("capture mutex")
+            .as_ref()
+            .expect("policy path")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_rolls_back_sandbox_when_initial_policy_apply_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let capture_for_check = capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--keep",
+                            "--no-auto-providers",
+                            "--from",
+                            "openclaw",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(4)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
+                },
+                Some(1),
+                "",
+                "policy set failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&["sandbox", "delete", "devbox"])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: Some(policy),
+                        metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("create should fail when initial policy apply fails");
+
+        match err {
+            agentenv_core::driver::DriverError::CommandFailed { command, .. } => {
+                assert!(command.contains("policy set"));
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls().len(), 3);
+        assert!(driver.current_policy_for_handle("devbox").is_none());
         assert!(!capture
             .lock()
             .expect("capture mutex")
@@ -2366,6 +2699,56 @@ mod driver_tests {
                 ]),
             }]
         );
+    }
+
+    #[test]
+    fn logs_stream_process_is_terminated_on_destroy() {
+        let runner = Arc::new(StreamCleanupRunner::new());
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            driver
+                .logs_stream(LogsStreamParams {
+                    handle: "sb-1".to_owned(),
+                    since: Some("2026-04-19T00:00:00Z".to_owned()),
+                })
+                .await
+                .expect("logs_stream");
+            assert_eq!(runner.terminations(), 0);
+
+            driver
+                .destroy(DestroyParams {
+                    handle: "sb-1".to_owned(),
+                })
+                .await
+                .expect("destroy");
+        });
+
+        assert_eq!(
+            runner.spawn_calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request(&[
+                    "logs",
+                    "sb-1",
+                    "--tail",
+                    "--since",
+                    "2026-04-19T00:00:00Z"
+                ]),
+            }]
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request(&["sandbox", "delete", "sb-1"]),
+            }]
+        );
+        assert_eq!(runner.terminations(), 1);
     }
 
     #[test]
