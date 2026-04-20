@@ -504,7 +504,7 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn logs(&self, params: LogsParams) -> DriverResult<LogsResult> {
-        let mut args = vec!["sandbox".to_owned(), "logs".to_owned(), params.handle];
+        let mut args = vec!["logs".to_owned(), params.handle];
         if params.follow {
             args.push("--tail".to_owned());
         }
@@ -523,12 +523,7 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn logs_stream(&self, params: LogsStreamParams) -> DriverResult<EmptyResult> {
-        let mut args = vec![
-            "sandbox".to_owned(),
-            "logs".to_owned(),
-            params.handle,
-            "--tail".to_owned(),
-        ];
+        let mut args = vec!["logs".to_owned(), params.handle, "--tail".to_owned()];
         if let Some(since) = params.since {
             args.push("--since".to_owned());
             args.push(since);
@@ -1394,14 +1389,14 @@ mod driver_tests {
             CommandScript::output("openshell", &["sandbox", "get", "sb-1"], Some(0), "deleted", ""),
             CommandScript::output(
                 "openshell",
-                &["sandbox", "logs", "sb-1", "--since", "2026-04-19T00:00:00Z"],
+                &["logs", "sb-1", "--since", "2026-04-19T00:00:00Z"],
                 Some(0),
                 "2026-04-19T00:00:00Z WARN action=deny DENIED outbound to api.example.com\nplain info line",
                 "",
             ),
             CommandScript::success(
                 "openshell",
-                &["sandbox", "logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"],
+                &["logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"],
                 "",
                 "",
             ),
@@ -1505,10 +1500,7 @@ mod driver_tests {
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
-                    request: command_request_with_env(
-                        &["sandbox", "logs", "sb-1", "--since", "2026-04-19T00:00:00Z"],
-                        BTreeMap::new(),
-                    ),
+                    request: command_request(&["logs", "sb-1", "--since", "2026-04-19T00:00:00Z"]),
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
@@ -1524,14 +1516,7 @@ mod driver_tests {
             runner.spawn_calls(),
             vec![CommandCall {
                 program: "openshell".to_owned(),
-                request: command_request(&[
-                    "sandbox",
-                    "logs",
-                    "sb-1",
-                    "--tail",
-                    "--since",
-                    "2026-04-19T00:00:00Z",
-                ]),
+                request: command_request(&["logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"]),
             }]
         );
     }
@@ -1540,7 +1525,7 @@ mod driver_tests {
     fn logs_denied_lines_set_egress_denied_kv() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
             "openshell",
-            &["sandbox", "logs", "sb-2"],
+            &["logs", "sb-2"],
             Some(0),
             "2026-04-19T00:00:00Z INFO action=deny BLOCKED outbound",
             "",
