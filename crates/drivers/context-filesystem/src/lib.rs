@@ -151,11 +151,13 @@ impl FilesystemMcpServer {
             .get("recursive")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let limit = self.limit(args);
         let root = self.resolve_path(path)?;
         let mut paths = Vec::new();
 
         self.collect_paths(&root, recursive, &mut paths)?;
         paths.sort();
+        paths.truncate(limit);
 
         Ok(json!({ "paths": paths }))
     }
@@ -861,6 +863,23 @@ mod mcp_tool_tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn fs_list_limit_returns_first_sorted_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("beta.txt"), "beta\n").unwrap();
+        fs::write(tmp.path().join("alpha.txt"), "alpha\n").unwrap();
+        let server = FilesystemMcpServer::new(tmp.path().to_path_buf(), true, Vec::new()).unwrap();
+
+        let listed = server
+            .call_tool(ToolCall {
+                name: "fs_list".to_owned(),
+                arguments: json!({"limit": 1}),
+            })
+            .unwrap();
+
+        assert_eq!(listed, json!({"paths": ["alpha.txt"]}));
     }
 
     #[cfg(unix)]
