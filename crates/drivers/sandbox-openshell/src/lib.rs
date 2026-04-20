@@ -1832,6 +1832,26 @@ mod driver_tests {
         ]));
         let mut driver = OpenShellDriver::with_command_runner(runner.clone());
 
+        let init = driver
+            .initialize(InitializeParams {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                core_version: "0.0.1".to_owned(),
+                workdir: "/tmp/agentenv".to_owned(),
+                log_level: LogLevel::Info,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(init.driver.kind, DriverKind::Sandbox);
+        let Capabilities::Sandbox(capabilities) = init.capabilities else {
+            panic!("openshell should report sandbox capabilities");
+        };
+        assert!(capabilities.supports_hot_reload_policy);
+        assert!(capabilities.supports_filesystem_lockdown);
+        assert!(capabilities.supports_syscall_filter);
+        assert!(capabilities.supports_native_inference_routing);
+        assert!(capabilities.supports_remote_host);
+
         assert_sandbox_driver_contract(&mut driver).await.unwrap();
 
         assert_eq!(

@@ -334,14 +334,6 @@ pub async fn assert_sandbox_driver_contract<D: agentenv_core::driver::SandboxDri
         "initialize must report Capabilities::Sandbox"
     );
 
-    let Capabilities::Sandbox(capabilities) = &init.capabilities else {
-        unreachable!("capabilities shape was already validated")
-    };
-    anyhow::ensure!(
-        capabilities.supports_hot_reload_policy,
-        "initialize must report supports_hot_reload_policy = true"
-    );
-
     let preflight = driver
         .preflight(agentenv_proto::PreflightParams::default())
         .await?;
@@ -949,7 +941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_driver_contract_rejects_hot_reload_disabled() {
+    async fn sandbox_driver_contract_accepts_sandbox_capabilities_without_hot_reload() {
         let mut driver = FakeSandboxDriver {
             init_capabilities: Some(Capabilities::Sandbox(SandboxCapabilities {
                 supports_hot_reload_policy: false,
@@ -961,16 +953,9 @@ mod tests {
             ..FakeSandboxDriver::default()
         };
 
-        let err = assert_sandbox_driver_contract(&mut driver)
+        assert_sandbox_driver_contract(&mut driver)
             .await
-            .expect_err(
-                "sandbox conformance should reject non-hot-reloadable sandbox capabilities",
-            );
-
-        assert!(
-            err.to_string().contains("hot reload")
-                || err.to_string().contains("supports_hot_reload_policy")
-        );
+            .expect("generic sandbox conformance should not require hot reload support");
     }
 
     #[tokio::test]
