@@ -159,7 +159,10 @@ where
     Ok(serde_json::from_slice(&payload)?)
 }
 
-fn read_bounded_header_line<R>(reader: &mut R, max_header_bytes: usize) -> Result<Option<Vec<u8>>, JsonRpcError>
+fn read_bounded_header_line<R>(
+    reader: &mut R,
+    max_header_bytes: usize,
+) -> Result<Option<Vec<u8>>, JsonRpcError>
 where
     R: BufRead,
 {
@@ -207,9 +210,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        read_framed_json_blocking, write_framed_json_blocking, JsonRpcError,
-        RpcResponseEnvelope, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_HEADER_BYTES,
-        DEFAULT_MAX_HEADER_LINES,
+        read_framed_json_blocking, write_framed_json_blocking, JsonRpcError, RpcResponseEnvelope,
+        DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_LINES,
     };
 
     #[test]
