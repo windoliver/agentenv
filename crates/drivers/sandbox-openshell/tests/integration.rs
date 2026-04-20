@@ -163,7 +163,10 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
 }
 
 fn should_run_integration() -> bool {
-    env::var_os("AGENTENV_RUN_OPENSHELL_INTEGRATION").is_some()
+    matches!(
+        env::var("AGENTENV_RUN_OPENSHELL_INTEGRATION").as_deref(),
+        Ok("1")
+    )
 }
 
 fn github_read_policy() -> NetworkPolicy {
