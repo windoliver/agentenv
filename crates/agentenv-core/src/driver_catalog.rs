@@ -67,16 +67,15 @@ pub fn built_in_driver_specs() -> &'static [BuiltInDriverSpec] {
 
 #[cfg(test)]
 mod tests {
-    use crate::registry::DriverKind;
     use super::*;
+    use crate::registry::DriverKind;
 
     #[test]
     fn built_in_specs_include_current_aliases() {
         let specs = built_in_driver_specs();
 
         assert!(specs.iter().any(|spec| {
-            spec.kind == DriverKind::Sandbox
-                && spec.names == &["openshell", "sandbox-openshell"]
+            spec.kind == DriverKind::Sandbox && spec.names == &["openshell", "sandbox-openshell"]
         }));
         assert!(specs.iter().any(|spec| {
             spec.kind == DriverKind::Agent && spec.names == &["codex", "agent-codex"]
