@@ -2,7 +2,9 @@
 
 use std::{
     collections::{btree_map::Entry, BTreeMap},
+    net::SocketAddr,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
 
 use agentenv_core::{
@@ -11,9 +13,9 @@ use agentenv_core::{
         remote_context_capabilities, required_object, successful_preflight,
     },
     driver::{ContextDriver, DriverError, DriverResult},
-    security::ssrf::{DnsResolver, SsrfOptions, SystemDnsResolver},
+    security::ssrf::{DnsResolver, SsrfOptions, SystemDnsResolver, ValidatedUrl},
 };
-use agentenv_mcp::validate_mcp_endpoint;
+use agentenv_mcp::{validate_mcp_endpoint, ValidatedMcpEndpoint};
 use agentenv_proto::{
     ContextHandle, ContextHandleRequest, ContextSpec, ContextStatus, CredentialKind,
     CredentialRequirement, CredentialRequirementsParams, CredentialRequirementsResult, EmptyResult,
@@ -25,6 +27,7 @@ use serde_json::json;
 
 pub const CRATE_NAME: &str = "context-mcp-generic";
 const DRIVER_NAME: &str = "mcp-generic";
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -113,9 +116,14 @@ impl ContextDriver for GenericMcpContextDriver {
 
     async fn provision(&self, spec: ContextSpec) -> DriverResult<ContextHandle> {
         let endpoint = endpoint_from_spec(&spec)?;
-        if self.probe.validate_ssrf {
-            validate_endpoint_for_driver(&endpoint, &SystemDnsResolver)?;
-        }
+        let validated_endpoint = if self.probe.validate_ssrf {
+            Some(validated_endpoint_for_driver(
+                &endpoint,
+                &SystemDnsResolver,
+            )?)
+        } else {
+            None
+        };
 
         if self.probe.enabled
             && matches!(
@@ -123,7 +131,18 @@ impl ContextDriver for GenericMcpContextDriver {
                 McpTransport::Http | McpTransport::HttpSse
             )
         {
-            probe_mcp_initialize(&endpoint.url).await?;
+            if let Some(validated_url) = validated_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.validated_url.as_ref())
+            {
+                probe_mcp_initialize_with_validated_url(&endpoint.url, validated_url).await?;
+            } else if self.probe.validate_ssrf {
+                return Err(DriverError::PreflightFailed {
+                    message: "MCP initialize probe requires a validated URL".to_owned(),
+                });
+            } else {
+                probe_mcp_initialize(&endpoint.url).await?;
+            }
         }
 
         let mut store = self.store()?;
@@ -218,20 +237,77 @@ pub fn validate_endpoint_for_driver(
     endpoint: &McpEndpoint,
     resolver: &dyn DnsResolver,
 ) -> DriverResult<()> {
+    validated_endpoint_for_driver(endpoint, resolver).map(|_| ())
+}
+
+fn validated_endpoint_for_driver(
+    endpoint: &McpEndpoint,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<ValidatedMcpEndpoint> {
     let options = SsrfOptions {
         allow_ssh_http: true,
         ..SsrfOptions::default()
     };
 
-    validate_mcp_endpoint(endpoint, options, resolver)
-        .map(|_| ())
-        .map_err(|err| DriverError::InvalidConfig {
-            field: "endpoint.url".to_owned(),
-            message: err.to_string(),
-        })
+    validate_mcp_endpoint(endpoint, options, resolver).map_err(|err| DriverError::InvalidConfig {
+        field: "endpoint.url".to_owned(),
+        message: err.to_string(),
+    })
 }
 
 pub async fn probe_mcp_initialize(url: &str) -> DriverResult<()> {
+    let client =
+        mcp_probe_client_builder()
+            .build()
+            .map_err(|err| DriverError::PreflightFailed {
+                message: format!("MCP initialize client build failed: {err}"),
+            })?;
+
+    send_mcp_initialize(client, url).await
+}
+
+async fn probe_mcp_initialize_with_validated_url(
+    url: &str,
+    validated_url: &ValidatedUrl,
+) -> DriverResult<()> {
+    let port =
+        validated_url
+            .url
+            .port_or_known_default()
+            .ok_or_else(|| DriverError::PreflightFailed {
+                message: "MCP initialize validated URL did not include a usable port".to_owned(),
+            })?;
+    let addrs = validated_url
+        .pinned_ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect::<Vec<_>>();
+
+    if addrs.is_empty() {
+        return Err(DriverError::PreflightFailed {
+            message: "MCP initialize validated URL did not include pinned IPs".to_owned(),
+        });
+    }
+
+    let client = mcp_probe_client_builder()
+        .resolve_to_addrs(&validated_url.host, &addrs)
+        .build()
+        .map_err(|err| DriverError::PreflightFailed {
+            message: format!("MCP initialize client build failed: {err}"),
+        })?;
+
+    send_mcp_initialize(client, url).await
+}
+
+fn mcp_probe_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(MCP_PROBE_TIMEOUT)
+}
+
+async fn send_mcp_initialize(client: reqwest::Client, url: &str) -> DriverResult<()> {
     let request_body = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -249,7 +325,7 @@ pub async fn probe_mcp_initialize(url: &str) -> DriverResult<()> {
         message: format!("MCP initialize request serialization failed: {err}"),
     })?;
 
-    let response = reqwest::Client::new()
+    let response = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(request_body)
@@ -301,11 +377,15 @@ mod tests {
     use std::{
         collections::BTreeMap,
         io::{Read, Write},
-        net::TcpListener,
+        net::{IpAddr, TcpListener},
         thread,
+        time::{Duration, Instant},
     };
 
-    use agentenv_core::{driver::ContextDriver, security::ssrf::StaticDnsResolver};
+    use agentenv_core::{
+        driver::ContextDriver,
+        security::ssrf::{StaticDnsResolver, ValidatedUrl},
+    };
     use agentenv_proto::{
         Capabilities, ContextHandleRequest, ContextSpec, CredentialRequirementsParams,
         InitializeParams, LogLevel, McpTransport, NetworkTarget, SCHEMA_VERSION,
@@ -313,8 +393,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        endpoint_from_spec, probe_mcp_initialize, validate_endpoint_for_driver,
-        GenericMcpContextDriver, ProbeExpectation,
+        endpoint_from_spec, probe_mcp_initialize, probe_mcp_initialize_with_validated_url,
+        validate_endpoint_for_driver, GenericMcpContextDriver, ProbeExpectation,
     };
 
     fn init_params() -> InitializeParams {
@@ -383,6 +463,31 @@ mod tests {
         let err = probe_mcp_initialize(&server.url()).await.unwrap_err();
 
         assert!(err.to_string().contains("MCP initialize"));
+    }
+
+    #[tokio::test]
+    async fn initialize_probe_rejects_redirect_instead_of_following() {
+        let server = spawn_redirect_server_to_valid_mcp_response();
+
+        let err = probe_mcp_initialize(&server.url()).await.unwrap_err();
+
+        assert!(err.to_string().contains("MCP initialize"));
+    }
+
+    #[tokio::test]
+    async fn initialize_probe_uses_validated_url_pinned_resolution() {
+        let server = spawn_probe_server(ProbeExpectation::ValidInitialize);
+        let url =
+            url::Url::parse(&format!("http://mcp.example.test:{}", server.addr().port())).unwrap();
+        let validated_url = ValidatedUrl {
+            url,
+            host: "mcp.example.test".to_owned(),
+            pinned_ips: vec![IpAddr::from([127, 0, 0, 1])],
+        };
+
+        probe_mcp_initialize_with_validated_url(validated_url.url.as_str(), &validated_url)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -459,12 +564,17 @@ mod tests {
 
     struct ProbeServer {
         url: String,
+        addr: std::net::SocketAddr,
         thread: Option<thread::JoinHandle<()>>,
     }
 
     impl ProbeServer {
         fn url(&self) -> String {
             self.url.clone()
+        }
+
+        fn addr(&self) -> std::net::SocketAddr {
+            self.addr
         }
     }
 
@@ -478,7 +588,8 @@ mod tests {
 
     fn spawn_probe_server(expectation: ProbeExpectation) -> ProbeServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
         let thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0; 4096];
@@ -514,7 +625,80 @@ mod tests {
 
         ProbeServer {
             url,
+            addr,
             thread: Some(thread),
         }
+    }
+
+    fn spawn_redirect_server_to_valid_mcp_response() -> ProbeServer {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target.local_addr().unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            loop {
+                match target.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0; 4096];
+                        let _ = stream.read(&mut buf).unwrap();
+                        write_valid_initialize_response(&mut stream);
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("target accept failed: {err}"),
+                }
+            }
+        });
+
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = redirect.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut buf = [0; 4096];
+            let read = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            assert!(request.contains("initialize"));
+
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+            target_thread
+                .join()
+                .expect("redirect target thread should finish");
+        });
+
+        ProbeServer {
+            url,
+            addr,
+            thread: Some(thread),
+        }
+    }
+
+    fn write_valid_initialize_response(stream: &mut impl Write) {
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "mock", "version": "0.0.1"}
+            }
+        }))
+        .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
     }
 }
