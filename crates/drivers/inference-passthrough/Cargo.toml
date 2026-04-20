@@ -9,3 +9,11 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Passthrough inference driver scaffold for agentenv"
+
+[dependencies]
+agentenv-core = { path = "../../agentenv-core" }
+agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

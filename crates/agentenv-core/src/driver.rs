@@ -20,6 +20,14 @@ pub enum DriverError {
     CapabilityMissing {
         capability: String,
     },
+    InvalidConfig {
+        field: String,
+        message: String,
+    },
+    InvalidHandle {
+        handle: String,
+        message: String,
+    },
     PreflightFailed {
         message: String,
     },
@@ -93,6 +101,12 @@ impl fmt::Display for DriverError {
             DriverError::SchemaVersion(err) => fmt::Display::fmt(err, f),
             DriverError::CapabilityMissing { capability } => {
                 write!(f, "driver is missing capability `{capability}`")
+            }
+            DriverError::InvalidConfig { field, message } => {
+                write!(f, "invalid driver config field `{field}`: {message}")
+            }
+            DriverError::InvalidHandle { handle, message } => {
+                write!(f, "invalid inference handle `{handle}`: {message}")
             }
             DriverError::PreflightFailed { message } => {
                 write!(f, "preflight failed: {message}")
@@ -341,5 +355,31 @@ mod tests {
             .into();
 
         assert!(err.to_string().contains("upgrade the driver or the core"));
+    }
+
+    #[test]
+    fn invalid_config_error_includes_field_and_message() {
+        let err = DriverError::InvalidConfig {
+            field: "base_url".to_owned(),
+            message: "must be a valid http or https URL".to_owned(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "invalid driver config field `base_url`: must be a valid http or https URL"
+        );
+    }
+
+    #[test]
+    fn invalid_handle_error_includes_handle_and_message() {
+        let err = DriverError::InvalidHandle {
+            handle: "openai|not-a-url".to_owned(),
+            message: "expected prefix `openai|`".to_owned(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "invalid inference handle `openai|not-a-url`: expected prefix `openai|`"
+        );
     }
 }
