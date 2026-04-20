@@ -1,8 +1,18 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use agentenv_proto::{EmptyResult, ShutdownParams};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -28,6 +38,28 @@ pub enum JsonRpcError {
     HeaderTooLarge { length: usize, max: usize },
     #[error("JSON-RPC frame has too many headers: {count} > {max}")]
     TooManyHeaders { count: usize, max: usize },
+    #[error("JSON-RPC protocol error: {0}")]
+    Protocol(String),
+    #[error("JSON-RPC request `{0}` timed out")]
+    Timeout(String),
+    #[error("remote JSON-RPC error {code}: {message}")]
+    Remote { code: i64, message: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonRpcClientConfig {
+    pub binary: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub timeout: Duration,
+}
+
+pub struct JsonRpcClient {
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<ChildStdin>,
+    stdout: Mutex<BufReader<ChildStdout>>,
+    next_id: AtomicU64,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -208,6 +240,213 @@ where
     }
 }
 
+impl JsonRpcClient {
+    pub async fn spawn(config: JsonRpcClientConfig) -> Result<Self, JsonRpcError> {
+        let mut command = Command::new(&config.binary);
+        command.args(&config.args);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::inherit());
+        command.env_clear();
+        command.env("PATH", std::env::var("PATH").unwrap_or_default());
+        for (key, value) in &config.env {
+            command.env(key, value);
+        }
+
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            JsonRpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "driver stdin was unavailable",
+            ))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            JsonRpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "driver stdout was unavailable",
+            ))
+        })?;
+
+        Ok(Self {
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            next_id: AtomicU64::new(1),
+            timeout: config.timeout,
+        })
+    }
+
+    pub async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, JsonRpcError>
+    where
+        P: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        let fut = async {
+            {
+                let mut stdin = self.stdin.lock().await;
+                write_framed_json_async(&mut *stdin, &request).await?;
+            }
+
+            loop {
+                let raw = {
+                    let mut stdout = self.stdout.lock().await;
+                    read_framed_json_async(&mut *stdout).await?
+                };
+                if raw.get("method").is_some() && raw.get("id").is_none() {
+                    continue;
+                }
+                let response: RpcResponseEnvelope = serde_json::from_value(raw)?;
+                if response.id.as_u64() != Some(id) {
+                    return Err(JsonRpcError::Protocol(format!(
+                        "received response id {} while waiting for {}",
+                        response.id, id
+                    )));
+                }
+                if let Some(error) = response.error {
+                    return Err(JsonRpcError::Remote {
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+                let result = response.result.ok_or_else(|| {
+                    JsonRpcError::Protocol(format!("missing result for `{method}`"))
+                })?;
+                return Ok(serde_json::from_value(result)?);
+            }
+        };
+
+        tokio::time::timeout(self.timeout, fut)
+            .await
+            .map_err(|_| JsonRpcError::Timeout(method.to_owned()))?
+    }
+
+    pub async fn shutdown(&mut self) -> Result<(), JsonRpcError> {
+        let _result: EmptyResult = self.call("shutdown", &ShutdownParams {}).await?;
+        let mut child = self
+            .child
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| JsonRpcError::Protocol("driver already shut down".to_owned()))?;
+        tokio::time::timeout(self.timeout, child.wait())
+            .await
+            .map_err(|_| JsonRpcError::Timeout("shutdown".to_owned()))??;
+        Ok(())
+    }
+}
+
+async fn write_framed_json_async<W, T>(writer: &mut W, message: &T) -> Result<(), JsonRpcError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize + ?Sized,
+{
+    let payload = serde_json::to_vec(message)?;
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(&payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn read_framed_json_async<R>(reader: &mut R) -> Result<Value, JsonRpcError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut content_length = None;
+    let mut header_count = 0usize;
+    loop {
+        let line = read_bounded_header_line_async(reader, DEFAULT_MAX_HEADER_BYTES).await?;
+        let Some(line) = line else {
+            break;
+        };
+        header_count += 1;
+        if header_count > DEFAULT_MAX_HEADER_LINES {
+            return Err(JsonRpcError::TooManyHeaders {
+                count: header_count,
+                max: DEFAULT_MAX_HEADER_LINES,
+            });
+        }
+        let line = String::from_utf8(line).map_err(|err| {
+            JsonRpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        })?;
+        if let Some(raw) = line.strip_prefix("Content-Length: ") {
+            let trimmed = raw.trim_end_matches("\r\n").trim();
+            if content_length.is_some() {
+                return Err(JsonRpcError::DuplicateContentLength);
+            }
+            content_length = Some(
+                trimmed
+                    .parse::<usize>()
+                    .map_err(|_| JsonRpcError::InvalidContentLength(trimmed.to_owned()))?,
+            );
+        }
+    }
+
+    let content_length = content_length.ok_or(JsonRpcError::MissingContentLength)?;
+    if content_length > DEFAULT_MAX_FRAME_BYTES {
+        return Err(JsonRpcError::FrameTooLarge {
+            length: content_length,
+            max: DEFAULT_MAX_FRAME_BYTES,
+        });
+    }
+    let mut payload = vec![0_u8; content_length];
+    reader.read_exact(&mut payload).await?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
+async fn read_bounded_header_line_async<R>(
+    reader: &mut R,
+    max_header_bytes: usize,
+) -> Result<Option<Vec<u8>>, JsonRpcError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Err(JsonRpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading JSON-RPC headers",
+                )));
+            }
+            return Err(JsonRpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF while reading JSON-RPC header line",
+            )));
+        }
+
+        let newline_index = available.iter().position(|byte| *byte == b'\n');
+        let chunk_len = newline_index.map_or(available.len(), |idx| idx + 1);
+        if line.len() + chunk_len > max_header_bytes {
+            return Err(JsonRpcError::HeaderTooLarge {
+                length: line.len() + chunk_len,
+                max: max_header_bytes,
+            });
+        }
+
+        line.extend_from_slice(&available[..chunk_len]);
+        reader.consume(chunk_len);
+
+        if matches!(line.as_slice(), b"\r\n" | b"\n") {
+            return Ok(None);
+        }
+        if newline_index.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -326,5 +565,69 @@ mod tests {
         let err = read_framed_json_blocking(&mut Cursor::new(framed.as_bytes())).unwrap_err();
 
         assert!(matches!(err, JsonRpcError::DuplicateContentLength));
+    }
+}
+
+#[cfg(test)]
+mod async_client_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::{JsonRpcClient, JsonRpcClientConfig};
+
+    #[tokio::test]
+    async fn jsonrpc_client_returns_method_result() {
+        let driver =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mock-driver");
+        assert!(
+            driver.is_file(),
+            "run `cargo build -p driver-conformance --bin mock-driver` first"
+        );
+
+        let mut client = JsonRpcClient::spawn(JsonRpcClientConfig {
+            binary: driver,
+            args: Vec::new(),
+            env: Default::default(),
+            timeout: Duration::from_secs(5),
+        })
+        .await
+        .unwrap();
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_surfaces_driver_error_code() {
+        let driver =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mock-driver");
+        assert!(
+            driver.is_file(),
+            "run `cargo build -p driver-conformance --bin mock-driver` first"
+        );
+
+        let mut client = JsonRpcClient::spawn(JsonRpcClientConfig {
+            binary: driver,
+            args: Vec::new(),
+            env: Default::default(),
+            timeout: Duration::from_secs(5),
+        })
+        .await
+        .unwrap();
+
+        let err = client
+            .call::<_, serde_json::Value>("driver/unknown", &json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("-32601"));
+        client.shutdown().await.unwrap();
     }
 }
