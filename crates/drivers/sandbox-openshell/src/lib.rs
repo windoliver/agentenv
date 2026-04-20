@@ -698,11 +698,9 @@ impl OpenShellDriver {
         let command = command_string(&self.binary, &request.args);
         let output =
             self.run_command_request(request)
-                .map_err(|source| DriverError::CommandFailed {
+                .map_err(|source| DriverError::CommandSpawn {
                     command: command.clone(),
-                    status: None,
-                    stdout: String::new(),
-                    stderr: source.to_string(),
+                    source,
                 })?;
 
         if output.status.is_none_or(|status| status != 0) {
@@ -726,6 +724,7 @@ impl TempPolicyFile {
     fn write(policy_yaml: &str) -> io::Result<Self> {
         let path =
             std::env::temp_dir().join(format!("sandbox-openshell-policy-{}.yaml", Uuid::new_v4()));
+        let guard = Self { path };
 
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
@@ -734,11 +733,11 @@ impl TempPolicyFile {
             options.mode(0o600);
         }
 
-        let mut file = options.open(&path)?;
+        let mut file = options.open(guard.path())?;
         file.write_all(policy_yaml.as_bytes())?;
         file.flush()?;
 
-        Ok(Self { path })
+        Ok(guard)
     }
 
     fn path(&self) -> &Path {
@@ -1235,6 +1234,22 @@ mod driver_tests {
                 }),
             }
         }
+
+        fn error(
+            program: &str,
+            verify: impl Fn(&CommandCall) + Send + Sync + 'static,
+            kind: io::ErrorKind,
+            message: &str,
+        ) -> Self {
+            Self {
+                program: program.to_owned(),
+                verify: Box::new(verify),
+                result: CommandScriptResult::Error {
+                    kind,
+                    message: message.to_owned(),
+                },
+            }
+        }
     }
 
     impl CommandRunner for FlexibleCommandRunner {
@@ -1706,6 +1721,66 @@ mod driver_tests {
                 assert!(command.contains("policy set"));
             }
             other => panic!("expected CommandFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls().len(), 1);
+        assert!(!capture
+            .lock()
+            .expect("capture mutex")
+            .as_ref()
+            .expect("policy path")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[tokio::test]
+    async fn apply_policy_maps_policy_command_spawn_error_to_command_spawn() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let capture_for_check = capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::error(
+                "openshell",
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(4)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
+                },
+                io::ErrorKind::BrokenPipe,
+                "spawn failed",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .apply_policy(agentenv_proto::ApplyPolicyParams {
+                handle: "devbox".to_owned(),
+                policy,
+            })
+            .await
+            .expect_err("apply_policy should fail");
+
+        match err {
+            agentenv_core::driver::DriverError::CommandSpawn { command, .. } => {
+                assert!(command.contains("policy set"));
+            }
+            other => panic!("expected CommandSpawn, got {other:?}"),
         }
         assert_eq!(runner.calls().len(), 1);
         assert!(!capture
