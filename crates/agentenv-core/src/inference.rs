@@ -167,6 +167,13 @@ pub fn routed_endpoint(
         err => err,
     })?;
 
+    if endpoint != DEFAULT_NATIVE_ENDPOINT {
+        return Err(DriverError::InvalidHandle {
+            handle: handle.to_owned(),
+            message: format!("expected endpoint `{DEFAULT_NATIVE_ENDPOINT}`"),
+        });
+    }
+
     Ok(EndpointInSandboxResult {
         url: endpoint.to_owned(),
     })
@@ -347,6 +354,17 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid inference handle `openai|not-a-url`: endpoint must be a valid http or https URL"
+        );
+    }
+
+    #[test]
+    fn routed_endpoint_rejects_forged_endpoint() {
+        let err = super::routed_endpoint(DEFAULTS, "openai|https://example.com")
+            .expect_err("forged endpoint must fail");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid inference handle `openai|https://example.com`: expected endpoint `http://inference.local`"
         );
     }
 

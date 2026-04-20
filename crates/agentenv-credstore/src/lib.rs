@@ -4,8 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use agentenv_core::security::ssrf::{
+    sanitize_untrusted_url_text, validate_outbound, SsrfBlocked, SsrfOptions, ValidatedUrl,
+};
 use agentenv_proto::{CredentialRequirement, ValidatorSpec};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -107,6 +111,12 @@ pub enum CredentialStoreError {
         name: String,
         #[source]
         source: reqwest::Error,
+    },
+    #[error("curl probe validator for `{name}` was blocked by SSRF policy: {source}")]
+    ValidatorProbeBlocked {
+        name: String,
+        #[source]
+        source: Box<SsrfBlocked>,
     },
     #[error("curl probe validator for `{name}` returned status {status}")]
     ValidatorProbeStatus {
@@ -429,18 +439,24 @@ impl CredentialStore {
                     }
                 }
                 ValidatorSpec::CurlProbe { url } => {
-                    let client = reqwest::blocking::Client::new();
-                    let response = client
-                        .get(url)
-                        .header(
-                            reqwest::header::AUTHORIZATION,
-                            format!("Bearer {}", secret.expose_secret()),
-                        )
-                        .send()
-                        .map_err(|source| CredentialStoreError::ValidatorProbeRequest {
+                    let parsed_url = url::Url::parse(url).map_err(|source| {
+                        let sanitized = sanitize_untrusted_url_text(url);
+                        CredentialStoreError::Validation {
+                            name: name.to_owned(),
+                            reason: format!("invalid curl probe URL `{sanitized}`: {source}"),
+                        }
+                    })?;
+                    let validated = validate_outbound(&parsed_url, SsrfOptions::default())
+                        .map_err(|source| CredentialStoreError::ValidatorProbeBlocked {
+                            name: name.to_owned(),
+                            source: Box::new(source),
+                        })?;
+                    let response = send_pinned_probe(&validated, secret).map_err(|source| {
+                        CredentialStoreError::ValidatorProbeRequest {
                             name: name.to_owned(),
                             source,
-                        })?;
+                        }
+                    })?;
 
                     if !response.status().is_success() {
                         return Err(CredentialStoreError::ValidatorProbeStatus {
@@ -514,6 +530,31 @@ impl CredentialStore {
         let index = self.read_index()?;
         Ok(index.locations.get(name).copied())
     }
+}
+
+fn send_pinned_probe(
+    validated: &ValidatedUrl,
+    secret: &SecretString,
+) -> std::result::Result<reqwest::blocking::Response, reqwest::Error> {
+    let port = validated.url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<SocketAddr> = validated
+        .pinned_ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&validated.host, &addrs)
+        .build()?
+        .get(validated.url.clone())
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", secret.expose_secret()),
+        )
+        .send()
 }
 
 fn disable_keyring_from_env() -> bool {
@@ -631,12 +672,52 @@ fn collect_permission_warnings(path: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use agentenv_proto::{CredentialKind, CredentialRequirement};
     use tempfile::TempDir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const PROXY_ENV_KEYS: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ];
+
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set_all(keys: &'static [&'static str], value: &str) -> Self {
+            let saved = keys
+                .iter()
+                .map(|key| {
+                    let original = std::env::var_os(key);
+                    std::env::set_var(key, value);
+                    (*key, original)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[derive(Default)]
     struct MockKeyringState {
@@ -932,6 +1013,104 @@ mod tests {
             CredentialStoreError::Validation { .. } => {}
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn curl_probe_validator_blocks_metadata_url_before_http_send() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let keyring = MockKeyring::default();
+        let mut store = test_store(keyring, &temp_dir);
+        store
+            .write_to_file("AGENTENV_TEST_TOKEN", &SecretString::new("token"))
+            .expect("write credential");
+
+        let requirement = CredentialRequirement {
+            name: "AGENTENV_TEST_TOKEN".to_owned(),
+            kind: CredentialKind::ApiKey,
+            required: true,
+            description: "probe must be SSRF guarded".to_owned(),
+            validator: Some(ValidatorSpec::CurlProbe {
+                url: "http://169.254.169.254/latest/meta-data/".to_owned(),
+            }),
+        };
+
+        let error = store
+            .resolve("AGENTENV_TEST_TOKEN", &requirement)
+            .expect_err("expected metadata probe to be blocked");
+        match error {
+            CredentialStoreError::ValidatorProbeBlocked { name, .. } => {
+                assert_eq!(name, "AGENTENV_TEST_TOKEN");
+            }
+            other => panic!("expected validator probe block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curl_probe_validator_rejects_malformed_url() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let keyring = MockKeyring::default();
+        let mut store = test_store(keyring, &temp_dir);
+        store
+            .write_to_file("AGENTENV_TEST_TOKEN", &SecretString::new("token"))
+            .expect("write credential");
+
+        let requirement = CredentialRequirement {
+            name: "AGENTENV_TEST_TOKEN".to_owned(),
+            kind: CredentialKind::ApiKey,
+            required: true,
+            description: "probe URL must parse".to_owned(),
+            validator: Some(ValidatorSpec::CurlProbe {
+                url: "http://user:pass@[?token=secret#frag".to_owned(),
+            }),
+        };
+
+        let error = store
+            .resolve("AGENTENV_TEST_TOKEN", &requirement)
+            .expect_err("expected malformed probe URL to fail validation");
+        match error {
+            CredentialStoreError::Validation { name, reason } => {
+                assert_eq!(name, "AGENTENV_TEST_TOKEN");
+                assert!(reason.contains("invalid curl probe URL"));
+                for redacted in ["user", "pass", "token", "secret", "?", "#"] {
+                    assert!(
+                        !reason.contains(redacted),
+                        "malformed probe URL reason leaked `{redacted}` in `{reason}`"
+                    );
+                }
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pinned_probe_ignores_proxy_environment() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let _proxy_guard = EnvVarGuard::set_all(PROXY_ENV_KEYS, "http://127.0.0.1:9");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes = stream.read(&mut buffer).expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .expect("write response");
+            String::from_utf8_lossy(&buffer[..bytes]).to_string()
+        });
+        let url = url::Url::parse(&format!("http://probe.example.test:{}/check", addr.port()))
+            .expect("probe URL");
+        let validated = ValidatedUrl {
+            url,
+            host: "probe.example.test".to_owned(),
+            pinned_ips: vec![addr.ip()],
+        };
+
+        let response = send_pinned_probe(&validated, &SecretString::new("sk-test"))
+            .expect("send pinned probe");
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let request = server.join().expect("join server");
+        assert!(request.starts_with("GET /check "));
+        assert!(request.contains("authorization: Bearer sk-test"));
     }
 
     #[test]

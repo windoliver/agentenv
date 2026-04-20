@@ -458,6 +458,23 @@ pub struct AgentSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentHealthCheckProbe {
+    pub cmd: String,
+    pub tty: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(
+        default = "default_success_exit_codes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub success_exit_codes: Vec<i32>,
+}
+
+fn default_success_exit_codes() -> Vec<i32> {
+    vec![0]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct DockerfileFragment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -509,18 +526,6 @@ pub struct CredentialRequirementsParams {}
 pub struct CredentialRequirementsResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<CredentialRequirement>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct HealthCheckParams {
-    pub handle: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct HealthCheckResult {
-    pub healthy: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]

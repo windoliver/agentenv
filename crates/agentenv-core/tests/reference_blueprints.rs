@@ -17,8 +17,8 @@ fn workspace_path(path: &str) -> std::path::PathBuf {
 fn all_reference_blueprints_parse() {
     let _guard = env_lock().lock().unwrap();
 
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
-    std::env::set_var("NEXUS_HUB_URL", "https://nexus.internal.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.34");
+    std::env::set_var("NEXUS_HUB_URL", "https://93.184.216.35");
 
     for (path, agent_driver, context_driver, tier, persists_home) in [
         (
@@ -95,7 +95,7 @@ fn all_reference_blueprints_parse() {
                 let endpoint = blueprint.context.extra.get("endpoint").unwrap();
                 let url = yaml_string_field(endpoint, "url");
                 let transport = yaml_string_field(endpoint, "transport");
-                assert_eq!(url, "https://mcp.internal.example.com", "{path}");
+                assert_eq!(url, "https://93.184.216.34", "{path}");
                 assert_eq!(transport, "http+sse", "{path}");
             }
             "nexus" => {
@@ -118,7 +118,7 @@ fn all_reference_blueprints_parse() {
                         .unwrap()
                         .as_str()
                         .unwrap(),
-                    "https://nexus.internal.example.com",
+                    "https://93.184.216.35",
                     "{path}"
                 );
             }
@@ -130,7 +130,7 @@ fn all_reference_blueprints_parse() {
 #[test]
 fn interpolation_resolves_env_variable() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.34");
 
     let yaml = r#"
 version: 0.1.0
@@ -155,7 +155,7 @@ policy:
     let endpoint = blueprint.context.extra.get("endpoint").unwrap();
     let url = yaml_string_field(endpoint, "url");
 
-    assert_eq!(url, "https://mcp.internal.example.com");
+    assert_eq!(url, "https://93.184.216.34");
 }
 
 #[test]
@@ -221,7 +221,7 @@ policy:
 fn interpolation_skips_credential_objects_but_still_resolves_other_fields() {
     let _guard = env_lock().lock().unwrap();
     std::env::set_var("OPENAI_API_KEY", "sk-secret-value");
-    std::env::set_var("MCP_URL", "https://mcp.internal.example.com");
+    std::env::set_var("MCP_URL", "https://93.184.216.34");
 
     let yaml = r#"
 version: 0.1.0
@@ -260,7 +260,7 @@ policy:
     let url = yaml_string_field(endpoint, "url");
 
     assert_eq!(note, "${OPENAI_API_KEY}");
-    assert_eq!(url, "https://mcp.internal.example.com");
+    assert_eq!(url, "https://93.184.216.34");
 }
 
 #[test]

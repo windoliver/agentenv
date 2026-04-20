@@ -1,3 +1,53 @@
 # agent-openclaw
 
-M1 scaffold crate for the `agentenv` workspace.
+Built-in OpenClaw agent driver for `agentenv`.
+
+## Implemented behavior
+
+- Installs OpenClaw with `RUN npm install -g openclaw`, honoring `AgentSpec.version` when present.
+- Writes MCP configuration to `~/.openclaw/openclaw.json`.
+- Renders deterministic MCP JSON using OpenClaw's `mcp.servers` shape.
+- Starts OpenClaw in TUI mode with `openclaw tui`.
+- Starts OpenClaw in headless mode with `openclaw agent`.
+- Returns a declarative `openclaw --version` health-check probe.
+- Reports MCP, slash-command, TUI, and headless capabilities.
+
+## Configuration
+
+Supported config keys:
+
+- `mode`: `tui` (default) or `headless`.
+- `provider`: `openai` or `anthropic`.
+- `model`: optional model identifier used for provider inference.
+
+Unknown keys and invalid values are rejected instead of silently falling back to defaults.
+
+## Credential selection
+
+OpenClaw defaults to OpenAI credentials:
+
+```yaml
+agent:
+  driver: openclaw
+```
+
+requires `OPENAI_API_KEY`.
+
+Set `provider: anthropic` to require `ANTHROPIC_API_KEY`:
+
+```yaml
+agent:
+  driver: openclaw
+  config:
+    provider: anthropic
+```
+
+If `provider` is omitted, `model` prefixes are used when possible:
+
+- `anthropic/...` requires `ANTHROPIC_API_KEY`.
+- `openai/...` requires `OPENAI_API_KEY`.
+
+An explicit provider that conflicts with an inferable model prefix is rejected.
+
+OpenShell install/probe activation scaffolds live under `tests/openshell_install.rs` and stay ignored until `sandbox-openshell` supports `create + exec`.
+They only run with `AGENTENV_RUN_OPEN_SHELL_TESTS` once sandbox execution exists.

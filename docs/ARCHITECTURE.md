@@ -264,7 +264,7 @@ Presets can be added at create or runtime via `agentenv policy-add <preset>`, su
 
 Drivers **never** touch credentials directly. They declare requirements; the core credstore owns the lifecycle:
 
-1. At `create` time, core reads the blueprint's credential spec and asks each driver for its `credential_requirements()`.
+1. At `create` time, core reads the blueprint's credential spec and asks each driver for credential requirements. Agent drivers receive the `AgentSpec` so requirements can depend on typed agent config; context and inference drivers use empty params.
 2. Core resolves each requirement from: OS keyring (preferred), `~/.agentenv/credentials.json` (fallback), or env var (explicit, one-shot).
 3. Core injects credentials into the sandbox driver's `create` call as env vars — the sandbox driver passes them to the container runtime, which injects at process-start time.
 4. Credentials never appear on disk inside the sandbox filesystem.
