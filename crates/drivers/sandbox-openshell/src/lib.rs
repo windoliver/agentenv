@@ -574,10 +574,15 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn logs(&self, params: LogsParams) -> DriverResult<LogsResult> {
-        let mut args = vec!["logs".to_owned(), params.handle];
         if params.follow {
-            args.push("--tail".to_owned());
+            return Err(DriverError::InvalidInput {
+                message:
+                    "logs.follow is not supported by logs(); use logs_stream for streaming logs"
+                        .to_owned(),
+            });
         }
+
+        let mut args = vec!["logs".to_owned(), params.handle];
         if let Some(since) = params.since {
             args.push("--since".to_owned());
             args.push(since);
@@ -781,10 +786,11 @@ impl OpenShellDriver {
             classify_policy_update(&current, &policy).map_err(driver_error_from_policy_error)?;
         }
 
-        let translated =
-            translate_for_openshell(&policy).map_err(|err| DriverError::PolicyTranslation {
+        let translated = translate_policy_for_openshell(&policy).map_err(|err| {
+            DriverError::PolicyTranslation {
                 message: err.to_string(),
-            })?;
+            }
+        })?;
         let temp_policy_file = TempPolicyFile::write(&translated.policy_yaml).map_err(|err| {
             DriverError::PolicyTranslation {
                 message: format!("failed to write translated policy to temp file: {err}"),
@@ -1193,6 +1199,14 @@ where
     S: Into<String>,
 {
     OpenShellTranslator::new(binaries).translate(policy)
+}
+
+fn translate_policy_for_openshell(policy: &NetworkPolicy) -> Result<TranslatedPolicy, PolicyError> {
+    if policy.network.allow.is_empty() && policy.network.approval_required.is_empty() {
+        return translate_for_openshell_with_binaries(policy, std::iter::empty::<String>());
+    }
+
+    translate_for_openshell(policy)
 }
 
 fn resolve_default_open_shell_binary_paths() -> Result<Vec<String>, PolicyError> {
@@ -1623,6 +1637,30 @@ mod driver_tests {
         )
     }
 
+    fn set_empty_path() -> (PathBuf, PathRestoreGuard) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let tempdir = std::env::temp_dir().join(format!(
+            "sandbox-openshell-empty-path-lib-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tempdir).expect("create tempdir");
+
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &tempdir);
+
+        (
+            tempdir,
+            PathRestoreGuard {
+                original: original_path,
+            },
+        )
+    }
+
     fn write_fake_binary(dir: &Path, binary: &str, executable: bool) {
         let path = binary_path(dir, binary);
         std::fs::write(&path, "").expect("create fake binary");
@@ -1759,6 +1797,55 @@ mod driver_tests {
             .clone()
             .expect("policy path should be captured");
         assert!(!policy_path.exists(), "temp policy file should be removed");
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_allows_empty_network_policy_without_host_agent_binaries() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
+            assert!(policy.network.allow.is_empty());
+            assert!(policy.network.approval_required.is_empty());
+            let (tempdir, path_guard) = set_empty_path();
+            (policy, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
+            })
+            .expect("apply_policy");
+
+        assert!(result.hot_reloaded);
+        assert_eq!(runner.calls().len(), 1);
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
@@ -2974,6 +3061,41 @@ mod driver_tests {
             logs.entries[0].kv.get("egress_denied"),
             Some(&Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn logs_rejects_follow_in_non_streaming_path() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::success(
+            "openshell",
+            &["logs", "sb-2", "--tail"],
+            "",
+            "",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .logs(LogsParams {
+                        handle: "sb-2".to_owned(),
+                        since: None,
+                        follow: true,
+                    })
+                    .await
+            })
+            .expect_err("follow logs should use logs_stream");
+
+        match err {
+            agentenv_core::driver::DriverError::InvalidInput { message } => {
+                assert!(message.contains("logs_stream"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
