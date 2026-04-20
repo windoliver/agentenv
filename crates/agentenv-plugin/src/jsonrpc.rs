@@ -1,10 +1,12 @@
 use std::io::{BufRead, Read, Write};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
+pub const DEFAULT_MAX_HEADER_LINES: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum JsonRpcError {
@@ -20,6 +22,10 @@ pub enum JsonRpcError {
     InvalidResponse(String),
     #[error("JSON-RPC frame length {length} exceeds maximum {max}")]
     FrameTooLarge { length: usize, max: usize },
+    #[error("JSON-RPC header line length {length} exceeds maximum {max}")]
+    HeaderTooLarge { length: usize, max: usize },
+    #[error("JSON-RPC frame has too many headers: {count} > {max}")]
+    TooManyHeaders { count: usize, max: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -30,7 +36,7 @@ pub struct RpcErrorObject {
     pub data: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RpcResponseEnvelope {
     pub jsonrpc: String,
     pub id: Value,
@@ -38,6 +44,16 @@ pub struct RpcResponseEnvelope {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcErrorObject>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RpcResponseEnvelopeRaw {
+    jsonrpc: String,
+    id: Value,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<RpcErrorObject>,
 }
 
 impl RpcResponseEnvelope {
@@ -50,6 +66,32 @@ impl RpcResponseEnvelope {
                 "response must contain either `result` or `error`".to_owned(),
             )),
             _ => Ok(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RpcResponseEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RpcResponseEnvelopeRaw::deserialize(deserializer)?;
+        if raw.jsonrpc != "2.0" {
+            return Err(serde::de::Error::custom("jsonrpc must equal \"2.0\""));
+        }
+        match (raw.result.as_ref(), raw.error.as_ref()) {
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "response cannot contain both `result` and `error`",
+            )),
+            (None, None) => Err(serde::de::Error::custom(
+                "response must contain either `result` or `error`",
+            )),
+            _ => Ok(Self {
+                jsonrpc: raw.jsonrpc,
+                id: raw.id,
+                result: raw.result,
+                error: raw.error,
+            }),
         }
     }
 }
@@ -79,20 +121,24 @@ where
     R: BufRead + Read,
 {
     let mut content_length = None;
+    let mut header_count = 0usize;
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            return Err(JsonRpcError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected EOF while reading JSON-RPC headers",
-            )));
-        }
-        if line == "\r\n" {
+        let line = read_bounded_header_line(reader, DEFAULT_MAX_HEADER_BYTES)?;
+        let Some(line) = line else {
             break;
+        };
+        header_count += 1;
+        if header_count > DEFAULT_MAX_HEADER_LINES {
+            return Err(JsonRpcError::TooManyHeaders {
+                count: header_count,
+                max: DEFAULT_MAX_HEADER_LINES,
+            });
         }
+        let line = String::from_utf8(line).map_err(|err| {
+            JsonRpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        })?;
         if let Some(raw) = line.strip_prefix("Content-Length: ") {
-            let trimmed = raw.trim();
+            let trimmed = raw.trim_end_matches("\r\n").trim();
             content_length = Some(
                 trimmed
                     .parse::<usize>()
@@ -113,6 +159,47 @@ where
     Ok(serde_json::from_slice(&payload)?)
 }
 
+fn read_bounded_header_line<R>(reader: &mut R, max_header_bytes: usize) -> Result<Option<Vec<u8>>, JsonRpcError>
+where
+    R: BufRead,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Err(JsonRpcError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading JSON-RPC headers",
+                )));
+            }
+            return Err(JsonRpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF while reading JSON-RPC header line",
+            )));
+        }
+
+        let newline_index = available.iter().position(|byte| *byte == b'\n');
+        let chunk_len = newline_index.map_or(available.len(), |idx| idx + 1);
+        if line.len() + chunk_len > max_header_bytes {
+            return Err(JsonRpcError::HeaderTooLarge {
+                length: line.len() + chunk_len,
+                max: max_header_bytes,
+            });
+        }
+
+        line.extend_from_slice(&available[..chunk_len]);
+        reader.consume(chunk_len);
+
+        if matches!(line.as_slice(), b"\r\n" | b"\n") {
+            return Ok(None);
+        }
+        if newline_index.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -121,7 +208,8 @@ mod tests {
 
     use super::{
         read_framed_json_blocking, write_framed_json_blocking, JsonRpcError,
-        RpcResponseEnvelope, DEFAULT_MAX_FRAME_BYTES,
+        RpcResponseEnvelope, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_HEADER_BYTES,
+        DEFAULT_MAX_HEADER_LINES,
     };
 
     #[test]
@@ -142,10 +230,9 @@ mod tests {
     #[test]
     fn response_envelope_rejects_missing_result_and_error() {
         let raw = json!({"jsonrpc": "2.0", "id": 1});
-        let envelope: RpcResponseEnvelope = serde_json::from_value(raw).unwrap();
+        let err = serde_json::from_value::<RpcResponseEnvelope>(raw).unwrap_err();
 
-        let err = envelope.validate_result_state().unwrap_err();
-        assert!(matches!(err, JsonRpcError::InvalidResponse(_)));
+        assert!(err.is_data());
     }
 
     #[test]
@@ -156,10 +243,21 @@ mod tests {
             "result": {"ok": true},
             "error": {"code": -1, "message": "bad"}
         });
-        let envelope: RpcResponseEnvelope = serde_json::from_value(raw).unwrap();
+        let err = serde_json::from_value::<RpcResponseEnvelope>(raw).unwrap_err();
 
-        let err = envelope.validate_result_state().unwrap_err();
-        assert!(matches!(err, JsonRpcError::InvalidResponse(_)));
+        assert!(err.is_data());
+    }
+
+    #[test]
+    fn response_envelope_rejects_wrong_jsonrpc_version() {
+        let raw = json!({
+            "jsonrpc": "1.0",
+            "id": 1,
+            "result": {"ok": true}
+        });
+        let err = serde_json::from_value::<RpcResponseEnvelope>(raw).unwrap_err();
+
+        assert!(err.is_data());
     }
 
     #[test]
@@ -173,6 +271,39 @@ mod tests {
             JsonRpcError::FrameTooLarge {
                 length: _,
                 max: DEFAULT_MAX_FRAME_BYTES
+            }
+        ));
+    }
+
+    #[test]
+    fn read_framed_json_rejects_overlong_header_line() {
+        let line = "a".repeat(DEFAULT_MAX_HEADER_BYTES + 1);
+        let framed = format!("{line}\r\n\r\n");
+        let err = read_framed_json_blocking(&mut Cursor::new(framed.into_bytes())).unwrap_err();
+
+        assert!(matches!(
+            err,
+            JsonRpcError::HeaderTooLarge {
+                length: _,
+                max: DEFAULT_MAX_HEADER_BYTES
+            }
+        ));
+    }
+
+    #[test]
+    fn read_framed_json_rejects_too_many_headers() {
+        let mut framed = String::new();
+        for _ in 0..(DEFAULT_MAX_HEADER_LINES + 1) {
+            framed.push_str("X-Test: ok\r\n");
+        }
+        framed.push_str("\r\n");
+        let err = read_framed_json_blocking(&mut Cursor::new(framed.into_bytes())).unwrap_err();
+
+        assert!(matches!(
+            err,
+            JsonRpcError::TooManyHeaders {
+                count: _,
+                max: DEFAULT_MAX_HEADER_LINES
             }
         ));
     }
