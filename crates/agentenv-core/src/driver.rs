@@ -10,24 +10,54 @@ use agentenv_proto::{
     ShutdownParams, StopParams,
 };
 use async_trait::async_trait;
-use thiserror::Error;
+use std::fmt;
 
 pub type DriverResult<T> = Result<T, DriverError>;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum DriverError {
-    #[error(transparent)]
-    SchemaVersion(#[from] SchemaVersionError),
-    #[error("driver is missing capability `{capability}`")]
-    CapabilityMissing { capability: String },
-    #[error("invalid driver config field `{field}`: {message}")]
-    InvalidConfig { field: String, message: String },
-    #[error("invalid inference handle `{handle}`: {message}")]
-    InvalidHandle { handle: String, message: String },
+    SchemaVersion(SchemaVersionError),
+    CapabilityMissing {
+        capability: String,
+    },
+    InvalidConfig {
+        field: String,
+        message: String,
+    },
+    InvalidHandle {
+        handle: String,
+        message: String,
+    },
+    PreflightFailed {
+        message: String,
+    },
+    CommandSpawn {
+        command: String,
+        source: std::io::Error,
+    },
+    CommandFailed {
+        command: String,
+        status: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    PolicyTranslation {
+        message: String,
+    },
+    PolicyRequiresRecreate {
+        domains: String,
+    },
+    CleanupFailed {
+        message: String,
+    },
+    InvalidInput {
+        message: String,
+    },
 }
 
 pub fn ensure_protocol_compatible(result: &InitializeResult) -> DriverResult<()> {
-    assert_compatible_schema_version(&result.driver.protocol_version)?;
+    assert_compatible_schema_version(&result.driver.protocol_version)
+        .map_err(DriverError::SchemaVersion)?;
     Ok(())
 }
 
@@ -38,6 +68,100 @@ pub fn require_capability(capability: &str, supported: bool) -> DriverResult<()>
         Err(DriverError::CapabilityMissing {
             capability: capability.to_owned(),
         })
+    }
+}
+
+impl DriverError {
+    fn status_label(status: Option<i32>) -> String {
+        match status {
+            Some(status) => format!("status {status}"),
+            None => "unknown status".to_owned(),
+        }
+    }
+
+    fn trimmed_output(output: &str) -> String {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            trimmed.to_owned()
+        }
+    }
+}
+
+impl From<SchemaVersionError> for DriverError {
+    fn from(value: SchemaVersionError) -> Self {
+        Self::SchemaVersion(value)
+    }
+}
+
+impl fmt::Display for DriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DriverError::SchemaVersion(err) => fmt::Display::fmt(err, f),
+            DriverError::CapabilityMissing { capability } => {
+                write!(f, "driver is missing capability `{capability}`")
+            }
+            DriverError::InvalidConfig { field, message } => {
+                write!(f, "invalid driver config field `{field}`: {message}")
+            }
+            DriverError::InvalidHandle { handle, message } => {
+                write!(f, "invalid inference handle `{handle}`: {message}")
+            }
+            DriverError::PreflightFailed { message } => {
+                write!(f, "preflight failed: {message}")
+            }
+            DriverError::CommandSpawn { command, source } => {
+                write!(f, "failed to spawn command `{command}`: {source}")
+            }
+            DriverError::CommandFailed {
+                command,
+                status,
+                stdout,
+                stderr,
+            } => {
+                let rendered = Self::trimmed_output(stderr);
+                let rendered = if rendered.is_empty() {
+                    let stdout = Self::trimmed_output(stdout);
+                    if stdout.is_empty() {
+                        "<empty stderr>".to_owned()
+                    } else {
+                        stdout
+                    }
+                } else {
+                    rendered
+                };
+
+                write!(
+                    f,
+                    "command `{command}` failed with {}: {}",
+                    Self::status_label(*status),
+                    rendered
+                )
+            }
+            DriverError::PolicyTranslation { message } => {
+                write!(f, "policy translation failed: {message}")
+            }
+            DriverError::PolicyRequiresRecreate { domains } => {
+                write!(f, "policy update requires recreate for domains: {domains}")
+            }
+            DriverError::CleanupFailed { message } => {
+                write!(f, "driver cleanup failed: {message}")
+            }
+            DriverError::InvalidInput { message } => {
+                write!(f, "invalid driver input: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DriverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DriverError::SchemaVersion(err) => Some(err),
+            DriverError::CommandSpawn { source, .. } => Some(source),
+            _ => None,
+        }
     }
 }
 
@@ -183,6 +307,54 @@ mod tests {
             .expect_err("unsupported capability should fail");
 
         assert!(matches!(err, DriverError::CapabilityMissing { .. }));
+    }
+
+    #[test]
+    fn command_failed_error_includes_command_status_and_trimmed_stderr() {
+        let err = DriverError::CommandFailed {
+            command: "openshell gateway status".to_owned(),
+            status: Some(2),
+            stdout: "gateway stdout\n".to_owned(),
+            stderr: "gateway down\n".to_owned(),
+        };
+
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("openshell gateway status"));
+        assert!(rendered.contains("status 2"));
+        assert!(rendered.contains("gateway down"));
+    }
+
+    #[test]
+    fn invalid_input_error_names_the_bad_field() {
+        let err = DriverError::InvalidInput {
+            message: "metadata.name must be a string".to_owned(),
+        };
+
+        assert!(err.to_string().contains("metadata.name"));
+    }
+
+    #[test]
+    fn command_failed_error_uses_stdout_when_stderr_is_empty() {
+        let err = DriverError::CommandFailed {
+            command: "openshell sandbox get devbox".to_owned(),
+            status: Some(1),
+            stdout: "sandbox not found\n".to_owned(),
+            stderr: "\n".to_owned(),
+        };
+
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("sandbox not found"));
+    }
+
+    #[test]
+    fn schema_version_error_converts_to_driver_error() {
+        let err: DriverError = agentenv_proto::assert_compatible_schema_version("2.0")
+            .expect_err("schema should mismatch")
+            .into();
+
+        assert!(err.to_string().contains("upgrade the driver or the core"));
     }
 
     #[test]
