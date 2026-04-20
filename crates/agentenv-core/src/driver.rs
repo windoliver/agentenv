@@ -57,13 +57,19 @@ impl DriverError {
         }
     }
 
-    fn trimmed_stderr(stderr: &str) -> String {
-        let trimmed = stderr.trim();
+    fn trimmed_output(output: &str) -> String {
+        let trimmed = output.trim();
         if trimmed.is_empty() {
-            "<empty stderr>".to_owned()
+            String::new()
         } else {
             trimmed.to_owned()
         }
+    }
+}
+
+impl From<SchemaVersionError> for DriverError {
+    fn from(value: SchemaVersionError) -> Self {
+        Self::SchemaVersion(value)
     }
 }
 
@@ -83,14 +89,28 @@ impl fmt::Display for DriverError {
             DriverError::CommandFailed {
                 command,
                 status,
-                stdout: _,
+                stdout,
                 stderr,
-            } => write!(
-                f,
-                "command `{command}` failed with {}: {}",
-                Self::status_label(*status),
-                Self::trimmed_stderr(stderr)
-            ),
+            } => {
+                let rendered = Self::trimmed_output(stderr);
+                let rendered = if rendered.is_empty() {
+                    let stdout = Self::trimmed_output(stdout);
+                    if stdout.is_empty() {
+                        "<empty stderr>".to_owned()
+                    } else {
+                        stdout
+                    }
+                } else {
+                    rendered
+                };
+
+                write!(
+                    f,
+                    "command `{command}` failed with {}: {}",
+                    Self::status_label(*status),
+                    rendered
+                )
+            }
             DriverError::PolicyTranslation { message } => {
                 write!(f, "policy translation failed: {message}")
             }
@@ -278,5 +298,28 @@ mod tests {
         };
 
         assert!(err.to_string().contains("metadata.name"));
+    }
+
+    #[test]
+    fn command_failed_error_uses_stdout_when_stderr_is_empty() {
+        let err = DriverError::CommandFailed {
+            command: "openshell sandbox get devbox".to_owned(),
+            status: Some(1),
+            stdout: "sandbox not found\n".to_owned(),
+            stderr: "\n".to_owned(),
+        };
+
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("sandbox not found"));
+    }
+
+    #[test]
+    fn schema_version_error_converts_to_driver_error() {
+        let err: DriverError = agentenv_proto::assert_compatible_schema_version("2.0")
+            .expect_err("schema should mismatch")
+            .into();
+
+        assert!(err.to_string().contains("upgrade the driver or the core"));
     }
 }
