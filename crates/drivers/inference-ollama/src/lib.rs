@@ -109,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_returns_ollama_capabilities() {
-        let mut driver = OllamaInferenceDriver::default();
+        let mut driver = OllamaInferenceDriver;
         let result = driver.initialize(init_params()).await.unwrap();
 
         assert_eq!(result.driver.name, "ollama");
@@ -143,7 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_requirements_are_empty() {
-        let driver = OllamaInferenceDriver::default();
+        let driver = OllamaInferenceDriver;
         let requirements = driver
             .credential_requirements(CredentialRequirementsParams::default())
             .await
@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn provision_then_endpoint_in_sandbox_returns_inference_local() {
-        let driver = OllamaInferenceDriver::default();
+        let driver = OllamaInferenceDriver;
         let handle = driver.provision(spec(Vec::new())).await.unwrap();
         let endpoint = driver
             .endpoint_in_sandbox(agentenv_proto::InferenceHandleRequest {
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_requires_ollama_handle_prefix() {
-        let driver = OllamaInferenceDriver::default();
+        let driver = OllamaInferenceDriver;
         let err = driver
             .endpoint_in_sandbox(agentenv_proto::InferenceHandleRequest {
                 handle: "openai|http://inference.local".to_owned(),

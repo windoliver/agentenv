@@ -109,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_returns_openai_capabilities() {
-        let mut driver = OpenAiInferenceDriver::default();
+        let mut driver = OpenAiInferenceDriver;
         let result = driver.initialize(init_params()).await.unwrap();
 
         assert_eq!(result.driver.name, "openai");
@@ -154,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_requirements_include_openai_key_once() {
-        let driver = OpenAiInferenceDriver::default();
+        let driver = OpenAiInferenceDriver;
         let requirements = driver
             .credential_requirements(CredentialRequirementsParams::default())
             .await
@@ -188,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn provision_then_endpoint_in_sandbox_returns_inference_local() {
-        let driver = OpenAiInferenceDriver::default();
+        let driver = OpenAiInferenceDriver;
         let handle = driver.provision(spec(Vec::new())).await.unwrap();
         let endpoint = driver
             .endpoint_in_sandbox(agentenv_proto::InferenceHandleRequest {

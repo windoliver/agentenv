@@ -77,7 +77,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_returns_passthrough_capabilities() {
-        let mut driver = PassthroughInferenceDriver::default();
+        let mut driver = PassthroughInferenceDriver;
         let result = driver.initialize(init_params()).await.unwrap();
 
         assert_eq!(result.driver.name, "passthrough");
@@ -90,7 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_succeeds_without_host_checks() {
-        let driver = PassthroughInferenceDriver::default();
+        let driver = PassthroughInferenceDriver;
         let result = driver.preflight(PreflightParams::default()).await.unwrap();
 
         assert!(result.ok);
@@ -99,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn provision_is_noop_and_endpoint_is_empty() {
-        let driver = PassthroughInferenceDriver::default();
+        let driver = PassthroughInferenceDriver;
         let handle = driver
             .provision(InferenceSpec {
                 config: Default::default(),
@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_requirements_are_empty() {
-        let driver = PassthroughInferenceDriver::default();
+        let driver = PassthroughInferenceDriver;
         let requirements = driver
             .credential_requirements(CredentialRequirementsParams::default())
             .await
