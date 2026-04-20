@@ -5,11 +5,13 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 #[cfg(test)]
-use std::{collections::VecDeque, sync::Mutex};
+use std::collections::VecDeque;
+
+use serde_json::Value;
 
 use agentenv_core::driver::{DriverError, DriverResult, SandboxDriver};
 use agentenv_policy::{OpenShellTranslator, PolicyError, PolicyTranslator, TranslatedPolicy};
@@ -22,6 +24,7 @@ use agentenv_proto::{
     ShellHandle, ShutdownParams, StopParams, SCHEMA_VERSION,
 };
 use semver::Version;
+use uuid::Uuid;
 
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "sandbox-openshell";
@@ -53,7 +56,7 @@ trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput>;
 
     #[allow(dead_code)]
-    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<std::process::Child>;
+    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -73,11 +76,13 @@ impl CommandRunner for ProcessCommandRunner {
         })
     }
 
-    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<std::process::Child> {
-        Command::new(program)
+    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<()> {
+        let _child = Command::new(program)
             .args(&request.args)
             .envs(&request.env)
-            .spawn()
+            .spawn()?;
+
+        Ok(())
     }
 }
 
@@ -111,6 +116,7 @@ struct CommandCall {
 struct RecordingCommandRunner {
     scripts: Mutex<VecDeque<CommandScript>>,
     calls: Mutex<Vec<CommandCall>>,
+    spawn_calls: Mutex<Vec<CommandCall>>,
 }
 
 #[cfg(test)]
@@ -119,11 +125,16 @@ impl RecordingCommandRunner {
         Self {
             scripts: Mutex::new(scripts.into_iter().collect()),
             calls: Mutex::new(Vec::new()),
+            spawn_calls: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<CommandCall> {
         self.calls.lock().expect("calls mutex").clone()
+    }
+
+    fn spawn_calls(&self) -> Vec<CommandCall> {
+        self.spawn_calls.lock().expect("spawn calls mutex").clone()
     }
 }
 
@@ -195,18 +206,36 @@ impl CommandRunner for RecordingCommandRunner {
         }
     }
 
-    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<std::process::Child> {
-        panic!(
-            "spawn was not expected in tests for program `{program}` with args {:?}",
-            request.args
-        );
+    fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<()> {
+        self.spawn_calls
+            .lock()
+            .expect("spawn calls mutex")
+            .push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+
+        let script = self
+            .scripts
+            .lock()
+            .expect("scripts mutex")
+            .pop_front()
+            .expect("unexpected command invocation");
+
+        assert_eq!(script.program, program);
+        assert_eq!(script.request, *request);
+
+        match script.result {
+            CommandScriptResult::Output(_) => Ok(()),
+            CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
+        }
     }
 }
 
 pub struct OpenShellDriver {
     binary: String,
     runner: Arc<dyn CommandRunner>,
-    current_policies: BTreeMap<String, NetworkPolicy>,
+    current_policies: Mutex<BTreeMap<String, NetworkPolicy>>,
 }
 
 impl Default for OpenShellDriver {
@@ -214,7 +243,7 @@ impl Default for OpenShellDriver {
         Self {
             binary: OPEN_SHELL_BINARY.to_owned(),
             runner: Arc::new(ProcessCommandRunner),
-            current_policies: BTreeMap::new(),
+            current_policies: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -225,7 +254,7 @@ impl OpenShellDriver {
         Self {
             binary: OPEN_SHELL_BINARY.to_owned(),
             runner,
-            current_policies: BTreeMap::new(),
+            current_policies: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -253,7 +282,7 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
-        let version_output = match self.run_command(&["--version"]) {
+        let version_output = match self.run_command_request(command_request(&["--version"])) {
             Ok(output) => output,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Ok(preflight_failure(
@@ -318,7 +347,8 @@ impl SandboxDriver for OpenShellDriver {
             ));
         }
 
-        let gateway_output = match self.run_command(&["gateway", "status"]) {
+        let gateway_output = match self.run_command_request(command_request(&["gateway", "status"]))
+        {
             Ok(output) => output,
             Err(err) => {
                 return Ok(preflight_failure(
@@ -349,66 +379,409 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
-        Err(invalid_input("create"))
+        let spec = _spec;
+        let image = spec.image.unwrap_or_else(|| "openclaw".to_owned());
+        let name = match spec.metadata.get("name") {
+            Some(Value::String(value)) if !value.is_empty() => value.clone(),
+            Some(Value::String(_)) | None => format!("agentenv-{}", Uuid::new_v4()),
+            Some(_) => {
+                return Err(DriverError::InvalidInput {
+                    message: "metadata.name must be a string when set".to_owned(),
+                });
+            }
+        };
+        let remote = match spec.metadata.get("remote") {
+            Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+            Some(Value::String(_)) | None => None,
+            Some(_) => {
+                return Err(DriverError::InvalidInput {
+                    message: "metadata.remote must be a string when set".to_owned(),
+                });
+            }
+        };
+
+        let mut args = vec![
+            "sandbox".to_owned(),
+            "create".to_owned(),
+            "--name".to_owned(),
+            name.clone(),
+            "--keep".to_owned(),
+            "--no-auto-providers".to_owned(),
+            "--from".to_owned(),
+            image,
+        ];
+        if let Some(remote) = remote {
+            args.push("--remote".to_owned());
+            args.push(remote);
+        }
+
+        let request = CommandRequest {
+            args,
+            env: spec.env,
+        };
+        let _output = self.run_checked_command(request)?;
+
+        Ok(SandboxHandle { handle: name })
     }
 
-    async fn connect(&self, _params: ConnectParams) -> DriverResult<ShellHandle> {
-        Err(invalid_input("connect"))
+    async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle> {
+        let request = command_request(&["sandbox", "connect", &params.handle, "--", "true"]);
+        let _output = self.run_checked_command(request)?;
+
+        Ok(ShellHandle {
+            session_id: params.handle,
+            tty: true,
+            working_dir: Some("/sandbox".to_owned()),
+        })
     }
 
-    async fn exec(&self, _params: ExecParams) -> DriverResult<ExecResult> {
-        Err(invalid_input("exec"))
+    async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult> {
+        let request = CommandRequest {
+            args: vec![
+                "sandbox".to_owned(),
+                "connect".to_owned(),
+                params.handle,
+                "--".to_owned(),
+                params.cmd,
+            ],
+            env: params.env,
+        };
+        let command = command_string(&self.binary, &request.args);
+        let output =
+            self.run_command_request(request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command.clone(),
+                    source,
+                })?;
+
+        Ok(ExecResult {
+            status: output.status.unwrap_or(1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 
-    async fn copy_in(&self, _params: CopyInParams) -> DriverResult<EmptyResult> {
-        Err(invalid_input("copy_in"))
+    async fn copy_in(&self, params: CopyInParams) -> DriverResult<EmptyResult> {
+        let request = command_request(&[
+            "sandbox",
+            "upload",
+            &params.handle,
+            &params.src_host_path,
+            &params.dst_sandbox_path,
+        ]);
+        let _output = self.run_checked_command(request)?;
+
+        Ok(EmptyResult::default())
     }
 
-    async fn copy_out(&self, _params: CopyOutParams) -> DriverResult<EmptyResult> {
-        Err(invalid_input("copy_out"))
+    async fn copy_out(&self, params: CopyOutParams) -> DriverResult<EmptyResult> {
+        let request = command_request(&[
+            "sandbox",
+            "download",
+            &params.handle,
+            &params.src_sandbox_path,
+            &params.dst_host_path,
+        ]);
+        let _output = self.run_checked_command(request)?;
+
+        Ok(EmptyResult::default())
     }
 
     async fn apply_policy(&self, _params: ApplyPolicyParams) -> DriverResult<ApplyPolicyResult> {
         Err(invalid_input("apply_policy"))
     }
 
-    async fn status(&self, _params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
-        Err(invalid_input("status"))
+    async fn status(&self, params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
+        let request = command_request(&["sandbox", "get", &params.handle]);
+        let output = self.run_checked_command(request)?;
+        let phase = classify_status_phase(&output.stdout);
+
+        Ok(SandboxStatus {
+            healthy: phase == agentenv_proto::SandboxPhase::Running,
+            phase,
+            last_ping: None,
+        })
     }
 
-    async fn logs(&self, _params: LogsParams) -> DriverResult<LogsResult> {
-        Err(invalid_input("logs"))
+    async fn logs(&self, params: LogsParams) -> DriverResult<LogsResult> {
+        let mut args = vec!["sandbox".to_owned(), "logs".to_owned(), params.handle];
+        if params.follow {
+            args.push("--tail".to_owned());
+        }
+        if let Some(since) = params.since {
+            args.push("--since".to_owned());
+            args.push(since);
+        }
+        let output = self.run_checked_command(CommandRequest {
+            args,
+            env: BTreeMap::new(),
+        })?;
+
+        Ok(LogsResult {
+            entries: parse_log_entries(&output.stdout),
+        })
     }
 
-    async fn logs_stream(&self, _params: LogsStreamParams) -> DriverResult<EmptyResult> {
-        Err(invalid_input("logs_stream"))
+    async fn logs_stream(&self, params: LogsStreamParams) -> DriverResult<EmptyResult> {
+        let mut args = vec![
+            "sandbox".to_owned(),
+            "logs".to_owned(),
+            params.handle,
+            "--tail".to_owned(),
+        ];
+        if let Some(since) = params.since {
+            args.push("--since".to_owned());
+            args.push(since);
+        }
+        self.spawn_checked_command(CommandRequest {
+            args,
+            env: BTreeMap::new(),
+        })?;
+
+        Ok(EmptyResult::default())
     }
 
-    async fn stop(&self, _params: StopParams) -> DriverResult<EmptyResult> {
-        Err(invalid_input("stop"))
+    async fn stop(&self, params: StopParams) -> DriverResult<EmptyResult> {
+        let request = command_request(&["sandbox", "stop", &params.handle]);
+        let _output = self.run_checked_command(request)?;
+
+        Ok(EmptyResult::default())
     }
 
-    async fn destroy(&self, _params: DestroyParams) -> DriverResult<EmptyResult> {
-        Err(invalid_input("destroy"))
+    async fn destroy(&self, params: DestroyParams) -> DriverResult<EmptyResult> {
+        let request = command_request(&["sandbox", "delete", &params.handle]);
+        let _output = self.run_checked_command(request)?;
+
+        match self.current_policies.lock() {
+            Ok(mut policies) => {
+                policies.remove(&params.handle);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&params.handle);
+            }
+        }
+
+        Ok(EmptyResult::default())
     }
 
     async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
-        self.current_policies.clear();
+        match self.current_policies.lock() {
+            Ok(mut policies) => policies.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
         Ok(EmptyResult::default())
     }
 }
 
 impl OpenShellDriver {
-    fn run_command(&self, args: &[&str]) -> io::Result<CommandOutput> {
-        self.runner.run(&self.binary, &command_request(args))
+    fn run_command_request(&self, request: CommandRequest) -> io::Result<CommandOutput> {
+        self.runner.run(&self.binary, &request)
+    }
+
+    fn spawn_command_request(&self, request: CommandRequest) -> io::Result<()> {
+        self.runner.spawn(&self.binary, &request)
+    }
+
+    fn run_checked_command(&self, request: CommandRequest) -> Result<CommandOutput, DriverError> {
+        let command = command_string(&self.binary, &request.args);
+        let output =
+            self.run_command_request(request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command.clone(),
+                    source,
+                })?;
+
+        if output.status.is_none_or(|status| status != 0) {
+            return Err(DriverError::CommandFailed {
+                command,
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+
+        Ok(output)
+    }
+
+    fn spawn_checked_command(&self, request: CommandRequest) -> Result<(), DriverError> {
+        let command = command_string(&self.binary, &request.args);
+        self.spawn_command_request(request)
+            .map_err(|source| DriverError::CommandSpawn { command, source })
     }
 }
 
 fn command_request(args: &[&str]) -> CommandRequest {
+    command_request_with_env(args, BTreeMap::new())
+}
+
+fn command_request_with_env(args: &[&str], env: BTreeMap<String, String>) -> CommandRequest {
     CommandRequest {
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-        env: BTreeMap::new(),
+        env,
     }
+}
+
+fn command_string(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn classify_status_phase(stdout: &str) -> agentenv_proto::SandboxPhase {
+    let lower = stdout.to_lowercase();
+    if lower.contains("destroyed") || lower.contains("deleted") {
+        agentenv_proto::SandboxPhase::Destroyed
+    } else if lower.contains("stopped") {
+        agentenv_proto::SandboxPhase::Stopped
+    } else if lower.contains("error") || lower.contains("failed") {
+        agentenv_proto::SandboxPhase::Error
+    } else {
+        agentenv_proto::SandboxPhase::Running
+    }
+}
+
+fn parse_log_entries(stdout: &str) -> Vec<agentenv_proto::LogEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                None
+            } else {
+                Some(parse_log_entry(line))
+            }
+        })
+        .collect()
+}
+
+fn parse_log_entry(line: &str) -> agentenv_proto::LogEntry {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) {
+        let level = map
+            .get("level")
+            .and_then(Value::as_str)
+            .map(parse_log_level)
+            .unwrap_or(agentenv_proto::LogLevel::Info);
+        let ts = map
+            .get("ts")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let msg = map
+            .get("msg")
+            .or_else(|| map.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or(line)
+            .to_owned();
+        let mut kv = map
+            .get("kv")
+            .and_then(Value::as_object)
+            .map(|kv| {
+                kv.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        if log_line_has_denial_signal(line) {
+            kv.insert("egress_denied".to_owned(), Value::Bool(true));
+        }
+
+        return agentenv_proto::LogEntry { level, ts, msg, kv };
+    }
+
+    let ts = parsed_log_timestamp(line).unwrap_or_default();
+    let msg = parsed_log_message(line);
+    let level = parse_log_level_from_text(line);
+    let mut kv = BTreeMap::new();
+    if log_line_has_denial_signal(line) {
+        kv.insert("egress_denied".to_owned(), Value::Bool(true));
+    }
+
+    agentenv_proto::LogEntry { level, ts, msg, kv }
+}
+
+fn parsed_log_timestamp(line: &str) -> Option<String> {
+    let (first, rest) = line.split_once(' ')?;
+    if looks_like_timestamp(first) && !rest.is_empty() {
+        Some(first.to_owned())
+    } else {
+        None
+    }
+}
+
+fn parsed_log_message(line: &str) -> String {
+    if let Some((first, rest)) = line.split_once(' ') {
+        if looks_like_timestamp(first) {
+            let rest = rest.trim_start();
+            if let Some((token, message)) = rest.split_once(' ') {
+                if let Some(_level) = parse_log_level_token(token) {
+                    return message.trim_start().to_owned();
+                }
+            }
+            return rest.to_owned();
+        }
+    }
+
+    if let Some((token, message)) = line.split_once(' ') {
+        if parse_log_level_token(token).is_some() {
+            return message.trim_start().to_owned();
+        }
+    }
+
+    line.to_owned()
+}
+
+fn parse_log_level_from_text(line: &str) -> agentenv_proto::LogLevel {
+    if let Some((first, rest)) = line.split_once(' ') {
+        if looks_like_timestamp(first) {
+            if let Some((token, _)) = rest.trim_start().split_once(' ') {
+                if let Some(level) = parse_log_level_token(token) {
+                    return level;
+                }
+            }
+        } else if let Some(level) = parse_log_level_token(first) {
+            return level;
+        }
+    }
+
+    let upper = line.to_ascii_uppercase();
+    if upper.contains("FATAL") || upper.contains("ERROR") {
+        agentenv_proto::LogLevel::Error
+    } else if upper.contains("WARN")
+        || upper.contains("MED")
+        || upper.contains("HIGH")
+        || upper.contains("CRIT")
+    {
+        agentenv_proto::LogLevel::Warn
+    } else {
+        agentenv_proto::LogLevel::Info
+    }
+}
+
+fn parse_log_level(level: &str) -> agentenv_proto::LogLevel {
+    parse_log_level_token(level).unwrap_or(agentenv_proto::LogLevel::Info)
+}
+
+fn parse_log_level_token(token: &str) -> Option<agentenv_proto::LogLevel> {
+    match token.to_ascii_uppercase().as_str() {
+        "TRACE" => Some(agentenv_proto::LogLevel::Trace),
+        "DEBUG" => Some(agentenv_proto::LogLevel::Debug),
+        "INFO" => Some(agentenv_proto::LogLevel::Info),
+        "WARN" | "WARNING" | "MED" | "HIGH" | "CRIT" | "CRITICAL" => {
+            Some(agentenv_proto::LogLevel::Warn)
+        }
+        "ERROR" | "ERR" | "FATAL" => Some(agentenv_proto::LogLevel::Error),
+        _ => None,
+    }
+}
+
+fn looks_like_timestamp(token: &str) -> bool {
+    token.contains('T') && token.contains(':')
+}
+
+fn log_line_has_denial_signal(line: &str) -> bool {
+    let upper = line.to_ascii_uppercase();
+    upper.contains("DENIED") || upper.contains("BLOCKED") || upper.contains("ACTION=DENY")
 }
 
 fn invalid_input(method: &str) -> DriverError {
@@ -578,18 +951,69 @@ fn is_executable_candidate(candidate: &Path) -> bool {
 
 #[cfg(test)]
 mod driver_tests {
-    use std::{io, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        io,
+        sync::{Arc, Mutex},
+    };
 
     use agentenv_core::driver::SandboxDriver;
     use agentenv_proto::{
-        Capabilities, DriverKind, InitializeParams, LogLevel, PreflightParams, SCHEMA_VERSION,
+        Capabilities, CopyInParams, CopyOutParams, DestroyParams, DriverKind, ExecParams,
+        InitializeParams, LogLevel, LogsParams, LogsStreamParams, PreflightParams, SandboxHandle,
+        SandboxSpec, SandboxStatusParams, StopParams, SCHEMA_VERSION,
     };
     use semver::Version;
+    use serde_json::{json, Value};
 
     use super::{
-        command_request, extract_semver_token, CommandCall, CommandScript, OpenShellDriver,
+        command_request, command_request_with_env, extract_semver_token, CommandCall,
+        CommandOutput, CommandRunner, CommandScript, CommandScriptResult, OpenShellDriver,
         RecordingCommandRunner,
     };
+
+    #[derive(Debug, Default)]
+    struct CapturingCommandRunner {
+        calls: Mutex<Vec<CommandCall>>,
+        spawn_calls: Mutex<Vec<CommandCall>>,
+    }
+
+    impl CapturingCommandRunner {
+        fn calls(&self) -> Vec<CommandCall> {
+            self.calls.lock().expect("calls mutex").clone()
+        }
+    }
+
+    impl CommandRunner for CapturingCommandRunner {
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            self.calls.lock().expect("calls mutex").push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+
+            Ok(super::CommandOutput {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        fn spawn(&self, program: &str, request: &super::CommandRequest) -> io::Result<()> {
+            self.spawn_calls
+                .lock()
+                .expect("spawn calls mutex")
+                .push(CommandCall {
+                    program: program.to_owned(),
+                    request: request.clone(),
+                });
+
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn openshell_driver_initializes_with_required_capabilities() {
@@ -757,6 +1181,393 @@ mod driver_tests {
                     request: command_request(&["gateway", "status"]),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn create_uses_explicit_name_image_remote_and_env_only_credentials() {
+        let env = BTreeMap::from([("OPENAI_API_KEY".to_owned(), "secret".to_owned())]);
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript {
+            program: "openshell".to_owned(),
+            request: command_request_with_env(
+                &[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "named-sandbox",
+                    "--keep",
+                    "--no-auto-providers",
+                    "--from",
+                    "custom-image",
+                    "--remote",
+                    "tcp://sandbox.example",
+                ],
+                env.clone(),
+            ),
+            result: CommandScriptResult::Output(CommandOutput {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        }]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: Some("custom-image".to_owned()),
+                        env: env.clone(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("named-sandbox")),
+                            ("remote".to_owned(), json!("tcp://sandbox.example")),
+                        ]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert_eq!(
+            result,
+            SandboxHandle {
+                handle: "named-sandbox".to_owned()
+            }
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request_with_env(
+                    &[
+                        "sandbox",
+                        "create",
+                        "--name",
+                        "named-sandbox",
+                        "--keep",
+                        "--no-auto-providers",
+                        "--from",
+                        "custom-image",
+                        "--remote",
+                        "tcp://sandbox.example",
+                    ],
+                    env
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn create_uses_openclaw_default_image_and_generated_name() {
+        let runner = Arc::new(CapturingCommandRunner::default());
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::new(),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert!(result.handle.starts_with("agentenv-"));
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, "openshell");
+        assert_eq!(
+            calls[0].request,
+            command_request(&[
+                "sandbox",
+                "create",
+                "--name",
+                &result.handle,
+                "--keep",
+                "--no-auto-providers",
+                "--from",
+                "openclaw",
+            ])
+        );
+    }
+
+    #[test]
+    fn create_rejects_non_string_metadata_name() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![]));
+        let driver = OpenShellDriver::with_command_runner(runner);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), Value::from(1))]),
+                    })
+                    .await
+            })
+            .expect_err("create should reject non-string metadata.name");
+
+        assert!(err.to_string().contains("metadata.name"));
+    }
+
+    #[test]
+    fn exec_returns_status_stdout_and_stderr() {
+        let env = BTreeMap::from([("TOKEN".to_owned(), "secret".to_owned())]);
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript {
+            program: "openshell".to_owned(),
+            request: command_request_with_env(
+                &["sandbox", "connect", "sb-1", "--", "echo hi"],
+                env.clone(),
+            ),
+            result: CommandScriptResult::Output(CommandOutput {
+                status: Some(7),
+                stdout: "stdout payload".to_owned(),
+                stderr: "stderr payload".to_owned(),
+            }),
+        }]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .exec(ExecParams {
+                        handle: "sb-1".to_owned(),
+                        cmd: "echo hi".to_owned(),
+                        tty: false,
+                        env: env.clone(),
+                    })
+                    .await
+            })
+            .expect("exec");
+
+        assert_eq!(result.status, 7);
+        assert_eq!(result.stdout, "stdout payload");
+        assert_eq!(result.stderr, "stderr payload");
+        assert_eq!(
+            runner.calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request_with_env(
+                    &["sandbox", "connect", "sb-1", "--", "echo hi"],
+                    env,
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn copy_status_logs_stream_stop_and_destroy_use_expected_commands() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::success(
+                "openshell",
+                &["sandbox", "upload", "sb-1", "/host/in.txt", "/sandbox/in.txt"],
+                "",
+                "",
+            ),
+            CommandScript::success(
+                "openshell",
+                &["sandbox", "download", "sb-1", "/sandbox/out.txt", "/host/out.txt"],
+                "",
+                "",
+            ),
+            CommandScript::output("openshell", &["sandbox", "get", "sb-1"], Some(0), "deleted", ""),
+            CommandScript::output(
+                "openshell",
+                &["sandbox", "logs", "sb-1", "--since", "2026-04-19T00:00:00Z"],
+                Some(0),
+                "2026-04-19T00:00:00Z WARN action=deny DENIED outbound to api.example.com\nplain info line",
+                "",
+            ),
+            CommandScript::success(
+                "openshell",
+                &["sandbox", "logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"],
+                "",
+                "",
+            ),
+            CommandScript::success("openshell", &["sandbox", "stop", "sb-1"], "", ""),
+            CommandScript::success("openshell", &["sandbox", "delete", "sb-1"], "", ""),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            driver
+                .copy_in(CopyInParams {
+                    handle: "sb-1".to_owned(),
+                    src_host_path: "/host/in.txt".to_owned(),
+                    dst_sandbox_path: "/sandbox/in.txt".to_owned(),
+                })
+                .await
+                .expect("copy_in");
+            driver
+                .copy_out(CopyOutParams {
+                    handle: "sb-1".to_owned(),
+                    src_sandbox_path: "/sandbox/out.txt".to_owned(),
+                    dst_host_path: "/host/out.txt".to_owned(),
+                })
+                .await
+                .expect("copy_out");
+            let status = driver
+                .status(SandboxStatusParams {
+                    handle: "sb-1".to_owned(),
+                })
+                .await
+                .expect("status");
+            assert_eq!(status.phase, agentenv_proto::SandboxPhase::Destroyed);
+            assert!(!status.healthy);
+
+            let logs = driver
+                .logs(LogsParams {
+                    handle: "sb-1".to_owned(),
+                    since: Some("2026-04-19T00:00:00Z".to_owned()),
+                    follow: false,
+                })
+                .await
+                .expect("logs");
+            assert_eq!(logs.entries.len(), 2);
+            assert_eq!(logs.entries[0].level, LogLevel::Warn);
+            assert_eq!(
+                logs.entries[0].kv.get("egress_denied"),
+                Some(&Value::Bool(true))
+            );
+
+            driver
+                .logs_stream(LogsStreamParams {
+                    handle: "sb-1".to_owned(),
+                    since: Some("2026-04-19T00:00:00Z".to_owned()),
+                })
+                .await
+                .expect("logs_stream");
+            driver
+                .stop(StopParams {
+                    handle: "sb-1".to_owned(),
+                })
+                .await
+                .expect("stop");
+            driver
+                .destroy(DestroyParams {
+                    handle: "sb-1".to_owned(),
+                })
+                .await
+                .expect("destroy");
+        });
+
+        assert_eq!(
+            runner.calls(),
+            vec![
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "upload",
+                        "sb-1",
+                        "/host/in.txt",
+                        "/sandbox/in.txt",
+                    ]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "download",
+                        "sb-1",
+                        "/sandbox/out.txt",
+                        "/host/out.txt",
+                    ]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "get", "sb-1"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request_with_env(
+                        &["sandbox", "logs", "sb-1", "--since", "2026-04-19T00:00:00Z"],
+                        BTreeMap::new(),
+                    ),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "stop", "sb-1"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "delete", "sb-1"]),
+                },
+            ]
+        );
+        assert_eq!(
+            runner.spawn_calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request(&[
+                    "sandbox",
+                    "logs",
+                    "sb-1",
+                    "--tail",
+                    "--since",
+                    "2026-04-19T00:00:00Z",
+                ]),
+            }]
+        );
+    }
+
+    #[test]
+    fn logs_denied_lines_set_egress_denied_kv() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "openshell",
+            &["sandbox", "logs", "sb-2"],
+            Some(0),
+            "2026-04-19T00:00:00Z INFO action=deny BLOCKED outbound",
+            "",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let logs = runtime
+            .block_on(async {
+                driver
+                    .logs(LogsParams {
+                        handle: "sb-2".to_owned(),
+                        since: None,
+                        follow: false,
+                    })
+                    .await
+            })
+            .expect("logs");
+
+        assert_eq!(logs.entries.len(), 1);
+        assert_eq!(logs.entries[0].level, LogLevel::Info);
+        assert_eq!(
+            logs.entries[0].kv.get("egress_denied"),
+            Some(&Value::Bool(true))
         );
     }
 
