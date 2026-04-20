@@ -23,6 +23,9 @@ agent:
 context:
   driver: filesystem
   mount: ~/projects            # mounted read-write into the sandbox; exposed as MCP
+  # exclude:
+  #   - ".git/"
+  #   - "node_modules/"
 
 inference:
   driver: passthrough          # agent uses its own key directly; no in-sandbox proxy

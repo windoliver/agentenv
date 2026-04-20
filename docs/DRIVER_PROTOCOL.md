@@ -157,6 +157,11 @@ Agent health checks are declarative probes exported as `agent-health-check-probe
 | `status` | `{handle}` | `ContextStatus` |
 | `teardown` | `{handle}` | `{}` |
 
+For built-in context drivers, an empty `McpEndpoint.url` with `transport = stdio` is
+the no-context sentinel and should be skipped when rendering agent MCP config.
+Filesystem context endpoints encode the stdio command in `McpEndpoint.url` until a
+future protocol version splits stdio command and arguments into separate fields.
+
 #### `InferenceDriver`
 
 | Method | Params | Result |

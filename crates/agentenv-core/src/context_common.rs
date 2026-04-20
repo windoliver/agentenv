@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn successful_preflight_reports_ok_without_issues() {
-        assert_eq!(successful_preflight().ok, true);
+        assert!(successful_preflight().ok);
         assert!(successful_preflight().issues.is_empty());
     }
 
