@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
+use crate::driver_catalog::built_in_driver_specs;
 use semver::{Version, VersionReq};
 use thiserror::Error;
 
@@ -147,84 +148,9 @@ impl Default for DriverRegistry {
         let current_version =
             Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be valid semver");
 
-        register_current_version(
-            &mut registry,
-            DriverKind::Sandbox,
-            &["openshell", "sandbox-openshell"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Agent,
-            &["claude", "agent-claude"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Agent,
-            &["codex", "agent-codex"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Agent,
-            &["hermes"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Agent,
-            &["openclaw", "agent-openclaw"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Context,
-            &["filesystem", "context-filesystem"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Context,
-            &["mcp-generic", "context-mcp-generic"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Context,
-            &["nexus"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Context,
-            &["none", "context-none"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Inference,
-            &["passthrough", "inference-passthrough"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Inference,
-            &["openai", "inference-openai"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Inference,
-            &["anthropic", "inference-anthropic"],
-            &current_version,
-        );
-        register_current_version(
-            &mut registry,
-            DriverKind::Inference,
-            &["ollama", "inference-ollama"],
-            &current_version,
-        );
+        for spec in built_in_driver_specs() {
+            register_current_version(&mut registry, spec.kind, spec.names, &current_version);
+        }
 
         registry
     }
@@ -263,5 +189,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(version.to_string(), "0.0.2");
+    }
+
+    #[test]
+    fn default_registry_uses_shared_builtin_aliases() {
+        let registry = DriverRegistry::default();
+
+        assert_eq!(
+            registry
+                .pin(DriverKind::Sandbox, "sandbox-openshell", None)
+                .unwrap()
+                .to_string(),
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            registry
+                .pin(DriverKind::Agent, "agent-codex", None)
+                .unwrap()
+                .to_string(),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 }
