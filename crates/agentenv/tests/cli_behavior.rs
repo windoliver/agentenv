@@ -66,6 +66,23 @@ fn drivers_list_includes_built_in_drivers() {
     assert!(stdout.contains("agent"));
     assert!(stdout.contains("codex"));
     assert!(stdout.contains("built-in"));
+
+    let expected_kind_col = format!("{:<10}", "agent");
+    let version = env!("CARGO_PKG_VERSION");
+    let expected_codex_row = format!(
+        "{:<10} {:<24} {:<14} {:<10} -",
+        "agent", "agent-codex", version, "built-in"
+    );
+
+    let codex_row = stdout
+        .lines()
+        .find(|line| {
+            line.contains("agent-codex") && line.contains("built-in") && line.ends_with("-")
+        })
+        .expect("missing codex built-in row");
+
+    assert!(codex_row.starts_with(&expected_kind_col));
+    assert_eq!(codex_row, expected_codex_row);
 }
 
 #[test]

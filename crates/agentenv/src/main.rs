@@ -208,7 +208,7 @@ fn print_driver_table(entries: &[DiscoveredDriver]) {
             .unwrap_or_else(|| "-".to_owned());
         println!(
             "{:<10} {:<24} {:<14} {:<10} {}",
-            entry.kind,
+            entry.kind.to_string(),
             entry.name,
             entry.version,
             entry.source.label(),
