@@ -7,6 +7,8 @@ use std::{
 use context_filesystem::{FilesystemMcpServer, ToolCall};
 use serde_json::{json, Value};
 
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let Ok(config) = parse_args(&args) else {
@@ -48,16 +50,12 @@ fn parse_args(args: &[String]) -> Result<CliConfig, String> {
         match args[index].as_str() {
             "--root" => {
                 index += 1;
-                root = args.get(index).map(PathBuf::from);
+                root = Some(PathBuf::from(required_value(args, index, "--root")?));
             }
             "--readonly" => readonly = true,
             "--exclude" => {
                 index += 1;
-                let value = args
-                    .get(index)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| "--exclude requires a value".to_owned())?;
-                exclude.push(value.clone());
+                exclude.push(required_value(args, index, "--exclude")?);
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -69,6 +67,20 @@ fn parse_args(args: &[String]) -> Result<CliConfig, String> {
         readonly,
         exclude,
     })
+}
+
+fn required_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
+    let value = args
+        .get(index)
+        .ok_or_else(|| format!("{flag} requires a value"))?;
+    if value.trim().is_empty() || is_flag_token(value) {
+        return Err(format!("{flag} requires a value"));
+    }
+    Ok(value.clone())
+}
+
+fn is_flag_token(value: &str) -> bool {
+    matches!(value, "--root" | "--readonly" | "--exclude")
 }
 
 pub fn handle_request(
@@ -161,6 +173,12 @@ pub fn read_framed_json<R: BufRead>(reader: &mut R) -> io::Result<Value> {
     let length = content_length.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
     })?;
+    if length > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Content-Length too large: {length} bytes"),
+        ));
+    }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload)?;
     serde_json::from_slice(&payload).map_err(|err| {
@@ -177,7 +195,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{handle_request, read_framed_json, write_framed_json};
+    use super::{handle_request, parse_args, read_framed_json, write_framed_json, MAX_FRAME_BYTES};
 
     #[test]
     fn framed_json_round_trips() {
@@ -188,6 +206,46 @@ mod tests {
         let value = read_framed_json(&mut reader).unwrap();
 
         assert_eq!(value, json!({"jsonrpc": "2.0", "id": 1}));
+    }
+
+    #[test]
+    fn read_framed_json_rejects_oversized_content_length() {
+        let too_large = MAX_FRAME_BYTES + 1;
+        let bytes = format!("Content-Length: {too_large}\r\n\r\n");
+        let mut reader = BufReader::new(Cursor::new(bytes.into_bytes()));
+
+        let err = read_framed_json(&mut reader).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn parse_args_rejects_root_followed_by_flag_token() {
+        let args = vec![
+            "agentenv-fs-mcp".to_owned(),
+            "--root".to_owned(),
+            "--readonly".to_owned(),
+        ];
+
+        let err = parse_args(&args).unwrap_err();
+
+        assert!(err.contains("--root"));
+    }
+
+    #[test]
+    fn parse_args_rejects_exclude_followed_by_flag_token() {
+        let args = vec![
+            "agentenv-fs-mcp".to_owned(),
+            "--root".to_owned(),
+            ".".to_owned(),
+            "--exclude".to_owned(),
+            "--readonly".to_owned(),
+        ];
+
+        let err = parse_args(&args).unwrap_err();
+
+        assert!(err.contains("--exclude"));
     }
 
     #[test]
