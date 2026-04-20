@@ -76,6 +76,7 @@ version = "0.0.1-alpha0"
 dependencies = [
  "agentenv-proto",
  "async-trait",
+ "dirs",
  "hex",
  "ipnet",
  "schemars",

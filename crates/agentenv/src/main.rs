@@ -4,6 +4,7 @@ use std::{
     process,
 };
 
+use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
 use agentenv_credstore::{CredentialStore, SecretString};
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -25,6 +26,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Credentials(CredentialsArgs),
+    Drivers(DriversArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -44,6 +46,18 @@ enum Commands {
 struct CredentialsArgs {
     #[command(subcommand)]
     command: CredentialCommand,
+}
+
+#[derive(Debug, Args)]
+struct DriversArgs {
+    #[command(subcommand)]
+    command: DriverCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DriverCommand {
+    /// Lists built-in and discovered subprocess drivers.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,6 +113,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Credentials(command)) => run_credentials(command),
+        Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Freeze {
             env,
@@ -166,6 +181,39 @@ fn run_credentials(args: CredentialsArgs) -> Result<()> {
             }
             None => bail!("credential `{name}` not found"),
         },
+    }
+}
+
+fn run_drivers(args: DriversArgs) -> Result<()> {
+    match args.command {
+        DriverCommand::List => {
+            let catalog =
+                DriverCatalog::discover_from_environment().context("discover installed drivers")?;
+            print_driver_table(&catalog.entries);
+            Ok(())
+        }
+    }
+}
+
+fn print_driver_table(entries: &[DiscoveredDriver]) {
+    println!(
+        "{:<10} {:<24} {:<14} {:<10} BINARY",
+        "KIND", "NAME", "VERSION", "SOURCE"
+    );
+    for entry in entries {
+        let binary = entry
+            .binary
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        println!(
+            "{:<10} {:<24} {:<14} {:<10} {}",
+            entry.kind.to_string(),
+            entry.name,
+            entry.version,
+            entry.source.label(),
+            binary
+        );
     }
 }
 
@@ -297,6 +345,7 @@ mod tests {
             subcommands,
             vec![
                 "credentials".to_string(),
+                "drivers".to_string(),
                 "verify-blueprint".to_string(),
                 "freeze".to_string(),
                 "reproduce".to_string(),

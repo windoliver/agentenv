@@ -4,6 +4,7 @@ pub mod agent_common;
 pub mod blueprint;
 pub mod digest;
 pub mod driver;
+pub mod driver_catalog;
 pub mod error;
 pub mod inference;
 pub mod lifecycle;
