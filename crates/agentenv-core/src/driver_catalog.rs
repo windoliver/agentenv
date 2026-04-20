@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::registry::DriverKind;
+use crate::registry::{DriverKind, DriverRegistry};
 use agentenv_proto::assert_compatible_schema_version;
 use semver::Version;
 use serde::Deserialize;
@@ -142,6 +142,14 @@ impl DriverCatalog {
         }
 
         Ok(catalog.into_entries())
+    }
+
+    pub fn register_with(&self, registry: &mut DriverRegistry) {
+        for entry in &self.entries {
+            if entry.source != DriverSource::BuiltIn {
+                registry.register_version(entry.kind, entry.name.clone(), entry.version.clone());
+            }
+        }
     }
 }
 
@@ -800,6 +808,38 @@ mod tests {
             entry.capabilities_preview,
             serde_json::json!({"is_remote": true})
         );
+    }
+
+    #[test]
+    fn catalog_registers_subprocess_versions_for_pinning() {
+        let root = manifest_root_with_binary("catalog-register");
+        write_manifest(
+            &root,
+            r#"{
+          "schema_version": "1.0",
+          "name": "custom-context",
+          "kind": "context",
+          "version": "2.1.0",
+          "binary": "./bin/driver"
+        }"#,
+        );
+        let catalog = DriverCatalog::discover(DriverDiscoveryConfig::new(
+            make_temp_dir("catalog-empty-installed"),
+            vec![root],
+        ))
+        .unwrap();
+
+        let mut registry = crate::registry::DriverRegistry::default();
+        catalog.register_with(&mut registry);
+
+        let pinned = registry
+            .pin(
+                DriverKind::Context,
+                "custom-context",
+                Some(">=2.0.0,<3.0.0"),
+            )
+            .unwrap();
+        assert_eq!(pinned.to_string(), "2.1.0");
     }
 
     #[test]
