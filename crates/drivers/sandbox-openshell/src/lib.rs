@@ -2,7 +2,9 @@
 
 use std::{
     collections::BTreeMap,
+    fs::{self, OpenOptions},
     io,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -10,6 +12,9 @@ use std::{
 
 #[cfg(test)]
 use std::collections::VecDeque;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde_json::Value;
 
@@ -380,6 +385,7 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
         let spec = _spec;
+        let policy = spec.policy;
         let image = spec.image.unwrap_or_else(|| "openclaw".to_owned());
         let name = match spec.metadata.get("name") {
             Some(Value::String(value)) if !value.is_empty() => value.clone(),
@@ -420,6 +426,10 @@ impl SandboxDriver for OpenShellDriver {
             env: spec.env,
         };
         let _output = self.run_checked_command(request)?;
+
+        if let Some(policy) = policy {
+            self.apply_policy_to_handle(&name, policy)?;
+        }
 
         Ok(SandboxHandle { handle: name })
     }
@@ -487,8 +497,9 @@ impl SandboxDriver for OpenShellDriver {
         Ok(EmptyResult::default())
     }
 
-    async fn apply_policy(&self, _params: ApplyPolicyParams) -> DriverResult<ApplyPolicyResult> {
-        Err(invalid_input("apply_policy"))
+    async fn apply_policy(&self, params: ApplyPolicyParams) -> DriverResult<ApplyPolicyResult> {
+        let ApplyPolicyParams { handle, policy } = params;
+        self.apply_policy_to_handle(&handle, policy)
     }
 
     async fn status(&self, params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
@@ -602,6 +613,142 @@ impl OpenShellDriver {
         let command = command_string(&self.binary, &request.args);
         self.spawn_command_request(request)
             .map_err(|source| DriverError::CommandSpawn { command, source })
+    }
+
+    fn current_policy_for_handle(&self, handle: &str) -> Option<NetworkPolicy> {
+        match self.current_policies.lock() {
+            Ok(policies) => policies.get(handle).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(handle).cloned(),
+        }
+    }
+
+    fn store_current_policy(&self, handle: String, policy: NetworkPolicy) {
+        match self.current_policies.lock() {
+            Ok(mut policies) => {
+                policies.insert(handle, policy);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(handle, policy);
+            }
+        }
+    }
+
+    fn apply_policy_to_handle(
+        &self,
+        handle: &str,
+        policy: NetworkPolicy,
+    ) -> DriverResult<ApplyPolicyResult> {
+        if let Some(current) = self.current_policy_for_handle(handle) {
+            classify_policy_update(&current, &policy).map_err(|err| {
+                DriverError::PolicyTranslation {
+                    message: err.to_string(),
+                }
+            })?;
+        }
+
+        let translated =
+            translate_for_openshell(&policy).map_err(|err| DriverError::PolicyTranslation {
+                message: err.to_string(),
+            })?;
+        let temp_policy_file = TempPolicyFile::write(&translated.policy_yaml).map_err(|err| {
+            DriverError::PolicyTranslation {
+                message: format!("failed to write translated policy to temp file: {err}"),
+            }
+        })?;
+
+        let policy_args = vec![
+            "policy".to_owned(),
+            "set".to_owned(),
+            handle.to_owned(),
+            "--policy".to_owned(),
+            temp_policy_file.path().to_string_lossy().into_owned(),
+            "--wait".to_owned(),
+        ];
+        self.run_policy_command(CommandRequest {
+            args: policy_args,
+            env: BTreeMap::new(),
+        })?;
+
+        if let Some(inference_update) = translated.inference_update {
+            let mut args = vec![
+                "inference".to_owned(),
+                "set".to_owned(),
+                "--provider".to_owned(),
+                inference_update.provider,
+                "--model".to_owned(),
+                inference_update.model,
+            ];
+            if let Some(timeout_seconds) = inference_update.timeout_seconds {
+                args.push("--timeout".to_owned());
+                args.push(timeout_seconds.to_string());
+            }
+
+            self.run_policy_command(CommandRequest {
+                args,
+                env: BTreeMap::new(),
+            })?;
+        }
+
+        self.store_current_policy(handle.to_owned(), policy);
+
+        Ok(ApplyPolicyResult { hot_reloaded: true })
+    }
+
+    fn run_policy_command(&self, request: CommandRequest) -> Result<CommandOutput, DriverError> {
+        let command = command_string(&self.binary, &request.args);
+        let output =
+            self.run_command_request(request)
+                .map_err(|source| DriverError::CommandFailed {
+                    command: command.clone(),
+                    status: None,
+                    stdout: String::new(),
+                    stderr: source.to_string(),
+                })?;
+
+        if output.status.is_none_or(|status| status != 0) {
+            return Err(DriverError::CommandFailed {
+                command,
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+
+        Ok(output)
+    }
+}
+
+struct TempPolicyFile {
+    path: PathBuf,
+}
+
+impl TempPolicyFile {
+    fn write(policy_yaml: &str) -> io::Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("sandbox-openshell-policy-{}.yaml", Uuid::new_v4()));
+
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&path)?;
+        file.write_all(policy_yaml.as_bytes())?;
+        file.flush()?;
+
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempPolicyFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -779,12 +926,6 @@ fn log_line_has_denial_signal(line: &str) -> bool {
     upper.contains("DENIED") || upper.contains("BLOCKED") || upper.contains("ACTION=DENY")
 }
 
-fn invalid_input(method: &str) -> DriverError {
-    DriverError::InvalidInput {
-        message: format!("openshell {method} is not implemented yet"),
-    }
-}
-
 fn preflight_failure(code: &str, message: String, remediation: Option<String>) -> PreflightResult {
     PreflightResult {
         ok: false,
@@ -947,8 +1088,10 @@ fn is_executable_candidate(candidate: &Path) -> bool {
 #[cfg(test)]
 mod driver_tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, VecDeque},
+        ffi::OsString,
         io,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
 
@@ -969,6 +1112,34 @@ mod driver_tests {
 
     #[derive(Debug, Default)]
     struct CapturingCommandRunner {
+        calls: Mutex<Vec<CommandCall>>,
+        spawn_calls: Mutex<Vec<CommandCall>>,
+    }
+
+    static PATH_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PathRestoreGuard {
+        original: Option<OsString>,
+    }
+
+    impl Drop for PathRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                std::env::set_var("PATH", original);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    struct FlexibleCommandExpectation {
+        program: String,
+        verify: Box<dyn Fn(&CommandCall) + Send + Sync>,
+        result: CommandScriptResult,
+    }
+
+    struct FlexibleCommandRunner {
+        expectations: Mutex<VecDeque<FlexibleCommandExpectation>>,
         calls: Mutex<Vec<CommandCall>>,
         spawn_calls: Mutex<Vec<CommandCall>>,
     }
@@ -1010,6 +1181,191 @@ mod driver_tests {
         }
     }
 
+    impl FlexibleCommandRunner {
+        fn new(expectations: Vec<FlexibleCommandExpectation>) -> Self {
+            Self {
+                expectations: Mutex::new(expectations.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+                spawn_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<CommandCall> {
+            self.calls.lock().expect("calls mutex").clone()
+        }
+
+        #[allow(dead_code)]
+        fn spawn_calls(&self) -> Vec<CommandCall> {
+            self.spawn_calls.lock().expect("spawn calls mutex").clone()
+        }
+    }
+
+    impl FlexibleCommandExpectation {
+        fn success(
+            program: &str,
+            verify: impl Fn(&CommandCall) + Send + Sync + 'static,
+            stdout: &str,
+            stderr: &str,
+        ) -> Self {
+            Self {
+                program: program.to_owned(),
+                verify: Box::new(verify),
+                result: CommandScriptResult::Output(CommandOutput {
+                    status: Some(0),
+                    stdout: stdout.to_owned(),
+                    stderr: stderr.to_owned(),
+                }),
+            }
+        }
+
+        fn output(
+            program: &str,
+            verify: impl Fn(&CommandCall) + Send + Sync + 'static,
+            status: Option<i32>,
+            stdout: &str,
+            stderr: &str,
+        ) -> Self {
+            Self {
+                program: program.to_owned(),
+                verify: Box::new(verify),
+                result: CommandScriptResult::Output(CommandOutput {
+                    status,
+                    stdout: stdout.to_owned(),
+                    stderr: stderr.to_owned(),
+                }),
+            }
+        }
+    }
+
+    impl CommandRunner for FlexibleCommandRunner {
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            let call = CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            };
+            self.calls.lock().expect("calls mutex").push(call.clone());
+
+            let expectation = self
+                .expectations
+                .lock()
+                .expect("expectations mutex")
+                .pop_front()
+                .expect("unexpected command invocation");
+
+            assert_eq!(expectation.program, program);
+            (expectation.verify)(&call);
+
+            match expectation.result {
+                CommandScriptResult::Output(output) => Ok(output),
+                CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
+            }
+        }
+
+        fn spawn(&self, program: &str, request: &super::CommandRequest) -> io::Result<()> {
+            let call = CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            };
+            self.spawn_calls
+                .lock()
+                .expect("spawn calls mutex")
+                .push(call.clone());
+
+            let expectation = self
+                .expectations
+                .lock()
+                .expect("expectations mutex")
+                .pop_front()
+                .expect("unexpected command invocation");
+
+            assert_eq!(expectation.program, program);
+            (expectation.verify)(&call);
+
+            match expectation.result {
+                CommandScriptResult::Output(_) => Ok(()),
+                CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
+            }
+        }
+    }
+
+    fn set_fake_openshell_path() -> (PathBuf, PathRestoreGuard) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let tempdir = std::env::temp_dir().join(format!(
+            "sandbox-openshell-lib-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tempdir).expect("create tempdir");
+        for binary in ["claude", "curl"] {
+            write_fake_binary(&tempdir, binary, true);
+        }
+
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &tempdir);
+
+        (
+            tempdir,
+            PathRestoreGuard {
+                original: original_path,
+            },
+        )
+    }
+
+    fn write_fake_binary(dir: &Path, binary: &str, executable: bool) {
+        let path = binary_path(dir, binary);
+        std::fs::write(&path, "").expect("create fake binary");
+
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = if executable { 0o755 } else { 0o644 };
+            let permissions = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&path, permissions).expect("set fake binary permissions");
+        }
+
+        #[cfg(windows)]
+        let _ = executable;
+    }
+
+    fn binary_path(dir: &Path, binary: &str) -> PathBuf {
+        #[cfg(windows)]
+        {
+            dir.join(format!("{binary}.exe"))
+        }
+
+        #[cfg(not(windows))]
+        {
+            dir.join(binary)
+        }
+    }
+
+    fn assert_args_prefix_suffix(args: &[String], prefix: &[&str], suffix: &[&str]) {
+        let expected_prefix: Vec<String> = prefix.iter().map(|value| (*value).to_owned()).collect();
+        let expected_suffix: Vec<String> = suffix.iter().map(|value| (*value).to_owned()).collect();
+
+        assert!(
+            args.starts_with(&expected_prefix),
+            "args {:?} did not start with {:?}",
+            args,
+            expected_prefix
+        );
+        assert!(
+            args.ends_with(&expected_suffix),
+            "args {:?} did not end with {:?}",
+            args,
+            expected_suffix
+        );
+    }
+
     #[tokio::test]
     async fn openshell_driver_initializes_with_required_capabilities() {
         let mut driver = OpenShellDriver::default();
@@ -1038,6 +1394,327 @@ mod driver_tests {
         assert!(capabilities.supports_syscall_filter);
         assert!(capabilities.supports_native_inference_routing);
         assert!(capabilities.supports_remote_host);
+    }
+
+    #[tokio::test]
+    async fn apply_policy_writes_temp_policy_runs_policy_set_and_removes_file() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let capture_for_check = capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(4)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .apply_policy(agentenv_proto::ApplyPolicyParams {
+                handle: "devbox".to_owned(),
+                policy,
+            })
+            .await
+            .expect("apply_policy");
+
+        assert!(result.hot_reloaded);
+        assert_eq!(runner.calls().len(), 1);
+        let policy_path = capture
+            .lock()
+            .expect("capture mutex")
+            .clone()
+            .expect("policy path should be captured");
+        assert!(!policy_path.exists(), "temp policy file should be removed");
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[tokio::test]
+    async fn apply_policy_rejects_locked_domain_change_before_running_command() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let mut next = policy.clone();
+        next.process.run_as_user = "agent".to_owned();
+        let runner = Arc::new(RecordingCommandRunner::new(vec![]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver
+            .current_policies
+            .lock()
+            .expect("policies mutex")
+            .insert("devbox".to_owned(), policy);
+
+        let err = driver
+            .apply_policy(agentenv_proto::ApplyPolicyParams {
+                handle: "devbox".to_owned(),
+                policy: next,
+            })
+            .await
+            .expect_err("apply_policy should reject locked-domain changes");
+
+        assert!(err.to_string().contains("process"));
+        assert!(runner.calls().is_empty());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[tokio::test]
+    async fn apply_policy_also_applies_inference_update() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (mut policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        policy
+            .inference
+            .routes
+            .push(agentenv_proto::InferenceRoute {
+                matcher: "default".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+                base_url: Some("https://api.openai.com/v1".to_owned()),
+                timeout_seconds: Some(30),
+            });
+
+        let capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let capture_for_check = capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(4)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "inference".to_owned(),
+                            "set".to_owned(),
+                            "--provider".to_owned(),
+                            "openai".to_owned(),
+                            "--model".to_owned(),
+                            "gpt-5".to_owned(),
+                            "--timeout".to_owned(),
+                            "30".to_owned(),
+                        ]
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .apply_policy(agentenv_proto::ApplyPolicyParams {
+                handle: "devbox".to_owned(),
+                policy,
+            })
+            .await
+            .expect("apply_policy");
+
+        assert!(result.hot_reloaded);
+        assert_eq!(runner.calls().len(), 2);
+        assert!(!capture
+            .lock()
+            .expect("capture mutex")
+            .as_ref()
+            .expect("policy path")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[tokio::test]
+    async fn create_applies_initial_policy_after_sandbox_create() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let capture_for_check = capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--keep",
+                            "--no-auto-providers",
+                            "--from",
+                            "openclaw",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(4)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::new(),
+                policy: Some(policy.clone()),
+                metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+            })
+            .await
+            .expect("create");
+
+        assert_eq!(result.handle, "devbox");
+        assert_eq!(runner.calls().len(), 2);
+        let stored_policy = driver
+            .current_policies
+            .lock()
+            .expect("policies mutex")
+            .get("devbox")
+            .cloned()
+            .expect("policy should be stored");
+        assert_eq!(stored_policy, policy);
+        assert!(!capture
+            .lock()
+            .expect("capture mutex")
+            .as_ref()
+            .expect("policy path")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[tokio::test]
+    async fn apply_policy_removes_temp_file_when_policy_set_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let capture_for_check = capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::output(
+                "openshell",
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(4)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
+                },
+                Some(1),
+                "",
+                "policy set failed",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .apply_policy(agentenv_proto::ApplyPolicyParams {
+                handle: "devbox".to_owned(),
+                policy,
+            })
+            .await
+            .expect_err("apply_policy should fail");
+
+        match err {
+            agentenv_core::driver::DriverError::CommandFailed { command, .. } => {
+                assert!(command.contains("policy set"));
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls().len(), 1);
+        assert!(!capture
+            .lock()
+            .expect("capture mutex")
+            .as_ref()
+            .expect("policy path")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
     #[tokio::test]
@@ -1516,7 +2193,13 @@ mod driver_tests {
             runner.spawn_calls(),
             vec![CommandCall {
                 program: "openshell".to_owned(),
-                request: command_request(&["logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"]),
+                request: command_request(&[
+                    "logs",
+                    "sb-1",
+                    "--tail",
+                    "--since",
+                    "2026-04-19T00:00:00Z"
+                ]),
             }]
         );
     }
