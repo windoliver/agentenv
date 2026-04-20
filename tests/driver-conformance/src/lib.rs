@@ -349,12 +349,11 @@ pub async fn assert_context_driver_contract<D: agentenv_core::driver::ContextDri
     let request = agentenv_proto::ContextHandleRequest {
         handle: handle.handle,
     };
-    let _endpoint = driver.mcp_endpoint(request.clone()).await?;
+    let endpoint = driver.mcp_endpoint(request.clone()).await?;
+    ensure_valid_mcp_endpoint(&endpoint)?;
     let network_rules = driver.required_network_rules(request.clone()).await?;
     for rule in network_rules.rules {
-        if let agentenv_proto::NetworkTarget::Host { host, .. } = rule.target {
-            anyhow::ensure!(!host.trim().is_empty(), "network host must not be empty");
-        }
+        ensure_valid_network_target(&rule.target)?;
     }
 
     let credentials = driver
@@ -371,6 +370,72 @@ pub async fn assert_context_driver_contract<D: agentenv_core::driver::ContextDri
     let status = driver.status(request.clone()).await?;
     anyhow::ensure!(status.healthy, "context status must be healthy");
     driver.teardown(request).await?;
+
+    Ok(())
+}
+
+fn ensure_valid_mcp_endpoint(endpoint: &agentenv_proto::McpEndpoint) -> anyhow::Result<()> {
+    match endpoint.transport {
+        agentenv_proto::McpTransport::Stdio => Ok(()),
+        agentenv_proto::McpTransport::Http
+        | agentenv_proto::McpTransport::HttpSse
+        | agentenv_proto::McpTransport::SshHttp => {
+            anyhow::ensure!(
+                !endpoint.url.trim().is_empty(),
+                "MCP endpoint URL must not be empty for URL-based transports"
+            );
+            agentenv_core::context_common::endpoint_host_rule(endpoint)
+                .context("MCP endpoint URL must parse and include a host")?;
+            Ok(())
+        }
+    }
+}
+
+fn ensure_valid_network_target(target: &agentenv_proto::NetworkTarget) -> anyhow::Result<()> {
+    match target {
+        agentenv_proto::NetworkTarget::Host { host, scheme, .. } => {
+            anyhow::ensure!(!host.trim().is_empty(), "network host must not be empty");
+            if let Some(scheme) = scheme {
+                anyhow::ensure!(
+                    !scheme.trim().is_empty(),
+                    "network host scheme must not be empty"
+                );
+            }
+        }
+        agentenv_proto::NetworkTarget::Cidr { cidr } => {
+            anyhow::ensure!(!cidr.trim().is_empty(), "network CIDR must not be empty");
+        }
+        agentenv_proto::NetworkTarget::Port { protocol, .. } => {
+            if let Some(protocol) = protocol {
+                anyhow::ensure!(
+                    !protocol.trim().is_empty(),
+                    "network port protocol must not be empty"
+                );
+            }
+        }
+        agentenv_proto::NetworkTarget::UrlPattern { pattern } => {
+            anyhow::ensure!(
+                !pattern.trim().is_empty(),
+                "network URL pattern must not be empty"
+            );
+        }
+        agentenv_proto::NetworkTarget::HttpMethodPath { host, method, path } => {
+            if let Some(host) = host {
+                anyhow::ensure!(
+                    !host.trim().is_empty(),
+                    "network HTTP method path host must not be empty"
+                );
+            }
+            anyhow::ensure!(
+                !method.trim().is_empty(),
+                "network HTTP method path method must not be empty"
+            );
+            anyhow::ensure!(
+                !path.trim().is_empty(),
+                "network HTTP method path path must not be empty"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -450,9 +515,9 @@ mod tests {
         CredentialRequirement, CredentialRequirementsParams, CredentialRequirementsResult,
         DriverInfo, DriverKind, EmptyResult, InitializeParams, InitializeResult,
         InstallStepsResult, McpConfigPathParams, McpConfigPathResult, McpEndpoint, McpTransport,
-        PreflightParams, PreflightResult, RenderEntrypointResult, RenderMcpConfigParams,
-        RenderMcpConfigResult, RequiredNetworkRulesResult, SandboxCapabilities, ShutdownParams,
-        SCHEMA_VERSION,
+        NetworkRule, NetworkTarget, PreflightParams, PreflightResult, RenderEntrypointResult,
+        RenderMcpConfigParams, RenderMcpConfigResult, RequiredNetworkRulesResult,
+        SandboxCapabilities, ShutdownParams, SCHEMA_VERSION,
     };
     use async_trait::async_trait;
 
@@ -1040,6 +1105,8 @@ mod tests {
     #[derive(Default)]
     struct FakeContextDriver {
         calls: Mutex<FakeContextDriverCalls>,
+        endpoint: Option<McpEndpoint>,
+        network_rules: Vec<NetworkRule>,
         credential_name: Option<String>,
     }
 
@@ -1099,11 +1166,11 @@ mod tests {
         async fn mcp_endpoint(&self, _params: ContextHandleRequest) -> DriverResult<McpEndpoint> {
             self.calls.lock().unwrap().endpoint_checked = true;
 
-            Ok(McpEndpoint {
+            Ok(self.endpoint.clone().unwrap_or_else(|| McpEndpoint {
                 url: "http://127.0.0.1:9000/mcp".to_owned(),
                 transport: McpTransport::Http,
                 headers: BTreeMap::new(),
-            })
+            }))
         }
 
         async fn required_network_rules(
@@ -1112,7 +1179,9 @@ mod tests {
         ) -> DriverResult<RequiredNetworkRulesResult> {
             self.calls.lock().unwrap().network_rules_checked = true;
 
-            Ok(RequiredNetworkRulesResult { rules: Vec::new() })
+            Ok(RequiredNetworkRulesResult {
+                rules: self.network_rules.clone(),
+            })
         }
 
         async fn credential_requirements(
@@ -1199,5 +1268,72 @@ mod tests {
         .expect_err("context conformance should reject empty credential names");
 
         assert!(err.to_string().contains("credential name"));
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_rejects_url_transport_with_malformed_url() {
+        let mut driver = FakeContextDriver {
+            endpoint: Some(McpEndpoint {
+                url: "not a url".to_owned(),
+                transport: McpTransport::Http,
+                headers: BTreeMap::new(),
+            }),
+            ..FakeContextDriver::default()
+        };
+
+        let err = assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("context conformance should reject malformed URL endpoints");
+
+        assert!(err.to_string().contains("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_allows_stdio_endpoint_with_empty_url() {
+        let mut driver = FakeContextDriver {
+            endpoint: Some(McpEndpoint {
+                url: String::new(),
+                transport: McpTransport::Stdio,
+                headers: BTreeMap::new(),
+            }),
+            ..FakeContextDriver::default()
+        };
+
+        assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("stdio context endpoints may use an empty URL sentinel");
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_rejects_empty_url_pattern_network_rule() {
+        let mut driver = FakeContextDriver {
+            network_rules: vec![NetworkRule {
+                target: NetworkTarget::UrlPattern {
+                    pattern: String::new(),
+                },
+            }],
+            ..FakeContextDriver::default()
+        };
+
+        let err = assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("context conformance should reject empty URL pattern network rules");
+
+        assert!(err.to_string().contains("network"));
     }
 }
