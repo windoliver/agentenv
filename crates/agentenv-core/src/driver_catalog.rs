@@ -118,6 +118,7 @@ pub struct DiscoveredDriver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverCatalog {
     pub entries: Vec<DiscoveredDriver>,
+    registry_entries: Vec<DiscoveredDriver>,
 }
 
 impl DriverCatalog {
@@ -144,11 +145,15 @@ impl DriverCatalog {
         Ok(catalog.into_entries())
     }
 
+    /// Registers every discovered subprocess version with an explicit registry.
+    ///
+    /// Catalog entries are precedence-filtered for listing, but registry
+    /// pinning remains semver-driven. Lifecycle code must opt in by discovering
+    /// a catalog and calling this method; default blueprint resolution is not
+    /// wired to environment discovery in this foundation slice.
     pub fn register_with(&self, registry: &mut DriverRegistry) {
-        for entry in &self.entries {
-            if entry.source != DriverSource::BuiltIn {
-                registry.register_version(entry.kind, entry.name.clone(), entry.version.clone());
-            }
+        for entry in &self.registry_entries {
+            registry.register_version(entry.kind, entry.name.clone(), entry.version.clone());
         }
     }
 }
@@ -181,6 +186,7 @@ impl DriverDiscoveryConfig {
 #[derive(Debug, Default)]
 struct CatalogBuilder {
     entries: BTreeMap<(DriverKind, String), DiscoveredDriver>,
+    registry_entries: Vec<DiscoveredDriver>,
 }
 
 impl CatalogBuilder {
@@ -215,47 +221,52 @@ impl CatalogBuilder {
         source: DriverSource,
     ) -> Result<(), DriverDiscoveryError> {
         let key = (manifest.kind, manifest.name.clone());
+        let incoming = DiscoveredDriver {
+            kind: manifest.kind,
+            name: manifest.name,
+            version: manifest.version,
+            source,
+            description: manifest.description,
+            binary: Some(manifest.binary),
+            manifest_path: Some(manifest.manifest_path),
+            args: manifest.args,
+            env: manifest.env,
+            capabilities_preview: manifest.capabilities_preview,
+        };
 
         if let Some(existing) = self.entries.get(&key) {
             if existing.source == source && source != DriverSource::BuiltIn {
                 return Err(DriverDiscoveryError::DuplicateDriver {
-                    kind: manifest.kind,
-                    name: manifest.name,
+                    kind: incoming.kind,
+                    name: incoming.name.clone(),
                     first: existing
                         .manifest_path
                         .as_ref()
                         .cloned()
                         .unwrap_or_else(|| PathBuf::from("<unknown>")),
-                    second: manifest.manifest_path,
+                    second: incoming
+                        .manifest_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("<unknown>")),
                 });
             }
 
-            if source.precedence() <= existing.source.precedence() {
+            self.registry_entries.push(incoming.clone());
+            if incoming.source.precedence() <= existing.source.precedence() {
                 return Ok(());
             }
+        } else {
+            self.registry_entries.push(incoming.clone());
         }
 
-        self.entries.insert(
-            key,
-            DiscoveredDriver {
-                kind: manifest.kind,
-                name: manifest.name,
-                version: manifest.version,
-                source,
-                description: manifest.description,
-                binary: Some(manifest.binary),
-                manifest_path: Some(manifest.manifest_path),
-                args: manifest.args,
-                env: manifest.env,
-                capabilities_preview: manifest.capabilities_preview,
-            },
-        );
+        self.entries.insert(key, incoming);
 
         Ok(())
     }
 
     fn into_entries(self) -> DriverCatalog {
         let mut entries: Vec<_> = self.entries.into_values().collect();
+        let mut registry_entries = self.registry_entries;
         entries.sort_by(|left, right| {
             (&left.kind, &left.name, left.source.precedence()).cmp(&(
                 &right.kind,
@@ -263,8 +274,25 @@ impl CatalogBuilder {
                 right.source.precedence(),
             ))
         });
+        registry_entries.sort_by(|left, right| {
+            (
+                &left.kind,
+                &left.name,
+                &left.version,
+                left.source.precedence(),
+            )
+                .cmp(&(
+                    &right.kind,
+                    &right.name,
+                    &right.version,
+                    right.source.precedence(),
+                ))
+        });
 
-        DriverCatalog { entries }
+        DriverCatalog {
+            entries,
+            registry_entries,
+        }
     }
 }
 
@@ -840,6 +868,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pinned.to_string(), "2.1.0");
+    }
+
+    #[test]
+    fn catalog_registers_lower_precedence_discovered_versions_for_pinning() {
+        let installed_root = make_temp_dir("catalog-register-installed-and-override");
+        let installed_driver = installed_root.join("custom-context-installed");
+        fs::create_dir_all(&installed_driver).unwrap();
+        touch_file(&installed_driver.join("bin/driver"));
+        write_manifest(
+            &installed_driver,
+            r#"{
+              "schema_version": "1.0",
+              "name": "custom-context",
+              "kind": "context",
+              "version": "1.0.0",
+              "binary": "./bin/driver"
+            }"#,
+        );
+
+        let override_driver = manifest_root_with_binary("catalog-register-override");
+        write_manifest(
+            &override_driver,
+            r#"{
+              "schema_version": "1.0",
+              "name": "custom-context",
+              "kind": "context",
+              "version": "2.0.0",
+              "binary": "./bin/driver"
+            }"#,
+        );
+
+        let catalog = DriverCatalog::discover(DriverDiscoveryConfig::new(
+            installed_root,
+            vec![override_driver],
+        ))
+        .unwrap();
+
+        let listing_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.kind == DriverKind::Context && entry.name == "custom-context")
+            .unwrap();
+        assert_eq!(listing_entry.source, DriverSource::DevelopmentOverride);
+        assert_eq!(listing_entry.version.to_string(), "2.0.0");
+
+        let mut registry = crate::registry::DriverRegistry::default();
+        catalog.register_with(&mut registry);
+
+        let installed_pin = registry
+            .pin(DriverKind::Context, "custom-context", Some("<2.0.0"))
+            .unwrap();
+        let override_pin = registry
+            .pin(
+                DriverKind::Context,
+                "custom-context",
+                Some(">=2.0.0,<3.0.0"),
+            )
+            .unwrap();
+
+        assert_eq!(installed_pin.to_string(), "1.0.0");
+        assert_eq!(override_pin.to_string(), "2.0.0");
     }
 
     #[test]
