@@ -11,5 +11,15 @@ readme = "README.md"
 description = "OpenShell sandbox driver scaffold for agentenv"
 
 [dependencies]
+agentenv-core = { path = "../../agentenv-core" }
 agentenv-policy = { path = "../../agentenv-policy" }
 agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+semver = "1"
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+driver-conformance = { path = "../../../tests/driver-conformance" }
+tokio = { version = "1", features = ["macros", "rt"] }
