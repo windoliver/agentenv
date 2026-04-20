@@ -751,6 +751,58 @@ mod tests {
     }
 
     #[test]
+    fn discovery_reads_installed_root() {
+        let installed_root = make_temp_dir("discovery-installed-only");
+        let root = installed_root.join("context-nexus");
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("bin/driver");
+        touch_file(&binary);
+        write_manifest(
+            &root,
+            r#"{
+              "schema_version": "1.0",
+              "name": "nexus",
+              "kind": "context",
+              "version": "0.2.0",
+              "description": "Installed Nexus context driver",
+              "binary": "./bin/driver",
+              "args": ["--stdio"],
+              "env": {"RUST_LOG": "warn"},
+              "capabilities_preview": {"is_remote": true}
+            }"#,
+        );
+
+        let catalog = DriverCatalog::discover(DriverDiscoveryConfig::new(
+            installed_root,
+            Vec::<PathBuf>::new(),
+        ))
+        .unwrap();
+
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.kind == DriverKind::Context && entry.name == "nexus")
+            .unwrap();
+
+        assert_eq!(entry.source, DriverSource::InstalledSubprocess);
+        assert_eq!(entry.binary.as_deref(), Some(binary.as_path()));
+        assert_eq!(
+            entry.manifest_path.as_deref(),
+            Some(root.join("manifest.json").as_path())
+        );
+        assert_eq!(
+            entry.description.as_deref(),
+            Some("Installed Nexus context driver")
+        );
+        assert_eq!(entry.args, vec!["--stdio"]);
+        assert_eq!(entry.env.get("RUST_LOG").unwrap(), "warn");
+        assert_eq!(
+            entry.capabilities_preview,
+            serde_json::json!({"is_remote": true})
+        );
+    }
+
+    #[test]
     fn development_override_wins_over_installed_and_builtin() {
         let installed_root = make_temp_dir("discovery-installed");
         let installed_driver = installed_root.join("codex-installed");
