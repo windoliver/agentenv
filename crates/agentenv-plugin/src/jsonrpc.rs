@@ -56,6 +56,7 @@ pub struct JsonRpcClientConfig {
 
 pub struct JsonRpcClient {
     child: Mutex<Option<Child>>,
+    rpc: Mutex<()>,
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
     next_id: AtomicU64,
@@ -269,6 +270,7 @@ impl JsonRpcClient {
 
         Ok(Self {
             child: Mutex::new(Some(child)),
+            rpc: Mutex::new(()),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
             next_id: AtomicU64::new(1),
@@ -281,6 +283,7 @@ impl JsonRpcClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        let _rpc_guard = self.rpc.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -570,8 +573,14 @@ mod tests {
 
 #[cfg(test)]
 mod async_client_tests {
+    use std::fs;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
@@ -629,5 +638,137 @@ mod async_client_tests {
 
         assert!(err.to_string().contains("-32601"));
         client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_serializes_concurrent_calls() {
+        let driver = write_racy_driver_script();
+
+        let client = Arc::new(
+            JsonRpcClient::spawn(JsonRpcClientConfig {
+                binary: driver,
+                args: Vec::new(),
+                env: Default::default(),
+                timeout: Duration::from_secs(5),
+            })
+            .await
+            .unwrap(),
+        );
+
+        let first = client.clone();
+        let second = client.clone();
+        let (left, right) = tokio::join!(
+            async move {
+                first
+                    .call::<_, agentenv_proto::PreflightResult>(
+                        "preflight",
+                        &agentenv_proto::PreflightParams::default(),
+                    )
+                    .await
+            },
+            async move {
+                second
+                    .call::<_, agentenv_proto::PreflightResult>(
+                        "preflight",
+                        &agentenv_proto::PreflightParams::default(),
+                    )
+                    .await
+            }
+        );
+
+        assert!(left.unwrap().ok);
+        assert!(right.unwrap().ok);
+
+        let mut client =
+            Arc::try_unwrap(client).unwrap_or_else(|_| panic!("all Arc clones dropped after join"));
+        client.shutdown().await.unwrap();
+    }
+
+    fn write_racy_driver_script() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agentenv-jsonrpc-racy-{}-{}.py",
+            std::process::id(),
+            unique
+        ));
+        let script = r#"#!/usr/bin/env python3
+import json
+import select
+import sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\n", b"\r\n"):
+            break
+        key, value = line.decode("utf-8").split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    length = int(headers["content-length"])
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(message):
+    payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
+
+def response(request):
+    if request["method"] == "preflight":
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"ok": True, "issues": []},
+        }
+    if request["method"] == "shutdown":
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {},
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "error": {"code": -32601, "message": "method not found"},
+    }
+
+first = read_message()
+if first is None:
+    sys.exit(0)
+
+if first["method"] == "preflight":
+    if select.select([sys.stdin], [], [], 0.1)[0]:
+        second = read_message()
+        if second is not None:
+            write_message(response(second))
+        write_message(response(first))
+    else:
+        write_message(response(first))
+else:
+    write_message(response(first))
+
+while True:
+    next_request = read_message()
+    if next_request is None:
+        break
+    write_message(response(next_request))
+    if next_request["method"] == "shutdown":
+        break
+"#;
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = file.metadata().unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        path
     }
 }
