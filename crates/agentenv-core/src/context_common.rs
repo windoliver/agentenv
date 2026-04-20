@@ -185,8 +185,9 @@ mod tests {
 
     use super::{
         context_initialize, empty_credential_requirements, empty_network_rules, empty_result,
-        endpoint_host_rule, expand_tilde, local_context_capabilities, optional_bool,
-        optional_string_list, remote_context_capabilities, required_object, required_string,
+        endpoint_host_rule, expand_tilde, local_context_capabilities, object_required_string,
+        optional_bool, optional_string, optional_string_list, remote_context_capabilities,
+        required_object, required_string, successful_preflight,
     };
 
     #[test]
@@ -229,6 +230,7 @@ mod tests {
         let spec = ContextSpec {
             config: BTreeMap::from([
                 ("mount".to_owned(), json!("/tmp/project")),
+                ("nickname".to_owned(), json!("alice")),
                 ("readonly".to_owned(), json!(false)),
                 ("exclude".to_owned(), json!([".git/", "target/"])),
                 (
@@ -241,6 +243,10 @@ mod tests {
         assert_eq!(
             required_string(&spec.config, "mount").unwrap(),
             "/tmp/project"
+        );
+        assert_eq!(
+            optional_string(&spec.config, "nickname").unwrap(),
+            Some("alice".to_owned())
         );
         assert_eq!(
             optional_bool(&spec.config, "readonly").unwrap(),
@@ -257,6 +263,38 @@ mod tests {
                 .unwrap(),
             &json!("https://example.com/mcp")
         );
+    }
+
+    #[test]
+    fn config_helpers_reject_invalid_types_and_empty_strings() {
+        let spec = ContextSpec {
+            config: BTreeMap::from([
+                ("nickname".to_owned(), json!(42)),
+                ("profile".to_owned(), json!("")),
+            ]),
+        };
+
+        let err = optional_string(&spec.config, "nickname").expect_err("wrong type must fail");
+        assert!(matches!(
+            err,
+            crate::driver::DriverError::InvalidConfig { field, message }
+                if field == "nickname" && message == "must be a string"
+        ));
+
+        let err = object_required_string(
+            required_object(
+                &BTreeMap::from([("profile".to_owned(), json!({"name": ""}))]),
+                "profile",
+            )
+            .unwrap(),
+            "name",
+        )
+        .expect_err("empty string must fail");
+        assert!(matches!(
+            err,
+            crate::driver::DriverError::InvalidConfig { field, message }
+                if field == "name" && message == "must not be empty"
+        ));
     }
 
     #[test]
@@ -289,6 +327,12 @@ mod tests {
         assert_eq!(empty_result(), agentenv_proto::EmptyResult {});
         assert!(empty_network_rules().rules.is_empty());
         assert!(empty_credential_requirements().requirements.is_empty());
+    }
+
+    #[test]
+    fn successful_preflight_reports_ok_without_issues() {
+        assert_eq!(successful_preflight().ok, true);
+        assert!(successful_preflight().issues.is_empty());
     }
 
     #[test]
