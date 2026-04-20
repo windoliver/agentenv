@@ -17,8 +17,12 @@ pub type DriverResult<T> = Result<T, DriverError>;
 #[derive(Debug)]
 pub enum DriverError {
     SchemaVersion(SchemaVersionError),
-    CapabilityMissing { capability: String },
-    PreflightFailed { message: String },
+    CapabilityMissing {
+        capability: String,
+    },
+    PreflightFailed {
+        message: String,
+    },
     CommandSpawn {
         command: String,
         source: std::io::Error,
@@ -29,8 +33,12 @@ pub enum DriverError {
         stdout: String,
         stderr: String,
     },
-    PolicyTranslation { message: String },
-    InvalidInput { message: String },
+    PolicyTranslation {
+        message: String,
+    },
+    InvalidInput {
+        message: String,
+    },
 }
 
 pub fn ensure_protocol_compatible(result: &InitializeResult) -> DriverResult<()> {
