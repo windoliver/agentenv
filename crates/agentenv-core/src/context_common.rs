@@ -178,15 +178,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     use agentenv_proto::{
-        Capabilities, ContextCapabilities, ContextSpec, HttpAccessLevel, McpEndpoint, McpTransport,
-        NetworkTarget,
+        Capabilities, ContextCapabilities, ContextSpec, DriverKind, HttpAccessLevel, McpEndpoint,
+        McpTransport, NetworkTarget, SCHEMA_VERSION,
     };
     use serde_json::json;
 
     use super::{
-        context_initialize, empty_credential_requirements, empty_network_rules, endpoint_host_rule,
-        expand_tilde, local_context_capabilities, optional_bool, optional_string_list,
-        remote_context_capabilities, required_object, required_string,
+        context_initialize, empty_credential_requirements, empty_network_rules, empty_result,
+        endpoint_host_rule, expand_tilde, local_context_capabilities, optional_bool,
+        optional_string_list, remote_context_capabilities, required_object, required_string,
     };
 
     #[test]
@@ -194,6 +194,9 @@ mod tests {
         let result = context_initialize("filesystem", local_context_capabilities());
 
         assert_eq!(result.driver.name, "filesystem");
+        assert_eq!(result.driver.kind, DriverKind::Context);
+        assert_eq!(result.driver.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(result.driver.protocol_version, SCHEMA_VERSION);
         let Capabilities::Context(capabilities) = result.capabilities else {
             panic!("expected context capabilities");
         };
@@ -283,6 +286,7 @@ mod tests {
 
     #[test]
     fn empty_results_are_empty() {
+        assert_eq!(empty_result(), agentenv_proto::EmptyResult {});
         assert!(empty_network_rules().rules.is_empty());
         assert!(empty_credential_requirements().requirements.is_empty());
     }
@@ -292,5 +296,17 @@ mod tests {
         let expanded = expand_tilde("~/project", Some("/home/alice"));
 
         assert_eq!(expanded.to_string_lossy(), "/home/alice/project");
+    }
+
+    #[test]
+    fn tilde_expansion_handles_root_and_plain_paths() {
+        assert_eq!(
+            expand_tilde("~", Some("/home/alice")).to_string_lossy(),
+            "/home/alice"
+        );
+        assert_eq!(
+            expand_tilde("plain/path", Some("/home/alice")).to_string_lossy(),
+            "plain/path"
+        );
     }
 }
