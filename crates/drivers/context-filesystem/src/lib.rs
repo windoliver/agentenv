@@ -3,6 +3,7 @@
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -27,6 +28,7 @@ use thiserror::Error;
 pub const CRATE_NAME: &str = "context-filesystem";
 const DRIVER_NAME: &str = "filesystem";
 const MAX_READ_BYTES: u64 = 1024 * 1024;
+const MAX_TRAVERSAL_ENTRIES: usize = 100_000;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
@@ -190,14 +192,22 @@ impl FilesystemMcpServer {
         let mut matches = Vec::new();
         for relative in paths {
             let full = self.root.join(&relative);
-            if fs::metadata(&full)
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(true)
-            {
+            let Ok(metadata) = fs::metadata(&full) else {
+                continue;
+            };
+            if metadata.is_dir() || metadata.len() > MAX_READ_BYTES {
                 continue;
             }
 
-            let Ok(content) = fs::read_to_string(&full) else {
+            let Ok(file) = fs::File::open(&full) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            let mut reader = file.take(MAX_READ_BYTES + 1);
+            if reader.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_READ_BYTES {
+                continue;
+            }
+            let Ok(content) = String::from_utf8(bytes) else {
                 continue;
             };
             for (index, line) in content.lines().enumerate() {
@@ -259,6 +269,10 @@ impl FilesystemMcpServer {
         if !canonical.starts_with(&self.root) {
             return Err(FsMcpError::OutsideRoot(path.to_owned()));
         }
+        let canonical_relative = self.relative_string(&canonical)?;
+        if self.is_excluded(&canonical_relative) {
+            return Err(FsMcpError::Excluded(path.to_owned()));
+        }
 
         Ok(canonical)
     }
@@ -269,6 +283,17 @@ impl FilesystemMcpServer {
         recursive: bool,
         paths: &mut Vec<String>,
     ) -> Result<(), FsMcpError> {
+        let mut traversed = 0;
+        self.collect_paths_inner(root, recursive, paths, &mut traversed)
+    }
+
+    fn collect_paths_inner(
+        &self,
+        root: &Path,
+        recursive: bool,
+        paths: &mut Vec<String>,
+        traversed: &mut usize,
+    ) -> Result<(), FsMcpError> {
         let metadata = fs::metadata(root).map_err(|source| FsMcpError::Io {
             path: root.display().to_string(),
             source,
@@ -278,6 +303,47 @@ impl FilesystemMcpServer {
             return Ok(());
         }
 
+        for path in self.sorted_child_paths(root, traversed)? {
+            let relative = self.relative_string(&path)?;
+            if self.is_excluded(&relative) {
+                continue;
+            }
+
+            let Ok(symlink_metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let Ok(canonical) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if !canonical.starts_with(&self.root) {
+                continue;
+            }
+            let canonical_relative = self.relative_string(&canonical)?;
+            if self.is_excluded(&canonical_relative) {
+                continue;
+            }
+
+            let Ok(metadata) = fs::metadata(&canonical) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if recursive && !symlink_metadata.file_type().is_symlink() {
+                    self.collect_paths_inner(&path, recursive, paths, traversed)?;
+                }
+            } else if metadata.is_file() {
+                paths.push(relative);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sorted_child_paths(
+        &self,
+        root: &Path,
+        traversed: &mut usize,
+    ) -> Result<Vec<PathBuf>, FsMcpError> {
+        let mut paths = Vec::new();
         for entry in fs::read_dir(root).map_err(|source| FsMcpError::Io {
             path: root.display().to_string(),
             source,
@@ -286,31 +352,20 @@ impl FilesystemMcpServer {
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
-            let path = entry.path();
-            let relative = self.relative_string(&path)?;
-            if self.is_excluded(&relative) {
-                continue;
-            }
-
-            let Ok(canonical) = fs::canonicalize(&path) else {
-                continue;
-            };
-            if !canonical.starts_with(&self.root) {
-                continue;
-            }
-
-            let Ok(metadata) = fs::metadata(&canonical) else {
-                continue;
-            };
-            if metadata.is_dir() {
-                if recursive {
-                    self.collect_paths(&path, recursive, paths)?;
-                }
-            } else if metadata.is_file() {
-                paths.push(relative);
-            }
+            Self::count_traversal_entry(traversed)?;
+            paths.push(entry.path());
         }
+        paths.sort();
+        Ok(paths)
+    }
 
+    fn count_traversal_entry(traversed: &mut usize) -> Result<(), FsMcpError> {
+        if *traversed >= MAX_TRAVERSAL_ENTRIES {
+            return Err(FsMcpError::InvalidParams(
+                "filesystem traversal limit exceeded".to_owned(),
+            ));
+        }
+        *traversed += 1;
         Ok(())
     }
 
@@ -685,7 +740,7 @@ mod mcp_tool_tests {
 
     use serde_json::json;
 
-    use super::{FilesystemMcpServer, ToolCall};
+    use super::{FilesystemMcpServer, ToolCall, MAX_READ_BYTES};
 
     #[test]
     fn tools_list_advertises_expected_tools() {
@@ -880,6 +935,98 @@ mod mcp_tool_tests {
             .unwrap();
 
         assert_eq!(listed, json!({"paths": ["alpha.txt"]}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_excluded_directory_target_is_blocked_and_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("secret")).unwrap();
+        fs::write(tmp.path().join("secret/token.txt"), "secret-token\n").unwrap();
+        symlink(tmp.path().join("secret"), tmp.path().join("public")).unwrap();
+        let server =
+            FilesystemMcpServer::new(tmp.path().to_path_buf(), true, vec!["secret/".to_owned()])
+                .unwrap();
+
+        let err = server
+            .call_tool(ToolCall {
+                name: "fs_read".to_owned(),
+                arguments: json!({"path": "public/token.txt"}),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("excluded"));
+
+        let listed = server
+            .call_tool(ToolCall {
+                name: "fs_list".to_owned(),
+                arguments: json!({"path": ".", "recursive": true}),
+            })
+            .unwrap();
+        assert_eq!(listed, json!({"paths": []}));
+
+        let searched = server
+            .call_tool(ToolCall {
+                name: "fs_search".to_owned(),
+                arguments: json!({"query": "token"}),
+            })
+            .unwrap();
+        assert_eq!(searched, json!({"paths": []}));
+
+        let grep = server
+            .call_tool(ToolCall {
+                name: "fs_grep".to_owned(),
+                arguments: json!({"pattern": "secret-token"}),
+            })
+            .unwrap();
+        assert_eq!(grep, json!({"matches": []}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_directory_loop_is_not_followed_during_recursive_listing() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("ordinary.txt"), "ordinary\n").unwrap();
+        symlink(".", tmp.path().join("loop")).unwrap();
+        let server = FilesystemMcpServer::new(tmp.path().to_path_buf(), true, Vec::new()).unwrap();
+
+        let listed = server
+            .call_tool(ToolCall {
+                name: "fs_list".to_owned(),
+                arguments: json!({"path": ".", "recursive": true}),
+            })
+            .unwrap();
+
+        assert_eq!(listed, json!({"paths": ["ordinary.txt"]}));
+    }
+
+    #[test]
+    fn fs_grep_skips_files_larger_than_read_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut content = vec![b'a'; MAX_READ_BYTES as usize + 1];
+        content[0..6].copy_from_slice(b"needle");
+        fs::write(tmp.path().join("huge.txt"), content).unwrap();
+        fs::write(tmp.path().join("small.txt"), "needle\n").unwrap();
+        let server = FilesystemMcpServer::new(tmp.path().to_path_buf(), true, Vec::new()).unwrap();
+
+        let grep = server
+            .call_tool(ToolCall {
+                name: "fs_grep".to_owned(),
+                arguments: json!({"pattern": "needle"}),
+            })
+            .unwrap();
+
+        assert_eq!(
+            grep,
+            json!({
+                "matches": [
+                    {"path": "small.txt", "line": 1, "text": "needle"}
+                ]
+            })
+        );
     }
 
     #[cfg(unix)]
