@@ -10,6 +10,9 @@ authors.workspace = true
 readme = "README.md"
 description = "OpenShell sandbox driver scaffold for agentenv"
 
+[features]
+integration = []
+
 [dependencies]
 agentenv-core = { path = "../../agentenv-core" }
 agentenv-policy = { path = "../../agentenv-policy" }
