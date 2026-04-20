@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use serde_json::Value;
 
 #[test]
-fn process_smoke_reads_file_over_stdio() {
+fn process_smoke_exercises_initialize_tools_list_and_read_over_stdio() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("note.txt"), "hello").unwrap();
     let binary = env!("CARGO_BIN_EXE_agentenv-fs-mcp");
@@ -16,21 +16,58 @@ fn process_smoke_reads_file_over_stdio() {
         .spawn()
         .unwrap();
 
-    let request = serde_json::json!({
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let initialize_request = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 7,
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    });
+    write_framed_json(&mut stdin, &initialize_request).unwrap();
+    let initialize_response = read_framed_json(&mut reader).unwrap();
+    assert_eq!(
+        initialize_response["result"]["serverInfo"]["name"],
+        "agentenv-fs-mcp"
+    );
+
+    let list_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    });
+    write_framed_json(&mut stdin, &list_request).unwrap();
+    let list_response = read_framed_json(&mut reader).unwrap();
+    let tool_names: Vec<_> = list_response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tool_names,
+        vec!["fs_grep", "fs_list", "fs_read", "fs_search"]
+    );
+
+    let read_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
         "method": "tools/call",
         "params": {"name": "fs_read", "arguments": {"path": "note.txt"}}
     });
-    write_framed_json(child.stdin.as_mut().unwrap(), &request).unwrap();
-    drop(child.stdin.take());
+    write_framed_json(&mut stdin, &read_request).unwrap();
+    drop(stdin);
 
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let response = read_framed_json(&mut reader).unwrap();
+    let read_response = read_framed_json(&mut reader).unwrap();
     let status = child.wait().unwrap();
 
     assert!(status.success());
-    assert_eq!(response["result"], serde_json::json!({"content": "hello"}));
+    assert_eq!(
+        read_response["result"],
+        serde_json::json!({"content": "hello"})
+    );
 }
 
 fn write_framed_json<W: Write>(writer: &mut W, message: &Value) -> io::Result<()> {

@@ -23,7 +23,7 @@ use agentenv_proto::{
     PreflightResult, RequiredNetworkRulesResult, ShutdownParams,
 };
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub const CRATE_NAME: &str = "context-mcp-generic";
 const DRIVER_NAME: &str = "mcp-generic";
@@ -34,6 +34,7 @@ const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum ProbeExpectation {
     ValidInitialize,
     InvalidInitialize,
+    EmptyInitializeResult,
 }
 
 #[derive(Debug, Clone)]
@@ -354,15 +355,39 @@ async fn send_mcp_initialize(client: reqwest::Client, url: &str) -> DriverResult
 
     if body.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
         || body.get("id") != Some(&json!(1))
-        || body.get("result").is_none()
-        || body.get("result") == Some(&serde_json::Value::Null)
+        || !body
+            .get("result")
+            .is_some_and(is_valid_mcp_initialize_result)
     {
         return Err(DriverError::PreflightFailed {
-            message: "MCP initialize response did not contain a JSON-RPC result".to_owned(),
+            message: "MCP initialize response did not contain a valid MCP initialize result"
+                .to_owned(),
         });
     }
 
     Ok(())
+}
+
+fn is_valid_mcp_initialize_result(result: &Value) -> bool {
+    let Some(result) = result.as_object() else {
+        return false;
+    };
+
+    has_non_empty_string(result.get("protocolVersion"))
+        && result.get("capabilities").is_some_and(Value::is_object)
+        && result.get("serverInfo").is_some_and(|server_info| {
+            let Some(server_info) = server_info.as_object() else {
+                return false;
+            };
+            has_non_empty_string(server_info.get("name"))
+                && has_non_empty_string(server_info.get("version"))
+        })
+}
+
+fn has_non_empty_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn invalid_handle(handle: &str) -> DriverError {
@@ -459,6 +484,15 @@ mod tests {
     #[tokio::test]
     async fn initialize_probe_rejects_non_mcp_response() {
         let server = spawn_probe_server(ProbeExpectation::InvalidInitialize);
+
+        let err = probe_mcp_initialize(&server.url()).await.unwrap_err();
+
+        assert!(err.to_string().contains("MCP initialize"));
+    }
+
+    #[tokio::test]
+    async fn initialize_probe_rejects_empty_initialize_result() {
+        let server = spawn_probe_server(ProbeExpectation::EmptyInitializeResult);
 
         let err = probe_mcp_initialize(&server.url()).await.unwrap_err();
 
@@ -611,6 +645,11 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": null
+                }),
+                ProbeExpectation::EmptyInitializeResult => json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {}
                 }),
             };
             let body = serde_json::to_string(&body).unwrap();
