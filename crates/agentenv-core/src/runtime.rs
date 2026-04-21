@@ -123,6 +123,24 @@ pub struct CreateResult {
     pub state_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EnvListRow {
+    pub name: String,
+    pub agent: String,
+    pub sandbox: String,
+    pub context: String,
+    pub inference: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EnvDescription {
+    pub state: crate::env::EnvStateFile,
+    pub blueprint_yaml: String,
+    pub lock_yaml: String,
+}
+
 struct CreateEnvRollback<'a> {
     temp_workspace: PathBuf,
     sandbox: Option<(&'a dyn SandboxDriver, String)>,
@@ -545,6 +563,93 @@ pub async fn create_env(
     result
 }
 
+pub fn list_envs(options: &RuntimeOptions) -> RuntimeResult<Vec<EnvListRow>> {
+    let envs_dir = options.root.join("envs");
+    if !envs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    for entry in fs::read_dir(&envs_dir).map_err(|source| crate::env::EnvError::Io {
+        path: envs_dir.clone(),
+        source,
+    })? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                return Err(crate::env::EnvError::Io {
+                    path: envs_dir.clone(),
+                    source,
+                }
+                .into());
+            }
+        };
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(env_name) = crate::env::validate_env_name(&name) else {
+            continue;
+        };
+
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let Ok(state) = crate::env::read_state(&paths) else {
+            continue;
+        };
+
+        rows.push(EnvListRow {
+            name: state.name,
+            agent: state.drivers.agent.name,
+            sandbox: state.drivers.sandbox.name,
+            context: state.drivers.context.name,
+            inference: state.drivers.inference.map(|driver| driver.name),
+            status: env_phase_status(state.phase),
+            created_at: state.created_at,
+        });
+    }
+
+    rows.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(rows)
+}
+
+pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDescription> {
+    let env_name = crate::env::validate_env_name(name)?;
+    let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+    if !paths.env_dir().is_dir() {
+        return Err(crate::env::EnvError::NotFound {
+            name: name.to_owned(),
+        }
+        .into());
+    }
+
+    let state = crate::env::read_state(&paths)?;
+    let blueprint_path = paths.blueprint_path();
+    let blueprint_yaml =
+        fs::read_to_string(&blueprint_path).map_err(|source| crate::env::EnvError::Io {
+            path: blueprint_path.clone(),
+            source,
+        })?;
+    let lock_path = paths.lock_path();
+    let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| crate::env::EnvError::Io {
+        path: lock_path.clone(),
+        source,
+    })?;
+
+    Ok(EnvDescription {
+        state,
+        blueprint_yaml,
+        lock_yaml,
+    })
+}
+
 fn create_temp_workspace(root: &Path, name: &str) -> PathBuf {
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -555,6 +660,17 @@ fn create_temp_workspace(root: &Path, name: &str) -> PathBuf {
 
     root.join(".agentenv-tmp")
         .join(format!("create-{name}-{pid}-{nanos}-{seq}"))
+}
+
+fn env_phase_status(phase: crate::env::EnvPhase) -> String {
+    match phase {
+        crate::env::EnvPhase::Creating => "creating",
+        crate::env::EnvPhase::Running => "running",
+        crate::env::EnvPhase::Destroying => "destroying",
+        crate::env::EnvPhase::Destroyed => "destroyed",
+        crate::env::EnvPhase::Error => "error",
+    }
+    .to_owned()
 }
 
 fn ensure_runtime_handshake(
@@ -1929,6 +2045,46 @@ policy:
         assert!(env_dir.join("lock.yaml").is_file());
         assert!(env_dir.join("state.json").is_file());
         assert!(env_dir.join("events.jsonl").is_file());
+    }
+
+    #[tokio::test]
+    async fn list_and_describe_read_persisted_state() {
+        let root =
+            std::env::temp_dir().join(format!("agentenv-list-describe-{}", std::process::id()));
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &TinyFactory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        let rows = super::list_envs(&options).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "demo");
+        assert_eq!(rows[0].agent, "codex");
+
+        let described = super::describe_env(&options, "demo").unwrap();
+        assert_eq!(described.state.name, "demo");
+        assert!(described.blueprint_yaml.contains("driver: codex"));
+        assert!(described.lock_yaml.contains("blueprint_hash:"));
     }
 
     #[tokio::test]
