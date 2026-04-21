@@ -336,9 +336,13 @@ async fn send_mcp_initialize(client: reqwest::Client, url: &str) -> DriverResult
             message: format!("MCP initialize request failed: {err}"),
         })?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    if is_auth_challenge(status) {
+        return Ok(());
+    }
+    if !status.is_success() {
         return Err(DriverError::PreflightFailed {
-            message: format!("MCP initialize returned HTTP {}", response.status()),
+            message: format!("MCP initialize returned HTTP {status}"),
         });
     }
 
@@ -388,6 +392,10 @@ fn has_non_empty_string(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn is_auth_challenge(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
 }
 
 fn invalid_handle(handle: &str) -> DriverError {
@@ -497,6 +505,15 @@ mod tests {
         let err = probe_mcp_initialize(&server.url()).await.unwrap_err();
 
         assert!(err.to_string().contains("MCP initialize"));
+    }
+
+    #[tokio::test]
+    async fn initialize_probe_accepts_auth_challenges() {
+        for status in [401, 403] {
+            let server = spawn_status_server(status);
+
+            probe_mcp_initialize(&server.url()).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -712,6 +729,31 @@ mod tests {
             target_thread
                 .join()
                 .expect("redirect target thread should finish");
+        });
+
+        ProbeServer {
+            url,
+            addr,
+            thread: Some(thread),
+        }
+    }
+
+    fn spawn_status_server(status: u16) -> ProbeServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let read = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            assert!(request.contains("initialize"));
+
+            write!(
+                stream,
+                "HTTP/1.1 {status} Auth Required\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
         });
 
         ProbeServer {
