@@ -1,13 +1,16 @@
-use std::{fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use agentenv_proto::{
-    AgentSpec, ContextSpec, InferenceSpec, InitializeParams, InitializeResult, LogLevel,
-    PreflightParams, SCHEMA_VERSION,
+    AgentSpec, Capabilities, ContextSpec, DriverKind, InferenceSpec, InitializeParams,
+    InitializeResult, LogLevel, PreflightParams, SCHEMA_VERSION,
 };
 use thiserror::Error;
 
 use crate::{
-    driver::{AgentDriver, ContextDriver, DriverError, InferenceDriver, SandboxDriver},
+    driver::{
+        ensure_protocol_compatible, AgentDriver, ContextDriver, DriverError, InferenceDriver,
+        SandboxDriver,
+    },
     env::EnvError,
 };
 
@@ -41,8 +44,33 @@ pub trait CredentialProvider {
     fn resolve(
         &mut self,
         requirement: &agentenv_proto::CredentialRequirement,
-    ) -> RuntimeResult<Option<String>>;
+    ) -> RuntimeResult<Option<RuntimeSecret>>;
     fn backend_name(&self, name: &str) -> RuntimeResult<Option<String>>;
+}
+
+#[derive(Clone)]
+pub struct RuntimeSecret(String);
+
+impl RuntimeSecret {
+    pub fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RuntimeSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RuntimeSecret([redacted])")
+    }
+}
+
+impl fmt::Display for RuntimeSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
 }
 
 #[derive(Debug, Error)]
@@ -59,6 +87,20 @@ pub enum RuntimeError {
     MissingCredential { name: String },
     #[error("command exited with status {status}")]
     CommandStatus { status: i32 },
+    #[error("failed to convert component config key `{key}`: {source}")]
+    ComponentConfigConversion {
+        key: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("invalid initialize handshake for {helper}: expected kind `{expected_kind:?}` and capabilities `{expected_capability}`, got kind `{actual_kind:?}` and capabilities `{actual_capability}`")]
+    InvalidDriverHandshake {
+        helper: &'static str,
+        expected_kind: DriverKind,
+        actual_kind: DriverKind,
+        expected_capability: &'static str,
+        actual_capability: &'static str,
+    },
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -67,40 +109,99 @@ pub async fn initialize_sandbox_driver(
     options: &RuntimeOptions,
     driver: &mut dyn SandboxDriver,
 ) -> RuntimeResult<InitializeResult> {
-    driver
+    let result = driver
         .initialize(initialize_params(options))
         .await
-        .map_err(Into::into)
+        .map_err(RuntimeError::from)?;
+    ensure_runtime_handshake(DriverKind::Sandbox, "sandbox", &result)?;
+    Ok(result)
 }
 
 pub async fn initialize_agent_driver(
     options: &RuntimeOptions,
     driver: &mut dyn AgentDriver,
 ) -> RuntimeResult<InitializeResult> {
-    driver
+    let result = driver
         .initialize(initialize_params(options))
         .await
-        .map_err(Into::into)
+        .map_err(RuntimeError::from)?;
+    ensure_runtime_handshake(DriverKind::Agent, "agent", &result)?;
+    Ok(result)
 }
 
 pub async fn initialize_context_driver(
     options: &RuntimeOptions,
     driver: &mut dyn ContextDriver,
 ) -> RuntimeResult<InitializeResult> {
-    driver
+    let result = driver
         .initialize(initialize_params(options))
         .await
-        .map_err(Into::into)
+        .map_err(RuntimeError::from)?;
+    ensure_runtime_handshake(DriverKind::Context, "context", &result)?;
+    Ok(result)
 }
 
 pub async fn initialize_inference_driver(
     options: &RuntimeOptions,
     driver: &mut dyn InferenceDriver,
 ) -> RuntimeResult<InitializeResult> {
-    driver
+    let result = driver
         .initialize(initialize_params(options))
         .await
-        .map_err(Into::into)
+        .map_err(RuntimeError::from)?;
+    ensure_runtime_handshake(DriverKind::Inference, "inference", &result)?;
+    Ok(result)
+}
+
+fn ensure_runtime_handshake(
+    expected_kind: DriverKind,
+    helper: &'static str,
+    result: &InitializeResult,
+) -> RuntimeResult<()> {
+    ensure_protocol_compatible(result).map_err(RuntimeError::from)?;
+
+    if result.driver.kind != expected_kind {
+        return Err(RuntimeError::InvalidDriverHandshake {
+            helper,
+            expected_kind: expected_kind.clone(),
+            actual_kind: result.driver.kind.clone(),
+            expected_capability: expected_capability_name(&expected_kind),
+            actual_capability: actual_capability_name(&result.capabilities),
+        });
+    }
+
+    let expected_capability = expected_capability_name(&expected_kind);
+    let actual_capability = actual_capability_name(&result.capabilities);
+
+    if actual_capability != expected_capability {
+        return Err(RuntimeError::InvalidDriverHandshake {
+            helper,
+            expected_kind: expected_kind.clone(),
+            actual_kind: result.driver.kind.clone(),
+            expected_capability,
+            actual_capability,
+        });
+    }
+
+    Ok(())
+}
+
+fn expected_capability_name(expected: &DriverKind) -> &'static str {
+    match expected {
+        DriverKind::Sandbox => "sandbox",
+        DriverKind::Agent => "agent",
+        DriverKind::Context => "context",
+        DriverKind::Inference => "inference",
+    }
+}
+
+fn actual_capability_name(capabilities: &Capabilities) -> &'static str {
+    match capabilities {
+        Capabilities::Sandbox(_) => "sandbox",
+        Capabilities::Agent(_) => "agent",
+        Capabilities::Context(_) => "context",
+        Capabilities::Inference(_) => "inference",
+    }
 }
 
 fn initialize_params(options: &RuntimeOptions) -> InitializeParams {
@@ -117,36 +218,37 @@ pub fn empty_preflight_params() -> PreflightParams {
 }
 
 pub fn component_spec(
-    extra: std::collections::BTreeMap<String, serde_yaml::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
+    extra: BTreeMap<String, serde_yaml::Value>,
+) -> RuntimeResult<serde_json::Map<String, serde_json::Value>> {
     extra
         .into_iter()
-        .filter_map(|(key, value)| serde_json::to_value(value).ok().map(|value| (key, value)))
+        .map(|(key, value)| match serde_json::to_value(value) {
+            Ok(value) => Ok((key, value)),
+            Err(source) => Err(RuntimeError::ComponentConfigConversion { key, source }),
+        })
         .collect()
 }
 
 pub fn agent_spec(
-    extra: std::collections::BTreeMap<String, serde_yaml::Value>,
+    extra: BTreeMap<String, serde_yaml::Value>,
     version: Option<String>,
-) -> AgentSpec {
-    AgentSpec {
+) -> RuntimeResult<AgentSpec> {
+    Ok(AgentSpec {
         version,
-        config: component_spec(extra).into_iter().collect(),
-    }
+        config: component_spec(extra)?.into_iter().collect(),
+    })
 }
 
-pub fn context_spec(extra: std::collections::BTreeMap<String, serde_yaml::Value>) -> ContextSpec {
-    ContextSpec {
-        config: component_spec(extra).into_iter().collect(),
-    }
+pub fn context_spec(extra: BTreeMap<String, serde_yaml::Value>) -> RuntimeResult<ContextSpec> {
+    Ok(ContextSpec {
+        config: component_spec(extra)?.into_iter().collect(),
+    })
 }
 
-pub fn inference_spec(
-    extra: std::collections::BTreeMap<String, serde_yaml::Value>,
-) -> InferenceSpec {
-    InferenceSpec {
-        config: component_spec(extra).into_iter().collect(),
-    }
+pub fn inference_spec(extra: BTreeMap<String, serde_yaml::Value>) -> RuntimeResult<InferenceSpec> {
+    Ok(InferenceSpec {
+        config: component_spec(extra)?.into_iter().collect(),
+    })
 }
 
 impl fmt::Debug for DriverSet {
@@ -266,8 +368,8 @@ mod tests {
     use crate::driver::{ContextDriver, DriverResult, SandboxDriver};
 
     use super::{
-        initialize_context_driver, initialize_sandbox_driver, DriverFactory, DriverSet,
-        RuntimeOptions,
+        component_spec, initialize_context_driver, initialize_sandbox_driver, DriverFactory,
+        DriverSet, RuntimeError, RuntimeOptions, RuntimeSecret,
     };
 
     #[derive(Default)]
@@ -408,10 +510,7 @@ mod tests {
 
     #[async_trait]
     impl ContextDriver for TinyContextDriver {
-        async fn initialize(
-            &mut self,
-            params: InitializeParams,
-        ) -> DriverResult<InitializeResult> {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
             assert_eq!(params.schema_version, SCHEMA_VERSION);
             Ok(InitializeResult {
                 driver: DriverInfo {
@@ -508,6 +607,231 @@ mod tests {
 
         assert_eq!(sandbox_info.driver.name, "openshell");
         assert_eq!(context_info.driver.name, "filesystem");
+    }
+
+    fn bad_initialize_result(
+        kind: DriverKind,
+        protocol_version: &str,
+        capabilities: Capabilities,
+    ) -> InitializeResult {
+        InitializeResult {
+            driver: DriverInfo {
+                name: format!("{kind:?}").to_lowercase(),
+                kind,
+                version: "0.0.1-alpha0".to_owned(),
+                protocol_version: protocol_version.to_owned(),
+            },
+            capabilities,
+        }
+    }
+
+    struct HandshakeSandboxDriver {
+        init_result: InitializeResult,
+    }
+
+    #[async_trait]
+    impl SandboxDriver for HandshakeSandboxDriver {
+        async fn initialize(
+            &mut self,
+            _params: InitializeParams,
+        ) -> DriverResult<InitializeResult> {
+            Ok(self.init_result.clone())
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+        async fn create(
+            &self,
+            _spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            Ok(agentenv_proto::SandboxHandle {
+                handle: "sb-1".to_owned(),
+            })
+        }
+        async fn connect(
+            &self,
+            _params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            Ok(agentenv_proto::ShellHandle {
+                session_id: "sh-1".to_owned(),
+                tty: true,
+                working_dir: None,
+            })
+        }
+        async fn exec(
+            &self,
+            _params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            Ok(agentenv_proto::ExecResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        async fn copy_in(
+            &self,
+            _params: agentenv_proto::CopyInParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+        async fn copy_out(
+            &self,
+            _params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+        async fn apply_policy(
+            &self,
+            _params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            Ok(agentenv_proto::ApplyPolicyResult {
+                hot_reloaded: false,
+            })
+        }
+        async fn status(
+            &self,
+            _params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            Ok(agentenv_proto::SandboxStatus {
+                phase: agentenv_proto::SandboxPhase::Running,
+                healthy: true,
+                last_ping: None,
+            })
+        }
+        async fn logs(
+            &self,
+            _params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            Ok(agentenv_proto::LogsResult {
+                entries: Vec::new(),
+            })
+        }
+        async fn logs_stream(
+            &self,
+            _params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+        async fn stop(&self, _params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+        async fn destroy(
+            &self,
+            _params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_sandbox_driver_rejects_wrong_protocol() {
+        let mut driver = HandshakeSandboxDriver {
+            init_result: bad_initialize_result(
+                DriverKind::Sandbox,
+                "0.0.0",
+                Capabilities::Sandbox(SandboxCapabilities {
+                    supports_hot_reload_policy: true,
+                    supports_filesystem_lockdown: true,
+                    supports_syscall_filter: true,
+                    supports_native_inference_routing: true,
+                    supports_remote_host: false,
+                }),
+            ),
+        };
+        let options = RuntimeOptions {
+            root: std::env::temp_dir(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let err = initialize_sandbox_driver(&options, &mut driver)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Driver(_)));
+    }
+
+    #[tokio::test]
+    async fn initialize_sandbox_driver_rejects_wrong_kind_or_capabilities() {
+        let options = RuntimeOptions {
+            root: std::env::temp_dir(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let mut wrong_kind = HandshakeSandboxDriver {
+            init_result: bad_initialize_result(
+                DriverKind::Context,
+                SCHEMA_VERSION,
+                Capabilities::Context(ContextCapabilities {
+                    is_remote: false,
+                    is_shared: false,
+                    supports_zones: false,
+                    supports_snapshots: false,
+                }),
+            ),
+        };
+        let mut wrong_capabilities = HandshakeSandboxDriver {
+            init_result: bad_initialize_result(
+                DriverKind::Sandbox,
+                SCHEMA_VERSION,
+                Capabilities::Context(ContextCapabilities {
+                    is_remote: false,
+                    is_shared: false,
+                    supports_zones: false,
+                    supports_snapshots: false,
+                }),
+            ),
+        };
+
+        let wrong_kind = initialize_sandbox_driver(&options, &mut wrong_kind)
+            .await
+            .unwrap_err();
+        let wrong_capabilities = initialize_sandbox_driver(&options, &mut wrong_capabilities)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            wrong_kind,
+            RuntimeError::InvalidDriverHandshake { .. }
+        ));
+        assert!(matches!(
+            wrong_capabilities,
+            RuntimeError::InvalidDriverHandshake { .. }
+        ));
+    }
+
+    #[test]
+    fn component_spec_preserves_conversion_errors() {
+        let bad_yaml = "pkg:\n  ? [foo, bar]: value\n";
+        let extra: BTreeMap<String, serde_yaml::Value> =
+            serde_yaml::from_str(bad_yaml).expect("test yaml parse");
+
+        let err = component_spec(extra).unwrap_err();
+        match err {
+            RuntimeError::ComponentConfigConversion { key, .. } => {
+                assert_eq!(key, "pkg");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_secret_masks_secret_in_logs() {
+        let secret = RuntimeSecret::new("super-secret-value".to_owned());
+
+        assert_eq!(secret.expose_secret(), "super-secret-value");
+        assert!(!format!("{:?}", secret).contains("super-secret-value"));
+        assert!(!format!("{}", secret).contains("super-secret-value"));
     }
 
     #[test]
