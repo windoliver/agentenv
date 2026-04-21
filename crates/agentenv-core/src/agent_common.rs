@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use agentenv_proto::AgentHealthCheckProbe;
+use agentenv_proto::{AgentHealthCheckProbe, McpEndpoint, McpTransport};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -32,6 +32,10 @@ pub fn version_probe(binary: &str) -> AgentHealthCheckProbe {
         env: BTreeMap::new(),
         success_exit_codes: vec![0],
     }
+}
+
+pub fn is_no_context_mcp_endpoint(endpoint: &McpEndpoint) -> bool {
+    endpoint.transport == McpTransport::Stdio && endpoint.url.trim().is_empty()
 }
 
 fn is_safe_npm_version(version: &str) -> bool {
