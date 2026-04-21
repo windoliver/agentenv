@@ -84,6 +84,8 @@ pub enum RuntimeError {
     Lifecycle(#[from] crate::lifecycle::LifecycleError),
     #[error("unsupported driver `{name}` for {kind}")]
     UnsupportedDriver { kind: &'static str, name: String },
+    #[error("unknown policy tier `{tier}`")]
+    InvalidPolicyTier { tier: String },
     #[error("missing credential `{name}`")]
     MissingCredential { name: String },
     #[error("command exited with status {status}")]
@@ -113,6 +115,69 @@ pub struct CreateResult {
     pub admission: crate::admission::AdmissionReport,
     pub state: crate::env::EnvStateFile,
     pub state_path: PathBuf,
+}
+
+struct CreateEnvRollback<'a> {
+    env_dir: PathBuf,
+    reserved_env_dir: bool,
+    sandbox: Option<(&'a dyn SandboxDriver, String)>,
+    context: Option<(&'a dyn ContextDriver, String)>,
+    inference: Option<(&'a dyn InferenceDriver, String)>,
+}
+
+impl<'a> CreateEnvRollback<'a> {
+    fn new(env_dir: PathBuf) -> Self {
+        Self {
+            env_dir,
+            reserved_env_dir: false,
+            sandbox: None,
+            context: None,
+            inference: None,
+        }
+    }
+
+    fn set_context(&mut self, driver: &'a dyn ContextDriver, handle: String) {
+        self.context = Some((driver, handle));
+    }
+
+    fn set_inference(&mut self, driver: &'a dyn InferenceDriver, handle: String) {
+        self.inference = Some((driver, handle));
+    }
+
+    fn set_sandbox(&mut self, driver: &'a dyn SandboxDriver, handle: String) {
+        self.sandbox = Some((driver, handle));
+    }
+
+    fn mark_reserved(&mut self) {
+        self.reserved_env_dir = true;
+    }
+
+    async fn rollback(&self) {
+        if let Some((driver, handle)) = self.sandbox.as_ref() {
+            let _ = driver
+                .destroy(agentenv_proto::DestroyParams {
+                    handle: handle.clone(),
+                })
+                .await;
+        }
+        if let Some((driver, handle)) = self.inference.as_ref() {
+            let _ = driver
+                .teardown(agentenv_proto::InferenceHandleRequest {
+                    handle: handle.clone(),
+                })
+                .await;
+        }
+        if let Some((driver, handle)) = self.context.as_ref() {
+            let _ = driver
+                .teardown(agentenv_proto::ContextHandleRequest {
+                    handle: handle.clone(),
+                })
+                .await;
+        }
+        if self.reserved_env_dir {
+            let _ = fs::remove_dir_all(&self.env_dir);
+        }
+    }
 }
 
 pub async fn initialize_sandbox_driver(
@@ -258,12 +323,10 @@ pub async fn create_env(
         });
     }
 
-    let temp_env_name = crate::env::validate_env_name(&format!(".{}.creating", name))?;
-    let temp_paths = crate::env::EnvPaths::new(options.root.clone(), temp_env_name);
-    let temp_env_dir = temp_paths.env_dir();
+    let mut set = factory.build(&selection)?;
+    let mut rollback = CreateEnvRollback::new(env_dir.clone());
 
     let result = async {
-        let mut set = factory.build(&selection)?;
         initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
         initialize_agent_driver(options, set.agent.as_mut()).await?;
         initialize_context_driver(options, set.context.as_mut()).await?;
@@ -312,6 +375,7 @@ pub async fn create_env(
             .context
             .provision(context_spec(resolved.blueprint.context.extra.clone())?)
             .await?;
+        rollback.set_context(set.context.as_ref(), context_handle.handle.clone());
         let context_endpoint = set
             .context
             .mcp_endpoint(agentenv_proto::ContextHandleRequest {
@@ -333,6 +397,7 @@ pub async fn create_env(
                 let handle = inference
                     .provision(inference_spec(component.extra.clone())?)
                     .await?;
+                rollback.set_inference(inference.as_ref(), handle.handle.clone());
                 let endpoint = inference
                     .endpoint_in_sandbox(agentenv_proto::InferenceHandleRequest {
                         handle: handle.handle.clone(),
@@ -344,7 +409,7 @@ pub async fn create_env(
         };
 
         let mut policy = compose_policy(
-            parse_tier(&resolved.blueprint.policy.tier),
+            parse_tier(&resolved.blueprint.policy.tier)?,
             &parse_presets(&resolved.blueprint.policy.presets)?,
             policy_overrides(&resolved.blueprint.policy.overrides)?,
             &PresetRegistry::load_builtin().map_err(|err| {
@@ -364,26 +429,29 @@ pub async fn create_env(
             path: paths.envs_dir(),
             source,
         })?;
-        if temp_env_dir.exists() {
-            fs::remove_dir_all(&temp_env_dir).map_err(|source| crate::env::EnvError::Io {
-                path: temp_env_dir.clone(),
-                source,
-            })?;
-        }
-        fs::create_dir_all(&temp_env_dir).map_err(|source| crate::env::EnvError::Io {
-            path: temp_env_dir.clone(),
-            source,
+        fs::create_dir(&env_dir).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                crate::env::EnvError::AlreadyExists {
+                    name: name.to_owned(),
+                }
+            } else {
+                crate::env::EnvError::Io {
+                    path: env_dir.clone(),
+                    source,
+                }
+            }
         })?;
+        rollback.mark_reserved();
 
-        fs::write(temp_env_dir.join("blueprint.yaml"), blueprint_yaml).map_err(|source| {
+        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).map_err(|source| {
             crate::env::EnvError::Io {
-                path: temp_env_dir.join("blueprint.yaml"),
+                path: env_dir.join("blueprint.yaml"),
                 source,
             }
         })?;
-        fs::write(temp_env_dir.join("lock.yaml"), lock_yaml).map_err(|source| {
+        fs::write(env_dir.join("lock.yaml"), lock_yaml).map_err(|source| {
             crate::env::EnvError::Io {
-                path: temp_env_dir.join("lock.yaml"),
+                path: env_dir.join("lock.yaml"),
                 source,
             }
         })?;
@@ -397,6 +465,7 @@ pub async fn create_env(
                 metadata: BTreeMap::new(),
             })
             .await?;
+        rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle.handle.clone());
 
         let now = now_utc_string();
         let drivers = crate::env::StateDriverSet {
@@ -438,9 +507,9 @@ pub async fn create_env(
             first_enter_hint_shown: false,
         };
 
-        crate::env::write_state(&temp_paths, &state)?;
+        crate::env::write_state(&paths, &state)?;
         crate::env::append_event(
-            &temp_paths,
+            &paths,
             serde_json::json!({
                 "kind": "admission",
                 "status": "accepted",
@@ -448,10 +517,6 @@ pub async fn create_env(
                 "env": name,
             }),
         )?;
-        fs::rename(&temp_env_dir, &env_dir).map_err(|source| crate::env::EnvError::Io {
-            path: env_dir.clone(),
-            source,
-        })?;
 
         Ok(CreateResult {
             admission: crate::admission::AdmissionReport::accepted(name),
@@ -462,7 +527,7 @@ pub async fn create_env(
     .await;
 
     if result.is_err() {
-        let _ = fs::remove_dir_all(&temp_env_dir);
+        rollback.rollback().await;
     }
 
     result
@@ -599,11 +664,14 @@ fn now_utc_string() -> String {
     }
 }
 
-fn parse_tier(value: &str) -> Tier {
+fn parse_tier(value: &str) -> RuntimeResult<Tier> {
     match value {
-        "restricted" => Tier::Restricted,
-        "open" => Tier::Open,
-        _ => Tier::Balanced,
+        "restricted" => Ok(Tier::Restricted),
+        "balanced" => Ok(Tier::Balanced),
+        "open" => Ok(Tier::Open),
+        _ => Err(RuntimeError::InvalidPolicyTier {
+            tier: value.to_owned(),
+        }),
     }
 }
 
@@ -630,20 +698,68 @@ fn policy_overrides(
     let mut policy = empty_policy_override();
     for item in overrides {
         if let Some(allow) = item.allow.as_ref() {
-            policy.network.allow.push(url_pattern_rule(allow));
+            policy.network.allow.push(policy_override_network_rule(
+                allow,
+                PolicyOverrideTargetKind::AllowOrDeny,
+            ));
         }
         if let Some(deny) = item.deny.as_ref() {
-            policy.network.deny.push(url_pattern_rule(deny));
+            policy.network.deny.push(policy_override_network_rule(
+                deny,
+                PolicyOverrideTargetKind::AllowOrDeny,
+            ));
         }
         if let Some(approval) = item.approval.as_ref() {
             policy
                 .network
                 .approval_required
-                .push(url_pattern_rule(approval));
+                .push(policy_override_network_rule(
+                    approval,
+                    PolicyOverrideTargetKind::Approval,
+                ));
         }
     }
 
     Ok(Some(policy))
+}
+
+enum PolicyOverrideTargetKind {
+    AllowOrDeny,
+    Approval,
+}
+
+fn policy_override_network_rule(
+    pattern: &str,
+    kind: PolicyOverrideTargetKind,
+) -> agentenv_proto::NetworkRule {
+    if let Ok(url) = url::Url::parse(pattern) {
+        if matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            let host = url.host_str().unwrap_or_default().to_owned();
+            return agentenv_proto::NetworkRule {
+                target: match kind {
+                    PolicyOverrideTargetKind::AllowOrDeny => agentenv_proto::NetworkTarget::Host {
+                        host,
+                        port: url.port_or_known_default(),
+                        scheme: Some(url.scheme().to_owned()),
+                        http_access: None,
+                    },
+                    PolicyOverrideTargetKind::Approval => {
+                        agentenv_proto::NetworkTarget::HttpMethodPath {
+                            host: Some(host),
+                            method: "*".to_owned(),
+                            path: url.path().to_owned(),
+                        }
+                    }
+                },
+            };
+        }
+    }
+
+    url_pattern_rule(pattern)
 }
 
 fn empty_policy_override() -> agentenv_proto::NetworkPolicy {
@@ -802,12 +918,20 @@ pub mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use agentenv_proto::{
         Capabilities, ContextCapabilities, DriverInfo, DriverKind, EmptyResult,
-        InferenceCapabilities, InitializeParams, InitializeResult, LogLevel, PreflightParams,
-        PreflightResult, SandboxCapabilities, SCHEMA_VERSION,
+        InferenceCapabilities, InitializeParams, InitializeResult, LogLevel, NetworkTarget,
+        PreflightParams, PreflightResult, SandboxCapabilities, SCHEMA_VERSION,
     };
     use async_trait::async_trait;
 
@@ -817,6 +941,14 @@ mod tests {
         component_spec, initialize_context_driver, initialize_sandbox_driver, DriverFactory,
         DriverSet, RuntimeError, RuntimeOptions, RuntimeSecret,
     };
+
+    fn unique_root(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
 
     #[derive(Default)]
     struct TinyFactory;
@@ -1117,6 +1249,337 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RollbackTracker {
+        context_teardown_called: AtomicBool,
+        inference_teardown_called: AtomicBool,
+        sandbox_destroy_called: AtomicBool,
+    }
+
+    struct RollbackFactory {
+        tracker: Arc<RollbackTracker>,
+    }
+
+    impl DriverFactory for RollbackFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(FailingCreateSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TrackingContextDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                inference: Some(Box::new(TrackingInferenceDriver {
+                    tracker: Arc::clone(&self.tracker),
+                })),
+            })
+        }
+    }
+
+    struct FailingCreateSandboxDriver {
+        tracker: Arc<RollbackTracker>,
+    }
+
+    #[async_trait]
+    impl SandboxDriver for FailingCreateSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "openshell".to_owned(),
+                    kind: DriverKind::Sandbox,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Sandbox(SandboxCapabilities {
+                    supports_hot_reload_policy: true,
+                    supports_filesystem_lockdown: true,
+                    supports_syscall_filter: true,
+                    supports_native_inference_routing: true,
+                    supports_remote_host: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn create(
+            &self,
+            _spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            let _ = &self.tracker;
+            Err(crate::driver::DriverError::InvalidInput {
+                message: "sandbox create failed".to_owned(),
+            })
+        }
+
+        async fn connect(
+            &self,
+            _params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            Ok(agentenv_proto::ShellHandle {
+                session_id: "sh-1".to_owned(),
+                tty: true,
+                working_dir: None,
+            })
+        }
+
+        async fn exec(
+            &self,
+            _params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            Ok(agentenv_proto::ExecResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn copy_in(
+            &self,
+            _params: agentenv_proto::CopyInParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn copy_out(
+            &self,
+            _params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn apply_policy(
+            &self,
+            _params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            Ok(agentenv_proto::ApplyPolicyResult { hot_reloaded: true })
+        }
+
+        async fn status(
+            &self,
+            _params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            Ok(agentenv_proto::SandboxStatus {
+                phase: agentenv_proto::SandboxPhase::Running,
+                healthy: true,
+                last_ping: None,
+            })
+        }
+
+        async fn logs(
+            &self,
+            _params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            Ok(agentenv_proto::LogsResult {
+                entries: Vec::new(),
+            })
+        }
+
+        async fn logs_stream(
+            &self,
+            _params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn stop(&self, _params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn destroy(
+            &self,
+            _params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            self.tracker
+                .sandbox_destroy_called
+                .store(true, Ordering::SeqCst);
+            Ok(EmptyResult {})
+        }
+
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
+    struct TrackingContextDriver {
+        tracker: Arc<RollbackTracker>,
+    }
+
+    #[async_trait]
+    impl ContextDriver for TrackingContextDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "filesystem".to_owned(),
+                    kind: DriverKind::Context,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Context(ContextCapabilities {
+                    is_remote: false,
+                    is_shared: false,
+                    supports_zones: false,
+                    supports_snapshots: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn provision(
+            &self,
+            _spec: agentenv_proto::ContextSpec,
+        ) -> DriverResult<agentenv_proto::ContextHandle> {
+            Ok(agentenv_proto::ContextHandle {
+                handle: "ctx-1".to_owned(),
+            })
+        }
+
+        async fn mcp_endpoint(
+            &self,
+            _params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::McpEndpoint> {
+            Ok(agentenv_proto::McpEndpoint {
+                url: "agentenv-fs-mcp".to_owned(),
+                transport: agentenv_proto::McpTransport::Stdio,
+                headers: BTreeMap::new(),
+            })
+        }
+
+        async fn required_network_rules(
+            &self,
+            _params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::RequiredNetworkRulesResult> {
+            Ok(agentenv_proto::RequiredNetworkRulesResult { rules: Vec::new() })
+        }
+
+        async fn credential_requirements(
+            &self,
+            _params: agentenv_proto::CredentialRequirementsParams,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            Ok(agentenv_proto::CredentialRequirementsResult {
+                requirements: Vec::new(),
+            })
+        }
+
+        async fn status(
+            &self,
+            _params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::ContextStatus> {
+            Ok(agentenv_proto::ContextStatus {
+                healthy: true,
+                detail: None,
+            })
+        }
+
+        async fn teardown(
+            &self,
+            _params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<EmptyResult> {
+            self.tracker
+                .context_teardown_called
+                .store(true, Ordering::SeqCst);
+            Ok(EmptyResult {})
+        }
+
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
+    struct TrackingInferenceDriver {
+        tracker: Arc<RollbackTracker>,
+    }
+
+    #[async_trait]
+    impl InferenceDriver for TrackingInferenceDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "passthrough".to_owned(),
+                    kind: DriverKind::Inference,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Inference(InferenceCapabilities {
+                    strips_caller_credentials: true,
+                    supports_model_switching: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn provision(
+            &self,
+            _spec: agentenv_proto::InferenceSpec,
+        ) -> DriverResult<agentenv_proto::InferenceHandle> {
+            Ok(agentenv_proto::InferenceHandle {
+                handle: "inf-1".to_owned(),
+            })
+        }
+
+        async fn endpoint_in_sandbox(
+            &self,
+            _params: agentenv_proto::InferenceHandleRequest,
+        ) -> DriverResult<agentenv_proto::EndpointInSandboxResult> {
+            Ok(agentenv_proto::EndpointInSandboxResult {
+                url: "http://inference.local".to_owned(),
+            })
+        }
+
+        async fn credential_requirements(
+            &self,
+            _params: agentenv_proto::CredentialRequirementsParams,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            Ok(agentenv_proto::CredentialRequirementsResult {
+                requirements: Vec::new(),
+            })
+        }
+
+        async fn teardown(
+            &self,
+            _params: agentenv_proto::InferenceHandleRequest,
+        ) -> DriverResult<EmptyResult> {
+            self.tracker
+                .inference_teardown_called
+                .store(true, Ordering::SeqCst);
+            Ok(EmptyResult {})
+        }
+
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
     #[tokio::test]
     async fn initialize_helpers_use_current_protocol() {
         let mut sandbox = TinySandboxDriver;
@@ -1243,7 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_env_writes_registry_files() {
-        let root = std::env::temp_dir().join(format!("agentenv-create-{}", std::process::id()));
+        let root = unique_root("agentenv-create");
         let options = RuntimeOptions {
             root: root.clone(),
             log_level: LogLevel::Info,
@@ -1289,6 +1752,157 @@ policy:
         assert!(env_dir.join("lock.yaml").is_file());
         assert!(env_dir.join("state.json").is_file());
         assert!(env_dir.join("events.jsonl").is_file());
+    }
+
+    #[tokio::test]
+    async fn create_env_preserves_existing_hidden_env_name_during_reservation() {
+        let root = unique_root("agentenv-hidden-reservation");
+        let hidden_env_dir = root.join("envs").join(".demo.creating");
+        fs::create_dir_all(&hidden_env_dir).unwrap();
+        fs::write(hidden_env_dir.join("sentinel"), "keep me").unwrap();
+
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::create_env(&options, &TinyFactory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.admission.status,
+            crate::admission::AdmissionStatus::Accepted
+        );
+        assert!(hidden_env_dir.join("sentinel").is_file());
+        assert!(root.join("envs").join("demo").join("state.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn create_env_rejects_unknown_policy_tier() {
+        let root = unique_root("agentenv-unknown-tier");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: balanceed
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(&options, &TinyFactory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RuntimeError::InvalidPolicyTier { .. }));
+        assert!(!root.join("envs").join("demo").exists());
+    }
+
+    #[tokio::test]
+    async fn create_env_rolls_back_provisioned_resources_on_sandbox_create_failure() {
+        let root = unique_root("agentenv-rollback");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+        let tracker = Arc::new(RollbackTracker::default());
+        let factory = RollbackFactory {
+            tracker: Arc::clone(&tracker),
+        };
+
+        let err = super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RuntimeError::Driver(_)));
+        assert!(tracker.context_teardown_called.load(Ordering::SeqCst));
+        assert!(tracker.inference_teardown_called.load(Ordering::SeqCst));
+        assert!(!tracker.sandbox_destroy_called.load(Ordering::SeqCst));
+        assert!(!root.join("envs").join("demo").exists());
+    }
+
+    #[test]
+    fn policy_overrides_url_allow_uses_host_rule() {
+        let overrides = vec![crate::blueprint::PolicyOverride {
+            allow: Some("https://example.com".to_owned()),
+            deny: None,
+            approval: Some("https://example.com/api".to_owned()),
+            extra: BTreeMap::new(),
+        }];
+
+        let policy = super::policy_overrides(&overrides)
+            .unwrap()
+            .expect("expected overrides policy");
+
+        match &policy.network.allow[0].target {
+            NetworkTarget::Host {
+                host,
+                port,
+                scheme,
+                http_access,
+            } => {
+                assert_eq!(host, "example.com");
+                assert_eq!(*port, Some(443));
+                assert_eq!(scheme.as_deref(), Some("https"));
+                assert_eq!(*http_access, None);
+            }
+            other => panic!("unexpected allow target: {other:?}"),
+        }
+
+        match &policy.network.approval_required[0].target {
+            NetworkTarget::HttpMethodPath { host, method, path } => {
+                assert_eq!(host.as_deref(), Some("example.com"));
+                assert_eq!(method, "*");
+                assert_eq!(path, "/api");
+            }
+            other => panic!("unexpected approval target: {other:?}"),
+        }
     }
 
     fn bad_initialize_result(
