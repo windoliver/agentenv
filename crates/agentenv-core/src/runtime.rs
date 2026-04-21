@@ -711,8 +711,9 @@ pub async fn exec_env(
 ) -> RuntimeResult<agentenv_proto::ExecResult> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let set = factory.build(&selection)?;
     let handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
     set.sandbox
         .exec(agentenv_proto::ExecParams {
@@ -733,8 +734,9 @@ pub async fn enter_env(
 ) -> RuntimeResult<agentenv_proto::ShellHandle> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let set = factory.build(&selection)?;
     let handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
     set.sandbox
         .connect(agentenv_proto::ConnectParams { handle })
@@ -749,20 +751,26 @@ pub async fn status_env(
 ) -> RuntimeResult<EnvStatusSummary> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let set = factory.build(&selection)?;
-    let handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
 
-    let sandbox_status = set
-        .sandbox
-        .status(agentenv_proto::SandboxStatusParams { handle })
-        .await?;
-    let sandbox = Some(DriverHealthSummary {
-        healthy: sandbox_status.healthy,
-        detail: Some(format!("{:?}", sandbox_status.phase).to_lowercase()),
-    });
+    let sandbox = match state.handles.sandbox.clone() {
+        Some(handle) => {
+            initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+            let status = set
+                .sandbox
+                .status(agentenv_proto::SandboxStatusParams { handle })
+                .await?;
+            Some(DriverHealthSummary {
+                healthy: status.healthy,
+                detail: Some(format!("{:?}", status.phase).to_lowercase()),
+            })
+        }
+        None => None,
+    };
 
     let context = match state.handles.context.clone() {
         Some(handle) => {
+            initialize_context_driver(options, set.context.as_mut()).await?;
             let status = set
                 .context
                 .status(agentenv_proto::ContextHandleRequest { handle })
@@ -793,8 +801,9 @@ pub async fn logs_env(
 ) -> RuntimeResult<agentenv_proto::LogsResult> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let set = factory.build(&selection)?;
     let handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
     set.sandbox
         .logs(agentenv_proto::LogsParams {
@@ -811,32 +820,41 @@ pub async fn destroy_env(
     factory: &dyn DriverFactory,
     name: &str,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
-    let state = describe_env(options, name)?.state;
+    let mut state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let set = factory.build(&selection)?;
-    let sandbox_handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
+    let paths =
+        crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
 
-    if let Some(handle) = state.handles.context.clone() {
-        set.context
-            .teardown(agentenv_proto::ContextHandleRequest { handle })
+    if let Some(handle) = state.handles.sandbox.clone() {
+        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+        set.sandbox
+            .destroy(agentenv_proto::DestroyParams { handle })
             .await?;
+        state.handles.sandbox = None;
+        crate::env::write_state(&paths, &state)?;
     }
+
     if let Some(handle) = state.handles.inference.clone() {
-        if let Some(inference) = set.inference.as_ref() {
+        if let Some(inference) = set.inference.as_mut() {
+            initialize_inference_driver(options, inference.as_mut()).await?;
             inference
                 .teardown(agentenv_proto::InferenceHandleRequest { handle })
                 .await?;
+            state.handles.inference = None;
+            crate::env::write_state(&paths, &state)?;
         }
     }
 
-    set.sandbox
-        .destroy(agentenv_proto::DestroyParams {
-            handle: sandbox_handle,
-        })
-        .await?;
+    if let Some(handle) = state.handles.context.clone() {
+        initialize_context_driver(options, set.context.as_mut()).await?;
+        set.context
+            .teardown(agentenv_proto::ContextHandleRequest { handle })
+            .await?;
+        state.handles.context = None;
+        crate::env::write_state(&paths, &state)?;
+    }
 
-    let paths =
-        crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
     fs::remove_dir_all(paths.env_dir()).map_err(|source| crate::env::EnvError::Io {
         path: paths.env_dir(),
         source,
@@ -1354,6 +1372,40 @@ mod tests {
         }
     }
 
+    struct InitializingFactory {
+        sandbox_initialized: Arc<AtomicBool>,
+    }
+
+    impl DriverFactory for InitializingFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(InitTrackingSandboxDriver {
+                    initialized: Arc::clone(&self.sandbox_initialized),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct FailingContextTeardownFactory {
+        sandbox_destroyed: Arc<AtomicBool>,
+    }
+
+    impl DriverFactory for FailingContextTeardownFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(DestroyTrackingSandboxDriver {
+                    destroyed: Arc::clone(&self.sandbox_destroyed),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(FailingTeardownContextDriver),
+                inference: None,
+            })
+        }
+    }
+
     #[derive(Default)]
     struct TinyInferenceFactory;
 
@@ -1369,6 +1421,14 @@ mod tests {
     }
 
     struct TinySandboxDriver;
+
+    struct InitTrackingSandboxDriver {
+        initialized: Arc<AtomicBool>,
+    }
+
+    struct DestroyTrackingSandboxDriver {
+        destroyed: Arc<AtomicBool>,
+    }
 
     #[async_trait]
     impl SandboxDriver for TinySandboxDriver {
@@ -1485,6 +1545,190 @@ mod tests {
             _params: agentenv_proto::ShutdownParams,
         ) -> DriverResult<EmptyResult> {
             Ok(EmptyResult {})
+        }
+    }
+
+    #[async_trait]
+    impl SandboxDriver for InitTrackingSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            self.initialized.store(true, Ordering::SeqCst);
+            let mut inner = TinySandboxDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinySandboxDriver;
+            inner.shutdown(params).await
+        }
+    }
+
+    #[async_trait]
+    impl SandboxDriver for DestroyTrackingSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = TinySandboxDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            self.destroyed.store(true, Ordering::SeqCst);
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinySandboxDriver;
+            inner.shutdown(params).await
         }
     }
 
@@ -1720,6 +1964,72 @@ mod tests {
             _params: agentenv_proto::ShutdownParams,
         ) -> DriverResult<EmptyResult> {
             Ok(EmptyResult {})
+        }
+    }
+
+    struct FailingTeardownContextDriver;
+
+    #[async_trait]
+    impl ContextDriver for FailingTeardownContextDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = TinyContextDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinyContextDriver.preflight(params).await
+        }
+
+        async fn provision(
+            &self,
+            spec: agentenv_proto::ContextSpec,
+        ) -> DriverResult<agentenv_proto::ContextHandle> {
+            TinyContextDriver.provision(spec).await
+        }
+
+        async fn mcp_endpoint(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::McpEndpoint> {
+            TinyContextDriver.mcp_endpoint(params).await
+        }
+
+        async fn required_network_rules(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::RequiredNetworkRulesResult> {
+            TinyContextDriver.required_network_rules(params).await
+        }
+
+        async fn credential_requirements(
+            &self,
+            params: agentenv_proto::CredentialRequirementsParams,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            TinyContextDriver.credential_requirements(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::ContextStatus> {
+            TinyContextDriver.status(params).await
+        }
+
+        async fn teardown(
+            &self,
+            _params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<EmptyResult> {
+            Err(crate::driver::DriverError::CleanupFailed {
+                message: "context teardown failed".to_owned(),
+            })
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinyContextDriver;
+            inner.shutdown(params).await
         }
     }
 
@@ -2953,6 +3263,26 @@ policy:
     }
 
     #[tokio::test]
+    async fn exec_env_initializes_sandbox_driver_before_command() {
+        let (options, _) = command_test_runtime("exec-init").await;
+        let sandbox_initialized = Arc::new(AtomicBool::new(false));
+        let factory = InitializingFactory {
+            sandbox_initialized: Arc::clone(&sandbox_initialized),
+        };
+
+        super::exec_env(
+            &options,
+            &factory,
+            "demo",
+            vec!["echo".to_owned(), "ok".to_owned()],
+        )
+        .await
+        .unwrap();
+
+        assert!(sandbox_initialized.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn enter_env_returns_shell_handle() {
         let (options, factory) = command_test_runtime("enter").await;
         let shell = super::enter_env(&options, &factory, "demo", false)
@@ -2987,6 +3317,24 @@ policy:
     }
 
     #[tokio::test]
+    async fn status_env_without_sandbox_handle_returns_unhealthy_summary() {
+        let (options, factory) = command_test_runtime("status-missing-handle").await;
+        let paths = crate::env::EnvPaths::new(
+            options.root.clone(),
+            crate::env::validate_env_name("demo").unwrap(),
+        );
+        let mut state = crate::env::read_state(&paths).unwrap();
+        state.handles.sandbox = None;
+        crate::env::write_state(&paths, &state).unwrap();
+
+        let status = super::status_env(&options, &factory, "demo").await.unwrap();
+
+        assert!(!status.healthy);
+        assert!(status.sandbox.is_none());
+        assert!(status.context.as_ref().unwrap().healthy);
+    }
+
+    #[tokio::test]
     async fn destroy_env_removes_registry_on_success() {
         let (options, factory) = command_test_runtime("destroy").await;
         let report = super::destroy_env(&options, &factory, "demo")
@@ -2996,6 +3344,50 @@ policy:
         assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
         assert_eq!(report.reason_code, crate::admission::ReasonCode::Destroyed);
         assert!(!options.root.join("envs").join("demo").exists());
+    }
+
+    #[tokio::test]
+    async fn destroy_env_removes_registry_without_sandbox_handle() {
+        let (options, factory) = command_test_runtime("destroy-missing-handle").await;
+        let paths = crate::env::EnvPaths::new(
+            options.root.clone(),
+            crate::env::validate_env_name("demo").unwrap(),
+        );
+        let mut state = crate::env::read_state(&paths).unwrap();
+        state.handles.sandbox = None;
+        crate::env::write_state(&paths, &state).unwrap();
+
+        let report = super::destroy_env(&options, &factory, "demo")
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        assert_eq!(report.reason_code, crate::admission::ReasonCode::Destroyed);
+        assert!(!options.root.join("envs").join("demo").exists());
+    }
+
+    #[tokio::test]
+    async fn destroy_env_persists_sandbox_progress_before_sidecar_failure() {
+        let (options, _) = command_test_runtime("destroy-progress").await;
+        let sandbox_destroyed = Arc::new(AtomicBool::new(false));
+        let factory = FailingContextTeardownFactory {
+            sandbox_destroyed: Arc::clone(&sandbox_destroyed),
+        };
+
+        let err = super::destroy_env(&options, &factory, "demo")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("context teardown failed"));
+        assert!(sandbox_destroyed.load(Ordering::SeqCst));
+
+        let paths = crate::env::EnvPaths::new(
+            options.root.clone(),
+            crate::env::validate_env_name("demo").unwrap(),
+        );
+        let state = crate::env::read_state(&paths).unwrap();
+        assert!(state.handles.sandbox.is_none());
+        assert_eq!(state.handles.context.as_deref(), Some("ctx-1"));
     }
 
     #[tokio::test]
