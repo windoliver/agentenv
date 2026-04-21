@@ -204,6 +204,34 @@ test_install_python_drivers_preserves_existing_driver_on_extract_failure() {
     pass
 }
 
+test_install_python_drivers_installs_context_nexus_bundle() {
+    tmp_root=$(mktemp -d)
+
+    mkdir -p "${tmp_root}/bundle/context-nexus/bin" "${tmp_root}/bundle/context-nexus/venv"
+    printf '{"name":"nexus","kind":"context"}\n' > "${tmp_root}/bundle/context-nexus/manifest.json"
+    printf '#!/bin/sh\n' > "${tmp_root}/bundle/context-nexus/bin/agentenv-driver-nexus"
+    chmod +x "${tmp_root}/bundle/context-nexus/bin/agentenv-driver-nexus"
+    (cd "${tmp_root}/bundle" && tar -czf "${tmp_root}/context-nexus.tar.gz" context-nexus)
+
+    expected_hash=$(sha256_file "${tmp_root}/context-nexus.tar.gz")
+    printf 'context-nexus|file://%s/context-nexus.tar.gz|%s\n' "${tmp_root}" "${expected_hash}" > "${tmp_root}/drivers.index"
+
+    TMP_ROOT="${tmp_root}/tmp"
+    mkdir -p "${TMP_ROOT}"
+    AGENTENV_HOME="${tmp_root}/home/.agentenv"
+    WITH_PYTHON_DRIVERS=1
+    PYTHON_DRIVERS_INDEX_URL="file://${tmp_root}/drivers.index"
+
+    install_python_drivers
+
+    test -f "${AGENTENV_HOME}/drivers/context-nexus/manifest.json" || fail "context-nexus manifest missing"
+    test -x "${AGENTENV_HOME}/drivers/context-nexus/bin/agentenv-driver-nexus" || fail "context-nexus launcher missing"
+    assert_eq "installed 1 bundle(s)" "${PYTHON_DRIVER_STATUS}" "python driver install status"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_choose_rc_targets_creates_profile_when_missing() {
     tmp_root=$(mktemp -d)
 
@@ -227,6 +255,7 @@ main() {
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
     test_install_python_drivers_preserves_existing_driver_on_extract_failure
+    test_install_python_drivers_installs_context_nexus_bundle
     test_choose_rc_targets_creates_profile_when_missing
     printf 'PASS: %s installer tests\n' "${TEST_COUNT}"
 }

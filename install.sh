@@ -635,6 +635,14 @@ install_python_drivers() {
         rm -rf "${staged_driver_dir}"
         mkdir -p "${staged_driver_dir}"
         tar -xzf "${archive_path}" -C "${staged_driver_dir}" || die "Could not extract Python driver bundle for ${driver_name}"
+        if [ ! -f "${staged_driver_dir}/manifest.json" ] && [ -f "${staged_driver_dir}/${driver_name}/manifest.json" ]; then
+            inner_dir="${staged_driver_dir}/${driver_name}"
+            flattened_dir="${TMP_ROOT}/${driver_name}.flattened"
+            rm -rf "${flattened_dir}"
+            mv "${inner_dir}" "${flattened_dir}"
+            rm -rf "${staged_driver_dir}"
+            mv "${flattened_dir}" "${staged_driver_dir}"
+        fi
         [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
         replace_driver_dir "${staged_driver_dir}" "${driver_dir}"
         installed_count=$((installed_count + 1))
