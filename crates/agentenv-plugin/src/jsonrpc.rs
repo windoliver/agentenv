@@ -674,7 +674,7 @@ mod async_client_tests {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -995,12 +995,12 @@ while True:
         ))
     }
 
-    fn read_fixture_pid(path: &PathBuf) -> u32 {
+    fn read_fixture_pid(path: &Path) -> u32 {
         let pid = fs::read_to_string(path).unwrap();
         pid.trim().parse::<u32>().unwrap()
     }
 
-    async fn wait_for_file(path: &PathBuf) {
+    async fn wait_for_file(path: &Path) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if path.is_file() {
