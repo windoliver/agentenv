@@ -644,7 +644,24 @@ install_python_drivers() {
             mv "${flattened_dir}" "${staged_driver_dir}"
         fi
         if [ -f "${staged_driver_dir}/scripts/install-driver.sh" ] && [ -f "${staged_driver_dir}/pyproject.toml" ]; then
-            AGENTENV_HOME="${AGENTENV_HOME}" sh "${staged_driver_dir}/scripts/install-driver.sh" >/dev/null
+            source_backup_dir=""
+            if [ -e "${driver_dir}" ] && [ ! -L "${driver_dir}" ]; then
+                source_backup_dir="${driver_dir}.backup.$$"
+                rm -rf "${source_backup_dir}"
+                mv "${driver_dir}" "${source_backup_dir}" || die "Could not back up the existing driver at ${driver_dir}"
+            fi
+
+            if AGENTENV_HOME="${AGENTENV_HOME}" sh "${staged_driver_dir}/scripts/install-driver.sh" >/dev/null; then
+                if [ -n "${source_backup_dir}" ]; then
+                    rm -rf "${source_backup_dir}"
+                fi
+            else
+                if [ -n "${source_backup_dir}" ]; then
+                    rm -rf "${driver_dir}"
+                    mv "${source_backup_dir}" "${driver_dir}" || die "Could not restore the previous driver at ${driver_dir}"
+                fi
+                die "Could not install Python driver ${driver_name}"
+            fi
         else
             [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
             replace_driver_dir "${staged_driver_dir}" "${driver_dir}"

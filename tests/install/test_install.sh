@@ -300,6 +300,46 @@ test_install_python_drivers_installs_source_context_nexus_bundle_with_venv() {
     pass
 }
 
+test_install_python_drivers_upgrades_directory_context_nexus_to_source_bundle() {
+    tmp_root=$(mktemp -d)
+
+    make_stub_python3_for_driver_install "${tmp_root}/bin"
+    bundle_path=$(cd "${REPO_ROOT}/external-drivers/context-nexus-py" && ./scripts/build-bundle.sh "${tmp_root}/dist")
+
+    expected_hash=$(sha256_file "${bundle_path}")
+    printf 'context-nexus|file://%s|%s\n' "${bundle_path}" "${expected_hash}" > "${tmp_root}/drivers.index"
+
+    AGENTENV_HOME="${tmp_root}/home/.agentenv"
+    mkdir -p "${AGENTENV_HOME}/drivers/context-nexus/bin"
+    printf '{"old":true}\n' > "${AGENTENV_HOME}/drivers/context-nexus/manifest.json"
+    printf '#!/bin/sh\n' > "${AGENTENV_HOME}/drivers/context-nexus/bin/agentenv-driver-nexus"
+    chmod +x "${AGENTENV_HOME}/drivers/context-nexus/bin/agentenv-driver-nexus"
+
+    TMP_ROOT="${tmp_root}/tmp"
+    mkdir -p "${TMP_ROOT}"
+    WITH_PYTHON_DRIVERS=1
+    PYTHON_DRIVERS_INDEX_URL="file://${tmp_root}/drivers.index"
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}"
+
+    install_python_drivers
+
+    PATH=${ORIGINAL_PATH}
+    driver_dir="${AGENTENV_HOME}/drivers/context-nexus"
+    if [ ! -L "${driver_dir}" ] && [ ! -x "${driver_dir}/venv/bin/python" ]; then
+        fail "context-nexus should be upgraded to a symlink install or contain venv/bin/python"
+    fi
+    test -f "${driver_dir}/manifest.json" || fail "upgraded context-nexus manifest missing"
+    test -x "${driver_dir}/bin/agentenv-driver-nexus" || fail "upgraded context-nexus launcher missing"
+    test -x "${driver_dir}/venv/bin/python" || fail "upgraded context-nexus venv python missing"
+    if grep -F '{"old":true}' "${driver_dir}/manifest.json" >/dev/null 2>&1; then
+        fail "upgraded context-nexus manifest still contains old manifest"
+    fi
+    assert_eq "installed 1 bundle(s)" "${PYTHON_DRIVER_STATUS}" "upgraded source python driver install status"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_install_driver_launcher_prepends_venv_bin_to_path() {
     tmp_root=$(mktemp -d)
 
@@ -343,6 +383,7 @@ main() {
     test_install_python_drivers_preserves_existing_driver_on_extract_failure
     test_install_python_drivers_installs_context_nexus_bundle
     test_install_python_drivers_installs_source_context_nexus_bundle_with_venv
+    test_install_python_drivers_upgrades_directory_context_nexus_to_source_bundle
     test_install_driver_launcher_prepends_venv_bin_to_path
     test_choose_rc_targets_creates_profile_when_missing
     printf 'PASS: %s installer tests\n' "${TEST_COUNT}"
