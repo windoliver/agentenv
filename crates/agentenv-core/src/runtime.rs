@@ -11,6 +11,7 @@ use agentenv_proto::{
     AgentSpec, Capabilities, ContextSpec, DriverKind, InferenceSpec, InitializeParams,
     InitializeResult, LogLevel, PreflightParams, SCHEMA_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -112,6 +113,8 @@ pub enum RuntimeError {
     },
     #[error("missing selected {kind} driver `{name}` from driver set")]
     MissingSelectedDriver { kind: &'static str, name: String },
+    #[error("env `{name}` is missing required sandbox handle")]
+    MissingSandboxHandle { name: String },
     #[error("state name `{actual}` does not match env `{expected}`")]
     StateNameMismatch { expected: String, actual: String },
 }
@@ -141,6 +144,22 @@ pub struct EnvDescription {
     pub state: crate::env::EnvStateFile,
     pub blueprint_yaml: String,
     pub lock_yaml: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverHealthSummary {
+    pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvStatusSummary {
+    pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<DriverHealthSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<DriverHealthSummary>,
 }
 
 struct CreateEnvRollback<'a> {
@@ -682,6 +701,176 @@ pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDe
         blueprint_yaml,
         lock_yaml,
     })
+}
+
+pub async fn exec_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    command: Vec<String>,
+) -> RuntimeResult<agentenv_proto::ExecResult> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let set = factory.build(&selection)?;
+    let handle = required_sandbox_handle(&state, name)?;
+
+    set.sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle,
+            cmd: command.join(" "),
+            tty: false,
+            env: BTreeMap::new(),
+        })
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn enter_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    _detach: bool,
+) -> RuntimeResult<agentenv_proto::ShellHandle> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let set = factory.build(&selection)?;
+    let handle = required_sandbox_handle(&state, name)?;
+
+    set.sandbox
+        .connect(agentenv_proto::ConnectParams { handle })
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn status_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+) -> RuntimeResult<EnvStatusSummary> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let set = factory.build(&selection)?;
+    let handle = required_sandbox_handle(&state, name)?;
+
+    let sandbox_status = set
+        .sandbox
+        .status(agentenv_proto::SandboxStatusParams { handle })
+        .await?;
+    let sandbox = Some(DriverHealthSummary {
+        healthy: sandbox_status.healthy,
+        detail: Some(format!("{:?}", sandbox_status.phase).to_lowercase()),
+    });
+
+    let context = match state.handles.context.clone() {
+        Some(handle) => {
+            let status = set
+                .context
+                .status(agentenv_proto::ContextHandleRequest { handle })
+                .await?;
+            Some(DriverHealthSummary {
+                healthy: status.healthy,
+                detail: status.detail,
+            })
+        }
+        None => None,
+    };
+
+    let healthy = sandbox.as_ref().map(|value| value.healthy).unwrap_or(false)
+        && context.as_ref().map(|value| value.healthy).unwrap_or(true);
+
+    Ok(EnvStatusSummary {
+        healthy,
+        sandbox,
+        context,
+    })
+}
+
+pub async fn logs_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    follow: bool,
+) -> RuntimeResult<agentenv_proto::LogsResult> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let set = factory.build(&selection)?;
+    let handle = required_sandbox_handle(&state, name)?;
+
+    set.sandbox
+        .logs(agentenv_proto::LogsParams {
+            handle,
+            since: None,
+            follow,
+        })
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn destroy_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+) -> RuntimeResult<crate::admission::AdmissionReport> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let set = factory.build(&selection)?;
+    let sandbox_handle = required_sandbox_handle(&state, name)?;
+
+    if let Some(handle) = state.handles.context.clone() {
+        set.context
+            .teardown(agentenv_proto::ContextHandleRequest { handle })
+            .await?;
+    }
+    if let Some(handle) = state.handles.inference.clone() {
+        if let Some(inference) = set.inference.as_ref() {
+            inference
+                .teardown(agentenv_proto::InferenceHandleRequest { handle })
+                .await?;
+        }
+    }
+
+    set.sandbox
+        .destroy(agentenv_proto::DestroyParams {
+            handle: sandbox_handle,
+        })
+        .await?;
+
+    let paths =
+        crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
+    fs::remove_dir_all(paths.env_dir()).map_err(|source| crate::env::EnvError::Io {
+        path: paths.env_dir(),
+        source,
+    })?;
+
+    Ok(crate::admission::AdmissionReport {
+        status: crate::admission::AdmissionStatus::Accepted,
+        reason_code: crate::admission::ReasonCode::Destroyed,
+        env: name.to_owned(),
+        checks: Vec::new(),
+    })
+}
+
+fn selection_from_state(state: &crate::env::EnvStateFile) -> DriverSelection {
+    DriverSelection {
+        sandbox: state.drivers.sandbox.name.clone(),
+        agent: state.drivers.agent.name.clone(),
+        context: state.drivers.context.name.clone(),
+        inference: state
+            .drivers
+            .inference
+            .as_ref()
+            .map(|driver| driver.name.clone()),
+    }
+}
+
+fn required_sandbox_handle(state: &crate::env::EnvStateFile, name: &str) -> RuntimeResult<String> {
+    state
+        .handles
+        .sandbox
+        .clone()
+        .ok_or_else(|| RuntimeError::MissingSandboxHandle {
+            name: name.to_owned(),
+        })
 }
 
 fn create_temp_workspace(root: &Path, name: &str) -> PathBuf {
@@ -2716,5 +2905,122 @@ policy:
         let set = TinyFactory.build(&selection).unwrap();
         let _set: Arc<str> = Arc::from(selection.agent.as_str());
         drop(set);
+    }
+
+    async fn command_test_runtime(label: &str) -> (RuntimeOptions, TinyFactory) {
+        let root = unique_root(&format!("agentenv-command-{label}"));
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+        super::create_env(&options, &TinyFactory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        (options, TinyFactory)
+    }
+
+    #[tokio::test]
+    async fn exec_env_returns_sandbox_exec_result() {
+        let (options, factory) = command_test_runtime("exec").await;
+        let result = super::exec_env(
+            &options,
+            &factory,
+            "demo",
+            vec!["echo".to_owned(), "ok".to_owned()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn enter_env_returns_shell_handle() {
+        let (options, factory) = command_test_runtime("enter").await;
+        let shell = super::enter_env(&options, &factory, "demo", false)
+            .await
+            .unwrap();
+
+        assert_eq!(shell.session_id, "sh-1");
+        assert!(shell.tty);
+    }
+
+    #[tokio::test]
+    async fn logs_env_returns_sandbox_logs() {
+        let (options, factory) = command_test_runtime("logs").await;
+        let logs = super::logs_env(&options, &factory, "demo", false)
+            .await
+            .unwrap();
+
+        assert!(logs.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_env_reports_healthy_sandbox() {
+        let (options, factory) = command_test_runtime("status").await;
+        let status = super::status_env(&options, &factory, "demo").await.unwrap();
+
+        assert!(status.healthy);
+        assert!(status.sandbox.as_ref().unwrap().healthy);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["sandbox"]["healthy"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_env_removes_registry_on_success() {
+        let (options, factory) = command_test_runtime("destroy").await;
+        let report = super::destroy_env(&options, &factory, "demo")
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        assert_eq!(report.reason_code, crate::admission::ReasonCode::Destroyed);
+        assert!(!options.root.join("envs").join("demo").exists());
+    }
+
+    #[tokio::test]
+    async fn exec_env_requires_persisted_sandbox_handle() {
+        let (options, factory) = command_test_runtime("missing-handle").await;
+        let paths = crate::env::EnvPaths::new(
+            options.root.clone(),
+            crate::env::validate_env_name("demo").unwrap(),
+        );
+        let mut state = crate::env::read_state(&paths).unwrap();
+        state.handles.sandbox = None;
+        crate::env::write_state(&paths, &state).unwrap();
+
+        let err = super::exec_env(
+            &options,
+            &factory,
+            "demo",
+            vec!["echo".to_owned(), "ok".to_owned()],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RuntimeError::MissingSandboxHandle { name } if name == "demo"
+        ));
     }
 }
