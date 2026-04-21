@@ -1,7 +1,9 @@
 import os
+import shlex
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 import agentenv_context_nexus.driver as driver_module
@@ -266,7 +268,10 @@ def test_lite_mode_starts_fake_nexus_process(tmp_path, monkeypatch):
     fake_bin.mkdir()
     fake_nexus = fake_bin / "nexus"
     fixture = os.path.join(os.path.dirname(__file__), "fixtures", "fake_nexus.py")
-    fake_nexus.write_text(f"#!/bin/sh\nexec python3 {fixture} \"$@\"\n", encoding="utf-8")
+    fake_nexus.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(fixture)} \"$@\"\n",
+        encoding="utf-8",
+    )
     fake_nexus.chmod(fake_nexus.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
 
@@ -288,13 +293,15 @@ def test_lite_mode_starts_fake_nexus_process(tmp_path, monkeypatch):
     provision = call(driver, "provision", {"config": {"mode": "lite", "data_dir": str(tmp_path / "data")}})
     handle = provision["result"]["handle"]
 
-    endpoint = call(driver, "mcp_endpoint", {"handle": handle})["result"]
-    time.sleep(0.5)
-    status = call(driver, "status", {"handle": handle})["result"]
-    teardown = call(driver, "teardown", {"handle": handle})
+    try:
+        endpoint = call(driver, "mcp_endpoint", {"handle": handle})["result"]
+        time.sleep(0.5)
+        status = call(driver, "status", {"handle": handle})["result"]
 
-    assert endpoint["url"].startswith("http://127.0.0.1:")
-    assert status["healthy"] is True
+        assert endpoint["url"].startswith("http://127.0.0.1:")
+        assert status["healthy"] is True
+    finally:
+        teardown = call(driver, "teardown", {"handle": handle})
     assert teardown["result"] == {}
 
 
