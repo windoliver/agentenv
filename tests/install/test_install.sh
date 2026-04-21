@@ -209,7 +209,7 @@ test_install_python_drivers_runs_bundle_install_hook() {
 
     mkdir -p "${tmp_root}/bundle/bin" "${tmp_root}/bundle/wheels" "${tmp_root}/index" "${tmp_root}/releases"
     printf '{"schema_version":"1.0","name":"hermes","kind":"agent","version":"0.1.0","binary":"./bin/agentenv-driver-hermes"}\n' > "${tmp_root}/bundle/manifest.json"
-    printf '#!/bin/sh\nset -eu\nprintf hook-ran > "$AGENTENV_DRIVER_STAGED_DIR/hook.txt"\n' > "${tmp_root}/bundle/install-driver.sh"
+    printf '#!/bin/sh\nset -eu\nprintf hook-ran > hook.txt\n' > "${tmp_root}/bundle/install-driver.sh"
     chmod +x "${tmp_root}/bundle/install-driver.sh"
     tar -C "${tmp_root}/bundle" -czf "${tmp_root}/releases/agent-hermes.tar.gz" .
 

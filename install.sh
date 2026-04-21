@@ -606,10 +606,13 @@ run_python_driver_bundle_hook() {
     fi
 
     chmod +x "${hook}"
-    AGENTENV_DRIVER_STAGED_DIR="${staged_driver_dir}" \
-    AGENTENV_DRIVER_INSTALL_ROOT="${driver_dir}" \
-    AGENTENV_HOME="${AGENTENV_HOME}" \
-    "${hook}" || die "Python driver bundle hook failed for $(basename "${driver_dir}")"
+    (
+        cd "${staged_driver_dir}" || exit 1
+        AGENTENV_DRIVER_STAGED_DIR="${staged_driver_dir}" \
+        AGENTENV_DRIVER_INSTALL_ROOT="${driver_dir}" \
+        AGENTENV_HOME="${AGENTENV_HOME}" \
+        ./install-driver.sh
+    ) || die "Python driver bundle hook failed for $(basename "${driver_dir}")"
 }
 
 install_python_drivers() {
