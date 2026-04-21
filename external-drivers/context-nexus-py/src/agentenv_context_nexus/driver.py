@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 
 from agentenv_context_nexus import __version__
-from agentenv_context_nexus.nexus import find_free_port, nexus_cli_available, parse_http_url, stable_hub_handle, start_lite_process
+from agentenv_context_nexus.nexus import check_nexus_cli, find_free_port, parse_http_url, stable_hub_handle, start_lite_process
 from agentenv_context_nexus.protocol import (
     ERROR_RESOURCE_NOT_FOUND,
     ERROR_SCHEMA_VERSION_INCOMPATIBLE,
@@ -95,7 +95,8 @@ class NexusContextDriver:
         )
 
     def _preflight(self, request_id):
-        if nexus_cli_available():
+        ok, code, message = check_nexus_cli()
+        if ok:
             return success(request_id, {"ok": True, "issues": []})
         return success(
             request_id,
@@ -104,8 +105,8 @@ class NexusContextDriver:
                 "issues": [
                     {
                         "severity": "error",
-                        "code": "nexus_cli_missing",
-                        "message": "Nexus CLI was not found in the driver environment",
+                        "code": code,
+                        "message": message,
                         "remediation": "Install the Nexus package into the context-nexus driver venv.",
                     }
                 ],

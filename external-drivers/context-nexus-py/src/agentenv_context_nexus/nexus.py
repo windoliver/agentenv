@@ -38,17 +38,39 @@ def find_free_port():
         return sock.getsockname()[1]
 
 
-def nexus_cli_available():
-    return shutil.which("nexus") is not None
-
-
-def start_lite_process(data_dir, port, extra_env=None):
+def _nexus_child_env(extra_env=None):
     env = {}
     if "PATH" in os.environ:
         env["PATH"] = os.environ["PATH"]
-    env["NEXUS_DATA_DIR"] = data_dir
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def check_nexus_cli(timeout=5):
+    nexus = shutil.which("nexus")
+    if nexus is None:
+        return False, "nexus_cli_missing", "Nexus CLI was not found in the driver environment"
+    try:
+        result = subprocess.run(
+            [nexus, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_nexus_child_env(),
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "nexus_cli_unusable", f"Nexus CLI version check failed: {exc}"
+    if result.returncode != 0:
+        return False, "nexus_cli_unusable", f"Nexus CLI version check exited with {result.returncode}"
+    return True, None, None
+
+
+def start_lite_process(data_dir, port, extra_env=None):
+    env = _nexus_child_env(extra_env)
+    env["NEXUS_DATA_DIR"] = data_dir
     return subprocess.Popen(
         ["nexus", "mcp", "serve", "--transport", "http", "--host", "127.0.0.1", "--port", str(port)],
         stdin=subprocess.DEVNULL,

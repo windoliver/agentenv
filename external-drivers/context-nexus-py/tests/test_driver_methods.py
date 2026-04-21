@@ -51,6 +51,20 @@ def test_credential_requirements_declares_nexus_token():
     assert requirement["required"] is False
 
 
+def test_preflight_rejects_unusable_nexus_cli(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_nexus = fake_bin / "nexus"
+    fake_nexus.write_text("#!/bin/sh\nexit 17\n", encoding="utf-8")
+    fake_nexus.chmod(fake_nexus.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    response = call(NexusContextDriver(), "preflight", {})
+
+    assert response["result"]["ok"] is False
+    assert response["result"]["issues"][0]["code"] == "nexus_cli_unusable"
+
+
 def test_hub_provision_requires_hub_url():
     response = call(NexusContextDriver(), "provision", {"config": {"mode": "hub"}})
 
