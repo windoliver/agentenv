@@ -410,8 +410,9 @@ mod tests {
     impl ContextDriver for TinyContextDriver {
         async fn initialize(
             &mut self,
-            _params: InitializeParams,
+            params: InitializeParams,
         ) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
             Ok(InitializeResult {
                 driver: DriverInfo {
                     name: "filesystem".to_owned(),
