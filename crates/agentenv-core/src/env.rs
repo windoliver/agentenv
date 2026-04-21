@@ -3,9 +3,11 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use agentenv_proto::McpEndpoint;
+use agentenv_proto::McpTransport;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -160,10 +162,25 @@ pub struct DriverHandles {
     pub inference: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedMcpEndpoint {
+    pub url: String,
+    pub transport: McpTransport,
+}
+
+impl PersistedMcpEndpoint {
+    pub fn from_mcp(endpoint: McpEndpoint) -> Self {
+        Self {
+            url: endpoint.url,
+            transport: endpoint.transport,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_mcp: Option<McpEndpoint>,
+    pub context_mcp: Option<PersistedMcpEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<String>,
 }
@@ -197,11 +214,55 @@ pub struct EnvStateFile {
 
 pub fn write_state(paths: &EnvPaths, state: &EnvStateFile) -> EnvResult<()> {
     let path = paths.state_path();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| EnvError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+
     let rendered = serde_json::to_string_pretty(state).map_err(|source| EnvError::Json {
         path: path.clone(),
         source,
     })?;
-    fs::write(&path, rendered).map_err(|source| EnvError::Io { path, source })
+    let rendered = rendered.as_bytes();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| EnvError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(source),
+        })?;
+    let temp_path = path.with_file_name(format!(
+        ".state.json.{}.{}.tmp",
+        std::process::id(),
+        timestamp.as_nanos()
+    ));
+
+    let mut options = OpenOptions::new();
+    restrict_file_permissions(&mut options);
+    let mut tmp_file = options
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|source| EnvError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+    tmp_file
+        .write_all(rendered)
+        .map_err(|source| EnvError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+    tmp_file.sync_all().map_err(|source| EnvError::Io {
+        path: temp_path.clone(),
+        source,
+    })?;
+    drop(tmp_file);
+
+    fs::rename(&temp_path, &path).map_err(|source| {
+        let _ = fs::remove_file(&temp_path);
+        EnvError::Io { path, source }
+    })
 }
 
 pub fn read_state(paths: &EnvPaths) -> EnvResult<EnvStateFile> {
@@ -220,7 +281,15 @@ pub fn append_event(paths: &EnvPaths, event: serde_json::Value) -> EnvResult<()>
         path: parent.to_path_buf(),
         source,
     })?;
-    let mut file = OpenOptions::new()
+
+    let mut encoded = serde_json::to_vec(&event).map_err(|source| EnvError::Json {
+        path: path.clone(),
+        source,
+    })?;
+    encoded.push(b'\n');
+    let mut options = OpenOptions::new();
+    restrict_file_permissions(&mut options);
+    let mut file = options
         .create(true)
         .append(true)
         .open(&path)
@@ -228,25 +297,31 @@ pub fn append_event(paths: &EnvPaths, event: serde_json::Value) -> EnvResult<()>
             path: path.clone(),
             source,
         })?;
-    serde_json::to_writer(&mut file, &event).map_err(|source| EnvError::Json {
-        path: path.clone(),
-        source,
-    })?;
-    file.write_all(b"\n")
+    file.write_all(&encoded)
         .map_err(|source| EnvError::Io { path, source })
 }
+
+#[cfg(unix)]
+fn restrict_file_permissions(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_options: &mut OpenOptions) {}
 
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, fs};
 
-    use agentenv_proto::{McpEndpoint, McpTransport};
+    use serde_json::Value;
 
     use super::{
         append_event, read_state, validate_env_name, write_state, DriverHandles, DriverRecord,
-        EndpointState, EnvPaths, EnvPhase, EnvStateFile, HealthRecord, StateDriverSet,
-        STATE_VERSION,
+        EndpointState, EnvPaths, EnvPhase, EnvStateFile, HealthRecord, PersistedMcpEndpoint,
+        StateDriverSet, STATE_VERSION,
     };
+    use agentenv_proto::{McpEndpoint, McpTransport};
 
     #[test]
     fn env_name_validation_rejects_traversal_and_empty_names() {
@@ -296,6 +371,16 @@ mod tests {
         let paths = EnvPaths::new(root, validate_env_name("demo").unwrap());
         fs::create_dir_all(paths.env_dir()).unwrap();
 
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_owned(), "sk-secret-value".to_owned());
+        headers.insert("x-api-key".to_owned(), "very-secret-key".to_owned());
+
+        let context_mcp = PersistedMcpEndpoint::from_mcp(McpEndpoint {
+            url: "stdio://agentenv-fs-mcp".to_owned(),
+            transport: McpTransport::Stdio,
+            headers,
+        });
+
         let drivers = StateDriverSet {
             sandbox: DriverRecord::new("openshell", "0.0.1-alpha0"),
             agent: DriverRecord::new("codex", "0.0.1-alpha0"),
@@ -316,11 +401,7 @@ mod tests {
                 inference: Some("inf-1".to_owned()),
             },
             endpoints: EndpointState {
-                context_mcp: Some(McpEndpoint {
-                    url: "stdio://agentenv-fs-mcp".to_owned(),
-                    transport: McpTransport::Stdio,
-                    headers: BTreeMap::new(),
-                }),
+                context_mcp: Some(context_mcp),
                 inference: Some("http://inference.local".to_owned()),
             },
             credential_names: vec!["OPENAI_API_KEY".to_owned()],
@@ -339,6 +420,11 @@ mod tests {
         write_state(&paths, &state).unwrap();
         let rendered = fs::read_to_string(paths.state_path()).unwrap();
         assert!(!rendered.contains("sk-secret-value"));
+        assert!(!rendered.contains("very-secret-key"));
+        let rendered_json: Value = serde_json::from_str(&rendered).unwrap();
+        assert!(rendered_json["endpoints"]["context_mcp"]
+            .get("headers")
+            .is_none());
         assert!(rendered.contains("OPENAI_API_KEY"));
 
         let loaded = read_state(&paths).unwrap();
