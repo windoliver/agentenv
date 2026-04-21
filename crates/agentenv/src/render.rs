@@ -79,6 +79,7 @@ pub fn exit_for_error(error: &RuntimeError) -> ExitClass {
         | ReasonCode::InvalidBlueprint
         | ReasonCode::CapabilityMissing => ExitClass::TerminalFailure,
         ReasonCode::MissingCredential => ExitClass::MissingCredential,
+        ReasonCode::PreflightFailed => ExitClass::PreflightFailed,
         ReasonCode::DriverCommandFailed | ReasonCode::CleanupFailed => ExitClass::RetryableFailure,
         _ => ExitClass::GenericFailure,
     }
@@ -133,4 +134,21 @@ pub fn print_describe_text(description: &EnvDescription) {
 #[allow(dead_code)]
 pub fn print_admission_text(report: &AdmissionReport) {
     println!("{}: {}", report.env, report.reason_code.as_str());
+}
+
+#[cfg(test)]
+mod tests {
+    use agentenv_core::{admission::ExitClass, driver::DriverError, runtime::RuntimeError};
+
+    use super::{exit_for_error, reason_for_error};
+
+    #[test]
+    fn preflight_driver_error_keeps_preflight_exit_class() {
+        let error = RuntimeError::Driver(DriverError::PreflightFailed {
+            message: "missing runtime".to_owned(),
+        });
+
+        assert_eq!(reason_for_error(&error).as_str(), "preflight_failed");
+        assert_eq!(exit_for_error(&error), ExitClass::PreflightFailed);
+    }
 }
