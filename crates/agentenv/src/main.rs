@@ -25,6 +25,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Create(CreateArgs),
+    Enter(EnterArgs),
+    List(ListArgs),
+    Destroy(DestroyArgs),
+    Describe(DescribeArgs),
+    Status(StatusArgs),
+    Logs(LogsArgs),
+    Exec(ExecArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
     VerifyBlueprint {
@@ -40,6 +48,73 @@ enum Commands {
     Reproduce {
         lockfile: PathBuf,
     },
+}
+
+#[derive(Debug, Args)]
+struct CreateArgs {
+    name: String,
+    #[arg(long, value_name = "FILE")]
+    blueprint: Option<PathBuf>,
+    #[arg(long, value_name = "FILE")]
+    reproduce: Option<PathBuf>,
+    #[arg(long)]
+    preflight_only: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, env = "AGENTENV_NON_INTERACTIVE")]
+    non_interactive: bool,
+}
+
+#[derive(Debug, Args)]
+struct EnterArgs {
+    name: String,
+    #[arg(long)]
+    detach: bool,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DestroyArgs {
+    name: String,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    purge_credentials: bool,
+}
+
+#[derive(Debug, Args)]
+struct DescribeArgs {
+    name: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    name: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct LogsArgs {
+    name: String,
+    #[arg(long)]
+    follow: bool,
+    #[arg(long)]
+    driver: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExecArgs {
+    name: String,
+    #[arg(last = true, required = true)]
+    cmd: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -91,9 +166,10 @@ enum CredentialCommand {
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     init_tracing();
-    if let Err(error) = run() {
+    if let Err(error) = run().await {
         eprintln!("error: {error:#}");
         process::exit(1);
     }
@@ -109,9 +185,17 @@ fn init_tracing() {
         .try_init();
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(Commands::Create(args)) => run_create(args).await,
+        Some(Commands::Enter(args)) => run_enter(args).await,
+        Some(Commands::List(args)) => run_list(args),
+        Some(Commands::Destroy(args)) => run_destroy(args).await,
+        Some(Commands::Describe(args)) => run_describe(args),
+        Some(Commands::Status(args)) => run_status(args).await,
+        Some(Commands::Logs(args)) => run_logs(args).await,
+        Some(Commands::Exec(args)) => run_exec(args).await,
         Some(Commands::Credentials(command)) => run_credentials(command),
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
@@ -128,6 +212,76 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn run_create(args: CreateArgs) -> Result<()> {
+    let CreateArgs {
+        name,
+        blueprint,
+        reproduce,
+        preflight_only,
+        json,
+        non_interactive,
+    } = args;
+    let _ = (
+        name,
+        blueprint,
+        reproduce,
+        preflight_only,
+        json,
+        non_interactive,
+    );
+    bail!("create runtime wiring is not connected")
+}
+
+async fn run_enter(args: EnterArgs) -> Result<()> {
+    let EnterArgs { name, detach } = args;
+    let _ = (name, detach);
+    bail!("enter runtime wiring is not connected")
+}
+
+fn run_list(args: ListArgs) -> Result<()> {
+    let ListArgs { json } = args;
+    let _ = json;
+    bail!("list runtime wiring is not connected")
+}
+
+async fn run_destroy(args: DestroyArgs) -> Result<()> {
+    let DestroyArgs {
+        name,
+        yes,
+        purge_credentials,
+    } = args;
+    let _ = (name, yes, purge_credentials);
+    bail!("destroy runtime wiring is not connected")
+}
+
+fn run_describe(args: DescribeArgs) -> Result<()> {
+    let DescribeArgs { name, json } = args;
+    let _ = (name, json);
+    bail!("describe runtime wiring is not connected")
+}
+
+async fn run_status(args: StatusArgs) -> Result<()> {
+    let StatusArgs { name, json } = args;
+    let _ = (name, json);
+    bail!("status runtime wiring is not connected")
+}
+
+async fn run_logs(args: LogsArgs) -> Result<()> {
+    let LogsArgs {
+        name,
+        follow,
+        driver,
+    } = args;
+    let _ = (name, follow, driver);
+    bail!("logs runtime wiring is not connected")
+}
+
+async fn run_exec(args: ExecArgs) -> Result<()> {
+    let ExecArgs { name, cmd } = args;
+    let _ = (name, cmd);
+    bail!("exec runtime wiring is not connected")
 }
 
 fn run_credentials(args: CredentialsArgs) -> Result<()> {
@@ -344,6 +498,14 @@ mod tests {
         assert_eq!(
             subcommands,
             vec![
+                "create".to_string(),
+                "enter".to_string(),
+                "list".to_string(),
+                "destroy".to_string(),
+                "describe".to_string(),
+                "status".to_string(),
+                "logs".to_string(),
+                "exec".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
                 "verify-blueprint".to_string(),
