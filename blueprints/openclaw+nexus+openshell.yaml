@@ -24,6 +24,7 @@ agent:
 
 context:
   driver: nexus
+  # External subprocess driver installed at ~/.agentenv/drivers/context-nexus/.
   mode: hub
   hub_url: ${NEXUS_HUB_URL}
   credentials:
