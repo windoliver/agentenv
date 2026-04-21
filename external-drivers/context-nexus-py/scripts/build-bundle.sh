@@ -11,7 +11,20 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "${OUT_DIR}" "${TMP_ROOT}/context-nexus"
-cp -R "${DRIVER_ROOT}/pyproject.toml" "${DRIVER_ROOT}/README.md" "${DRIVER_ROOT}/manifest.json.in" "${DRIVER_ROOT}/src" "${DRIVER_ROOT}/scripts" "${TMP_ROOT}/context-nexus/"
+bundle_root="${TMP_ROOT}/context-nexus"
+mkdir -p "${OUT_DIR}" "${bundle_root}/bin" "${bundle_root}/src"
+cp -R "${DRIVER_ROOT}/pyproject.toml" "${DRIVER_ROOT}/README.md" "${DRIVER_ROOT}/manifest.json.in" "${DRIVER_ROOT}/scripts" "${bundle_root}/"
+cp "${DRIVER_ROOT}/manifest.json.in" "${bundle_root}/manifest.json"
+cp -R "${DRIVER_ROOT}/src/agentenv_context_nexus" "${bundle_root}/src/"
+
+cat > "${bundle_root}/bin/agentenv-driver-nexus" <<'EOF'
+#!/bin/sh
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+PYTHONPATH="${SCRIPT_DIR}/../src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec "${PYTHON:-python3}" -m agentenv_context_nexus "$@"
+EOF
+chmod +x "${bundle_root}/bin/agentenv-driver-nexus"
+
 (cd "${TMP_ROOT}" && tar -czf "${OUT_DIR}/context-nexus.tar.gz" context-nexus)
 printf '%s\n' "${OUT_DIR}/context-nexus.tar.gz"

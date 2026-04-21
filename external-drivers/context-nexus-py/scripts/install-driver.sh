@@ -7,6 +7,7 @@ DRIVER_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 
 AGENTENV_HOME="${AGENTENV_HOME:-$HOME/.agentenv}"
 DRIVERS_ROOT="${AGENTENV_HOME}/drivers"
+RELEASES_ROOT="${DRIVERS_ROOT}/.releases"
 INSTALL_ROOT="${DRIVERS_ROOT}/context-nexus"
 mkdir -p "${DRIVERS_ROOT}"
 
@@ -15,7 +16,9 @@ if [ -e "${INSTALL_ROOT}" ] && [ ! -L "${INSTALL_ROOT}" ]; then
     exit 1
 fi
 
-release=$(mktemp -d "${DRIVERS_ROOT}/.context-nexus.XXXXXX")
+mkdir -p "${RELEASES_ROOT}"
+
+release=$(mktemp -d "${RELEASES_ROOT}/context-nexus.XXXXXX")
 tmp_link=""
 installed=0
 
@@ -56,21 +59,26 @@ chmod +x "${staged}/bin/agentenv-driver-nexus"
 cp "${DRIVER_ROOT}/manifest.json.in" "${staged}/manifest.json"
 tmp_link=$(mktemp "${DRIVERS_ROOT}/.context-nexus.link.XXXXXX")
 rm -f "${tmp_link}"
-ln -s "$(basename "${release}")" "${tmp_link}"
+ln -s ".releases/$(basename "${release}")" "${tmp_link}"
 
 old_release=""
 if [ -L "${INSTALL_ROOT}" ]; then
     old_target=$(readlink "${INSTALL_ROOT}")
     case "${old_target}" in
-        /*) old_release="${old_target}" ;;
-        *) old_release="${DRIVERS_ROOT}/${old_target}" ;;
+        .releases/context-nexus.*)
+            old_name=${old_target#.releases/}
+            case "${old_name}" in
+                */*|*..*) old_release="" ;;
+                context-nexus.*) old_release="${RELEASES_ROOT}/${old_name}" ;;
+            esac
+            ;;
     esac
     replace_link "${tmp_link}" "${INSTALL_ROOT}"
     tmp_link=""
     installed=1
-    case "${old_release}" in
-        "${DRIVERS_ROOT}/.context-nexus."*) rm -rf "${old_release}" ;;
-    esac
+    if [ -n "${old_release}" ] && [ -d "${old_release}" ]; then
+        rm -rf "${old_release}"
+    fi
 else
     if replace_link "${tmp_link}" "${INSTALL_ROOT}"; then
         tmp_link=""
