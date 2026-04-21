@@ -118,7 +118,10 @@ class NexusContextDriver:
         if not isinstance(config, dict):
             raise ValueError("config must be an object")
         mode = config.get("mode", "lite")
-        zones = config.get("zones") or []
+        if "zones" in config:
+            zones = config["zones"]
+        else:
+            zones = []
         if not isinstance(zones, list) or not all(isinstance(zone, str) for zone in zones):
             raise ValueError("zones must be a list of strings")
         if mode == "hub":
@@ -130,8 +133,8 @@ class NexusContextDriver:
             self._handles[handle] = HandleState("hub", parsed.url, zones, parsed_url=parsed)
             return success(request_id, {"handle": handle})
         if mode == "lite":
-            data_dir = config.get("data_dir") or os.path.join(self._workdir, "nexus-data")
-            port = int(config.get("mcp_port") or find_free_port())
+            data_dir = self._lite_data_dir(config)
+            port = self._lite_mcp_port(config)
             os.makedirs(data_dir, exist_ok=True)
             process = start_lite_process(data_dir, port)
             handle = f"nexus-lite-{uuid.uuid4().hex[:16]}"
@@ -144,6 +147,25 @@ class NexusContextDriver:
             )
             return success(request_id, {"handle": handle})
         raise ValueError("mode must be hub or lite")
+
+    def _lite_data_dir(self, config):
+        if "data_dir" not in config or config["data_dir"] is None:
+            return os.path.join(self._workdir, "nexus-data")
+        data_dir = config["data_dir"]
+        if not isinstance(data_dir, str) or not data_dir:
+            raise ValueError("data_dir must be a non-empty string")
+        return data_dir
+
+    def _lite_mcp_port(self, config):
+        if "mcp_port" not in config or config["mcp_port"] is None:
+            return find_free_port()
+        try:
+            port = int(config["mcp_port"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("mcp_port must be a valid TCP port") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("mcp_port must be a valid TCP port")
+        return port
 
     def _lookup(self, params):
         handle = params.get("handle")

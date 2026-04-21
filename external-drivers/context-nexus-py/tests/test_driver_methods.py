@@ -1,5 +1,6 @@
 import subprocess
 
+import agentenv_context_nexus.driver as driver_module
 from agentenv_context_nexus.driver import HandleState, NexusContextDriver
 from agentenv_context_nexus.protocol import (
     ERROR_RESOURCE_NOT_FOUND,
@@ -138,6 +139,21 @@ def test_provision_rejects_non_object_params_without_creating_handle():
 
     assert response["error"]["code"] == JSON_RPC_INVALID_PARAMS
     assert driver._handles == {}
+
+
+def test_lite_provision_rejects_falsey_malformed_config_fields(monkeypatch):
+    def fail_start_lite_process(_data_dir, _port):
+        raise AssertionError("start_lite_process should not be called for invalid config")
+
+    monkeypatch.setattr(driver_module, "start_lite_process", fail_start_lite_process)
+
+    for config in ({"zones": ""}, {"mcp_port": []}, {"data_dir": []}):
+        driver = NexusContextDriver()
+
+        response = call(driver, "provision", {"config": config})
+
+        assert response["error"]["code"] == JSON_RPC_INVALID_PARAMS
+        assert driver._handles == {}
 
 
 def test_handle_methods_reject_missing_and_non_string_handles():
