@@ -17,3 +17,5 @@ def test_reference_blueprint_names_external_driver_directory():
     text = (WORKSPACE / "blueprints" / "hermes+nexus+openshell.yaml").read_text()
 
     assert "agent-hermes" in text
+    assert "agentenv drivers list" in text
+    assert "subprocess AgentDriver host integration" in text
