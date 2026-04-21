@@ -153,6 +153,57 @@ pub async fn initialize_inference_driver(
     Ok(result)
 }
 
+pub async fn run_preflight_only(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    env: &str,
+    selection: &DriverSelection,
+) -> RuntimeResult<crate::admission::AdmissionReport> {
+    let mut set = factory.build(selection)?;
+    let sandbox_info = initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+    let agent_info = initialize_agent_driver(options, set.agent.as_mut()).await?;
+    let context_info = initialize_context_driver(options, set.context.as_mut()).await?;
+    let sandbox_preflight = set.sandbox.preflight(empty_preflight_params()).await?;
+    let agent_preflight = set.agent.preflight(empty_preflight_params()).await?;
+    let context_preflight = set.context.preflight(empty_preflight_params()).await?;
+
+    let sandbox_check = crate::admission::PreflightCheck {
+        kind: DriverKind::Sandbox,
+        driver: sandbox_info.driver.name,
+        ok: sandbox_preflight.ok,
+        issues: sandbox_preflight.issues,
+    };
+    let agent_check = crate::admission::PreflightCheck {
+        kind: DriverKind::Agent,
+        driver: agent_info.driver.name,
+        ok: agent_preflight.ok,
+        issues: agent_preflight.issues,
+    };
+    let context_check = crate::admission::PreflightCheck {
+        kind: DriverKind::Context,
+        driver: context_info.driver.name,
+        ok: context_preflight.ok,
+        issues: context_preflight.issues,
+    };
+
+    let mut checks = vec![sandbox_check, agent_check, context_check];
+
+    if selection.inference.is_some() {
+        if let Some(inference) = set.inference.as_mut() {
+            let inference_info = initialize_inference_driver(options, inference.as_mut()).await?;
+            let inference_preflight = inference.preflight(empty_preflight_params()).await?;
+            checks.push(crate::admission::PreflightCheck {
+                kind: DriverKind::Inference,
+                driver: inference_info.driver.name,
+                ok: inference_preflight.ok,
+                issues: inference_preflight.issues,
+            });
+        }
+    }
+
+    Ok(crate::admission::AdmissionReport::from_checks(env, checks))
+}
+
 fn ensure_runtime_handshake(
     expected_kind: DriverKind,
     helper: &'static str,
@@ -607,6 +658,31 @@ mod tests {
 
         assert_eq!(sandbox_info.driver.name, "openshell");
         assert_eq!(context_info.driver.name, "filesystem");
+    }
+
+    #[tokio::test]
+    async fn preflight_only_returns_per_driver_checks() {
+        let options = RuntimeOptions {
+            root: std::env::temp_dir(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let selection = super::DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: None,
+        };
+
+        let report = super::run_preflight_only(&options, &TinyFactory, "demo", &selection)
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        assert_eq!(report.checks.len(), 3);
+        assert_eq!(report.checks[0].kind, DriverKind::Sandbox);
+        assert_eq!(report.checks[1].kind, DriverKind::Agent);
+        assert_eq!(report.checks[2].kind, DriverKind::Context);
     }
 
     fn bad_initialize_result(
