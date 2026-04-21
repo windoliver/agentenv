@@ -112,6 +112,8 @@ pub enum RuntimeError {
     },
     #[error("missing selected {kind} driver `{name}` from driver set")]
     MissingSelectedDriver { kind: &'static str, name: String },
+    #[error("state name `{actual}` does not match env `{expected}`")]
+    StateNameMismatch { expected: String, actual: String },
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -585,10 +587,12 @@ pub fn list_envs(options: &RuntimeOptions) -> RuntimeResult<Vec<EnvListRow>> {
             }
         };
 
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => continue,
-        };
+        let file_type = entry
+            .file_type()
+            .map_err(|source| crate::env::EnvError::Io {
+                path: entry.path(),
+                source,
+            })?;
         if !file_type.is_dir() {
             continue;
         }
@@ -601,12 +605,16 @@ pub fn list_envs(options: &RuntimeOptions) -> RuntimeResult<Vec<EnvListRow>> {
         };
 
         let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
-        let Ok(state) = crate::env::read_state(&paths) else {
-            continue;
-        };
+        let state = crate::env::read_state(&paths)?;
+        if state.name != name {
+            return Err(RuntimeError::StateNameMismatch {
+                expected: name,
+                actual: state.name,
+            });
+        }
 
         rows.push(EnvListRow {
-            name: state.name,
+            name,
             agent: state.drivers.agent.name,
             sandbox: state.drivers.sandbox.name,
             context: state.drivers.context.name,
@@ -631,6 +639,12 @@ pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDe
     }
 
     let state = crate::env::read_state(&paths)?;
+    if state.name != name {
+        return Err(RuntimeError::StateNameMismatch {
+            expected: name.to_owned(),
+            actual: state.name.clone(),
+        });
+    }
     let blueprint_path = paths.blueprint_path();
     let blueprint_yaml =
         fs::read_to_string(&blueprint_path).map_err(|source| crate::env::EnvError::Io {
@@ -1088,6 +1102,33 @@ mod tests {
             .expect("system clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn state_fixture(name: &str) -> crate::env::EnvStateFile {
+        crate::env::EnvStateFile {
+            version: crate::env::STATE_VERSION.to_owned(),
+            name: name.to_owned(),
+            phase: crate::env::EnvPhase::Running,
+            created_at: "2026-04-21T00:00:00Z".to_owned(),
+            updated_at: "2026-04-21T00:00:00Z".to_owned(),
+            drivers: crate::env::StateDriverSet {
+                sandbox: crate::env::DriverRecord::new("openshell", "0.0.1-alpha0"),
+                agent: crate::env::DriverRecord::new("codex", "0.0.1-alpha0"),
+                context: crate::env::DriverRecord::new("filesystem", "0.0.1-alpha0"),
+                inference: None,
+            },
+            handles: crate::env::DriverHandles::default(),
+            endpoints: crate::env::EndpointState::default(),
+            credential_names: Vec::new(),
+            health: BTreeMap::new(),
+            first_enter_hint_shown: false,
+        }
+    }
+
+    fn write_state_json(env_dir: &std::path::Path, state: crate::env::EnvStateFile) {
+        fs::create_dir_all(env_dir).unwrap();
+        let rendered = serde_json::to_string_pretty(&state).unwrap();
+        fs::write(env_dir.join("state.json"), rendered).unwrap();
     }
 
     #[derive(Default)]
@@ -2084,6 +2125,62 @@ policy:
         assert_eq!(described.state.name, "demo");
         assert!(described.blueprint_yaml.contains("driver: codex"));
         assert!(described.lock_yaml.contains("blueprint_hash:"));
+    }
+
+    #[test]
+    fn list_envs_skips_dot_prefixed_registry_dirs() {
+        let root = unique_root("agentenv-list-hidden");
+        let env_dir = root.join("envs").join(".demo.creating");
+        write_state_json(&env_dir, state_fixture(".demo.creating"));
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let rows = super::list_envs(&options).unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn list_envs_errors_on_corrupt_visible_state() {
+        let root = unique_root("agentenv-list-corrupt");
+        let env_dir = root.join("envs").join("demo");
+        fs::create_dir_all(&env_dir).unwrap();
+        fs::write(env_dir.join("state.json"), "{").unwrap();
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let err = super::list_envs(&options).unwrap_err();
+
+        assert!(matches!(
+            err,
+            RuntimeError::Env(crate::env::EnvError::Json { .. })
+        ));
+    }
+
+    #[test]
+    fn describe_env_rejects_state_name_mismatch() {
+        let root = unique_root("agentenv-describe-mismatch");
+        let env_dir = root.join("envs").join("demo");
+        write_state_json(&env_dir, state_fixture("other"));
+        fs::write(env_dir.join("blueprint.yaml"), "agent:\n  driver: codex\n").unwrap();
+        fs::write(env_dir.join("lock.yaml"), "blueprint_hash: test\n").unwrap();
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let err = super::describe_env(&options, "demo").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("state name `other` does not match env `demo`"));
     }
 
     #[tokio::test]

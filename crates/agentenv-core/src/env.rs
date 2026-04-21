@@ -15,7 +15,9 @@ pub const STATE_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Error)]
 pub enum EnvError {
-    #[error("invalid env name `{name}`: use ASCII letters, numbers, dot, dash, or underscore")]
+    #[error(
+        "invalid env name `{name}`: use ASCII letters, numbers, dot, dash, or underscore, and do not start with dot"
+    )]
     InvalidName { name: String },
     #[error("env `{name}` already exists")]
     AlreadyExists { name: String },
@@ -50,6 +52,7 @@ pub fn validate_env_name(name: &str) -> EnvResult<EnvName> {
     let valid = !name.is_empty()
         && name != "."
         && name != ".."
+        && !name.starts_with('.')
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
@@ -329,6 +332,7 @@ mod tests {
             "",
             ".",
             "..",
+            ".hidden",
             "../demo",
             "demo/name",
             "demo:name",
