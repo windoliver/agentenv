@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
-import re
+import sys
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -67,7 +70,7 @@ class HermesDriver:
 
     def preflight(self, params: dict[str, Any]) -> dict[str, Any]:
         del params
-        hermes = shutil.which("hermes")
+        hermes = _resolve_hermes_executable()
         if hermes is None:
             return {
                 "ok": False,
@@ -75,7 +78,10 @@ class HermesDriver:
                     {
                         "severity": "error",
                         "code": "hermes_missing",
-                        "message": "Hermes executable was not found in PATH.",
+                        "message": (
+                            "Hermes executable was not found in PATH or next to the "
+                            "driver Python."
+                        ),
                         "remediation": (
                             "Install the driver venv or run `python3 -m pip install "
                             '"hermes-agent[mcp]"` in it.'
@@ -222,3 +228,15 @@ def _shell_word(value: str) -> str:
     if value.replace("-", "").replace("_", "").replace("/", "").replace(".", "").isalnum():
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _resolve_hermes_executable() -> str | None:
+    hermes = shutil.which("hermes")
+    if hermes is not None:
+        return hermes
+
+    sibling = Path(sys.executable).with_name("hermes")
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+
+    return None

@@ -1,7 +1,10 @@
+import sys
+
 import yaml
 
 import pytest
 
+import agentenv_agent_hermes.hermes as hermes_module
 from agentenv_agent_hermes.hermes import HermesDriver
 from agentenv_agent_hermes.protocol import (
     ERROR_CAPABILITY_MISSING,
@@ -59,6 +62,37 @@ def test_initialize_schema_mismatch_uses_protocol_error():
         )
 
     assert raised.value.code == ERROR_SCHEMA_VERSION_INCOMPATIBLE
+
+
+def test_preflight_finds_hermes_next_to_current_python(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    python = bin_dir / "python"
+    python.write_text("")
+    hermes = bin_dir / "hermes"
+    hermes.write_text("#!/bin/sh\nexit 0\n")
+    hermes.chmod(0o755)
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        del kwargs
+        calls.append(args)
+        return hermes_module.subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="hermes 0.10.0\n",
+            stderr="",
+        )
+
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setattr(hermes_module.subprocess, "run", fake_run)
+
+    result = HermesDriver().preflight({})
+
+    assert result == {"ok": True, "issues": []}
+    assert calls == [[str(hermes), "--version"]]
 
 
 def test_install_steps_use_pypi_package_with_mcp_extra():
