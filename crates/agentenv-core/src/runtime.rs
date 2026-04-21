@@ -663,16 +663,19 @@ pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDe
         });
     }
     let blueprint_path = paths.blueprint_path();
-    let blueprint_yaml =
-        fs::read_to_string(&blueprint_path).map_err(|source| crate::env::EnvError::Io {
+    let blueprint_yaml = String::from_utf8(crate::env::read_regular_file(&blueprint_path)?)
+        .map_err(|source| crate::env::EnvError::Io {
             path: blueprint_path.clone(),
-            source,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
         })?;
     let lock_path = paths.lock_path();
-    let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| crate::env::EnvError::Io {
-        path: lock_path.clone(),
-        source,
-    })?;
+    let lock_yaml =
+        String::from_utf8(crate::env::read_regular_file(&lock_path)?).map_err(|source| {
+            crate::env::EnvError::Io {
+                path: lock_path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            }
+        })?;
 
     Ok(EnvDescription {
         state,
@@ -2180,6 +2183,30 @@ policy:
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn list_envs_errors_on_symlinked_state_file() {
+        let root = unique_root("agentenv-list-state-symlink");
+        let env_dir = root.join("envs").join("demo");
+        fs::create_dir_all(&env_dir).unwrap();
+        let outside_state = root.join("outside-state.json");
+        fs::write(
+            &outside_state,
+            serde_json::to_string_pretty(&state_fixture("demo")).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside_state, env_dir.join("state.json")).unwrap();
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let err = super::list_envs(&options).unwrap_err();
+
+        assert!(err.to_string().contains("not a regular file"));
+    }
+
     #[test]
     fn describe_env_rejects_state_name_mismatch() {
         let root = unique_root("agentenv-describe-mismatch");
@@ -2227,6 +2254,35 @@ policy:
             err,
             RuntimeError::Env(crate::env::EnvError::NotFound { name }) if name == "demo"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn describe_env_rejects_symlinked_registry_files() {
+        for (label, linked_file, regular_file) in [
+            ("blueprint", "blueprint.yaml", "lock.yaml"),
+            ("lock", "lock.yaml", "blueprint.yaml"),
+        ] {
+            let root = unique_root(&format!("agentenv-describe-{label}-symlink"));
+            let env_dir = root.join("envs").join("demo");
+            write_state_json(&env_dir, state_fixture("demo"));
+            fs::write(env_dir.join(regular_file), "regular: true\n").unwrap();
+            let outside_file = root.join(format!("outside-{linked_file}"));
+            fs::write(&outside_file, "external: true\n").unwrap();
+            std::os::unix::fs::symlink(&outside_file, env_dir.join(linked_file)).unwrap();
+            let options = RuntimeOptions {
+                root,
+                log_level: LogLevel::Info,
+                non_interactive: true,
+            };
+
+            let err = super::describe_env(&options, "demo").unwrap_err();
+
+            assert!(
+                err.to_string().contains("not a regular file"),
+                "expected {linked_file} symlink to be rejected, got {err}"
+            );
+        }
     }
 
     #[tokio::test]

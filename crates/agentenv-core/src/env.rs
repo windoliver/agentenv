@@ -270,11 +270,29 @@ pub fn write_state(paths: &EnvPaths, state: &EnvStateFile) -> EnvResult<()> {
 
 pub fn read_state(paths: &EnvPaths) -> EnvResult<EnvStateFile> {
     let path = paths.state_path();
-    let bytes = fs::read(&path).map_err(|source| EnvError::Io {
-        path: path.clone(),
+    let bytes = read_regular_file(&path)?;
+    serde_json::from_slice(&bytes).map_err(|source| EnvError::Json { path, source })
+}
+
+pub fn read_regular_file(path: &Path) -> EnvResult<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| EnvError::Io {
+        path: path.to_path_buf(),
         source,
     })?;
-    serde_json::from_slice(&bytes).map_err(|source| EnvError::Json { path, source })
+    if !metadata.file_type().is_file() {
+        return Err(EnvError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "registry file is not a regular file",
+            ),
+        });
+    }
+
+    fs::read(path).map_err(|source| EnvError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn append_event(paths: &EnvPaths, event: serde_json::Value) -> EnvResult<()> {
