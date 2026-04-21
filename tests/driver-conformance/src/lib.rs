@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const DEFAULT_DRIVER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcRequestEnvelope {
@@ -100,7 +102,7 @@ pub fn read_framed_json<R: BufRead>(reader: &mut R) -> Result<Value> {
 pub struct RpcClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: Option<BufReader<ChildStdout>>,
 }
 
 impl RpcClient {
@@ -124,7 +126,7 @@ impl RpcClient {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout: Some(BufReader::new(stdout)),
         })
     }
 
@@ -134,6 +136,28 @@ impl RpcClient {
         R: DeserializeOwned,
     {
         let response = self.call(id, method, params)?;
+        Self::decode_success_response(response, method)
+    }
+
+    pub fn call_success_timeout<P, R>(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &P,
+        timeout: Duration,
+    ) -> Result<R>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let response = self.call_timeout(id, method, params, timeout)?;
+        Self::decode_success_response(response, method)
+    }
+
+    fn decode_success_response<R>(response: RpcResponseEnvelope, method: &str) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
         if let Some(error) = response.error {
             bail!(
                 "unexpected JSON-RPC error {}: {}",
@@ -200,6 +224,19 @@ impl RpcClient {
     where
         P: Serialize,
     {
+        self.call_timeout(id, method, params, DEFAULT_RPC_TIMEOUT)
+    }
+
+    fn call_timeout<P>(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &P,
+        timeout: Duration,
+    ) -> Result<RpcResponseEnvelope>
+    where
+        P: Serialize,
+    {
         let expected_id = json!(id);
         let request = json!({
             "jsonrpc": "2.0",
@@ -209,7 +246,54 @@ impl RpcClient {
         });
 
         write_framed_json(&mut self.stdin, &request)?;
-        read_response_envelope(&mut self.stdout, &request["id"])
+        let mut stdout = self.stdout.take().ok_or_else(|| {
+            anyhow!("driver stdout pipe was not available while calling `{method}`")
+        })?;
+        let expected_id_for_thread = request["id"].clone();
+        let (tx, rx) = mpsc::channel();
+
+        let reader = thread::spawn(move || {
+            let result = read_response_envelope(&mut stdout, &expected_id_for_thread);
+            let _ = tx.send((result, stdout));
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok((result, stdout)) => {
+                self.stdout = Some(stdout);
+                reader
+                    .join()
+                    .map_err(|_| anyhow!("JSON-RPC reader thread panicked"))?;
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let kill_result = self.child.kill();
+                let reap_result = self.child.wait();
+                let _ = reader.join();
+                match (kill_result, reap_result) {
+                    (Ok(()), Ok(status)) => bail!(
+                        "JSON-RPC method `{method}` timed out after {:?} waiting for response; killed and reaped driver with status {status}",
+                        timeout
+                    ),
+                    (Ok(()), Err(error)) => Err(error).with_context(|| {
+                        format!(
+                            "JSON-RPC method `{method}` timed out after {timeout:?}; killed driver but failed to reap"
+                        )
+                    }),
+                    (Err(kill_error), Ok(status)) => bail!(
+                        "JSON-RPC method `{method}` timed out after {:?} waiting for response; failed to kill driver: {kill_error}; reaped with status {status}",
+                        timeout
+                    ),
+                    (Err(kill_error), Err(reap_error)) => bail!(
+                        "JSON-RPC method `{method}` timed out after {:?} waiting for response; failed to kill driver: {kill_error}; failed to reap: {reap_error}",
+                        timeout
+                    ),
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = reader.join();
+                bail!("JSON-RPC reader thread disconnected while calling `{method}`")
+            }
+        }
     }
 }
 
@@ -613,6 +697,51 @@ mod tests {
         );
 
         fs::remove_file(script_path).expect("remove sleeping script");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_call_timeout_kills_non_responding_child() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-silent-{}-{unique}.sh",
+            process::id()
+        ));
+        fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write silent script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read silent script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions).expect("make silent script executable");
+
+        let mut client = RpcClient::spawn(&script_path).expect("spawn silent script");
+        let err = client
+            .call_success_timeout::<_, EmptyResult>(
+                1,
+                "initialize",
+                &json!({}),
+                Duration::from_millis(20),
+            )
+            .expect_err("silent script should time out waiting for initialize response");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("initialize") && message.contains("timed out"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            client
+                .child
+                .try_wait()
+                .expect("query child exit after RPC timeout")
+                .is_some(),
+            "RPC timeout path should kill and reap the child"
+        );
+
+        fs::remove_file(script_path).expect("remove silent script");
     }
 
     #[test]
