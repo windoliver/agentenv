@@ -635,7 +635,7 @@ install_python_drivers() {
         rm -rf "${staged_driver_dir}"
         mkdir -p "${staged_driver_dir}"
         tar -xzf "${archive_path}" -C "${staged_driver_dir}" || die "Could not extract Python driver bundle for ${driver_name}"
-        if [ ! -f "${staged_driver_dir}/manifest.json" ] && [ -f "${staged_driver_dir}/${driver_name}/manifest.json" ]; then
+        if [ ! -f "${staged_driver_dir}/manifest.json" ] && [ ! -f "${staged_driver_dir}/pyproject.toml" ] && [ -d "${staged_driver_dir}/${driver_name}" ]; then
             inner_dir="${staged_driver_dir}/${driver_name}"
             flattened_dir="${TMP_ROOT}/${driver_name}.flattened"
             rm -rf "${flattened_dir}"
@@ -643,8 +643,12 @@ install_python_drivers() {
             rm -rf "${staged_driver_dir}"
             mv "${flattened_dir}" "${staged_driver_dir}"
         fi
-        [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
-        replace_driver_dir "${staged_driver_dir}" "${driver_dir}"
+        if [ -f "${staged_driver_dir}/scripts/install-driver.sh" ] && [ -f "${staged_driver_dir}/pyproject.toml" ]; then
+            AGENTENV_HOME="${AGENTENV_HOME}" sh "${staged_driver_dir}/scripts/install-driver.sh" >/dev/null
+        else
+            [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
+            replace_driver_dir "${staged_driver_dir}" "${driver_dir}"
+        fi
         installed_count=$((installed_count + 1))
     done < "${index_path}"
 

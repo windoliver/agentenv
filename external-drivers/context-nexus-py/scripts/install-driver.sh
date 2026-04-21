@@ -52,6 +52,8 @@ mkdir -p "${staged}/bin" "${staged}/wheels"
 cat > "${staged}/bin/agentenv-driver-nexus" <<'EOF'
 #!/bin/sh
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+PATH="${SCRIPT_DIR}/../venv/bin${PATH:+:$PATH}"
+export PATH
 exec "${SCRIPT_DIR}/../venv/bin/python" -m agentenv_context_nexus "$@"
 EOF
 chmod +x "${staged}/bin/agentenv-driver-nexus"

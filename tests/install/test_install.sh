@@ -49,6 +49,46 @@ EOF
     chmod +x "${command_dir}/${name}"
 }
 
+make_stub_python3_for_driver_install() {
+    command_dir=$1
+    mkdir -p "${command_dir}"
+    cat > "${command_dir}/python3" <<'EOF'
+#!/bin/sh
+set -eu
+
+if [ "$#" -ge 3 ] && [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+    venv_dir=$3
+    mkdir -p "${venv_dir}/bin"
+    cat > "${venv_dir}/bin/python" <<'PYEOF'
+#!/bin/sh
+set -eu
+
+if [ "$#" -ge 3 ] && [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+    exit 0
+fi
+
+printf 'unexpected venv python invocation: %s\n' "$*" >&2
+exit 1
+PYEOF
+    chmod +x "${venv_dir}/bin/python"
+    exit 0
+fi
+
+if [ "$#" -ge 3 ] && [ "$1" = "-" ]; then
+    cat >/dev/null
+    src=$2
+    dst=$3
+    rm -f "${dst}"
+    mv "${src}" "${dst}"
+    exit 0
+fi
+
+printf 'unexpected python3 invocation: %s\n' "$*" >&2
+exit 1
+EOF
+    chmod +x "${command_dir}/python3"
+}
+
 test_detect_target_linux_gnu() {
     tmp_root=$(mktemp -d)
 
@@ -232,6 +272,52 @@ test_install_python_drivers_installs_context_nexus_bundle() {
     pass
 }
 
+test_install_python_drivers_installs_source_context_nexus_bundle_with_venv() {
+    tmp_root=$(mktemp -d)
+
+    make_stub_python3_for_driver_install "${tmp_root}/bin"
+    bundle_path=$(cd "${REPO_ROOT}/external-drivers/context-nexus-py" && ./scripts/build-bundle.sh "${tmp_root}/dist")
+
+    expected_hash=$(sha256_file "${bundle_path}")
+    printf 'context-nexus|file://%s|%s\n' "${bundle_path}" "${expected_hash}" > "${tmp_root}/drivers.index"
+
+    TMP_ROOT="${tmp_root}/tmp"
+    mkdir -p "${TMP_ROOT}"
+    AGENTENV_HOME="${tmp_root}/home/.agentenv"
+    WITH_PYTHON_DRIVERS=1
+    PYTHON_DRIVERS_INDEX_URL="file://${tmp_root}/drivers.index"
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}"
+
+    install_python_drivers
+
+    PATH=${ORIGINAL_PATH}
+    test -f "${AGENTENV_HOME}/drivers/context-nexus/manifest.json" || fail "source context-nexus manifest missing"
+    test -x "${AGENTENV_HOME}/drivers/context-nexus/bin/agentenv-driver-nexus" || fail "source context-nexus launcher missing"
+    test -x "${AGENTENV_HOME}/drivers/context-nexus/venv/bin/python" || fail "source context-nexus venv python missing"
+    assert_eq "installed 1 bundle(s)" "${PYTHON_DRIVER_STATUS}" "source python driver install status"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_install_driver_launcher_prepends_venv_bin_to_path() {
+    tmp_root=$(mktemp -d)
+
+    make_stub_python3_for_driver_install "${tmp_root}/bin"
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}"
+    AGENTENV_HOME="${tmp_root}/home/.agentenv"
+    (cd "${REPO_ROOT}/external-drivers/context-nexus-py" && AGENTENV_HOME="${AGENTENV_HOME}" ./scripts/install-driver.sh > "${tmp_root}/install-driver.out")
+    PATH=${ORIGINAL_PATH}
+
+    launcher="${AGENTENV_HOME}/drivers/context-nexus/bin/agentenv-driver-nexus"
+    test -x "${launcher}" || fail "context-nexus launcher missing after install-driver.sh"
+    assert_contains 'PATH="${SCRIPT_DIR}/../venv/bin${PATH:+:$PATH}"' "${launcher}" "launcher should prepend venv bin to PATH"
+    assert_contains 'export PATH' "${launcher}" "launcher should export PATH"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_choose_rc_targets_creates_profile_when_missing() {
     tmp_root=$(mktemp -d)
 
@@ -256,6 +342,8 @@ main() {
     test_configure_shell_path_persists_when_current_shell_has_path
     test_install_python_drivers_preserves_existing_driver_on_extract_failure
     test_install_python_drivers_installs_context_nexus_bundle
+    test_install_python_drivers_installs_source_context_nexus_bundle_with_venv
+    test_install_driver_launcher_prepends_venv_bin_to_path
     test_choose_rc_targets_creates_profile_when_missing
     printf 'PASS: %s installer tests\n' "${TEST_COUNT}"
 }
