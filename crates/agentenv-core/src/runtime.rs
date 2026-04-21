@@ -826,6 +826,10 @@ pub async fn destroy_env(
     let paths =
         crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
 
+    if state.handles.inference.is_some() && set.inference.is_none() {
+        return Err(missing_inference_driver(&state));
+    }
+
     if let Some(handle) = state.handles.sandbox.clone() {
         initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
         set.sandbox
@@ -837,16 +841,7 @@ pub async fn destroy_env(
 
     if let Some(handle) = state.handles.inference.clone() {
         let Some(inference) = set.inference.as_mut() else {
-            let name = state
-                .drivers
-                .inference
-                .as_ref()
-                .map(|driver| driver.name.clone())
-                .unwrap_or_else(|| "<unknown>".to_owned());
-            return Err(RuntimeError::MissingSelectedDriver {
-                kind: "inference",
-                name,
-            });
+            return Err(missing_inference_driver(&state));
         };
         initialize_inference_driver(options, inference.as_mut()).await?;
         inference
@@ -899,6 +894,19 @@ fn required_sandbox_handle(state: &crate::env::EnvStateFile, name: &str) -> Runt
         .ok_or_else(|| RuntimeError::MissingSandboxHandle {
             name: name.to_owned(),
         })
+}
+
+fn missing_inference_driver(state: &crate::env::EnvStateFile) -> RuntimeError {
+    let name = state
+        .drivers
+        .inference
+        .as_ref()
+        .map(|driver| driver.name.clone())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    RuntimeError::MissingSelectedDriver {
+        kind: "inference",
+        name,
+    }
 }
 
 fn create_temp_workspace(root: &Path, name: &str) -> PathBuf {
@@ -3440,6 +3448,9 @@ policy:
             RuntimeError::MissingSelectedDriver { kind: "inference", name } if name == "passthrough"
         ));
         assert!(options.root.join("envs").join("demo").exists());
+        let state = crate::env::read_state(&paths).unwrap();
+        assert_eq!(state.handles.sandbox.as_deref(), Some("sb-1"));
+        assert_eq!(state.handles.inference.as_deref(), Some("inf-1"));
     }
 
     #[tokio::test]
