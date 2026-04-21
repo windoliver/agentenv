@@ -66,7 +66,7 @@ Add a durable lifecycle layer to `agentenv-core`. The binary crate remains CLI g
 1. env registry paths and state file schema.
 2. env name validation and registry locking.
 3. state transitions for create, destroy, status, logs, and exec.
-4. driver selection and built-in driver instantiation.
+4. driver selection and a factory interface for concrete driver construction.
 5. preflight aggregation.
 6. credential requirement aggregation without credential value rendering.
 7. policy composition and driver-required network-rule merging.
@@ -82,7 +82,7 @@ Add a durable lifecycle layer to `agentenv-core`. The binary crate remains CLI g
 6. exit-code mapping.
 7. terminal attachment for `enter` and `logs --follow`.
 
-Driver protocol methods remain the narrow waist. The core should call built-in driver trait implementations directly in this slice. Future subprocess adapters can implement the same traits without changing CLI behavior.
+Driver protocol methods remain the narrow waist. The core should call driver trait implementations directly through an injected factory in this slice. The concrete built-in factory lives in the `agentenv` binary crate because built-in driver crates already depend on `agentenv-core`; putting concrete construction in core would create a dependency cycle. Future subprocess adapters can implement the same traits without changing CLI behavior.
 
 ## 4. Env Registry And State
 
@@ -101,7 +101,7 @@ The canonical state layout is:
   credentials.json
 ```
 
-`create` writes into a temporary sibling directory first, then atomically renames it to `envs/<name>` after the minimum viable state is present. If a driver operation fails after resources have been created, the temp directory is kept with enough state for cleanup and the error is marked retryable where appropriate.
+`create` writes into a temporary sibling directory first, then atomically renames it to `envs/<name>` after the minimum viable state is present. If a driver operation fails after resources have been created, the temp directory is kept with enough state for cleanup and the error is marked retryable when the failure is safe to retry.
 
 `state.json` is versioned and contains no secrets:
 
@@ -133,7 +133,7 @@ The canonical state layout is:
 }
 ```
 
-Exact field names may be adjusted during implementation, but the invariant is strict: state may include names, backends, handles, endpoints, and health summaries, never credential values.
+Exact field names may be changed during implementation, but the invariant is strict: state may include names, backends, handles, endpoints, and health summaries, never credential values.
 
 `events.jsonl` is append-only. Events should include lifecycle steps, progress, preflight results, admission decisions, command failures, and fallback log records. Driver logs remain the primary source for `agentenv logs`; `events.jsonl` is the fallback when driver logs are unavailable.
 
