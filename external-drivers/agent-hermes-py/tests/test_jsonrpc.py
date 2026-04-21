@@ -51,13 +51,6 @@ def test_server_returns_parse_error_for_negative_content_length():
     class NegativeContentLengthStream(io.BytesIO):
         def __init__(self):
             super().__init__(b"Content-Length: -1\r\n\r\n")
-            self.read_sizes: list[int] = []
-
-        def read(self, size: int = -1):
-            self.read_sizes.append(size)
-            if size == -1:
-                return b"{}"
-            return super().read(size)
 
     input_stream = NegativeContentLengthStream()
     output_stream = io.BytesIO()
@@ -66,8 +59,9 @@ def test_server_returns_parse_error_for_negative_content_length():
 
     output_stream.seek(0)
     payload = read_framed_json(output_stream)
+    second_payload = read_framed_json(output_stream)
 
     assert payload["jsonrpc"] == "2.0"
     assert payload["id"] is None
     assert payload["error"]["code"] == JSON_RPC_PARSE_ERROR
-    assert input_stream.read_sizes == []
+    assert second_payload is None

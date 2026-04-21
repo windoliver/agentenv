@@ -26,6 +26,7 @@ def write_framed_json(stream: BinaryIO, payload: dict[str, Any]) -> None:
 
 def read_framed_json(stream: BinaryIO) -> dict[str, Any] | None:
     content_length: int | None = None
+    invalid_content_length: str | None = None
 
     while True:
         line = stream.readline()
@@ -42,12 +43,14 @@ def read_framed_json(stream: BinaryIO) -> dict[str, Any] | None:
                     f"invalid Content-Length `{raw.decode('ascii', 'replace')}`"
                 ) from exc
             if content_length < 0:
-                raise ValueError(
+                invalid_content_length = (
                     f"invalid Content-Length `{content_length}`: must be non-negative"
                 )
 
     if content_length is None:
         raise ValueError("missing Content-Length header")
+    if invalid_content_length is not None:
+        raise ValueError(invalid_content_length)
 
     body = stream.read(content_length)
     if len(body) != content_length:
