@@ -1,6 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use agentenv_proto::{
     assert_compatible_schema_version, schema_version_major, Capabilities, ContextHandleRequest,
@@ -12,6 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const DEFAULT_DRIVER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcRequestEnvelope {
@@ -157,7 +161,39 @@ impl RpcClient {
     }
 
     pub fn wait_for_exit(&mut self) -> Result<ExitStatus> {
-        self.child.wait().context("wait for driver to exit")
+        self.wait_for_exit_timeout(DEFAULT_DRIVER_EXIT_TIMEOUT)
+    }
+
+    pub fn wait_for_exit_timeout(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().context("poll driver exit status")? {
+                return Ok(status);
+            }
+
+            if started.elapsed() >= timeout {
+                let kill_result = self.child.kill();
+                let reap_result = self.child.wait();
+                return match (kill_result, reap_result) {
+                    (Ok(()), Ok(status)) => bail!(
+                        "driver timed out after {:?} without exiting; killed and reaped with status {status}",
+                        timeout
+                    ),
+                    (Ok(()), Err(error)) => Err(error)
+                        .context("driver timed out without exiting; killed but failed to reap"),
+                    (Err(kill_error), Ok(status)) => bail!(
+                        "driver timed out after {:?} without exiting; failed to kill: {kill_error}; reaped with status {status}",
+                        timeout
+                    ),
+                    (Err(kill_error), Err(reap_error)) => bail!(
+                        "driver timed out after {:?} without exiting; failed to kill: {kill_error}; failed to reap: {reap_error}",
+                        timeout
+                    ),
+                };
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn call<P>(&mut self, id: u64, method: &str, params: &P) -> Result<RpcResponseEnvelope>
@@ -221,6 +257,16 @@ fn read_response_envelope<R: BufRead>(
 
         return Ok(response);
     }
+}
+
+fn record_cleanup_error(result: &mut Result<()>, operation: &str, error: anyhow::Error) {
+    let previous = std::mem::replace(result, Ok(()));
+    *result = match previous {
+        Ok(()) => Err(anyhow!("cleanup failed during {operation}: {error:#}")),
+        Err(primary) => Err(anyhow!(
+            "{primary:#}; additionally, cleanup failed during {operation}: {error:#}"
+        )),
+    };
 }
 
 pub fn run_standard_suite(driver_path: &Path) -> Result<()> {
@@ -311,58 +357,79 @@ pub fn run_context_suite(driver_path: &Path) -> Result<()> {
 
     let handle: agentenv_proto::ContextHandle =
         client.call_success(3, "provision", &nexus_hub_conformance_spec())?;
-    let endpoint: agentenv_proto::McpEndpoint = client.call_success(
-        4,
-        "mcp_endpoint",
-        &ContextHandleRequest {
-            handle: handle.handle.clone(),
-        },
-    )?;
-    if endpoint.transport != McpTransport::Http {
-        bail!("nexus context endpoint must use HTTP transport");
-    }
+    let mut suite_result = (|| -> Result<()> {
+        let endpoint: agentenv_proto::McpEndpoint = client.call_success(
+            4,
+            "mcp_endpoint",
+            &ContextHandleRequest {
+                handle: handle.handle.clone(),
+            },
+        )?;
+        if endpoint.transport != McpTransport::Http {
+            bail!("nexus context endpoint must use HTTP transport");
+        }
 
-    let rules: agentenv_proto::RequiredNetworkRulesResult = client.call_success(
-        5,
-        "required_network_rules",
-        &ContextHandleRequest {
-            handle: handle.handle.clone(),
-        },
-    )?;
-    if !rules.rules.iter().any(|rule| {
-        matches!(
-            &rule.target,
-            NetworkTarget::Host { host, .. } if host == "nexus.example.test"
+        let rules: agentenv_proto::RequiredNetworkRulesResult = client.call_success(
+            5,
+            "required_network_rules",
+            &ContextHandleRequest {
+                handle: handle.handle.clone(),
+            },
+        )?;
+        if !rules.rules.iter().any(|rule| {
+            matches!(
+                &rule.target,
+                NetworkTarget::Host { host, .. } if host == "nexus.example.test"
+            )
+        }) {
+            bail!("hub mode must emit a network rule for nexus.example.test");
+        }
+
+        let status: agentenv_proto::ContextStatus = client.call_success(
+            6,
+            "status",
+            &ContextHandleRequest {
+                handle: handle.handle.clone(),
+            },
+        )?;
+        if !status.healthy {
+            bail!("context status must be healthy after hub provision");
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = client
+        .call_success::<_, EmptyResult>(
+            7,
+            "teardown",
+            &ContextHandleRequest {
+                handle: handle.handle,
+            },
         )
-    }) {
-        bail!("hub mode must emit a network rule for nexus.example.test");
+        .map(|_| ())
+    {
+        record_cleanup_error(&mut suite_result, "teardown", error);
     }
 
-    let status: agentenv_proto::ContextStatus = client.call_success(
-        6,
-        "status",
-        &ContextHandleRequest {
-            handle: handle.handle.clone(),
-        },
-    )?;
-    if !status.healthy {
-        bail!("context status must be healthy after hub provision");
+    if let Err(error) = client
+        .call_success::<_, EmptyResult>(8, "shutdown", &agentenv_proto::ShutdownParams {})
+        .map(|_| ())
+    {
+        record_cleanup_error(&mut suite_result, "shutdown", error);
     }
 
-    let _: EmptyResult = client.call_success(
-        7,
-        "teardown",
-        &ContextHandleRequest {
-            handle: handle.handle,
-        },
-    )?;
-    let _: EmptyResult = client.call_success(8, "shutdown", &agentenv_proto::ShutdownParams {})?;
-    let status = client.wait_for_exit()?;
-    if !status.success() {
-        bail!("driver exited with status {status}");
+    match client.wait_for_exit() {
+        Ok(status) if status.success() => {}
+        Ok(status) => record_cleanup_error(
+            &mut suite_result,
+            "wait_for_exit",
+            anyhow!("driver exited with status {status}"),
+        ),
+        Err(error) => record_cleanup_error(&mut suite_result, "wait_for_exit", error),
     }
 
-    Ok(())
+    suite_result
 }
 
 pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>(
@@ -480,8 +547,16 @@ pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::fs;
     use std::io::{BufReader, Cursor};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::process;
     use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use agentenv_core::driver::{AgentDriver, DriverResult, SandboxDriver};
     use agentenv_proto::{
@@ -496,9 +571,49 @@ mod tests {
 
     use super::{
         assert_agent_driver_contract, assert_sandbox_driver_contract, nexus_hub_conformance_spec,
-        read_response_envelope, write_framed_json,
+        read_response_envelope, write_framed_json, RpcClient,
     };
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_timeout_kills_non_exiting_child() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-sleep-{}-{unique}.sh",
+            process::id()
+        ));
+        fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeping script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read sleeping script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions).expect("make sleeping script executable");
+
+        let mut client = RpcClient::spawn(&script_path).expect("spawn sleeping script");
+        let err = client
+            .wait_for_exit_timeout(Duration::from_millis(20))
+            .expect_err("sleeping script should time out");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out") || message.contains("exit"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            client
+                .child
+                .try_wait()
+                .expect("query child exit after timeout")
+                .is_some(),
+            "timeout path should kill and reap the child"
+        );
+
+        fs::remove_file(script_path).expect("remove sleeping script");
+    }
 
     #[test]
     fn context_conformance_hub_spec_contains_required_config() {
