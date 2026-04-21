@@ -568,6 +568,134 @@ pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>
     Ok(())
 }
 
+pub async fn assert_context_driver_contract<D: agentenv_core::driver::ContextDriver>(
+    driver: &mut D,
+    spec: agentenv_proto::ContextSpec,
+) -> anyhow::Result<()> {
+    let init = driver
+        .initialize(agentenv_proto::InitializeParams {
+            schema_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
+            core_version: "0.0.1".to_owned(),
+            workdir: "/tmp/agentenv".to_owned(),
+            log_level: agentenv_proto::LogLevel::Info,
+        })
+        .await?;
+
+    agentenv_core::driver::ensure_protocol_compatible(&init)?;
+    anyhow::ensure!(
+        init.driver.kind == DriverKind::Context,
+        "initialize must report DriverKind::Context"
+    );
+    anyhow::ensure!(
+        matches!(init.capabilities, Capabilities::Context(_)),
+        "initialize must report Capabilities::Context"
+    );
+
+    let preflight = driver
+        .preflight(agentenv_proto::PreflightParams::default())
+        .await?;
+    anyhow::ensure!(preflight.ok, "preflight must pass");
+
+    let handle = driver.provision(spec).await?;
+    anyhow::ensure!(
+        !handle.handle.trim().is_empty(),
+        "context handle must not be empty"
+    );
+
+    let request = agentenv_proto::ContextHandleRequest {
+        handle: handle.handle,
+    };
+    let endpoint = driver.mcp_endpoint(request.clone()).await?;
+    ensure_valid_mcp_endpoint(&endpoint)?;
+    let network_rules = driver.required_network_rules(request.clone()).await?;
+    for rule in network_rules.rules {
+        ensure_valid_network_target(&rule.target)?;
+    }
+
+    let credentials = driver
+        .credential_requirements(agentenv_proto::CredentialRequirementsParams::default())
+        .await?;
+    anyhow::ensure!(
+        credentials
+            .requirements
+            .iter()
+            .all(|requirement| !requirement.name.trim().is_empty()),
+        "credential name must not be empty"
+    );
+
+    let status = driver.status(request.clone()).await?;
+    anyhow::ensure!(status.healthy, "context status must be healthy");
+    driver.teardown(request).await?;
+
+    Ok(())
+}
+
+fn ensure_valid_mcp_endpoint(endpoint: &agentenv_proto::McpEndpoint) -> anyhow::Result<()> {
+    match endpoint.transport {
+        agentenv_proto::McpTransport::Stdio => Ok(()),
+        agentenv_proto::McpTransport::Http
+        | agentenv_proto::McpTransport::HttpSse
+        | agentenv_proto::McpTransport::SshHttp => {
+            anyhow::ensure!(
+                !endpoint.url.trim().is_empty(),
+                "MCP endpoint URL must not be empty for URL-based transports"
+            );
+            agentenv_core::context_common::endpoint_host_rule(endpoint)
+                .context("MCP endpoint URL must parse and include a host")?;
+            Ok(())
+        }
+    }
+}
+
+fn ensure_valid_network_target(target: &agentenv_proto::NetworkTarget) -> anyhow::Result<()> {
+    match target {
+        agentenv_proto::NetworkTarget::Host { host, scheme, .. } => {
+            anyhow::ensure!(!host.trim().is_empty(), "network host must not be empty");
+            if let Some(scheme) = scheme {
+                anyhow::ensure!(
+                    !scheme.trim().is_empty(),
+                    "network host scheme must not be empty"
+                );
+            }
+        }
+        agentenv_proto::NetworkTarget::Cidr { cidr } => {
+            anyhow::ensure!(!cidr.trim().is_empty(), "network CIDR must not be empty");
+        }
+        agentenv_proto::NetworkTarget::Port { protocol, .. } => {
+            if let Some(protocol) = protocol {
+                anyhow::ensure!(
+                    !protocol.trim().is_empty(),
+                    "network port protocol must not be empty"
+                );
+            }
+        }
+        agentenv_proto::NetworkTarget::UrlPattern { pattern } => {
+            anyhow::ensure!(
+                !pattern.trim().is_empty(),
+                "network URL pattern must not be empty"
+            );
+        }
+        agentenv_proto::NetworkTarget::HttpMethodPath { host, method, path } => {
+            if let Some(host) = host {
+                anyhow::ensure!(
+                    !host.trim().is_empty(),
+                    "network HTTP method path host must not be empty"
+                );
+            }
+            anyhow::ensure!(
+                !method.trim().is_empty(),
+                "network HTTP method path method must not be empty"
+            );
+            anyhow::ensure!(
+                !path.trim().is_empty(),
+                "network HTTP method path path must not be empty"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn assert_sandbox_driver_contract<D: agentenv_core::driver::SandboxDriver>(
     driver: &mut D,
 ) -> anyhow::Result<()> {
@@ -646,20 +774,23 @@ mod tests {
     #[cfg(unix)]
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use agentenv_core::driver::{AgentDriver, DriverResult, SandboxDriver};
+    use agentenv_core::driver::{AgentDriver, ContextDriver, DriverResult, SandboxDriver};
     use agentenv_proto::{
-        AgentCapabilities, AgentHealthCheckProbe, AgentSpec, Capabilities, CredentialKind,
-        CredentialRequirement, CredentialRequirementsResult, DriverInfo, DriverKind, EmptyResult,
-        InitializeParams, InitializeResult, InstallStepsResult, McpConfigPathParams,
-        McpConfigPathResult, PreflightParams, PreflightResult, RenderEntrypointResult,
-        RenderMcpConfigParams, RenderMcpConfigResult, SandboxCapabilities, ShutdownParams,
-        SCHEMA_VERSION,
+        AgentCapabilities, AgentHealthCheckProbe, AgentSpec, Capabilities, ContextCapabilities,
+        ContextHandle, ContextHandleRequest, ContextSpec, ContextStatus, CredentialKind,
+        CredentialRequirement, CredentialRequirementsParams, CredentialRequirementsResult,
+        DriverInfo, DriverKind, EmptyResult, InitializeParams, InitializeResult,
+        InstallStepsResult, McpConfigPathParams, McpConfigPathResult, McpEndpoint, McpTransport,
+        NetworkRule, NetworkTarget, PreflightParams, PreflightResult, RenderEntrypointResult,
+        RenderMcpConfigParams, RenderMcpConfigResult, RequiredNetworkRulesResult,
+        SandboxCapabilities, ShutdownParams, SCHEMA_VERSION,
     };
     use async_trait::async_trait;
 
     use super::{
-        assert_agent_driver_contract, assert_sandbox_driver_contract, nexus_hub_conformance_spec,
-        read_response_envelope, write_framed_json, RpcClient,
+        assert_agent_driver_contract, assert_context_driver_contract,
+        assert_sandbox_driver_contract, nexus_hub_conformance_spec, read_response_envelope,
+        write_framed_json, RpcClient,
     };
     use serde_json::json;
 
@@ -1403,5 +1534,240 @@ mod tests {
             .expect_err("sandbox conformance should reject failed preflight");
 
         assert!(err.to_string().contains("preflight"));
+    }
+
+    #[derive(Default)]
+    struct FakeContextDriver {
+        calls: Mutex<FakeContextDriverCalls>,
+        endpoint: Option<McpEndpoint>,
+        network_rules: Vec<NetworkRule>,
+        credential_name: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct FakeContextDriverCalls {
+        initialized: bool,
+        preflight_checked: bool,
+        provisioned: bool,
+        endpoint_checked: bool,
+        network_rules_checked: bool,
+        credential_requirements_checked: bool,
+        status_checked: bool,
+        torn_down: bool,
+    }
+
+    #[async_trait]
+    impl ContextDriver for FakeContextDriver {
+        async fn initialize(
+            &mut self,
+            _params: InitializeParams,
+        ) -> DriverResult<InitializeResult> {
+            self.calls.lock().unwrap().initialized = true;
+
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "fake-context".to_owned(),
+                    kind: DriverKind::Context,
+                    version: "0.0.1".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Context(ContextCapabilities {
+                    is_remote: false,
+                    is_shared: false,
+                    supports_zones: false,
+                    supports_snapshots: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            self.calls.lock().unwrap().preflight_checked = true;
+
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn provision(&self, _spec: ContextSpec) -> DriverResult<ContextHandle> {
+            self.calls.lock().unwrap().provisioned = true;
+
+            Ok(ContextHandle {
+                handle: "fake-context".to_owned(),
+            })
+        }
+
+        async fn mcp_endpoint(&self, _params: ContextHandleRequest) -> DriverResult<McpEndpoint> {
+            self.calls.lock().unwrap().endpoint_checked = true;
+
+            Ok(self.endpoint.clone().unwrap_or_else(|| McpEndpoint {
+                url: "http://127.0.0.1:9000/mcp".to_owned(),
+                transport: McpTransport::Http,
+                headers: BTreeMap::new(),
+            }))
+        }
+
+        async fn required_network_rules(
+            &self,
+            _params: ContextHandleRequest,
+        ) -> DriverResult<RequiredNetworkRulesResult> {
+            self.calls.lock().unwrap().network_rules_checked = true;
+
+            Ok(RequiredNetworkRulesResult {
+                rules: self.network_rules.clone(),
+            })
+        }
+
+        async fn credential_requirements(
+            &self,
+            _params: CredentialRequirementsParams,
+        ) -> DriverResult<CredentialRequirementsResult> {
+            self.calls.lock().unwrap().credential_requirements_checked = true;
+
+            Ok(CredentialRequirementsResult {
+                requirements: self
+                    .credential_name
+                    .clone()
+                    .map(|name| {
+                        vec![CredentialRequirement {
+                            name,
+                            kind: CredentialKind::ApiKey,
+                            required: true,
+                            description: "Fake context credential.".to_owned(),
+                            validator: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+            })
+        }
+
+        async fn status(&self, _params: ContextHandleRequest) -> DriverResult<ContextStatus> {
+            self.calls.lock().unwrap().status_checked = true;
+
+            Ok(ContextStatus {
+                healthy: true,
+                detail: None,
+            })
+        }
+
+        async fn teardown(&self, _params: ContextHandleRequest) -> DriverResult<EmptyResult> {
+            self.calls.lock().unwrap().torn_down = true;
+
+            Ok(EmptyResult::default())
+        }
+
+        async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_accepts_context_capabilities() {
+        let mut driver = FakeContextDriver::default();
+
+        assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("fake context should satisfy the in-process conformance contract");
+
+        let calls = driver.calls.lock().unwrap();
+        assert!(calls.initialized);
+        assert!(calls.preflight_checked);
+        assert!(calls.provisioned);
+        assert!(calls.endpoint_checked);
+        assert!(calls.network_rules_checked);
+        assert!(calls.credential_requirements_checked);
+        assert!(calls.status_checked);
+        assert!(calls.torn_down);
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_rejects_empty_credential_names() {
+        let mut driver = FakeContextDriver {
+            credential_name: Some(String::new()),
+            ..FakeContextDriver::default()
+        };
+
+        let err = assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("context conformance should reject empty credential names");
+
+        assert!(err.to_string().contains("credential name"));
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_rejects_url_transport_with_malformed_url() {
+        let mut driver = FakeContextDriver {
+            endpoint: Some(McpEndpoint {
+                url: "not a url".to_owned(),
+                transport: McpTransport::Http,
+                headers: BTreeMap::new(),
+            }),
+            ..FakeContextDriver::default()
+        };
+
+        let err = assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("context conformance should reject malformed URL endpoints");
+
+        assert!(err.to_string().contains("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_allows_stdio_endpoint_with_empty_url() {
+        let mut driver = FakeContextDriver {
+            endpoint: Some(McpEndpoint {
+                url: String::new(),
+                transport: McpTransport::Stdio,
+                headers: BTreeMap::new(),
+            }),
+            ..FakeContextDriver::default()
+        };
+
+        assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("stdio context endpoints may use an empty URL sentinel");
+    }
+
+    #[tokio::test]
+    async fn context_driver_contract_rejects_empty_url_pattern_network_rule() {
+        let mut driver = FakeContextDriver {
+            network_rules: vec![NetworkRule {
+                target: NetworkTarget::UrlPattern {
+                    pattern: String::new(),
+                },
+            }],
+            ..FakeContextDriver::default()
+        };
+
+        let err = assert_context_driver_contract(
+            &mut driver,
+            ContextSpec {
+                config: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("context conformance should reject empty URL pattern network rules");
+
+        assert!(err.to_string().contains("network"));
     }
 }

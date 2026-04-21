@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use agentenv_core::agent_common::{npm_package_spec, version_probe, AgentMode};
+use agentenv_core::agent_common::{
+    is_no_context_mcp_endpoint, npm_package_spec, version_probe, AgentMode,
+};
 use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
     assert_compatible_schema_version, AgentCapabilities, AgentHealthCheckProbe, AgentSpec,
@@ -76,7 +78,12 @@ impl AgentDriver for OpenClawDriver {
     ) -> DriverResult<RenderMcpConfigResult> {
         let mut mcp_servers = Map::new();
 
-        for (index, endpoint) in params.endpoints.into_iter().enumerate() {
+        for endpoint in params
+            .endpoints
+            .into_iter()
+            .filter(|endpoint| !is_no_context_mcp_endpoint(endpoint))
+        {
+            let index = mcp_servers.len();
             let mut server = Map::new();
             match endpoint.transport {
                 McpTransport::Stdio => {
@@ -497,6 +504,11 @@ mod tests {
         let rendered = driver
             .render_mcp_config(RenderMcpConfigParams {
                 endpoints: vec![
+                    McpEndpoint {
+                        url: String::new(),
+                        transport: McpTransport::Stdio,
+                        headers: BTreeMap::new(),
+                    },
                     McpEndpoint {
                         url: "agentenv-context".to_owned(),
                         transport: McpTransport::Stdio,

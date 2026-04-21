@@ -9,3 +9,12 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "No-op context driver scaffold for agentenv"
+
+[dependencies]
+agentenv-core = { path = "../../agentenv-core" }
+agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+driver-conformance = { path = "../../../tests/driver-conformance" }

@@ -9,3 +9,16 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Generic MCP context driver scaffold for agentenv"
+
+[dependencies]
+agentenv-core = { path = "../../agentenv-core" }
+agentenv-mcp = { path = "../../agentenv-mcp" }
+agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+driver-conformance = { path = "../../../tests/driver-conformance" }
+tokio.workspace = true
