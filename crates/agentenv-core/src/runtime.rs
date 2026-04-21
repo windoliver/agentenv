@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, fmt, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt, fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use agentenv_policy::{compose_policy, PresetRegistry, PresetSelection, Tier};
 use agentenv_proto::{
@@ -118,18 +124,16 @@ pub struct CreateResult {
 }
 
 struct CreateEnvRollback<'a> {
-    env_dir: PathBuf,
-    reserved_env_dir: bool,
+    temp_workspace: PathBuf,
     sandbox: Option<(&'a dyn SandboxDriver, String)>,
     context: Option<(&'a dyn ContextDriver, String)>,
     inference: Option<(&'a dyn InferenceDriver, String)>,
 }
 
 impl<'a> CreateEnvRollback<'a> {
-    fn new(env_dir: PathBuf) -> Self {
+    fn new(temp_workspace: PathBuf) -> Self {
         Self {
-            env_dir,
-            reserved_env_dir: false,
+            temp_workspace,
             sandbox: None,
             context: None,
             inference: None,
@@ -146,10 +150,6 @@ impl<'a> CreateEnvRollback<'a> {
 
     fn set_sandbox(&mut self, driver: &'a dyn SandboxDriver, handle: String) {
         self.sandbox = Some((driver, handle));
-    }
-
-    fn mark_reserved(&mut self) {
-        self.reserved_env_dir = true;
     }
 
     async fn rollback(&self) {
@@ -174,11 +174,11 @@ impl<'a> CreateEnvRollback<'a> {
                 })
                 .await;
         }
-        if self.reserved_env_dir {
-            let _ = fs::remove_dir_all(&self.env_dir);
-        }
+        let _ = fs::remove_dir_all(&self.temp_workspace);
     }
 }
+
+static CREATE_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub async fn initialize_sandbox_driver(
     options: &RuntimeOptions,
@@ -294,7 +294,7 @@ pub async fn create_env(
     blueprint_yaml: &str,
 ) -> RuntimeResult<CreateResult> {
     let env_name = crate::env::validate_env_name(name)?;
-    let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+    let paths = crate::env::EnvPaths::new(options.root.clone(), env_name.clone());
     let env_dir = paths.env_dir();
     if env_dir.exists() {
         return Err(crate::env::EnvError::AlreadyExists {
@@ -324,7 +324,9 @@ pub async fn create_env(
     }
 
     let mut set = factory.build(&selection)?;
-    let mut rollback = CreateEnvRollback::new(env_dir.clone());
+    let temp_workspace = create_temp_workspace(&options.root, env_name.as_str());
+    let temp_paths = crate::env::EnvPaths::new(temp_workspace.clone(), env_name.clone());
+    let mut rollback = CreateEnvRollback::new(temp_workspace.clone());
 
     let result = async {
         initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
@@ -370,6 +372,23 @@ pub async fn create_env(
                 });
             }
         }
+
+        fs::create_dir_all(temp_paths.env_dir()).map_err(|source| crate::env::EnvError::Io {
+            path: temp_paths.env_dir(),
+            source,
+        })?;
+        fs::write(temp_paths.blueprint_path(), blueprint_yaml).map_err(|source| {
+            crate::env::EnvError::Io {
+                path: temp_paths.blueprint_path(),
+                source,
+            }
+        })?;
+        fs::write(temp_paths.lock_path(), lock_yaml).map_err(|source| {
+            crate::env::EnvError::Io {
+                path: temp_paths.lock_path(),
+                source,
+            }
+        })?;
 
         let context_handle = set
             .context
@@ -425,37 +444,6 @@ pub async fn create_env(
         })?;
         policy.network.allow.extend(context_network_rules.rules);
 
-        fs::create_dir_all(paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
-            path: paths.envs_dir(),
-            source,
-        })?;
-        fs::create_dir(&env_dir).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                crate::env::EnvError::AlreadyExists {
-                    name: name.to_owned(),
-                }
-            } else {
-                crate::env::EnvError::Io {
-                    path: env_dir.clone(),
-                    source,
-                }
-            }
-        })?;
-        rollback.mark_reserved();
-
-        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).map_err(|source| {
-            crate::env::EnvError::Io {
-                path: env_dir.join("blueprint.yaml"),
-                source,
-            }
-        })?;
-        fs::write(env_dir.join("lock.yaml"), lock_yaml).map_err(|source| {
-            crate::env::EnvError::Io {
-                path: env_dir.join("lock.yaml"),
-                source,
-            }
-        })?;
-
         let sandbox_handle = set
             .sandbox
             .create(agentenv_proto::SandboxSpec {
@@ -507,9 +495,9 @@ pub async fn create_env(
             first_enter_hint_shown: false,
         };
 
-        crate::env::write_state(&paths, &state)?;
+        crate::env::write_state(&temp_paths, &state)?;
         crate::env::append_event(
-            &paths,
+            &temp_paths,
             serde_json::json!({
                 "kind": "admission",
                 "status": "accepted",
@@ -517,6 +505,30 @@ pub async fn create_env(
                 "env": name,
             }),
         )?;
+
+        fs::create_dir_all(paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
+            path: paths.envs_dir(),
+            source,
+        })?;
+        if env_dir.exists() {
+            return Err(crate::env::EnvError::AlreadyExists {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+        fs::rename(temp_paths.env_dir(), &env_dir).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                crate::env::EnvError::AlreadyExists {
+                    name: name.to_owned(),
+                }
+            } else {
+                crate::env::EnvError::Io {
+                    path: env_dir.clone(),
+                    source,
+                }
+            }
+        })?;
+        let _ = fs::remove_dir_all(&temp_workspace);
 
         Ok(CreateResult {
             admission: crate::admission::AdmissionReport::accepted(name),
@@ -531,6 +543,18 @@ pub async fn create_env(
     }
 
     result
+}
+
+fn create_temp_workspace(root: &Path, name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let seq = CREATE_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+
+    root.join(".agentenv-tmp")
+        .join(format!("create-{name}-{pid}-{nanos}-{seq}"))
 }
 
 fn ensure_runtime_handshake(
@@ -1095,6 +1119,159 @@ mod tests {
             _params: agentenv_proto::ShutdownParams,
         ) -> DriverResult<EmptyResult> {
             Ok(EmptyResult {})
+        }
+    }
+
+    struct ObservingSandboxDriver {
+        root: std::path::PathBuf,
+        observed_final_dir_exists: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SandboxDriver for ObservingSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "openshell".to_owned(),
+                    kind: DriverKind::Sandbox,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Sandbox(SandboxCapabilities {
+                    supports_hot_reload_policy: true,
+                    supports_filesystem_lockdown: true,
+                    supports_syscall_filter: true,
+                    supports_native_inference_routing: true,
+                    supports_remote_host: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn create(
+            &self,
+            _spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            let final_env_dir = self.root.join("envs").join("demo");
+            self.observed_final_dir_exists
+                .store(final_env_dir.exists(), Ordering::SeqCst);
+            Ok(agentenv_proto::SandboxHandle {
+                handle: "sb-1".to_owned(),
+            })
+        }
+
+        async fn connect(
+            &self,
+            _params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            Ok(agentenv_proto::ShellHandle {
+                session_id: "sh-1".to_owned(),
+                tty: true,
+                working_dir: None,
+            })
+        }
+
+        async fn exec(
+            &self,
+            _params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            Ok(agentenv_proto::ExecResult {
+                status: 0,
+                stdout: "ok\n".to_owned(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn copy_in(
+            &self,
+            _params: agentenv_proto::CopyInParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn copy_out(
+            &self,
+            _params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn apply_policy(
+            &self,
+            _params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            Ok(agentenv_proto::ApplyPolicyResult { hot_reloaded: true })
+        }
+
+        async fn status(
+            &self,
+            _params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            Ok(agentenv_proto::SandboxStatus {
+                phase: agentenv_proto::SandboxPhase::Running,
+                healthy: true,
+                last_ping: Some("2026-04-21T00:00:00Z".to_owned()),
+            })
+        }
+
+        async fn logs(
+            &self,
+            _params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            Ok(agentenv_proto::LogsResult {
+                entries: Vec::new(),
+            })
+        }
+
+        async fn logs_stream(
+            &self,
+            _params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn stop(&self, _params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn destroy(
+            &self,
+            _params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
+    struct ObservingFactory {
+        root: std::path::PathBuf,
+        observed_final_dir_exists: Arc<AtomicBool>,
+    }
+
+    impl DriverFactory for ObservingFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(ObservingSandboxDriver {
+                    root: self.root.clone(),
+                    observed_final_dir_exists: Arc::clone(&self.observed_final_dir_exists),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
         }
     }
 
@@ -1752,6 +1929,50 @@ policy:
         assert!(env_dir.join("lock.yaml").is_file());
         assert!(env_dir.join("state.json").is_file());
         assert!(env_dir.join("events.jsonl").is_file());
+    }
+
+    #[tokio::test]
+    async fn create_env_does_not_expose_final_dir_before_publish() {
+        let root = unique_root("agentenv-atomic-create");
+        let observed_final_dir_exists = Arc::new(AtomicBool::new(false));
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let factory = ObservingFactory {
+            root: root.clone(),
+            observed_final_dir_exists: Arc::clone(&observed_final_dir_exists),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.admission.status,
+            crate::admission::AdmissionStatus::Accepted
+        );
+        assert!(
+            !observed_final_dir_exists.load(Ordering::SeqCst),
+            "final env dir was visible before publish"
+        );
+        assert!(root.join("envs").join("demo").is_dir());
     }
 
     #[tokio::test]
