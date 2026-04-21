@@ -204,6 +204,72 @@ test_install_python_drivers_preserves_existing_driver_on_extract_failure() {
     pass
 }
 
+test_install_python_drivers_runs_bundle_install_hook() {
+    tmp_root=$(mktemp -d)
+
+    mkdir -p "${tmp_root}/bundle/bin" "${tmp_root}/bundle/wheels" "${tmp_root}/index" "${tmp_root}/releases"
+    printf '{"schema_version":"1.0","name":"hermes","kind":"agent","version":"0.1.0","binary":"./bin/agentenv-driver-hermes"}\n' > "${tmp_root}/bundle/manifest.json"
+    printf '#!/bin/sh\nset -eu\nprintf hook-ran > "$AGENTENV_DRIVER_STAGED_DIR/hook.txt"\n' > "${tmp_root}/bundle/install-driver.sh"
+    chmod +x "${tmp_root}/bundle/install-driver.sh"
+    tar -C "${tmp_root}/bundle" -czf "${tmp_root}/releases/agent-hermes.tar.gz" .
+
+    expected_hash=$(sha256_file "${tmp_root}/releases/agent-hermes.tar.gz")
+    printf 'agent-hermes|file://%s/releases/agent-hermes.tar.gz|%s\n' "${tmp_root}" "${expected_hash}" > "${tmp_root}/index/drivers.index"
+
+    sh -c '
+        tmp_root=$1
+        repo_root=$2
+        AGENTENV_INSTALLER_SOURCE_ONLY=1 . "$repo_root/install.sh"
+        TMP_ROOT="$tmp_root/tmp"
+        mkdir -p "$TMP_ROOT"
+        AGENTENV_HOME="$tmp_root/home/.agentenv"
+        WITH_PYTHON_DRIVERS=1
+        PYTHON_DRIVERS_INDEX_URL="file://$tmp_root/index/drivers.index"
+        install_python_drivers
+    ' sh "${tmp_root}" "${REPO_ROOT}"
+
+    assert_contains "hook-ran" "${tmp_root}/home/.agentenv/drivers/agent-hermes/hook.txt" "bundle install hook should run before replacement"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_install_python_drivers_preserves_existing_driver_on_hook_failure() {
+    tmp_root=$(mktemp -d)
+
+    mkdir -p "${tmp_root}/home/.agentenv/drivers/agent-hermes"
+    printf '{"old":true}\n' > "${tmp_root}/home/.agentenv/drivers/agent-hermes/manifest.json"
+    mkdir -p "${tmp_root}/bundle/bin" "${tmp_root}/index" "${tmp_root}/releases"
+    printf '{"schema_version":"1.0","name":"hermes","kind":"agent","version":"0.1.0","binary":"./bin/agentenv-driver-hermes"}\n' > "${tmp_root}/bundle/manifest.json"
+    printf '#!/bin/sh\nset -eu\nexit 7\n' > "${tmp_root}/bundle/install-driver.sh"
+    chmod +x "${tmp_root}/bundle/install-driver.sh"
+    tar -C "${tmp_root}/bundle" -czf "${tmp_root}/releases/agent-hermes.tar.gz" .
+
+    expected_hash=$(sha256_file "${tmp_root}/releases/agent-hermes.tar.gz")
+    printf 'agent-hermes|file://%s/releases/agent-hermes.tar.gz|%s\n' "${tmp_root}" "${expected_hash}" > "${tmp_root}/index/drivers.index"
+
+    set +e
+    sh -c '
+        tmp_root=$1
+        repo_root=$2
+        AGENTENV_INSTALLER_SOURCE_ONLY=1 . "$repo_root/install.sh"
+        TMP_ROOT="$tmp_root/tmp"
+        mkdir -p "$TMP_ROOT"
+        AGENTENV_HOME="$tmp_root/home/.agentenv"
+        WITH_PYTHON_DRIVERS=1
+        PYTHON_DRIVERS_INDEX_URL="file://$tmp_root/index/drivers.index"
+        install_python_drivers
+    ' sh "${tmp_root}" "${REPO_ROOT}" > "${tmp_root}/hook-failure.log" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "install_python_drivers should fail when bundle hook fails"
+    assert_contains '{"old":true}' "${tmp_root}/home/.agentenv/drivers/agent-hermes/manifest.json" "existing driver manifest should survive a failed hook"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_choose_rc_targets_creates_profile_when_missing() {
     tmp_root=$(mktemp -d)
 
@@ -227,6 +293,8 @@ main() {
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
     test_install_python_drivers_preserves_existing_driver_on_extract_failure
+    test_install_python_drivers_runs_bundle_install_hook
+    test_install_python_drivers_preserves_existing_driver_on_hook_failure
     test_choose_rc_targets_creates_profile_when_missing
     printf 'PASS: %s installer tests\n' "${TEST_COUNT}"
 }
