@@ -65,6 +65,12 @@ old_release=""
 if [ -L "${INSTALL_ROOT}" ]; then
     old_target=$(readlink "${INSTALL_ROOT}")
     case "${old_target}" in
+        .context-nexus.*)
+            case "${old_target}" in
+                */*|*..*) old_release="" ;;
+                .context-nexus.*) old_release="${DRIVERS_ROOT}/${old_target}" ;;
+            esac
+            ;;
         .releases/context-nexus.*)
             old_name=${old_target#.releases/}
             case "${old_name}" in
