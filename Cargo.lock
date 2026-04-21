@@ -67,6 +67,7 @@ dependencies = [
  "context-filesystem",
  "context-mcp-generic",
  "context-none",
+ "dirs",
  "inference-anthropic",
  "inference-ollama",
  "inference-openai",

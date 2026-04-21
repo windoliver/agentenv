@@ -143,6 +143,43 @@ fn create_accepts_non_interactive_env_one() {
 }
 
 #[test]
+fn list_json_returns_empty_rows_when_registry_missing() {
+    let temp_dir = make_temp_dir("list-json-empty");
+
+    let output = Command::new(agentenv_bin())
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["envs"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn describe_json_missing_env_uses_stable_error() {
+    let temp_dir = make_temp_dir("describe-json-missing");
+
+    let output = Command::new(agentenv_bin())
+        .arg("describe")
+        .arg("missing")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "env_not_found");
+}
+
+#[test]
 fn drivers_list_reports_malformed_manifest_path() {
     let temp_dir = make_temp_dir("drivers-list-bad-manifest");
     let driver_root = temp_dir.join("bad-driver");

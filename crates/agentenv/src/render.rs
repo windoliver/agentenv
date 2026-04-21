@@ -1,0 +1,115 @@
+use agentenv_core::{
+    admission::{AdmissionReport, ExitClass, ReasonCode},
+    env::EnvError,
+    runtime::{EnvDescription, EnvListRow, EnvStatusSummary, RuntimeError},
+};
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+pub struct ErrorBody {
+    pub reason_code: &'static str,
+    pub message: String,
+}
+
+pub fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub fn print_error_json(error: &RuntimeError) {
+    let body = ErrorBody {
+        reason_code: reason_for_error(error).as_str(),
+        message: error.to_string(),
+    };
+    eprintln!(
+        "{}",
+        serde_json::to_string(&body).unwrap_or_else(|_| {
+            "{\"reason_code\":\"driver_command_failed\",\"message\":\"failed to serialize error\"}"
+                .to_owned()
+        })
+    );
+}
+
+pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
+    match error {
+        RuntimeError::Env(EnvError::NotFound { .. }) => ReasonCode::EnvNotFound,
+        RuntimeError::Env(EnvError::AlreadyExists { .. }) => ReasonCode::EnvExists,
+        RuntimeError::MissingCredential { .. } => ReasonCode::MissingCredential,
+        RuntimeError::UnsupportedDriver { .. } | RuntimeError::MissingSelectedDriver { .. } => {
+            ReasonCode::CapabilityMissing
+        }
+        RuntimeError::Lifecycle(_) | RuntimeError::InvalidPolicyTier { .. } => {
+            ReasonCode::InvalidBlueprint
+        }
+        RuntimeError::Driver(_)
+        | RuntimeError::CommandStatus { .. }
+        | RuntimeError::MissingSandboxHandle { .. }
+        | RuntimeError::ComponentConfigConversion { .. }
+        | RuntimeError::InvalidDriverHandshake { .. }
+        | RuntimeError::StateNameMismatch { .. }
+        | RuntimeError::Env(_) => ReasonCode::DriverCommandFailed,
+    }
+}
+
+pub fn exit_for_error(error: &RuntimeError) -> ExitClass {
+    match reason_for_error(error) {
+        ReasonCode::EnvNotFound
+        | ReasonCode::EnvExists
+        | ReasonCode::InvalidBlueprint
+        | ReasonCode::CapabilityMissing => ExitClass::TerminalFailure,
+        ReasonCode::MissingCredential => ExitClass::MissingCredential,
+        ReasonCode::DriverCommandFailed | ReasonCode::CleanupFailed => ExitClass::RetryableFailure,
+        _ => ExitClass::GenericFailure,
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListJson {
+    pub envs: Vec<EnvListRow>,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+pub struct StatusJson {
+    pub healthy: bool,
+    pub status: EnvStatusSummary,
+}
+
+pub fn print_list_text(rows: &[EnvListRow]) {
+    println!(
+        "{:<20} {:<14} {:<14} {:<18} {:<18} {:<10} CREATED",
+        "NAME", "AGENT", "SANDBOX", "CONTEXT", "INFERENCE", "STATUS"
+    );
+    for row in rows {
+        println!(
+            "{:<20} {:<14} {:<14} {:<18} {:<18} {:<10} {}",
+            row.name,
+            row.agent,
+            row.sandbox,
+            row.context,
+            row.inference.as_deref().unwrap_or("-"),
+            row.status,
+            row.created_at
+        );
+    }
+}
+
+pub fn print_describe_text(description: &EnvDescription) {
+    println!("Name: {}", description.state.name);
+    println!("Phase: {:?}", description.state.phase);
+    println!("Agent: {}", description.state.drivers.agent.name);
+    println!("Sandbox: {}", description.state.drivers.sandbox.name);
+    println!("Context: {}", description.state.drivers.context.name);
+    if let Some(inference) = description.state.drivers.inference.as_ref() {
+        println!("Inference: {}", inference.name);
+    }
+    println!(
+        "Credentials: {}",
+        description.state.credential_names.join(", ")
+    );
+}
+
+#[allow(dead_code)]
+pub fn print_admission_text(report: &AdmissionReport) {
+    println!("{}: {}", report.env, report.reason_code.as_str());
+}

@@ -23,6 +23,7 @@ clap.workspace = true
 context-filesystem = { path = "../drivers/context-filesystem" }
 context-mcp-generic = { path = "../drivers/context-mcp-generic" }
 context-none = { path = "../drivers/context-none" }
+dirs.workspace = true
 inference-anthropic = { path = "../drivers/inference-anthropic" }
 inference-ollama = { path = "../drivers/inference-ollama" }
 inference-openai = { path = "../drivers/inference-openai" }

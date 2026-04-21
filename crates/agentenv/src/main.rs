@@ -11,6 +11,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
+mod render;
 
 const SELF_ENV_SENTINEL: &str = "__self__";
 
@@ -248,9 +249,14 @@ async fn run_enter(args: EnterArgs) -> Result<()> {
 }
 
 fn run_list(args: ListArgs) -> Result<()> {
-    let ListArgs { json } = args;
-    let _ = json;
-    bail!("list runtime wiring is not connected")
+    let options = runtime_options(true)?;
+    let rows = agentenv_core::runtime::list_envs(&options)?;
+    if args.json {
+        render::print_json(&render::ListJson { envs: rows })?;
+    } else {
+        render::print_list_text(&rows);
+    }
+    Ok(())
 }
 
 async fn run_destroy(args: DestroyArgs) -> Result<()> {
@@ -264,9 +270,19 @@ async fn run_destroy(args: DestroyArgs) -> Result<()> {
 }
 
 fn run_describe(args: DescribeArgs) -> Result<()> {
-    let DescribeArgs { name, json } = args;
-    let _ = (name, json);
-    bail!("describe runtime wiring is not connected")
+    let options = runtime_options(true)?;
+    match agentenv_core::runtime::describe_env(&options, &args.name) {
+        Ok(description) if args.json => render::print_json(&description),
+        Ok(description) => {
+            render::print_describe_text(&description);
+            Ok(())
+        }
+        Err(error) if args.json => {
+            render::print_error_json(&error);
+            process::exit(render::exit_for_error(&error).code());
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn run_status(args: StatusArgs) -> Result<()> {
@@ -289,6 +305,15 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     let ExecArgs { name, cmd } = args;
     let _ = (name, cmd);
     bail!("exec runtime wiring is not connected")
+}
+
+fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::RuntimeOptions> {
+    let home = dirs::home_dir().context("home directory is unavailable")?;
+    Ok(agentenv_core::runtime::RuntimeOptions {
+        root: home.join(".agentenv"),
+        log_level: agentenv_proto::LogLevel::Info,
+        non_interactive,
+    })
 }
 
 fn run_credentials(args: CredentialsArgs) -> Result<()> {
