@@ -784,7 +784,7 @@ pub async fn status_env(
     };
 
     let healthy = sandbox.as_ref().map(|value| value.healthy).unwrap_or(false)
-        && context.as_ref().map(|value| value.healthy).unwrap_or(true);
+        && context.as_ref().map(|value| value.healthy).unwrap_or(false);
 
     Ok(EnvStatusSummary {
         healthy,
@@ -836,14 +836,24 @@ pub async fn destroy_env(
     }
 
     if let Some(handle) = state.handles.inference.clone() {
-        if let Some(inference) = set.inference.as_mut() {
-            initialize_inference_driver(options, inference.as_mut()).await?;
-            inference
-                .teardown(agentenv_proto::InferenceHandleRequest { handle })
-                .await?;
-            state.handles.inference = None;
-            crate::env::write_state(&paths, &state)?;
-        }
+        let Some(inference) = set.inference.as_mut() else {
+            let name = state
+                .drivers
+                .inference
+                .as_ref()
+                .map(|driver| driver.name.clone())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            return Err(RuntimeError::MissingSelectedDriver {
+                kind: "inference",
+                name,
+            });
+        };
+        initialize_inference_driver(options, inference.as_mut()).await?;
+        inference
+            .teardown(agentenv_proto::InferenceHandleRequest { handle })
+            .await?;
+        state.handles.inference = None;
+        crate::env::write_state(&paths, &state)?;
     }
 
     if let Some(handle) = state.handles.context.clone() {
@@ -3335,6 +3345,24 @@ policy:
     }
 
     #[tokio::test]
+    async fn status_env_without_context_handle_returns_unhealthy_summary() {
+        let (options, factory) = command_test_runtime("status-missing-context").await;
+        let paths = crate::env::EnvPaths::new(
+            options.root.clone(),
+            crate::env::validate_env_name("demo").unwrap(),
+        );
+        let mut state = crate::env::read_state(&paths).unwrap();
+        state.handles.context = None;
+        crate::env::write_state(&paths, &state).unwrap();
+
+        let status = super::status_env(&options, &factory, "demo").await.unwrap();
+
+        assert!(!status.healthy);
+        assert!(status.sandbox.as_ref().unwrap().healthy);
+        assert!(status.context.is_none());
+    }
+
+    #[tokio::test]
     async fn destroy_env_removes_registry_on_success() {
         let (options, factory) = command_test_runtime("destroy").await;
         let report = super::destroy_env(&options, &factory, "demo")
@@ -3388,6 +3416,30 @@ policy:
         let state = crate::env::read_state(&paths).unwrap();
         assert!(state.handles.sandbox.is_none());
         assert_eq!(state.handles.context.as_deref(), Some("ctx-1"));
+    }
+
+    #[tokio::test]
+    async fn destroy_env_preserves_registry_when_inference_handle_has_no_driver() {
+        let (options, factory) = command_test_runtime("destroy-missing-inference-driver").await;
+        let paths = crate::env::EnvPaths::new(
+            options.root.clone(),
+            crate::env::validate_env_name("demo").unwrap(),
+        );
+        let mut state = crate::env::read_state(&paths).unwrap();
+        state.drivers.inference =
+            Some(crate::env::DriverRecord::new("passthrough", "0.0.1-alpha0"));
+        state.handles.inference = Some("inf-1".to_owned());
+        crate::env::write_state(&paths, &state).unwrap();
+
+        let err = super::destroy_env(&options, &factory, "demo")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RuntimeError::MissingSelectedDriver { kind: "inference", name } if name == "passthrough"
+        ));
+        assert!(options.root.join("envs").join("demo").exists());
     }
 
     #[tokio::test]
