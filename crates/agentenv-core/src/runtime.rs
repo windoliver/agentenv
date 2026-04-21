@@ -2049,8 +2049,7 @@ policy:
 
     #[tokio::test]
     async fn list_and_describe_read_persisted_state() {
-        let root =
-            std::env::temp_dir().join(format!("agentenv-list-describe-{}", std::process::id()));
+        let root = unique_root("agentenv-list-describe");
         let options = RuntimeOptions {
             root: root.clone(),
             log_level: LogLevel::Info,
