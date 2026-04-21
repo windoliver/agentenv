@@ -13,6 +13,7 @@ pub mod inference;
 pub mod lifecycle;
 pub mod lockfile;
 pub mod registry;
+pub mod runtime;
 pub mod security;
 
 /// Placeholder surface for the M1 workspace scaffold.
