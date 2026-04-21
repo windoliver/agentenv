@@ -1,8 +1,10 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{self, Command},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 fn agentenv_bin() -> &'static str {
@@ -140,6 +142,48 @@ fn create_accepts_non_interactive_env_one() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no blueprint provided"));
     assert!(!stderr.contains("invalid value"));
+}
+
+#[test]
+fn create_json_missing_blueprint_uses_stable_error() {
+    let temp_dir = make_temp_dir("create-json-missing-blueprint");
+
+    let output = process::Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .arg("--json")
+        .arg("--non-interactive")
+        .env("HOME", temp_dir.join("home"))
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "invalid_blueprint");
+}
+
+#[test]
+fn create_preflight_json_invalid_blueprint_uses_stable_error() {
+    let temp_dir = make_temp_dir("create-preflight-json-invalid");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(&blueprint, "version: [").unwrap();
+
+    let output = process::Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--preflight-only")
+        .arg("--json")
+        .arg("--non-interactive")
+        .env("HOME", temp_dir.join("home"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "invalid_blueprint");
 }
 
 #[test]
@@ -287,6 +331,174 @@ drivers:
     assert!(!output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(json["reason_code"], "reproduce_blueprint_missing");
+    assert_eq!(output.status.code(), Some(10));
+}
+
+#[test]
+fn logs_context_driver_falls_back_to_events_jsonl() {
+    let temp_dir = make_temp_dir("logs-context-events");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    fs::write(
+        env_dir.join("events.jsonl"),
+        r#"{"ts":"2026-04-21T00:00:00Z","driver":"context","level":"info","msg":"context ready"}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("logs")
+        .arg("demo")
+        .arg("--driver")
+        .arg("context")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("context ready"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn logs_context_follow_streams_appended_events_jsonl() {
+    let temp_dir = make_temp_dir("logs-context-follow-events");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    let events_path = env_dir.join("events.jsonl");
+    fs::write(&events_path, "").unwrap();
+
+    let mut child = Command::new(agentenv_bin())
+        .arg("logs")
+        .arg("demo")
+        .arg("--driver")
+        .arg("context")
+        .arg("--follow")
+        .env("HOME", &temp_dir)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "logs --follow exited before new events were appended"
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&events_path)
+        .unwrap()
+        .write_all(
+            b"{\"ts\":\"2026-04-21T00:00:01Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context followed\"}\n",
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("context followed"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn destroy_prompts_when_yes_is_absent() {
+    let temp_dir = make_temp_dir("destroy-prompt");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+
+    let mut child = Command::new(agentenv_bin())
+        .arg("destroy")
+        .arg("demo")
+        .env("HOME", &temp_dir)
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"demo\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!env_dir.exists());
+}
+
+#[test]
+fn destroy_non_interactive_without_yes_uses_stable_reason() {
+    let temp_dir = make_temp_dir("destroy-non-interactive-no-yes");
+
+    let output = Command::new(agentenv_bin())
+        .arg("destroy")
+        .arg("demo")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_NON_INTERACTIVE", "1")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "non_interactive_prompt_required");
+}
+
+#[test]
+fn destroy_purge_credentials_removes_state_credentials() {
+    let temp_dir = make_temp_dir("destroy-purge-scoped");
+    let credential_name = format!("AGENTENV_SCOPED_TOKEN_{}", unique_suffix());
+    write_minimal_env_state_with_credentials(&temp_dir, "demo", &[credential_name.as_str()]);
+    fs::write(
+        temp_dir.join(".agentenv").join("credentials.json"),
+        serde_json::json!({
+            "values": {
+                credential_name.clone(): "secret"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("destroy")
+        .arg("demo")
+        .arg("--yes")
+        .arg("--purge-credentials")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let list = Command::new(agentenv_bin())
+        .arg("credentials")
+        .arg("list")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains(&credential_name),
+        "stdout was: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
 }
 
 #[test]
@@ -380,15 +592,56 @@ fn fixture_blueprint() -> PathBuf {
 }
 
 fn make_temp_dir(prefix: &str) -> PathBuf {
-    let unique = format!(
-        "{prefix}-{}-{}",
+    let unique = format!("{prefix}-{}", unique_suffix());
+    let path = std::env::temp_dir().join(unique);
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn unique_suffix() -> String {
+    format!(
+        "{}-{}",
         process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    );
-    let path = std::env::temp_dir().join(unique);
-    fs::create_dir_all(&path).unwrap();
-    path
+    )
+}
+
+fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
+    write_minimal_env_state_with_credentials(home, name, &[])
+}
+
+fn write_minimal_env_state_with_credentials(
+    home: &Path,
+    name: &str,
+    credential_names: &[&str],
+) -> PathBuf {
+    let env_dir = home.join(".agentenv").join("envs").join(name);
+    fs::create_dir_all(&env_dir).unwrap();
+    fs::write(
+        env_dir.join("state.json"),
+        serde_json::json!({
+            "version": "0.1.0",
+            "name": name,
+            "phase": "running",
+            "created_at": "2026-04-21T00:00:00Z",
+            "updated_at": "2026-04-21T00:00:00Z",
+            "drivers": {
+                "sandbox": {"name": "openshell", "version": "0.0.1-alpha0"},
+                "agent": {"name": "codex", "version": "0.0.1-alpha0"},
+                "context": {"name": "filesystem", "version": "0.0.1-alpha0"}
+            },
+            "handles": {},
+            "endpoints": {},
+            "credential_names": credential_names,
+            "first_enter_hint_shown": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(env_dir.join("blueprint.yaml"), "version: 0.1.0\n").unwrap();
+    fs::write(env_dir.join("lock.yaml"), "version: 0.1.0\n").unwrap();
+    env_dir
 }

@@ -18,9 +18,13 @@ pub fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 pub fn print_error_json(error: &RuntimeError) {
+    print_error_body_json(reason_for_error(error), error.to_string());
+}
+
+pub fn print_error_body_json(reason_code: ReasonCode, message: impl Into<String>) {
     let body = ErrorBody {
-        reason_code: reason_for_error(error).as_str(),
-        message: error.to_string(),
+        reason_code: reason_code.as_str(),
+        message: message.into(),
     };
     eprintln!(
         "{}",
@@ -73,11 +77,17 @@ fn reason_for_driver_error(error: &DriverError) -> ReasonCode {
 }
 
 pub fn exit_for_error(error: &RuntimeError) -> ExitClass {
-    match reason_for_error(error) {
+    exit_for_reason(reason_for_error(error))
+}
+
+pub fn exit_for_reason(reason_code: ReasonCode) -> ExitClass {
+    match reason_code {
         ReasonCode::EnvNotFound
         | ReasonCode::EnvExists
         | ReasonCode::InvalidBlueprint
-        | ReasonCode::CapabilityMissing => ExitClass::TerminalFailure,
+        | ReasonCode::CapabilityMissing
+        | ReasonCode::ReproduceBlueprintMissing => ExitClass::TerminalFailure,
+        ReasonCode::NonInteractivePromptRequired => ExitClass::Usage,
         ReasonCode::MissingCredential => ExitClass::MissingCredential,
         ReasonCode::PreflightFailed => ExitClass::PreflightFailed,
         ReasonCode::DriverCommandFailed | ReasonCode::CleanupFailed => ExitClass::RetryableFailure,

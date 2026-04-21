@@ -1,11 +1,14 @@
 use std::{
     fs,
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process,
+    process, thread,
+    time::Duration,
 };
 
+use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
-use agentenv_credstore::{CredentialStore, SecretString};
+use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -93,6 +96,13 @@ struct DestroyArgs {
     yes: bool,
     #[arg(long)]
     purge_credentials: bool,
+    #[arg(
+        long,
+        env = "AGENTENV_NON_INTERACTIVE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    non_interactive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -179,7 +189,7 @@ async fn main() {
     init_tracing();
     if let Err(error) = run().await {
         eprintln!("error: {error:#}");
-        process::exit(1);
+        exit_process(1);
     }
 }
 
@@ -232,22 +242,28 @@ async fn run_create(args: CreateArgs) -> Result<()> {
     ) {
         Ok(path) => path,
         Err(error) if args.json => {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "reason_code": "reproduce_blueprint_missing",
-                    "message": error.to_string(),
-                })
-            );
-            process::exit(agentenv_core::admission::ExitClass::TerminalFailure.code());
+            let reason_code = if args.reproduce.is_some() {
+                ReasonCode::ReproduceBlueprintMissing
+            } else {
+                ReasonCode::InvalidBlueprint
+            };
+            exit_json_error(reason_code, error);
         }
         Err(error) => return Err(error),
     };
-    let blueprint_yaml = read_text_file(&blueprint_path, "blueprint")?;
+    let blueprint_yaml = match read_text_file(&blueprint_path, "blueprint") {
+        Ok(yaml) => yaml,
+        Err(error) if args.json => exit_json_error(ReasonCode::InvalidBlueprint, error),
+        Err(error) => return Err(error),
+    };
     let factory = builtin_factory::BuiltInDriverFactory;
 
     if args.preflight_only {
-        let resolved = agentenv_core::lifecycle::verify_blueprint_yaml(&blueprint_yaml)?;
+        let resolved = match agentenv_core::lifecycle::verify_blueprint_yaml(&blueprint_yaml) {
+            Ok(resolved) => resolved,
+            Err(error) if args.json => exit_json_error(ReasonCode::InvalidBlueprint, error),
+            Err(error) => return Err(error.into()),
+        };
         let selection = agentenv_core::runtime::DriverSelection {
             sandbox: resolved.sandbox.driver,
             agent: resolved.agent.driver,
@@ -260,20 +276,20 @@ async fn run_create(args: CreateArgs) -> Result<()> {
             Ok(report) if args.json => {
                 render::print_json(&report)?;
                 if report.status == agentenv_core::admission::AdmissionStatus::Rejected {
-                    process::exit(report.exit_class().code());
+                    exit_process(report.exit_class().code());
                 }
                 Ok(())
             }
             Ok(report) => {
                 render::print_admission_text(&report);
                 if report.status == agentenv_core::admission::AdmissionStatus::Rejected {
-                    process::exit(report.exit_class().code());
+                    exit_process(report.exit_class().code());
                 }
                 Ok(())
             }
             Err(error) if args.json => {
                 render::print_error_json(&error);
-                process::exit(render::exit_for_error(&error).code());
+                exit_process(render::exit_for_error(&error).code());
             }
             Err(error) => Err(error.into()),
         }
@@ -292,15 +308,20 @@ async fn run_create(args: CreateArgs) -> Result<()> {
         )
         .await
         {
-            Ok(result) if args.json => render::print_json(&result.admission),
+            Ok(result) if args.json => {
+                render::print_json(&result.admission)?;
+                exit_if_rejected(&result.admission);
+                Ok(())
+            }
             Ok(result) => {
                 render::print_admission_text(&result.admission);
+                exit_if_rejected(&result.admission);
                 println!("Next: agentenv enter {}", args.name);
                 Ok(())
             }
             Err(error) if args.json => {
                 render::print_error_json(&error);
-                process::exit(render::exit_for_error(&error).code());
+                exit_process(render::exit_for_error(&error).code());
             }
             Err(error) => Err(error.into()),
         }
@@ -330,24 +351,33 @@ fn run_list(args: ListArgs) -> Result<()> {
         }
         Err(error) if args.json => {
             render::print_error_json(&error);
-            process::exit(render::exit_for_error(&error).code());
+            exit_process(render::exit_for_error(&error).code());
         }
         Err(error) => Err(error.into()),
     }
 }
 
 async fn run_destroy(args: DestroyArgs) -> Result<()> {
-    if !args.yes {
-        bail!("destroy requires --yes in this non-interactive implementation path");
-    }
-    let _ = args.purge_credentials;
     let options = runtime_options(true)?;
+    if !args.yes {
+        confirm_destroy(&args.name, args.non_interactive)?;
+    }
+    let purge_credentials = if args.purge_credentials {
+        agentenv_core::runtime::describe_env(&options, &args.name)?
+            .state
+            .credential_names
+    } else {
+        Vec::new()
+    };
     let report = agentenv_core::runtime::destroy_env(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
     )
     .await?;
+    if args.purge_credentials {
+        purge_state_credentials(&purge_credentials)?;
+    }
     render::print_admission_text(&report);
     Ok(())
 }
@@ -362,7 +392,7 @@ fn run_describe(args: DescribeArgs) -> Result<()> {
         }
         Err(error) if args.json => {
             render::print_error_json(&error);
-            process::exit(render::exit_for_error(&error).code());
+            exit_process(render::exit_for_error(&error).code());
         }
         Err(error) => Err(error.into()),
     }
@@ -385,20 +415,17 @@ async fn run_status(args: StatusArgs) -> Result<()> {
         println!("healthy: {}", status.healthy);
     }
     if !status.healthy {
-        process::exit(agentenv_core::admission::ExitClass::Unhealthy.code());
+        exit_process(agentenv_core::admission::ExitClass::Unhealthy.code());
     }
     Ok(())
 }
 
 async fn run_logs(args: LogsArgs) -> Result<()> {
-    if args
-        .driver
-        .as_deref()
-        .is_some_and(|driver| driver != "sandbox")
-    {
-        bail!("only --driver sandbox is supported by the current log surface");
-    }
     let options = runtime_options(true)?;
+    if let Some(driver) = args.driver.as_deref().filter(|driver| *driver != "sandbox") {
+        print_event_logs(&options, &args.name, Some(driver), args.follow)?;
+        return Ok(());
+    }
     let logs = agentenv_core::runtime::logs_env(
         &options,
         &builtin_factory::BuiltInDriverFactory,
@@ -423,7 +450,165 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     .await?;
     print!("{}", result.stdout);
     eprint!("{}", result.stderr);
+    io::stdout().flush().context("flush forwarded stdout")?;
+    io::stderr().flush().context("flush forwarded stderr")?;
     process::exit(result.status);
+}
+
+fn exit_json_error(reason_code: ReasonCode, error: impl std::fmt::Display) -> ! {
+    render::print_error_body_json(reason_code, error.to_string());
+    exit_process(render::exit_for_reason(reason_code).code());
+}
+
+fn exit_if_rejected(report: &AdmissionReport) {
+    if report.status == AdmissionStatus::Rejected {
+        exit_process(report.exit_class().code());
+    }
+}
+
+fn exit_process(code: i32) -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    process::exit(code);
+}
+
+fn confirm_destroy(name: &str, non_interactive: bool) -> Result<()> {
+    if non_interactive {
+        exit_json_error(
+            ReasonCode::NonInteractivePromptRequired,
+            "destroy requires --yes in non-interactive mode",
+        );
+    }
+
+    print!("Type `{name}` to destroy environment `{name}`: ");
+    io::stdout().flush().context("flush destroy prompt")?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("read destroy confirmation")?;
+    if answer.trim() != name {
+        bail!("destroy canceled");
+    }
+    Ok(())
+}
+
+fn purge_state_credentials(credential_names: &[String]) -> Result<()> {
+    if credential_names.is_empty() {
+        return Ok(());
+    }
+
+    let mut store =
+        CredentialStore::from_default_paths().context("initialize credential store for purge")?;
+    for name in credential_names {
+        match store.remove(name) {
+            Ok(()) => eprintln!("purged credential `{name}`"),
+            Err(CredentialStoreError::MissingCredential { .. }) => {}
+            Err(error) => return Err(error).with_context(|| format!("purge credential `{name}`")),
+        }
+    }
+    Ok(())
+}
+
+fn print_event_logs(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    name: &str,
+    driver_filter: Option<&str>,
+    follow: bool,
+) -> Result<()> {
+    agentenv_core::runtime::describe_env(options, name)?;
+    let env_name = agentenv_core::env::validate_env_name(name)?;
+    let paths = agentenv_core::env::EnvPaths::new(options.root.clone(), env_name);
+    let events_path = paths.events_path();
+
+    if follow {
+        follow_event_logs(&events_path, driver_filter)
+    } else {
+        print_event_log_chunk(&events_path, driver_filter, 0).map(|_| ())
+    }
+}
+
+fn follow_event_logs(events_path: &Path, driver_filter: Option<&str>) -> Result<()> {
+    let mut position = 0;
+    loop {
+        position = print_event_log_chunk(events_path, driver_filter, position)?;
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn print_event_log_chunk(
+    events_path: &Path,
+    driver_filter: Option<&str>,
+    position: u64,
+) -> Result<u64> {
+    let mut file = match fs::File::open(events_path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(position),
+        Err(source) => {
+            return Err(agentenv_core::env::EnvError::Io {
+                path: events_path.to_path_buf(),
+                source,
+            }
+            .into());
+        }
+    };
+    let len = file
+        .metadata()
+        .with_context(|| format!("read events metadata `{}`", events_path.display()))?
+        .len();
+    let start = if position <= len { position } else { 0 };
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("seek events log `{}`", events_path.display()))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("read events log `{}`", events_path.display()))?;
+
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(event) if event_matches_driver(&event, driver_filter) => {
+                if let Some(rendered) = format_event_log(&event) {
+                    println!("{rendered}");
+                } else {
+                    println!("{line}");
+                }
+            }
+            Ok(_) => {}
+            Err(_) if driver_filter.is_none() => println!("{line}"),
+            Err(_) => {}
+        }
+    }
+    io::stdout().flush().context("flush event logs")?;
+
+    Ok(start + content.len() as u64)
+}
+
+fn event_matches_driver(event: &serde_json::Value, driver_filter: Option<&str>) -> bool {
+    match driver_filter {
+        Some(driver) => event
+            .get("driver")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == driver),
+        None => true,
+    }
+}
+
+fn format_event_log(event: &serde_json::Value) -> Option<String> {
+    let msg = event
+        .get("msg")
+        .or_else(|| event.get("message"))
+        .and_then(serde_json::Value::as_str)?;
+    let ts = event
+        .get("ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let level = event
+        .get("level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let driver = event
+        .get("driver")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("event");
+    Some(format!("{ts} {level} {driver} {msg}"))
 }
 
 fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::RuntimeOptions> {
@@ -450,15 +635,24 @@ impl agentenv_core::runtime::CredentialProvider for CliCredentialProvider {
             Ok(secret) => Ok(Some(agentenv_core::runtime::RuntimeSecret::new(
                 secret.expose_secret().to_owned(),
             ))),
-            Err(_) if !requirement.required => Ok(None),
-            Err(_) if self.non_interactive => {
+            Err(CredentialStoreError::MissingCredential { .. }) if !requirement.required => {
+                Ok(None)
+            }
+            Err(CredentialStoreError::MissingCredential { .. }) if self.non_interactive => {
                 Err(agentenv_core::runtime::RuntimeError::MissingCredential {
                     name: name.to_owned(),
                 })
             }
-            Err(_) => Err(agentenv_core::runtime::RuntimeError::MissingCredential {
-                name: name.to_owned(),
-            }),
+            Err(CredentialStoreError::MissingCredential { .. }) => {
+                Err(agentenv_core::runtime::RuntimeError::MissingCredential {
+                    name: name.to_owned(),
+                })
+            }
+            Err(error) => Err(agentenv_core::runtime::RuntimeError::Driver(
+                agentenv_core::driver::DriverError::InvalidInput {
+                    message: error.to_string(),
+                },
+            )),
         }
     }
 
@@ -728,7 +922,9 @@ fn read_text_file(path: &Path, description: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentenv_core::lockfile::Lockfile;
+    use agentenv_core::{lockfile::Lockfile, runtime::CredentialProvider};
+    use agentenv_credstore::CredentialStoreConfig;
+    use agentenv_proto::{CredentialKind, CredentialRequirement, ValidatorSpec};
     use std::{
         env,
         time::{SystemTime, UNIX_EPOCH},
@@ -821,6 +1017,51 @@ mod tests {
         assert_eq!(
             derive_reproduced_env_name(Path::new("/tmp/agentenv.lock")),
             "agentenv"
+        );
+    }
+
+    #[test]
+    fn optional_credential_validator_errors_are_preserved() {
+        let store_root = make_temp_dir("optional-credential-validation");
+        let name = format!(
+            "AGENTENV_OPTIONAL_TOKEN_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(
+            store_root.join("credentials.json"),
+            serde_json::json!({
+                "values": {
+                    name.clone(): "bad-token"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = CredentialStore::new(CredentialStoreConfig::from_root_dir(&store_root))
+            .expect("credential store");
+        let mut provider = CliCredentialProvider {
+            store,
+            non_interactive: true,
+        };
+        let requirement = CredentialRequirement {
+            name,
+            kind: CredentialKind::ApiKey,
+            required: false,
+            description: "optional test token".to_owned(),
+            validator: Some(ValidatorSpec::Regex {
+                pattern: "^sk-".to_owned(),
+            }),
+        };
+
+        let error = CredentialProvider::resolve(&mut provider, &requirement)
+            .expect_err("optional validator failures must not be suppressed");
+
+        assert!(
+            error.to_string().contains("failed validation"),
+            "unexpected error: {error}"
         );
     }
 
