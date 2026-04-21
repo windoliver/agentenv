@@ -43,7 +43,9 @@ def nexus_cli_available():
 
 
 def start_lite_process(data_dir, port, extra_env=None):
-    env = os.environ.copy()
+    env = {}
+    if "PATH" in os.environ:
+        env["PATH"] = os.environ["PATH"]
     env["NEXUS_DATA_DIR"] = data_dir
     if extra_env:
         env.update(extra_env)

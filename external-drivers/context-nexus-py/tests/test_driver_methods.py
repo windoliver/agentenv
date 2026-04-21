@@ -104,9 +104,18 @@ def test_start_lite_process_starts_new_session_and_discards_stderr(monkeypatch):
         captured["kwargs"] = kwargs
         return sentinel
 
+    monkeypatch.setattr(
+        nexus_module.os,
+        "environ",
+        {
+            "PATH": "/tmp/nexus-venv/bin",
+            "NEXUS_TOKEN": "secret",
+            "AGENTENV_DRIVER_CONFIG": "secret",
+        },
+    )
     monkeypatch.setattr(nexus_module.subprocess, "Popen", fake_popen)
 
-    process = nexus_module.start_lite_process("/tmp/nexus-data", 8765)
+    process = nexus_module.start_lite_process("/tmp/nexus-data", 8765, extra_env={"NEXUS_EXTRA": "ok"})
 
     assert process is sentinel
     assert captured["args"] == [
@@ -122,7 +131,12 @@ def test_start_lite_process_starts_new_session_and_discards_stderr(monkeypatch):
     ]
     assert captured["kwargs"]["stderr"] == nexus_module.subprocess.DEVNULL
     assert captured["kwargs"]["start_new_session"] is True
-    assert captured["kwargs"]["env"]["NEXUS_DATA_DIR"] == "/tmp/nexus-data"
+    child_env = captured["kwargs"]["env"]
+    assert child_env["PATH"] == "/tmp/nexus-venv/bin"
+    assert child_env["NEXUS_DATA_DIR"] == "/tmp/nexus-data"
+    assert child_env["NEXUS_EXTRA"] == "ok"
+    assert "NEXUS_TOKEN" not in child_env
+    assert "AGENTENV_DRIVER_CONFIG" not in child_env
 
 
 def test_lite_teardown_signals_process_group_when_pid_available(monkeypatch):
