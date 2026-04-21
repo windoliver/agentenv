@@ -1,6 +1,8 @@
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, BinaryIO
 
 
@@ -37,11 +39,21 @@ def _read_framed_json(stream: BinaryIO) -> dict[str, Any]:
 
 
 def test_module_entrypoint_serves_jsonrpc_over_stdio():
+    src_path = str(Path(__file__).resolve().parents[1] / "src")
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        src_path
+        if not existing_pythonpath
+        else f"{src_path}{os.pathsep}{existing_pythonpath}"
+    )
+
     process = subprocess.Popen(
         [sys.executable, "-m", "agentenv_agent_hermes"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     assert process.stdin is not None
     assert process.stdout is not None
