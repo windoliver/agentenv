@@ -95,29 +95,34 @@ def test_preflight_finds_hermes_next_to_current_python(monkeypatch, tmp_path):
     assert calls == [[str(hermes), "--version"]]
 
 
-def test_install_steps_use_pypi_package_with_mcp_extra():
+def test_install_steps_use_official_git_package_with_mcp_extra():
     result = HermesDriver().install_steps({"version": None, "config": {}})
 
     assert result == {
         "steps": [
             {
                 "name": "install-hermes",
-                "content": 'RUN python3 -m pip install --no-cache-dir "hermes-agent[mcp]"',
+                "content": (
+                    'ARG HERMES_AGENT_PACKAGE="hermes-agent[mcp] @ '
+                    'git+https://github.com/NousResearch/hermes-agent.git"\n'
+                    'RUN python3 -m pip install --no-cache-dir "$HERMES_AGENT_PACKAGE"'
+                ),
             }
         ]
     }
 
 
-def test_install_steps_pin_agent_spec_version():
-    result = HermesDriver().install_steps({"version": "0.10.0", "config": {}})
+def test_install_steps_pin_agent_spec_version_to_git_ref():
+    result = HermesDriver().install_steps({"version": "v2026.4.16", "config": {}})
 
     assert result["steps"][0]["content"] == (
-        'RUN python3 -m pip install --no-cache-dir "hermes-agent[mcp]==0.10.0"'
+        'RUN python3 -m pip install --no-cache-dir "hermes-agent[mcp] @ '
+        'git+https://github.com/NousResearch/hermes-agent.git@v2026.4.16"'
     )
 
 
 def test_install_steps_reject_unsafe_version_for_docker_shell():
-    with pytest.raises(ValueError, match="unsafe hermes version"):
+    with pytest.raises(ValueError, match="unsafe hermes git ref"):
         HermesDriver().install_steps(
             {"version": '0.10.0"; touch /tmp/pwned #', "config": {}}
         )

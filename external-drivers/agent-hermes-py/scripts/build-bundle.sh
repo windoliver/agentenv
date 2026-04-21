@@ -5,6 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 DRIVER_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
 PYTHON=${PYTHON:-python3}
 DIST_DIR=${DIST_DIR:-"${DRIVER_ROOT}/dist"}
+HERMES_AGENT_PACKAGE=${HERMES_AGENT_PACKAGE:-"hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git"}
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/agentenv-hermes-bundle.XXXXXX")
 
 cleanup() {
@@ -14,7 +15,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${DIST_DIR}" "${TMP_ROOT}/agent-hermes/bin" "${TMP_ROOT}/agent-hermes/wheels"
-"${PYTHON}" -m pip wheel --wheel-dir "${TMP_ROOT}/agent-hermes/wheels" "${DRIVER_ROOT}" "hermes-agent[mcp]"
+"${PYTHON}" -m pip wheel --wheel-dir "${TMP_ROOT}/agent-hermes/wheels" "${DRIVER_ROOT}" "${HERMES_AGENT_PACKAGE}"
 cp "${DRIVER_ROOT}/manifest.json.in" "${TMP_ROOT}/agent-hermes/manifest.json"
 cp "${DRIVER_ROOT}/scripts/install-driver.sh" "${TMP_ROOT}/agent-hermes/install-driver.sh"
 chmod 0755 "${TMP_ROOT}/agent-hermes/install-driver.sh"

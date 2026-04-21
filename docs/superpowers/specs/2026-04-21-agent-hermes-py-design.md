@@ -23,7 +23,7 @@ Goals:
 
 ## 2. External Hermes Reference Points
 
-Hermes Agent currently publishes the `hermes-agent` Python package. Its `pyproject.toml` declares the `hermes` console script and optional extras including `mcp` and `acp`.
+Hermes Agent is installed from the official `NousResearch/hermes-agent` GitHub repository. Its `pyproject.toml` declares the `hermes-agent` Python package, the `hermes` console script, and optional extras including `mcp` and `acp`.
 
 Relevant upstream behavior:
 
@@ -53,7 +53,7 @@ Relevant upstream behavior:
 2. Implementing `agentenv create`, `enter`, or full lifecycle CLI commands.
 3. Adding a second serialization format or changing `agentenv-proto`.
 4. Passing credential values over RPC.
-5. Cloning Hermes source by default.
+5. Vendoring Hermes source into this repository.
 6. Proving real model calls in CI.
 7. Changing Nexus or the context-driver path.
 
@@ -91,7 +91,7 @@ Responsibilities:
 4. `driver.py` maps JSON-RPC methods to Hermes driver behavior.
 5. `__main__.py` runs the stdio server.
 
-The package should use the Python standard library for its own JSON-RPC server. It should declare `PyYAML` for Hermes config rendering and `pytest` for tests. The installed driver venv also includes `hermes-agent[mcp]`.
+The package should use the Python standard library for its own JSON-RPC server. It should declare `PyYAML` for Hermes config rendering and `pytest` for tests. The installed driver venv also includes Hermes Agent with the `mcp` extra from staged wheels.
 
 ## 5. Manifest
 
@@ -171,16 +171,17 @@ Preflight must not require `OPENAI_API_KEY` or any model provider key.
 Returns Dockerfile fragments that install Hermes inside the sandbox:
 
 ```dockerfile
-RUN python3 -m pip install --no-cache-dir "hermes-agent[mcp]"
+ARG HERMES_AGENT_PACKAGE="hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git"
+RUN python3 -m pip install --no-cache-dir "$HERMES_AGENT_PACKAGE"
 ```
 
-If `AgentSpec.version` is provided, render:
+If `AgentSpec.version` is provided, treat it as a safe Git ref and render:
 
 ```dockerfile
-RUN python3 -m pip install --no-cache-dir "hermes-agent[mcp]==<version>"
+RUN python3 -m pip install --no-cache-dir "hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git@<version>"
 ```
 
-The driver does not clone upstream source by default. A future config field can add source installs if Hermes packaging changes.
+The default source can be overridden in sandbox builds with `--build-arg HERMES_AGENT_PACKAGE=...`.
 
 ### mcp_config_path
 
@@ -314,8 +315,8 @@ Returns `{}` and exits after the response is flushed.
 1. resolves `AGENTENV_HOME` or defaults to `~/.agentenv`
 2. creates a temporary staged directory
 3. creates `venv` with `python3 -m venv`
-4. installs the driver wheel into the venv
-5. installs `hermes-agent[mcp]` into the same venv
+4. builds wheels for the driver and `HERMES_AGENT_PACKAGE`
+5. installs the driver and `hermes-agent[mcp]` from the staged wheel directory with `--no-index`
 6. writes `bin/agentenv-driver-hermes`
 7. writes `manifest.json`
 8. atomically replaces `~/.agentenv/drivers/agent-hermes/`
@@ -335,8 +336,8 @@ Add package-local tests for:
 3. unknown methods return `-32601`.
 4. schema mismatch returns `-32002`.
 5. initialize reports agent kind and agent capabilities.
-6. install steps include `hermes-agent[mcp]`.
-7. versioned install steps pin `hermes-agent[mcp]==<version>`.
+6. install steps use the official Hermes GitHub source with `mcp` extras.
+7. versioned install steps pin the Hermes Git source to a safe ref.
 8. MCP config renders HTTP, HTTP+SSE, stdio, and headers.
 9. `ssh+http` reports capability missing.
 10. entrypoint renders TUI and headless modes.
@@ -386,7 +387,7 @@ Every error message should include the method or config field that caused it.
 3. Manifest `env` remains empty by default.
 4. Install scripts stage and atomically replace driver directories.
 5. The package does not add Python as a build-time dependency of Rust core.
-6. The default install uses PyPI package resolution inside the driver or sandbox environment, not vendored arbitrary source code.
+6. The default install builds from the official Hermes GitHub source and then installs from staged wheels with `--no-index`.
 
 ## 11. Acceptance and Follow-Ups
 

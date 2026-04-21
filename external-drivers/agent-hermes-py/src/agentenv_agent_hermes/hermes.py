@@ -43,7 +43,10 @@ PROVIDER_CREDENTIALS: dict[str, str | None] = {
     "llamacpp": None,
 }
 
-SAFE_HERMES_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+!*-]*$")
+HERMES_AGENT_PACKAGE = (
+    "hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git"
+)
+SAFE_HERMES_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+!*-]*$")
 
 
 class HermesDriver:
@@ -84,7 +87,7 @@ class HermesDriver:
                         ),
                         "remediation": (
                             "Install the driver venv or run `python3 -m pip install "
-                            '"hermes-agent[mcp]"` in it.'
+                            f'"{HERMES_AGENT_PACKAGE}"` in it.'
                         ),
                     }
                 ],
@@ -115,12 +118,19 @@ class HermesDriver:
 
     def install_steps(self, spec: dict[str, Any]) -> dict[str, Any]:
         version = spec.get("version")
-        package = "hermes-agent[mcp]"
-        if version:
-            version = str(version)
-            if not SAFE_HERMES_VERSION.fullmatch(version):
-                raise ValueError(f"unsafe hermes version `{version}`")
-            package = f"{package}=={version}"
+        package = _hermes_agent_package(version)
+        if not version:
+            return {
+                "steps": [
+                    {
+                        "name": "install-hermes",
+                        "content": (
+                            f'ARG HERMES_AGENT_PACKAGE="{package}"\n'
+                            'RUN python3 -m pip install --no-cache-dir "$HERMES_AGENT_PACKAGE"'
+                        ),
+                    }
+                ]
+            }
         return {
             "steps": [
                 {
@@ -228,6 +238,16 @@ def _shell_word(value: str) -> str:
     if value.replace("-", "").replace("_", "").replace("/", "").replace(".", "").isalnum():
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _hermes_agent_package(version: Any) -> str:
+    if not version:
+        return HERMES_AGENT_PACKAGE
+
+    ref = str(version)
+    if not SAFE_HERMES_REF.fullmatch(ref):
+        raise ValueError(f"unsafe hermes git ref `{ref}`")
+    return f"{HERMES_AGENT_PACKAGE}@{ref}"
 
 
 def _resolve_hermes_executable() -> str | None:

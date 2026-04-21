@@ -14,7 +14,20 @@ It implements agentenv's JSON-RPC driver protocol over stdio and installs as the
 external-drivers/agent-hermes-py/scripts/install-driver.sh
 ```
 
-The installer creates an isolated virtual environment, installs this driver package, installs `hermes-agent[mcp]`, writes `manifest.json`, and atomically replaces the installed driver directory.
+The installer creates an isolated virtual environment, builds wheels for this driver package and Hermes Agent from the official GitHub source, installs those wheels offline into the driver venv, writes `manifest.json`, and atomically replaces the installed driver directory.
+
+By default it builds Hermes from:
+
+```text
+hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git
+```
+
+Set `HERMES_AGENT_PACKAGE` to override the wheel source, for example to pin a release tag:
+
+```bash
+HERMES_AGENT_PACKAGE="hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git@v2026.4.16" \
+  external-drivers/agent-hermes-py/scripts/install-driver.sh
+```
 
 ## Test
 

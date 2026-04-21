@@ -11,6 +11,8 @@ AGENTENV_HOME=${AGENTENV_HOME:-"$HOME/.agentenv"}
 INSTALL_ROOT=${AGENTENV_DRIVER_INSTALL_ROOT:-"${AGENTENV_HOME}/drivers/agent-hermes"}
 STAGED=${AGENTENV_DRIVER_STAGED_DIR:-}
 PYTHON=${PYTHON:-python3}
+HERMES_AGENT_PACKAGE=${HERMES_AGENT_PACKAGE:-"hermes-agent[mcp] @ git+https://github.com/NousResearch/hermes-agent.git"}
+HERMES_AGENT_INSTALL_REQUIREMENT=${HERMES_AGENT_INSTALL_REQUIREMENT:-"hermes-agent[mcp]"}
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/agentenv-hermes-driver.XXXXXX")
 EXTERNAL_STAGED=0
 
@@ -23,14 +25,14 @@ trap cleanup EXIT INT TERM
 if [ -z "${STAGED}" ]; then
     STAGED="${TMP_ROOT}/agent-hermes"
     mkdir -p "${STAGED}/bin" "${STAGED}/wheels"
-    "${PYTHON}" -m pip wheel --wheel-dir "${STAGED}/wheels" "${DRIVER_ROOT}" "hermes-agent[mcp]"
+    "${PYTHON}" -m pip wheel --wheel-dir "${STAGED}/wheels" "${DRIVER_ROOT}" "${HERMES_AGENT_PACKAGE}"
     cp "${DRIVER_ROOT}/manifest.json.in" "${STAGED}/manifest.json"
 else
     EXTERNAL_STAGED=1
 fi
 
 "${PYTHON}" -m venv "${STAGED}/venv"
-"${STAGED}/venv/bin/python" -m pip install --no-index --find-links "${STAGED}/wheels" agentenv-agent-hermes "hermes-agent[mcp]"
+"${STAGED}/venv/bin/python" -m pip install --no-index --find-links "${STAGED}/wheels" agentenv-agent-hermes "${HERMES_AGENT_INSTALL_REQUIREMENT}"
 
 cat > "${STAGED}/bin/agentenv-driver-hermes" <<'LAUNCHER'
 #!/bin/sh

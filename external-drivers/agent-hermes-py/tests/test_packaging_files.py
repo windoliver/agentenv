@@ -40,16 +40,21 @@ def test_packaging_scripts_are_executable():
 def test_installer_uses_only_staged_wheels_after_bundle_creation():
     text = (ROOT / "scripts" / "install-driver.sh").read_text()
 
+    assert "HERMES_AGENT_PACKAGE=" in text
+    assert "git+https://github.com/NousResearch/hermes-agent.git" in text
+    assert '"${HERMES_AGENT_PACKAGE}"' in text
     assert '"hermes-agent[mcp]"' in text
     assert '--wheel-dir "${STAGED}/wheels"' in text
     assert "--no-index" in text
     assert '--find-links "${STAGED}/wheels"' in text
     assert "pip install --upgrade pip" not in text
-    assert 'pip install "hermes-agent[mcp]"' not in text
+    assert 'pip install "${HERMES_AGENT_PACKAGE}"' not in text
 
 
-def test_bundle_includes_hermes_agent_runtime_wheels():
+def test_bundle_includes_hermes_agent_runtime_wheels_from_configurable_source():
     text = (ROOT / "scripts" / "build-bundle.sh").read_text()
 
-    assert '"hermes-agent[mcp]"' in text
+    assert "HERMES_AGENT_PACKAGE=" in text
+    assert "git+https://github.com/NousResearch/hermes-agent.git" in text
+    assert '"${HERMES_AGENT_PACKAGE}"' in text
     assert '--wheel-dir "${TMP_ROOT}/agent-hermes/wheels"' in text
