@@ -10,9 +10,13 @@ DRIVERS_ROOT="${AGENTENV_HOME}/drivers"
 INSTALL_ROOT="${DRIVERS_ROOT}/context-nexus"
 mkdir -p "${DRIVERS_ROOT}"
 
+if [ -e "${INSTALL_ROOT}" ] && [ ! -L "${INSTALL_ROOT}" ]; then
+    printf '%s\n' "error: ${INSTALL_ROOT} exists but is not a symlink; remove it before reinstalling" >&2
+    exit 1
+fi
+
 release=$(mktemp -d "${DRIVERS_ROOT}/.context-nexus.XXXXXX")
 tmp_link=""
-backup=""
 installed=0
 
 cleanup() {
@@ -21,10 +25,6 @@ cleanup() {
             rm -f "${tmp_link}"
         fi
         rm -rf "${release}"
-        if [ -n "${backup}" ] && [ -e "${backup}" ] \
-            && [ ! -e "${INSTALL_ROOT}" ] && [ ! -L "${INSTALL_ROOT}" ]; then
-            mv "${backup}" "${INSTALL_ROOT}"
-        fi
     fi
 }
 trap cleanup EXIT INT TERM
@@ -72,22 +72,11 @@ if [ -L "${INSTALL_ROOT}" ]; then
         "${DRIVERS_ROOT}/.context-nexus."*) rm -rf "${old_release}" ;;
     esac
 else
-    backup="${DRIVERS_ROOT}/.context-nexus.backup.$$"
-    rm -rf "${backup}"
-    if [ -e "${INSTALL_ROOT}" ]; then
-        # Legacy installs were real directories. POSIX cannot atomically replace a
-        # non-empty directory with a symlink, so keep rollback for this migration.
-        mv "${INSTALL_ROOT}" "${backup}"
-    fi
     if replace_link "${tmp_link}" "${INSTALL_ROOT}"; then
         tmp_link=""
         installed=1
-        rm -rf "${backup}"
     else
         rm -f "${INSTALL_ROOT}"
-        if [ -e "${backup}" ]; then
-            mv "${backup}" "${INSTALL_ROOT}"
-        fi
         exit 1
     fi
 fi
