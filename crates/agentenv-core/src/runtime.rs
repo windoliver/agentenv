@@ -1,5 +1,6 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, fs, path::PathBuf};
 
+use agentenv_policy::{compose_policy, PresetRegistry, PresetSelection, Tier};
 use agentenv_proto::{
     AgentSpec, Capabilities, ContextSpec, DriverKind, InferenceSpec, InitializeParams,
     InitializeResult, LogLevel, PreflightParams, SCHEMA_VERSION,
@@ -107,6 +108,13 @@ pub enum RuntimeError {
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
+#[derive(Debug, Clone)]
+pub struct CreateResult {
+    pub admission: crate::admission::AdmissionReport,
+    pub state: crate::env::EnvStateFile,
+    pub state_path: PathBuf,
+}
+
 pub async fn initialize_sandbox_driver(
     options: &RuntimeOptions,
     driver: &mut dyn SandboxDriver,
@@ -213,6 +221,253 @@ pub async fn run_preflight_only(
     Ok(crate::admission::AdmissionReport::from_checks(env, checks))
 }
 
+pub async fn create_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    credentials: &mut dyn CredentialProvider,
+    name: &str,
+    blueprint_yaml: &str,
+) -> RuntimeResult<CreateResult> {
+    let env_name = crate::env::validate_env_name(name)?;
+    let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+    let env_dir = paths.env_dir();
+    if env_dir.exists() {
+        return Err(crate::env::EnvError::AlreadyExists {
+            name: name.to_owned(),
+        }
+        .into());
+    }
+
+    let resolved = crate::lifecycle::verify_blueprint_yaml(blueprint_yaml)?;
+    let lock_yaml = crate::lifecycle::freeze_from_blueprint_yaml(blueprint_yaml)?;
+    let selection = DriverSelection {
+        sandbox: resolved.sandbox.driver.clone(),
+        agent: resolved.agent.driver.clone(),
+        context: resolved.context.driver.clone(),
+        inference: resolved
+            .inference
+            .as_ref()
+            .map(|driver| driver.driver.clone()),
+    };
+    let admission = run_preflight_only(options, factory, name, &selection).await?;
+    if admission.status == crate::admission::AdmissionStatus::Rejected {
+        return Ok(CreateResult {
+            admission,
+            state: empty_state(name, selection),
+            state_path: paths.state_path(),
+        });
+    }
+
+    let temp_env_name = crate::env::validate_env_name(&format!(".{}.creating", name))?;
+    let temp_paths = crate::env::EnvPaths::new(options.root.clone(), temp_env_name);
+    let temp_env_dir = temp_paths.env_dir();
+
+    let result = async {
+        let mut set = factory.build(&selection)?;
+        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+        initialize_agent_driver(options, set.agent.as_mut()).await?;
+        initialize_context_driver(options, set.context.as_mut()).await?;
+        if let Some(inference) = set.inference.as_mut() {
+            initialize_inference_driver(options, inference.as_mut()).await?;
+        }
+
+        let agent_spec = agent_spec(
+            resolved.blueprint.agent.extra.clone(),
+            resolved.blueprint.agent.version.clone(),
+        )?;
+        let mut requirements = set
+            .agent
+            .credential_requirements(agent_spec)
+            .await?
+            .requirements;
+        requirements.extend(
+            set.context
+                .credential_requirements(agentenv_proto::CredentialRequirementsParams {})
+                .await?
+                .requirements,
+        );
+        if let Some(inference) = set.inference.as_ref() {
+            requirements.extend(
+                inference
+                    .credential_requirements(agentenv_proto::CredentialRequirementsParams {})
+                    .await?
+                    .requirements,
+            );
+        }
+
+        let mut env = BTreeMap::new();
+        let mut credential_names = Vec::new();
+        for requirement in requirements {
+            credential_names.push(requirement.name.clone());
+            if let Some(value) = credentials.resolve(&requirement)? {
+                env.insert(requirement.name, value.expose_secret().to_owned());
+            } else if requirement.required {
+                return Err(RuntimeError::MissingCredential {
+                    name: requirement.name,
+                });
+            }
+        }
+
+        let context_handle = set
+            .context
+            .provision(context_spec(resolved.blueprint.context.extra.clone())?)
+            .await?;
+        let context_endpoint = set
+            .context
+            .mcp_endpoint(agentenv_proto::ContextHandleRequest {
+                handle: context_handle.handle.clone(),
+            })
+            .await?;
+        let context_network_rules = set
+            .context
+            .required_network_rules(agentenv_proto::ContextHandleRequest {
+                handle: context_handle.handle.clone(),
+            })
+            .await?;
+
+        let (inference_handle, inference_endpoint) = match (
+            set.inference.as_ref(),
+            resolved.blueprint.inference.as_ref(),
+        ) {
+            (Some(inference), Some(component)) => {
+                let handle = inference
+                    .provision(inference_spec(component.extra.clone())?)
+                    .await?;
+                let endpoint = inference
+                    .endpoint_in_sandbox(agentenv_proto::InferenceHandleRequest {
+                        handle: handle.handle.clone(),
+                    })
+                    .await?;
+                (Some(handle.handle), Some(endpoint.url))
+            }
+            _ => (None, None),
+        };
+
+        let mut policy = compose_policy(
+            parse_tier(&resolved.blueprint.policy.tier),
+            &parse_presets(&resolved.blueprint.policy.presets)?,
+            policy_overrides(&resolved.blueprint.policy.overrides)?,
+            &PresetRegistry::load_builtin().map_err(|err| {
+                RuntimeError::Driver(crate::driver::DriverError::PolicyTranslation {
+                    message: err.to_string(),
+                })
+            })?,
+        )
+        .map_err(|err| {
+            RuntimeError::Driver(crate::driver::DriverError::PolicyTranslation {
+                message: err.to_string(),
+            })
+        })?;
+        policy.network.allow.extend(context_network_rules.rules);
+
+        fs::create_dir_all(paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
+            path: paths.envs_dir(),
+            source,
+        })?;
+        if temp_env_dir.exists() {
+            fs::remove_dir_all(&temp_env_dir).map_err(|source| crate::env::EnvError::Io {
+                path: temp_env_dir.clone(),
+                source,
+            })?;
+        }
+        fs::create_dir_all(&temp_env_dir).map_err(|source| crate::env::EnvError::Io {
+            path: temp_env_dir.clone(),
+            source,
+        })?;
+
+        fs::write(temp_env_dir.join("blueprint.yaml"), blueprint_yaml).map_err(|source| {
+            crate::env::EnvError::Io {
+                path: temp_env_dir.join("blueprint.yaml"),
+                source,
+            }
+        })?;
+        fs::write(temp_env_dir.join("lock.yaml"), lock_yaml).map_err(|source| {
+            crate::env::EnvError::Io {
+                path: temp_env_dir.join("lock.yaml"),
+                source,
+            }
+        })?;
+
+        let sandbox_handle = set
+            .sandbox
+            .create(agentenv_proto::SandboxSpec {
+                image: None,
+                env,
+                policy: Some(policy),
+                metadata: BTreeMap::new(),
+            })
+            .await?;
+
+        let now = now_utc_string();
+        let drivers = crate::env::StateDriverSet {
+            sandbox: crate::env::DriverRecord::new(
+                &selection.sandbox,
+                resolved.sandbox.version.to_string(),
+            ),
+            agent: crate::env::DriverRecord::new(
+                &selection.agent,
+                resolved.agent.version.to_string(),
+            ),
+            context: crate::env::DriverRecord::new(
+                &selection.context,
+                resolved.context.version.to_string(),
+            ),
+            inference: resolved.inference.as_ref().map(|driver| {
+                crate::env::DriverRecord::new(&driver.driver, driver.version.to_string())
+            }),
+        };
+
+        let state = crate::env::EnvStateFile {
+            version: crate::env::STATE_VERSION.to_owned(),
+            name: name.to_owned(),
+            phase: crate::env::EnvPhase::Running,
+            created_at: now.clone(),
+            updated_at: now,
+            drivers,
+            handles: crate::env::DriverHandles {
+                sandbox: Some(sandbox_handle.handle),
+                context: Some(context_handle.handle),
+                inference: inference_handle,
+            },
+            endpoints: crate::env::EndpointState {
+                context_mcp: Some(crate::env::PersistedMcpEndpoint::from_mcp(context_endpoint)),
+                inference: inference_endpoint,
+            },
+            credential_names,
+            health: BTreeMap::new(),
+            first_enter_hint_shown: false,
+        };
+
+        crate::env::write_state(&temp_paths, &state)?;
+        crate::env::append_event(
+            &temp_paths,
+            serde_json::json!({
+                "kind": "admission",
+                "status": "accepted",
+                "reason_code": crate::admission::ReasonCode::Created.as_str(),
+                "env": name,
+            }),
+        )?;
+        fs::rename(&temp_env_dir, &env_dir).map_err(|source| crate::env::EnvError::Io {
+            path: env_dir.clone(),
+            source,
+        })?;
+
+        Ok(CreateResult {
+            admission: crate::admission::AdmissionReport::accepted(name),
+            state,
+            state_path: paths.state_path(),
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temp_env_dir);
+    }
+
+    result
+}
+
 fn ensure_runtime_handshake(
     expected_kind: DriverKind,
     helper: &'static str,
@@ -309,6 +564,122 @@ pub fn inference_spec(extra: BTreeMap<String, serde_yaml::Value>) -> RuntimeResu
     Ok(InferenceSpec {
         config: component_spec(extra)?.into_iter().collect(),
     })
+}
+
+fn empty_state(name: &str, selection: DriverSelection) -> crate::env::EnvStateFile {
+    let now = now_utc_string();
+    let drivers = crate::env::StateDriverSet {
+        sandbox: crate::env::DriverRecord::new(selection.sandbox, ""),
+        agent: crate::env::DriverRecord::new(selection.agent, ""),
+        context: crate::env::DriverRecord::new(selection.context, ""),
+        inference: selection
+            .inference
+            .map(|name| crate::env::DriverRecord::new(name, "")),
+    };
+
+    crate::env::EnvStateFile {
+        version: crate::env::STATE_VERSION.to_owned(),
+        name: name.to_owned(),
+        phase: crate::env::EnvPhase::Error,
+        created_at: now.clone(),
+        updated_at: now,
+        drivers,
+        handles: crate::env::DriverHandles::default(),
+        endpoints: crate::env::EndpointState::default(),
+        credential_names: Vec::new(),
+        health: BTreeMap::new(),
+        first_enter_hint_shown: false,
+    }
+}
+
+fn now_utc_string() -> String {
+    match time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) {
+        Ok(value) => value,
+        Err(_) => "1970-01-01T00:00:00Z".to_owned(),
+    }
+}
+
+fn parse_tier(value: &str) -> Tier {
+    match value {
+        "restricted" => Tier::Restricted,
+        "open" => Tier::Open,
+        _ => Tier::Balanced,
+    }
+}
+
+fn parse_presets(values: &[String]) -> RuntimeResult<Vec<PresetSelection>> {
+    values
+        .iter()
+        .map(|value| {
+            PresetSelection::from_slug(value).map_err(|err| {
+                RuntimeError::Driver(crate::driver::DriverError::PolicyTranslation {
+                    message: err.to_string(),
+                })
+            })
+        })
+        .collect()
+}
+
+fn policy_overrides(
+    overrides: &[crate::blueprint::PolicyOverride],
+) -> RuntimeResult<Option<agentenv_proto::NetworkPolicy>> {
+    if overrides.is_empty() {
+        return Ok(None);
+    }
+
+    let mut policy = empty_policy_override();
+    for item in overrides {
+        if let Some(allow) = item.allow.as_ref() {
+            policy.network.allow.push(url_pattern_rule(allow));
+        }
+        if let Some(deny) = item.deny.as_ref() {
+            policy.network.deny.push(url_pattern_rule(deny));
+        }
+        if let Some(approval) = item.approval.as_ref() {
+            policy
+                .network
+                .approval_required
+                .push(url_pattern_rule(approval));
+        }
+    }
+
+    Ok(Some(policy))
+}
+
+fn empty_policy_override() -> agentenv_proto::NetworkPolicy {
+    agentenv_proto::NetworkPolicy {
+        network: agentenv_proto::NetworkAccessPolicy {
+            reloadability: agentenv_proto::PolicyReloadability::HotReload,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            approval_required: Vec::new(),
+        },
+        filesystem: agentenv_proto::FilesystemPolicy {
+            reloadability: agentenv_proto::PolicyReloadability::LockedAtCreate,
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+        },
+        process: agentenv_proto::ProcessPolicy {
+            reloadability: agentenv_proto::PolicyReloadability::LockedAtCreate,
+            run_as_user: String::new(),
+            run_as_group: String::new(),
+            profile: String::new(),
+            allow_syscalls: Vec::new(),
+            deny_syscalls: Vec::new(),
+        },
+        inference: agentenv_proto::InferencePolicy {
+            reloadability: agentenv_proto::PolicyReloadability::HotReload,
+            routes: Vec::new(),
+        },
+    }
+}
+
+fn url_pattern_rule(pattern: &str) -> agentenv_proto::NetworkRule {
+    agentenv_proto::NetworkRule {
+        target: agentenv_proto::NetworkTarget::UrlPattern {
+            pattern: pattern.to_owned(),
+        },
+    }
 }
 
 impl fmt::Debug for DriverSet {
@@ -410,6 +781,21 @@ pub mod tests_support {
             _params: agentenv_proto::ShutdownParams,
         ) -> DriverResult<EmptyResult> {
             Ok(EmptyResult {})
+        }
+    }
+
+    pub struct EmptyCredentialProvider;
+
+    impl super::CredentialProvider for EmptyCredentialProvider {
+        fn resolve(
+            &mut self,
+            _requirement: &agentenv_proto::CredentialRequirement,
+        ) -> super::RuntimeResult<Option<super::RuntimeSecret>> {
+            Ok(None)
+        }
+
+        fn backend_name(&self, _name: &str) -> super::RuntimeResult<Option<String>> {
+            Ok(None)
         }
     }
 }
@@ -853,6 +1239,56 @@ mod tests {
         assert_eq!(report.checks.len(), 4);
         assert_eq!(report.checks[3].kind, DriverKind::Inference);
         assert_eq!(report.checks[3].driver, "inference-passthrough");
+    }
+
+    #[tokio::test]
+    async fn create_env_writes_registry_files() {
+        let root = std::env::temp_dir().join(format!("agentenv-create-{}", std::process::id()));
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::create_env(
+            &options,
+            &TinyInferenceFactory,
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.admission.status,
+            crate::admission::AdmissionStatus::Accepted
+        );
+        assert_eq!(result.state.name, "demo");
+        assert_eq!(result.state.handles.sandbox.as_deref(), Some("sb-1"));
+
+        let env_dir = root.join("envs").join("demo");
+        assert!(env_dir.join("blueprint.yaml").is_file());
+        assert!(env_dir.join("lock.yaml").is_file());
+        assert!(env_dir.join("state.json").is_file());
+        assert!(env_dir.join("events.jsonl").is_file());
     }
 
     fn bad_initialize_result(

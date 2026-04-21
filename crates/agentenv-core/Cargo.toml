@@ -12,6 +12,7 @@ description = "Core abstractions and orchestration scaffolding for agentenv"
 
 [dependencies]
 agentenv-proto = { path = "../agentenv-proto" }
+agentenv-policy = { path = "../agentenv-policy" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

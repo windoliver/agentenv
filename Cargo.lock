@@ -74,6 +74,7 @@ version = "0.0.1-alpha0"
 name = "agentenv-core"
 version = "0.0.1-alpha0"
 dependencies = [
+ "agentenv-policy",
  "agentenv-proto",
  "async-trait",
  "dirs",
