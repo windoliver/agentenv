@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import re
 from typing import Any
 
 import yaml
@@ -38,6 +39,8 @@ PROVIDER_CREDENTIALS: dict[str, str | None] = {
     "vllm": None,
     "llamacpp": None,
 }
+
+SAFE_HERMES_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+!*-]*$")
 
 
 class HermesDriver:
@@ -108,6 +111,9 @@ class HermesDriver:
         version = spec.get("version")
         package = "hermes-agent[mcp]"
         if version:
+            version = str(version)
+            if not SAFE_HERMES_VERSION.fullmatch(version):
+                raise ValueError(f"unsafe hermes version `{version}`")
             package = f"{package}=={version}"
         return {
             "steps": [

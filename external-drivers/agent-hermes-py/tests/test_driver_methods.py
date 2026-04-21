@@ -82,6 +82,13 @@ def test_install_steps_pin_agent_spec_version():
     )
 
 
+def test_install_steps_reject_unsafe_version_for_docker_shell():
+    with pytest.raises(ValueError, match="unsafe hermes version"):
+        HermesDriver().install_steps(
+            {"version": '0.10.0"; touch /tmp/pwned #', "config": {}}
+        )
+
+
 def test_mcp_config_path_is_hermes_config_yaml():
     assert HermesDriver().mcp_config_path({}) == {"path": "~/.hermes/config.yaml"}
 
