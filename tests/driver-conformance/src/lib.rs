@@ -268,7 +268,9 @@ impl RpcClient {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let kill_result = self.child.kill();
                 let reap_result = self.child.wait();
-                let _ = reader.join();
+                // Do not join here: a descendant may have inherited stdout and keep
+                // the reader blocked even after the direct driver child is reaped.
+                drop(reader);
                 match (kill_result, reap_result) {
                     (Ok(()), Ok(status)) => bail!(
                         "JSON-RPC method `{method}` timed out after {:?} waiting for response; killed and reaped driver with status {status}",
@@ -640,7 +642,9 @@ mod tests {
     use std::process;
     use std::sync::Mutex;
     #[cfg(unix)]
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use agentenv_core::driver::{AgentDriver, DriverResult, SandboxDriver};
     use agentenv_proto::{
@@ -742,6 +746,77 @@ mod tests {
         );
 
         fs::remove_file(script_path).expect("remove silent script");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_call_timeout_does_not_wait_for_descendant_inherited_stdout() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-inherited-stdout-{}-{unique}.sh",
+            process::id()
+        ));
+        let pid_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-inherited-stdout-{}-{unique}.pid",
+            process::id()
+        ));
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nsleep 2 &\nprintf '%s\\n' \"$!\" > {}\nwait\n",
+                pid_path.display()
+            ),
+        )
+        .expect("write inherited-stdout script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read inherited-stdout script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions)
+            .expect("make inherited-stdout script executable");
+
+        let mut client = RpcClient::spawn(&script_path).expect("spawn inherited-stdout script");
+        let wait_started = Instant::now();
+        while !pid_path.exists() {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "descendant pid file was not written"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let call_started = Instant::now();
+        let err = client
+            .call_success_timeout::<_, EmptyResult>(
+                1,
+                "initialize",
+                &json!({}),
+                Duration::from_millis(20),
+            )
+            .expect_err("inherited stdout should still time out waiting for initialize response");
+        let elapsed = call_started.elapsed();
+
+        if let Ok(pid) = fs::read_to_string(&pid_path) {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.trim())
+                .status();
+        }
+        fs::remove_file(&script_path).expect("remove inherited-stdout script");
+        fs::remove_file(&pid_path).expect("remove descendant pid file");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("initialize") && message.contains("timed out"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timeout path took {elapsed:?}; reader join likely waited for descendant stdout"
+        );
     }
 
     #[test]
