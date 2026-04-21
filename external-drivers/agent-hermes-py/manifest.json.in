@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "name": "hermes",
+  "kind": "agent",
+  "version": "0.1.0",
+  "description": "Hermes Agent driver for agentenv",
+  "binary": "./bin/agentenv-driver-hermes",
+  "args": [],
+  "env": {},
+  "capabilities_preview": {
+    "supports_mcp": true,
+    "supports_slash_commands": true,
+    "supports_tui": true,
+    "supports_headless": true
+  }
+}

@@ -596,6 +596,25 @@ replace_driver_dir() {
     die "Could not install the updated driver at ${driver_dir}"
 }
 
+run_python_driver_bundle_hook() {
+    staged_driver_dir=$1
+    driver_dir=$2
+
+    hook="${staged_driver_dir}/install-driver.sh"
+    if [ ! -f "${hook}" ]; then
+        return 0
+    fi
+
+    chmod +x "${hook}"
+    (
+        cd "${staged_driver_dir}" || exit 1
+        AGENTENV_DRIVER_STAGED_DIR="${staged_driver_dir}" \
+        AGENTENV_DRIVER_INSTALL_ROOT="${driver_dir}" \
+        AGENTENV_HOME="${AGENTENV_HOME}" \
+        ./install-driver.sh
+    ) || die "Python driver bundle hook failed for $(basename "${driver_dir}")"
+}
+
 install_python_drivers() {
     if [ "${WITH_PYTHON_DRIVERS}" != "1" ]; then
         PYTHON_DRIVER_STATUS="skipped"
@@ -664,6 +683,8 @@ install_python_drivers() {
             fi
         else
             [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
+            run_python_driver_bundle_hook "${staged_driver_dir}" "${driver_dir}"
+            [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} hook removed manifest.json"
             replace_driver_dir "${staged_driver_dir}" "${driver_dir}"
         fi
         installed_count=$((installed_count + 1))
