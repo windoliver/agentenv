@@ -631,11 +631,28 @@ pub fn list_envs(options: &RuntimeOptions) -> RuntimeResult<Vec<EnvListRow>> {
 pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDescription> {
     let env_name = crate::env::validate_env_name(name)?;
     let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
-    if !paths.env_dir().is_dir() {
-        return Err(crate::env::EnvError::NotFound {
-            name: name.to_owned(),
+    let env_dir = paths.env_dir();
+    match fs::symlink_metadata(&env_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(crate::env::EnvError::NotFound {
+                name: name.to_owned(),
+            }
+            .into());
         }
-        .into());
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(crate::env::EnvError::NotFound {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+        Err(source) => {
+            return Err(crate::env::EnvError::Io {
+                path: env_dir,
+                source,
+            }
+            .into());
+        }
     }
 
     let state = crate::env::read_state(&paths)?;
@@ -2181,6 +2198,35 @@ policy:
         assert!(err
             .to_string()
             .contains("state name `other` does not match env `demo`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn describe_env_rejects_symlinked_registry_dir() {
+        let root = unique_root("agentenv-describe-symlink");
+        let envs_dir = root.join("envs");
+        let target_dir = root.join("outside-demo");
+        write_state_json(&target_dir, state_fixture("demo"));
+        fs::write(
+            target_dir.join("blueprint.yaml"),
+            "agent:\n  driver: codex\n",
+        )
+        .unwrap();
+        fs::write(target_dir.join("lock.yaml"), "blueprint_hash: test\n").unwrap();
+        fs::create_dir_all(&envs_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, envs_dir.join("demo")).unwrap();
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+
+        let err = super::describe_env(&options, "demo").unwrap_err();
+
+        assert!(matches!(
+            err,
+            RuntimeError::Env(crate::env::EnvError::NotFound { name }) if name == "demo"
+        ));
     }
 
     #[tokio::test]
