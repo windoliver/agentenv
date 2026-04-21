@@ -101,6 +101,8 @@ pub enum RuntimeError {
         expected_capability: &'static str,
         actual_capability: &'static str,
     },
+    #[error("missing selected {kind} driver `{name}` from driver set")]
+    MissingSelectedDriver { kind: &'static str, name: String },
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -160,45 +162,52 @@ pub async fn run_preflight_only(
     selection: &DriverSelection,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
     let mut set = factory.build(selection)?;
-    let sandbox_info = initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
-    let agent_info = initialize_agent_driver(options, set.agent.as_mut()).await?;
-    let context_info = initialize_context_driver(options, set.context.as_mut()).await?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+    initialize_agent_driver(options, set.agent.as_mut()).await?;
+    initialize_context_driver(options, set.context.as_mut()).await?;
     let sandbox_preflight = set.sandbox.preflight(empty_preflight_params()).await?;
     let agent_preflight = set.agent.preflight(empty_preflight_params()).await?;
     let context_preflight = set.context.preflight(empty_preflight_params()).await?;
 
     let sandbox_check = crate::admission::PreflightCheck {
         kind: DriverKind::Sandbox,
-        driver: sandbox_info.driver.name,
+        driver: selection.sandbox.clone(),
         ok: sandbox_preflight.ok,
         issues: sandbox_preflight.issues,
     };
     let agent_check = crate::admission::PreflightCheck {
         kind: DriverKind::Agent,
-        driver: agent_info.driver.name,
+        driver: selection.agent.clone(),
         ok: agent_preflight.ok,
         issues: agent_preflight.issues,
     };
     let context_check = crate::admission::PreflightCheck {
         kind: DriverKind::Context,
-        driver: context_info.driver.name,
+        driver: selection.context.clone(),
         ok: context_preflight.ok,
         issues: context_preflight.issues,
     };
 
     let mut checks = vec![sandbox_check, agent_check, context_check];
 
-    if selection.inference.is_some() {
-        if let Some(inference) = set.inference.as_mut() {
-            let inference_info = initialize_inference_driver(options, inference.as_mut()).await?;
+    match (selection.inference.as_ref(), set.inference.as_mut()) {
+        (Some(inference_name), Some(inference)) => {
+            initialize_inference_driver(options, inference.as_mut()).await?;
             let inference_preflight = inference.preflight(empty_preflight_params()).await?;
             checks.push(crate::admission::PreflightCheck {
                 kind: DriverKind::Inference,
-                driver: inference_info.driver.name,
+                driver: inference_name.clone(),
                 ok: inference_preflight.ok,
                 issues: inference_preflight.issues,
             });
         }
+        (Some(inference_name), None) => {
+            return Err(RuntimeError::MissingSelectedDriver {
+                kind: "inference",
+                name: inference_name.clone(),
+            });
+        }
+        (None, _) => {}
     }
 
     Ok(crate::admission::AdmissionReport::from_checks(env, checks))
@@ -410,13 +419,13 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use agentenv_proto::{
-        Capabilities, ContextCapabilities, DriverInfo, DriverKind, EmptyResult, InitializeParams,
-        InitializeResult, LogLevel, PreflightParams, PreflightResult, SandboxCapabilities,
-        SCHEMA_VERSION,
+        Capabilities, ContextCapabilities, DriverInfo, DriverKind, EmptyResult,
+        InferenceCapabilities, InitializeParams, InitializeResult, LogLevel, PreflightParams,
+        PreflightResult, SandboxCapabilities, SCHEMA_VERSION,
     };
     use async_trait::async_trait;
 
-    use crate::driver::{ContextDriver, DriverResult, SandboxDriver};
+    use crate::driver::{ContextDriver, DriverResult, InferenceDriver, SandboxDriver};
 
     use super::{
         component_spec, initialize_context_driver, initialize_sandbox_driver, DriverFactory,
@@ -433,6 +442,20 @@ mod tests {
                 agent: Box::new(super::tests_support::TinyAgentDriver),
                 context: Box::new(TinyContextDriver),
                 inference: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct TinyInferenceFactory;
+
+    impl DriverFactory for TinyInferenceFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(TinySandboxDriver),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: Some(Box::new(TinyInferenceDriver)),
             })
         }
     }
@@ -639,6 +662,75 @@ mod tests {
         }
     }
 
+    struct TinyInferenceDriver;
+
+    #[async_trait]
+    impl InferenceDriver for TinyInferenceDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "passthrough".to_owned(),
+                    kind: DriverKind::Inference,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Inference(InferenceCapabilities {
+                    strips_caller_credentials: true,
+                    supports_model_switching: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn provision(
+            &self,
+            _spec: agentenv_proto::InferenceSpec,
+        ) -> DriverResult<agentenv_proto::InferenceHandle> {
+            Ok(agentenv_proto::InferenceHandle {
+                handle: "inf-1".to_owned(),
+            })
+        }
+
+        async fn endpoint_in_sandbox(
+            &self,
+            _params: agentenv_proto::InferenceHandleRequest,
+        ) -> DriverResult<agentenv_proto::EndpointInSandboxResult> {
+            Ok(agentenv_proto::EndpointInSandboxResult {
+                url: "http://inference.local".to_owned(),
+            })
+        }
+
+        async fn credential_requirements(
+            &self,
+            _params: agentenv_proto::CredentialRequirementsParams,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            Ok(agentenv_proto::CredentialRequirementsResult {
+                requirements: Vec::new(),
+            })
+        }
+
+        async fn teardown(
+            &self,
+            _params: agentenv_proto::InferenceHandleRequest,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
     #[tokio::test]
     async fn initialize_helpers_use_current_protocol() {
         let mut sandbox = TinySandboxDriver;
@@ -683,6 +775,84 @@ mod tests {
         assert_eq!(report.checks[0].kind, DriverKind::Sandbox);
         assert_eq!(report.checks[1].kind, DriverKind::Agent);
         assert_eq!(report.checks[2].kind, DriverKind::Context);
+    }
+
+    #[tokio::test]
+    async fn preflight_only_reports_selected_driver_names() {
+        let options = RuntimeOptions {
+            root: std::env::temp_dir(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let selection = super::DriverSelection {
+            sandbox: "sandbox-openshell".to_owned(),
+            agent: "agent-codex".to_owned(),
+            context: "context-filesystem".to_owned(),
+            inference: None,
+        };
+
+        let report = super::run_preflight_only(&options, &TinyFactory, "demo", &selection)
+            .await
+            .unwrap();
+
+        let drivers = report
+            .checks
+            .iter()
+            .map(|check| check.driver.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            drivers,
+            ["sandbox-openshell", "agent-codex", "context-filesystem"]
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_only_errors_when_requested_inference_driver_missing() {
+        let options = RuntimeOptions {
+            root: std::env::temp_dir(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let selection = super::DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: Some("passthrough".to_owned()),
+        };
+
+        let err = super::run_preflight_only(&options, &TinyFactory, "demo", &selection)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("missing selected inference driver `passthrough`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_only_includes_selected_inference_driver_name() {
+        let options = RuntimeOptions {
+            root: std::env::temp_dir(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let selection = super::DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: Some("inference-passthrough".to_owned()),
+        };
+
+        let report = super::run_preflight_only(&options, &TinyInferenceFactory, "demo", &selection)
+            .await
+            .unwrap();
+
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        assert_eq!(report.checks.len(), 4);
+        assert_eq!(report.checks[3].kind, DriverKind::Inference);
+        assert_eq!(report.checks[3].driver, "inference-passthrough");
     }
 
     fn bad_initialize_result(
