@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "name": "nexus",
+  "kind": "context",
+  "version": "0.1.0",
+  "description": "Nexus context backend driver",
+  "binary": "./bin/agentenv-driver-nexus",
+  "args": [],
+  "env": {},
+  "capabilities_preview": {
+    "is_remote": true,
+    "is_shared": true,
+    "supports_zones": true,
+    "supports_snapshots": true
+  }
+}

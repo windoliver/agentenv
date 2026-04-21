@@ -1,16 +1,23 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use agentenv_proto::{
-    assert_compatible_schema_version, schema_version_major, Capabilities, DriverKind, EmptyResult,
-    InitializeParams, InitializeResult, PreflightParams, PreflightResult,
+    assert_compatible_schema_version, schema_version_major, Capabilities, ContextHandleRequest,
+    ContextSpec, CredentialRequirementsParams, DriverKind, EmptyResult, InitializeParams,
+    InitializeResult, McpTransport, NetworkTarget, PreflightParams, PreflightResult,
     ERROR_SCHEMA_VERSION_INCOMPATIBLE, JSON_RPC_METHOD_NOT_FOUND, SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const DEFAULT_DRIVER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RpcRequestEnvelope {
@@ -95,7 +102,7 @@ pub fn read_framed_json<R: BufRead>(reader: &mut R) -> Result<Value> {
 pub struct RpcClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: Option<BufReader<ChildStdout>>,
 }
 
 impl RpcClient {
@@ -119,7 +126,7 @@ impl RpcClient {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout: Some(BufReader::new(stdout)),
         })
     }
 
@@ -129,6 +136,28 @@ impl RpcClient {
         R: DeserializeOwned,
     {
         let response = self.call(id, method, params)?;
+        Self::decode_success_response(response, method)
+    }
+
+    pub fn call_success_timeout<P, R>(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &P,
+        timeout: Duration,
+    ) -> Result<R>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let response = self.call_timeout(id, method, params, timeout)?;
+        Self::decode_success_response(response, method)
+    }
+
+    fn decode_success_response<R>(response: RpcResponseEnvelope, method: &str) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
         if let Some(error) = response.error {
             bail!(
                 "unexpected JSON-RPC error {}: {}",
@@ -156,10 +185,55 @@ impl RpcClient {
     }
 
     pub fn wait_for_exit(&mut self) -> Result<ExitStatus> {
-        self.child.wait().context("wait for driver to exit")
+        self.wait_for_exit_timeout(DEFAULT_DRIVER_EXIT_TIMEOUT)
+    }
+
+    pub fn wait_for_exit_timeout(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().context("poll driver exit status")? {
+                return Ok(status);
+            }
+
+            if started.elapsed() >= timeout {
+                let kill_result = self.child.kill();
+                let reap_result = self.child.wait();
+                return match (kill_result, reap_result) {
+                    (Ok(()), Ok(status)) => bail!(
+                        "driver timed out after {:?} without exiting; killed and reaped with status {status}",
+                        timeout
+                    ),
+                    (Ok(()), Err(error)) => Err(error)
+                        .context("driver timed out without exiting; killed but failed to reap"),
+                    (Err(kill_error), Ok(status)) => bail!(
+                        "driver timed out after {:?} without exiting; failed to kill: {kill_error}; reaped with status {status}",
+                        timeout
+                    ),
+                    (Err(kill_error), Err(reap_error)) => bail!(
+                        "driver timed out after {:?} without exiting; failed to kill: {kill_error}; failed to reap: {reap_error}",
+                        timeout
+                    ),
+                };
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn call<P>(&mut self, id: u64, method: &str, params: &P) -> Result<RpcResponseEnvelope>
+    where
+        P: Serialize,
+    {
+        self.call_timeout(id, method, params, DEFAULT_RPC_TIMEOUT)
+    }
+
+    fn call_timeout<P>(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &P,
+        timeout: Duration,
+    ) -> Result<RpcResponseEnvelope>
     where
         P: Serialize,
     {
@@ -172,7 +246,56 @@ impl RpcClient {
         });
 
         write_framed_json(&mut self.stdin, &request)?;
-        read_response_envelope(&mut self.stdout, &request["id"])
+        let mut stdout = self.stdout.take().ok_or_else(|| {
+            anyhow!("driver stdout pipe was not available while calling `{method}`")
+        })?;
+        let expected_id_for_thread = request["id"].clone();
+        let (tx, rx) = mpsc::channel();
+
+        let reader = thread::spawn(move || {
+            let result = read_response_envelope(&mut stdout, &expected_id_for_thread);
+            let _ = tx.send((result, stdout));
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok((result, stdout)) => {
+                self.stdout = Some(stdout);
+                reader
+                    .join()
+                    .map_err(|_| anyhow!("JSON-RPC reader thread panicked"))?;
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let kill_result = self.child.kill();
+                let reap_result = self.child.wait();
+                // Do not join here: a descendant may have inherited stdout and keep
+                // the reader blocked even after the direct driver child is reaped.
+                drop(reader);
+                match (kill_result, reap_result) {
+                    (Ok(()), Ok(status)) => bail!(
+                        "JSON-RPC method `{method}` timed out after {:?} waiting for response; killed and reaped driver with status {status}",
+                        timeout
+                    ),
+                    (Ok(()), Err(error)) => Err(error).with_context(|| {
+                        format!(
+                            "JSON-RPC method `{method}` timed out after {timeout:?}; killed driver but failed to reap"
+                        )
+                    }),
+                    (Err(kill_error), Ok(status)) => bail!(
+                        "JSON-RPC method `{method}` timed out after {:?} waiting for response; failed to kill driver: {kill_error}; reaped with status {status}",
+                        timeout
+                    ),
+                    (Err(kill_error), Err(reap_error)) => bail!(
+                        "JSON-RPC method `{method}` timed out after {:?} waiting for response; failed to kill driver: {kill_error}; failed to reap: {reap_error}",
+                        timeout
+                    ),
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = reader.join();
+                bail!("JSON-RPC reader thread disconnected while calling `{method}`")
+            }
+        }
     }
 }
 
@@ -222,6 +345,16 @@ fn read_response_envelope<R: BufRead>(
     }
 }
 
+fn record_cleanup_error(result: &mut Result<()>, operation: &str, error: anyhow::Error) {
+    let previous = std::mem::replace(result, Ok(()));
+    *result = match previous {
+        Ok(()) => Err(anyhow!("cleanup failed during {operation}: {error:#}")),
+        Err(primary) => Err(anyhow!(
+            "{primary:#}; additionally, cleanup failed during {operation}: {error:#}"
+        )),
+    };
+}
+
 pub fn run_standard_suite(driver_path: &Path) -> Result<()> {
     let mut client = RpcClient::spawn(driver_path)?;
     let initialize_result: InitializeResult = client.call_success(
@@ -260,6 +393,129 @@ pub fn run_standard_suite(driver_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn nexus_hub_conformance_spec() -> ContextSpec {
+    let mut config = std::collections::BTreeMap::new();
+    config.insert("mode".to_owned(), serde_json::json!("hub"));
+    config.insert(
+        "hub_url".to_owned(),
+        serde_json::json!("https://nexus.example.test"),
+    );
+    config.insert("zones".to_owned(), serde_json::json!(["eng"]));
+    ContextSpec { config }
+}
+
+pub fn run_context_suite(driver_path: &Path) -> Result<()> {
+    let mut client = RpcClient::spawn(driver_path)?;
+    let initialize_result: InitializeResult = client.call_success(
+        1,
+        "initialize",
+        &InitializeParams {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            core_version: "0.0.1".to_owned(),
+            workdir: "/tmp/agentenv".to_owned(),
+            log_level: agentenv_proto::LogLevel::Info,
+        },
+    )?;
+
+    assert_compatible_schema_version(&initialize_result.driver.protocol_version)
+        .context("initialize result must report a compatible protocol version")?;
+    if initialize_result.driver.kind != DriverKind::Context {
+        bail!("initialize must report DriverKind::Context");
+    }
+    if !matches!(initialize_result.capabilities, Capabilities::Context(_)) {
+        bail!("initialize must report context capabilities");
+    }
+
+    let credentials: agentenv_proto::CredentialRequirementsResult = client.call_success(
+        2,
+        "credential_requirements",
+        &CredentialRequirementsParams {},
+    )?;
+    if !credentials
+        .requirements
+        .iter()
+        .any(|requirement| requirement.name == "NEXUS_TOKEN")
+    {
+        bail!("context driver must declare NEXUS_TOKEN");
+    }
+
+    let handle: agentenv_proto::ContextHandle =
+        client.call_success(3, "provision", &nexus_hub_conformance_spec())?;
+    let mut suite_result = (|| -> Result<()> {
+        let endpoint: agentenv_proto::McpEndpoint = client.call_success(
+            4,
+            "mcp_endpoint",
+            &ContextHandleRequest {
+                handle: handle.handle.clone(),
+            },
+        )?;
+        if endpoint.transport != McpTransport::Http {
+            bail!("nexus context endpoint must use HTTP transport");
+        }
+
+        let rules: agentenv_proto::RequiredNetworkRulesResult = client.call_success(
+            5,
+            "required_network_rules",
+            &ContextHandleRequest {
+                handle: handle.handle.clone(),
+            },
+        )?;
+        if !rules.rules.iter().any(|rule| {
+            matches!(
+                &rule.target,
+                NetworkTarget::Host { host, .. } if host == "nexus.example.test"
+            )
+        }) {
+            bail!("hub mode must emit a network rule for nexus.example.test");
+        }
+
+        let status: agentenv_proto::ContextStatus = client.call_success(
+            6,
+            "status",
+            &ContextHandleRequest {
+                handle: handle.handle.clone(),
+            },
+        )?;
+        if !status.healthy {
+            bail!("context status must be healthy after hub provision");
+        }
+
+        Ok(())
+    })();
+
+    if let Err(error) = client
+        .call_success::<_, EmptyResult>(
+            7,
+            "teardown",
+            &ContextHandleRequest {
+                handle: handle.handle,
+            },
+        )
+        .map(|_| ())
+    {
+        record_cleanup_error(&mut suite_result, "teardown", error);
+    }
+
+    if let Err(error) = client
+        .call_success::<_, EmptyResult>(8, "shutdown", &agentenv_proto::ShutdownParams {})
+        .map(|_| ())
+    {
+        record_cleanup_error(&mut suite_result, "shutdown", error);
+    }
+
+    match client.wait_for_exit() {
+        Ok(status) if status.success() => {}
+        Ok(status) => record_cleanup_error(
+            &mut suite_result,
+            "wait_for_exit",
+            anyhow!("driver exited with status {status}"),
+        ),
+        Err(error) => record_cleanup_error(&mut suite_result, "wait_for_exit", error),
+    }
+
+    suite_result
 }
 
 pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>(
@@ -505,8 +761,18 @@ pub fn run_schema_mismatch_suite(driver_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(unix)]
+    use std::fs;
     use std::io::{BufReader, Cursor};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::process;
     use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use agentenv_core::driver::{AgentDriver, ContextDriver, DriverResult, SandboxDriver};
     use agentenv_proto::{
@@ -523,9 +789,177 @@ mod tests {
 
     use super::{
         assert_agent_driver_contract, assert_context_driver_contract,
-        assert_sandbox_driver_contract, read_response_envelope, write_framed_json,
+        assert_sandbox_driver_contract, nexus_hub_conformance_spec, read_response_envelope,
+        write_framed_json, RpcClient,
     };
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_timeout_kills_non_exiting_child() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-sleep-{}-{unique}.sh",
+            process::id()
+        ));
+        fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeping script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read sleeping script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions).expect("make sleeping script executable");
+
+        let mut client = RpcClient::spawn(&script_path).expect("spawn sleeping script");
+        let err = client
+            .wait_for_exit_timeout(Duration::from_millis(20))
+            .expect_err("sleeping script should time out");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("timed out") || message.contains("exit"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            client
+                .child
+                .try_wait()
+                .expect("query child exit after timeout")
+                .is_some(),
+            "timeout path should kill and reap the child"
+        );
+
+        fs::remove_file(script_path).expect("remove sleeping script");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_call_timeout_kills_non_responding_child() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-silent-{}-{unique}.sh",
+            process::id()
+        ));
+        fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write silent script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read silent script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions).expect("make silent script executable");
+
+        let mut client = RpcClient::spawn(&script_path).expect("spawn silent script");
+        let err = client
+            .call_success_timeout::<_, EmptyResult>(
+                1,
+                "initialize",
+                &json!({}),
+                Duration::from_millis(20),
+            )
+            .expect_err("silent script should time out waiting for initialize response");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("initialize") && message.contains("timed out"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            client
+                .child
+                .try_wait()
+                .expect("query child exit after RPC timeout")
+                .is_some(),
+            "RPC timeout path should kill and reap the child"
+        );
+
+        fs::remove_file(script_path).expect("remove silent script");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_call_timeout_does_not_wait_for_descendant_inherited_stdout() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-inherited-stdout-{}-{unique}.sh",
+            process::id()
+        ));
+        let pid_path = std::env::temp_dir().join(format!(
+            "agentenv-driver-conformance-inherited-stdout-{}-{unique}.pid",
+            process::id()
+        ));
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nsleep 2 &\nprintf '%s\\n' \"$!\" > {}\nwait\n",
+                pid_path.display()
+            ),
+        )
+        .expect("write inherited-stdout script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("read inherited-stdout script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions)
+            .expect("make inherited-stdout script executable");
+
+        let mut client = RpcClient::spawn(&script_path).expect("spawn inherited-stdout script");
+        let wait_started = Instant::now();
+        while !pid_path.exists() {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "descendant pid file was not written"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let call_started = Instant::now();
+        let err = client
+            .call_success_timeout::<_, EmptyResult>(
+                1,
+                "initialize",
+                &json!({}),
+                Duration::from_millis(20),
+            )
+            .expect_err("inherited stdout should still time out waiting for initialize response");
+        let elapsed = call_started.elapsed();
+
+        if let Ok(pid) = fs::read_to_string(&pid_path) {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.trim())
+                .status();
+        }
+        fs::remove_file(&script_path).expect("remove inherited-stdout script");
+        fs::remove_file(&pid_path).expect("remove descendant pid file");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("initialize") && message.contains("timed out"),
+            "unexpected timeout error: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timeout path took {elapsed:?}; reader join likely waited for descendant stdout"
+        );
+    }
+
+    #[test]
+    fn context_conformance_hub_spec_contains_required_config() {
+        let spec = nexus_hub_conformance_spec();
+
+        assert_eq!(spec.config["mode"], serde_json::json!("hub"));
+        assert_eq!(
+            spec.config["hub_url"],
+            serde_json::json!("https://nexus.example.test")
+        );
+    }
 
     #[test]
     fn response_reader_skips_notifications() {

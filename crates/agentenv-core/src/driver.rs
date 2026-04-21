@@ -41,6 +41,10 @@ pub enum DriverError {
         stdout: String,
         stderr: String,
     },
+    Subprocess {
+        driver: String,
+        message: String,
+    },
     PolicyTranslation {
         message: String,
     },
@@ -138,6 +142,9 @@ impl fmt::Display for DriverError {
                     Self::status_label(*status),
                     rendered
                 )
+            }
+            DriverError::Subprocess { driver, message } => {
+                write!(f, "subprocess driver `{driver}` failed: {message}")
             }
             DriverError::PolicyTranslation { message } => {
                 write!(f, "policy translation failed: {message}")

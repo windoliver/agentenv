@@ -157,6 +157,11 @@ Agent health checks are declarative probes exported as `agent-health-check-probe
 | `status` | `{handle}` | `ContextStatus` |
 | `teardown` | `{handle}` | `{}` |
 
+For subprocess context drivers, the core sends the same method names over
+JSON-RPC. Credentials are declared through `credential_requirements` and are not
+included in generic method params. Driver-specific launchers receive credentials
+only through their process environment when the lifecycle layer injects them.
+
 For built-in context drivers, an empty `McpEndpoint.url` with `transport = stdio` is
 the no-context sentinel and should be skipped when rendering agent MCP config.
 Filesystem context endpoints encode the stdio command in `McpEndpoint.url` until a

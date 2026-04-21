@@ -127,6 +127,16 @@ dependencies = [
 [[package]]
 name = "agentenv-plugin"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "agentenv-policy"
