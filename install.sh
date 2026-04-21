@@ -654,10 +654,39 @@ install_python_drivers() {
         rm -rf "${staged_driver_dir}"
         mkdir -p "${staged_driver_dir}"
         tar -xzf "${archive_path}" -C "${staged_driver_dir}" || die "Could not extract Python driver bundle for ${driver_name}"
-        [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
-        run_python_driver_bundle_hook "${staged_driver_dir}" "${driver_dir}"
-        [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} hook removed manifest.json"
-        replace_driver_dir "${staged_driver_dir}" "${driver_dir}"
+        if [ ! -f "${staged_driver_dir}/manifest.json" ] && [ ! -f "${staged_driver_dir}/pyproject.toml" ] && [ -d "${staged_driver_dir}/${driver_name}" ]; then
+            inner_dir="${staged_driver_dir}/${driver_name}"
+            flattened_dir="${TMP_ROOT}/${driver_name}.flattened"
+            rm -rf "${flattened_dir}"
+            mv "${inner_dir}" "${flattened_dir}"
+            rm -rf "${staged_driver_dir}"
+            mv "${flattened_dir}" "${staged_driver_dir}"
+        fi
+        if [ -f "${staged_driver_dir}/scripts/install-driver.sh" ] && [ -f "${staged_driver_dir}/pyproject.toml" ]; then
+            source_backup_dir=""
+            if [ -e "${driver_dir}" ] && [ ! -L "${driver_dir}" ]; then
+                source_backup_dir="${driver_dir}.backup.$$"
+                rm -rf "${source_backup_dir}"
+                mv "${driver_dir}" "${source_backup_dir}" || die "Could not back up the existing driver at ${driver_dir}"
+            fi
+
+            if AGENTENV_HOME="${AGENTENV_HOME}" sh "${staged_driver_dir}/scripts/install-driver.sh" >/dev/null; then
+                if [ -n "${source_backup_dir}" ]; then
+                    rm -rf "${source_backup_dir}"
+                fi
+            else
+                if [ -n "${source_backup_dir}" ]; then
+                    rm -rf "${driver_dir}"
+                    mv "${source_backup_dir}" "${driver_dir}" || die "Could not restore the previous driver at ${driver_dir}"
+                fi
+                die "Could not install Python driver ${driver_name}"
+            fi
+        else
+            [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} did not contain manifest.json"
+            run_python_driver_bundle_hook "${staged_driver_dir}" "${driver_dir}"
+            [ -f "${staged_driver_dir}/manifest.json" ] || die "Python driver ${driver_name} hook removed manifest.json"
+            replace_driver_dir "${staged_driver_dir}" "${driver_dir}"
+        fi
         installed_count=$((installed_count + 1))
     done < "${index_path}"
 

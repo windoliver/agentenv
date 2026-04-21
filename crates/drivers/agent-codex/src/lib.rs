@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use agentenv_core::agent_common::{npm_package_spec, version_probe, AgentMode, SharedAgentConfig};
+use agentenv_core::agent_common::{
+    is_no_context_mcp_endpoint, npm_package_spec, version_probe, AgentMode, SharedAgentConfig,
+};
 use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
     assert_compatible_schema_version, AgentCapabilities, AgentHealthCheckProbe, AgentSpec,
@@ -75,12 +77,17 @@ impl AgentDriver for CodexDriver {
     ) -> DriverResult<RenderMcpConfigResult> {
         let mut content = String::new();
 
-        for (index, endpoint) in params.endpoints.into_iter().enumerate() {
-            if index > 0 {
+        let mut rendered_index = 0;
+        for endpoint in params.endpoints {
+            if is_no_context_mcp_endpoint(&endpoint) {
+                continue;
+            }
+
+            if rendered_index > 0 {
                 content.push('\n');
             }
 
-            content.push_str(&format!("[mcp_servers.endpoint_{index}]\n"));
+            content.push_str(&format!("[mcp_servers.endpoint_{rendered_index}]\n"));
             match endpoint.transport {
                 McpTransport::Stdio => {
                     content.push_str("command = ");
@@ -114,6 +121,8 @@ impl AgentDriver for CodexDriver {
                 }
                 content.push_str(" }\n");
             }
+
+            rendered_index += 1;
         }
 
         Ok(RenderMcpConfigResult { content })
@@ -375,6 +384,11 @@ mod tests {
         let rendered = driver
             .render_mcp_config(RenderMcpConfigParams {
                 endpoints: vec![
+                    McpEndpoint {
+                        url: String::new(),
+                        transport: McpTransport::Stdio,
+                        headers: BTreeMap::new(),
+                    },
                     McpEndpoint {
                         url: "agentenv-context".to_owned(),
                         transport: McpTransport::Stdio,
