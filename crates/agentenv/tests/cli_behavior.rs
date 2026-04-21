@@ -587,8 +587,89 @@ fn reproduce_succeeds_from_generated_lockfile() {
     );
 }
 
+#[test]
+#[ignore = "requires OpenShell and external reference blueprint dependencies"]
+fn reference_blueprints_create_status_destroy_roundtrip() {
+    if std::env::var_os("AGENTENV_RUN_OPEN_SHELL_TESTS").is_none() {
+        eprintln!("set AGENTENV_RUN_OPEN_SHELL_TESTS=1 to run OpenShell CLI integration");
+        return;
+    }
+
+    for blueprint in [
+        "blueprints/claude+filesystem+openshell.yaml",
+        "blueprints/codex+mcp-generic+openshell.yaml",
+        "blueprints/openclaw+nexus+openshell.yaml",
+        "blueprints/hermes+nexus+openshell.yaml",
+    ] {
+        let temp_dir = make_temp_dir("reference-blueprint");
+        let name = blueprint
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .replace(".yaml", "")
+            .replace('+', "-");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(blueprint);
+
+        let create = Command::new(agentenv_bin())
+            .arg("create")
+            .arg(&name)
+            .arg("--blueprint")
+            .arg(&path)
+            .arg("--non-interactive")
+            .env("HOME", &temp_dir)
+            .output()
+            .unwrap();
+        if !create.status.success() {
+            let stderr = String::from_utf8_lossy(&create.stderr);
+            if reference_blueprint_skip_reason(&stderr) {
+                continue;
+            }
+            panic!("create failed for {blueprint}: {stderr}");
+        }
+
+        let status = Command::new(agentenv_bin())
+            .arg("status")
+            .arg(&name)
+            .env("HOME", &temp_dir)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "status stderr: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        let destroy = Command::new(agentenv_bin())
+            .arg("destroy")
+            .arg(&name)
+            .arg("--yes")
+            .env("HOME", &temp_dir)
+            .output()
+            .unwrap();
+        assert!(
+            destroy.status.success(),
+            "destroy stderr: {}",
+            String::from_utf8_lossy(&destroy.stderr)
+        );
+    }
+}
+
 fn fixture_blueprint() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../blueprints/claude+filesystem+openshell.yaml")
+}
+
+fn reference_blueprint_skip_reason(stderr: &str) -> bool {
+    [
+        "unsupported driver",
+        "OpenShell binary not found",
+        "gateway",
+        "missing credential",
+        "missing_credential",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
 }
 
 fn make_temp_dir(prefix: &str) -> PathBuf {
