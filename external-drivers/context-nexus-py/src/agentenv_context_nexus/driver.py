@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -35,8 +36,12 @@ class NexusContextDriver:
     def handle(self, request):
         request_id = request.get("id")
         method = request.get("method")
-        params = request.get("params") or {}
         try:
+            params = request.get("params", {})
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                raise ValueError("params must be an object")
             if method == "initialize":
                 return self._initialize(request_id, params)
             if method == "preflight":
@@ -107,7 +112,11 @@ class NexusContextDriver:
         )
 
     def _provision(self, request_id, params):
-        config = params.get("config") or {}
+        config = params.get("config", {})
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise ValueError("config must be an object")
         mode = config.get("mode", "lite")
         zones = config.get("zones") or []
         if not isinstance(zones, list) or not all(isinstance(zone, str) for zone in zones):
@@ -138,6 +147,8 @@ class NexusContextDriver:
 
     def _lookup(self, params):
         handle = params.get("handle")
+        if not isinstance(handle, str) or not handle:
+            raise ValueError("handle must be a non-empty string")
         if handle not in self._handles:
             raise KeyError(handle)
         return handle, self._handles[handle]
@@ -205,9 +216,7 @@ class NexusContextDriver:
             handle, state = self._lookup(params)
         except KeyError as exc:
             return error(request_id, ERROR_RESOURCE_NOT_FOUND, f"unknown context handle `{exc.args[0]}`")
-        if state.process is not None and state.process.poll() is None:
-            state.process.terminate()
-            state.process.wait(timeout=5)
+        self._stop_process(state.process)
         self._handles.pop(handle, None)
         return success(request_id, {})
 
@@ -215,3 +224,13 @@ class NexusContextDriver:
         for handle in list(self._handles):
             self._teardown(request_id, {"handle": handle})
         return success(request_id, {})
+
+    def _stop_process(self, process):
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()

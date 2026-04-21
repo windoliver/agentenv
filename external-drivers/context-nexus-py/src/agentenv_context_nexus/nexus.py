@@ -21,7 +21,10 @@ def parse_http_url(raw):
         raise ValueError("hub_url must use http or https")
     if not parsed.hostname:
         raise ValueError("hub_url must include a host")
-    return ParsedUrl(url=raw.rstrip("/"), scheme=parsed.scheme, host=parsed.hostname, port=parsed.port)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return ParsedUrl(url=raw.rstrip("/"), scheme=parsed.scheme, host=parsed.hostname, port=port)
 
 
 def stable_hub_handle(hub_url, zones):
@@ -48,6 +51,6 @@ def start_lite_process(data_dir, port, extra_env=None):
         ["nexus", "mcp", "serve", "--transport", "http", "--host", "127.0.0.1", "--port", str(port)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         env=env,
     )
