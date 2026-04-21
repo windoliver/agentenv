@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use agentenv_proto::{EmptyResult, ShutdownParams};
+use agentenv_proto::ShutdownParams;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -308,13 +308,19 @@ impl JsonRpcClient {
     pub async fn shutdown(&mut self) -> Result<(), JsonRpcError> {
         let _rpc_guard = self.rpc.lock().await;
         self.ensure_open().await?;
-        let _result: EmptyResult = match tokio::time::timeout(
+        let shutdown_result = tokio::time::timeout(
             self.timeout,
-            self.call_inner("shutdown", &ShutdownParams {}),
+            self.call_inner::<_, agentenv_proto::EmptyResult>("shutdown", &ShutdownParams {}),
         )
-        .await
-        {
-            Ok(result) => result?,
+        .await;
+        match shutdown_result {
+            Ok(Ok(_result)) => {}
+            Ok(Err(err)) => {
+                self.poison_and_terminate(format!("shutdown rpc failed: {err}"))
+                    .await
+                    .ok();
+                return Err(err);
+            }
             Err(_) => {
                 self.poison_and_terminate("shutdown timed out".to_owned())
                     .await?;
@@ -427,6 +433,10 @@ impl JsonRpcClient {
     }
 
     async fn kill_and_reap_child(child: &mut Child) -> Result<(), JsonRpcError> {
+        if child.try_wait()?.is_some() {
+            let _ = child.wait().await?;
+            return Ok(());
+        }
         child.start_kill()?;
         let _ = child.wait().await?;
         Ok(())
@@ -774,6 +784,40 @@ mod async_client_tests {
     }
 
     #[tokio::test]
+    async fn jsonrpc_client_shutdown_reaps_child_on_shutdown_rpc_failure() {
+        let pid_file = temp_fixture_path("shutdown-rpc-failure");
+        let mut client = spawn_fixture_client(
+            "shutdown_invalid_then_hang",
+            Duration::from_millis(200),
+            &[(
+                "JSONRPC_FIXTURE_PID_FILE",
+                pid_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        wait_for_file(&pid_file).await;
+        let pid = read_fixture_pid(&pid_file);
+
+        let err = client.shutdown().await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid JSON-RPC payload")
+                || err.to_string().contains("JSON-RPC")
+        );
+        assert_process_exits(pid).await;
+
+        let poisoned = client
+            .call::<_, agentenv_proto::PreflightResult>(
+                "preflight",
+                &agentenv_proto::PreflightParams::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            poisoned.to_string().contains("poisoned") || poisoned.to_string().contains("closed")
+        );
+    }
+
+    #[tokio::test]
     async fn jsonrpc_client_serializes_concurrent_calls() {
         let driver = write_racy_driver_script();
 
@@ -894,6 +938,11 @@ def response(request):
             "result": {"ok": True, "issues": []},
         }
     if request["method"] == "shutdown":
+        if MODE == "shutdown_invalid_then_hang":
+            sys.stdout.buffer.write(b"Content-Length: 2\r\n\r\n{")
+            sys.stdout.buffer.flush()
+            while True:
+                time.sleep(1.0)
         return {
             "jsonrpc": "2.0",
             "id": request["id"],
