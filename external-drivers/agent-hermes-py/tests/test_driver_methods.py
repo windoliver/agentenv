@@ -1,6 +1,7 @@
 from agentenv_agent_hermes.protocol import (
     ERROR_SCHEMA_VERSION_INCOMPATIBLE,
     SCHEMA_VERSION,
+    RpcError,
     assert_schema_compatible,
 )
 
@@ -21,3 +22,7 @@ def test_schema_version_rejects_mismatched_major_versions():
 
 def test_protocol_error_codes_match_agentenv_proto():
     assert ERROR_SCHEMA_VERSION_INCOMPATIBLE == -32002
+
+
+def test_rpc_error_stringifies_to_message():
+    assert str(RpcError(-32002, "schema mismatch")) == "schema mismatch"

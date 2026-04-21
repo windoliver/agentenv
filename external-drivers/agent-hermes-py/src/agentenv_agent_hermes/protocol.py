@@ -38,6 +38,9 @@ class RpcError(Exception):
     message: str
     data: Any | None = None
 
+    def __str__(self) -> str:
+        return self.message
+
     def to_response_error(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "code": self.code,
