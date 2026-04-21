@@ -1,5 +1,8 @@
+import os
 import signal
+import stat
 import subprocess
+import time
 
 import agentenv_context_nexus.driver as driver_module
 import agentenv_context_nexus.nexus as nexus_module
@@ -256,6 +259,43 @@ def test_lite_provision_rejects_malformed_mcp_ports(monkeypatch):
 
         assert response["error"]["code"] == JSON_RPC_INVALID_PARAMS
         assert driver._handles == {}
+
+
+def test_lite_mode_starts_fake_nexus_process(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_nexus = fake_bin / "nexus"
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "fake_nexus.py")
+    fake_nexus.write_text(f"#!/bin/sh\nexec python3 {fixture} \"$@\"\n", encoding="utf-8")
+    fake_nexus.chmod(fake_nexus.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+
+    driver = NexusContextDriver()
+    driver.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "schema_version": "1.0",
+                "workdir": str(tmp_path),
+                "core_version": "0.0.1",
+                "log_level": "info",
+            },
+        }
+    )
+
+    provision = call(driver, "provision", {"config": {"mode": "lite", "data_dir": str(tmp_path / "data")}})
+    handle = provision["result"]["handle"]
+
+    endpoint = call(driver, "mcp_endpoint", {"handle": handle})["result"]
+    time.sleep(0.5)
+    status = call(driver, "status", {"handle": handle})["result"]
+    teardown = call(driver, "teardown", {"handle": handle})
+
+    assert endpoint["url"].startswith("http://127.0.0.1:")
+    assert status["healthy"] is True
+    assert teardown["result"] == {}
 
 
 def test_handle_methods_reject_missing_and_non_string_handles():
