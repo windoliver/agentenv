@@ -65,3 +65,19 @@ def test_server_returns_parse_error_for_negative_content_length():
     assert payload["id"] is None
     assert payload["error"]["code"] == JSON_RPC_PARSE_ERROR
     assert second_payload is None
+
+
+def test_server_returns_parse_error_for_non_integer_content_length():
+    input_stream = io.BytesIO(b"Content-Length: nope\r\n\r\n")
+    output_stream = io.BytesIO()
+
+    JsonRpcServer({}).serve(input_stream=input_stream, output_stream=output_stream)
+
+    output_stream.seek(0)
+    payload = read_framed_json(output_stream)
+    second_payload = read_framed_json(output_stream)
+
+    assert payload["jsonrpc"] == "2.0"
+    assert payload["id"] is None
+    assert payload["error"]["code"] == JSON_RPC_PARSE_ERROR
+    assert second_payload is None
