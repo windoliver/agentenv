@@ -41,6 +41,10 @@ def read_framed_json(stream: BinaryIO) -> dict[str, Any] | None:
                 raise ValueError(
                     f"invalid Content-Length `{raw.decode('ascii', 'replace')}`"
                 ) from exc
+            if content_length < 0:
+                raise ValueError(
+                    f"invalid Content-Length `{content_length}`: must be non-negative"
+                )
 
     if content_length is None:
         raise ValueError("missing Content-Length header")
