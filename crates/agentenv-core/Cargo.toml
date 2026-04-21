@@ -23,4 +23,5 @@ url.workspace = true
 sha2.workspace = true
 hex.workspace = true
 dirs.workspace = true
+time = { workspace = true, features = ["formatting"] }
 semver = "1"
