@@ -53,4 +53,5 @@ def start_lite_process(data_dir, port, extra_env=None):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
+        start_new_session=True,
     )

@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -159,10 +160,15 @@ class NexusContextDriver:
     def _lite_mcp_port(self, config):
         if "mcp_port" not in config or config["mcp_port"] is None:
             return find_free_port()
-        try:
-            port = int(config["mcp_port"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("mcp_port must be a valid TCP port") from exc
+        raw_port = config["mcp_port"]
+        if isinstance(raw_port, bool):
+            raise ValueError("mcp_port must be a valid TCP port")
+        if isinstance(raw_port, int):
+            port = raw_port
+        elif isinstance(raw_port, str) and raw_port.isdecimal():
+            port = int(raw_port)
+        else:
+            raise ValueError("mcp_port must be a valid TCP port")
         if port < 1 or port > 65535:
             raise ValueError("mcp_port must be a valid TCP port")
         return port
@@ -250,9 +256,27 @@ class NexusContextDriver:
     def _stop_process(self, process):
         if process is None or process.poll() is not None:
             return
-        process.terminate()
+        try:
+            use_process_group = self._signal_process_group(process, signal.SIGTERM)
+        except Exception:
+            use_process_group = False
+        if not use_process_group:
+            process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
+            if use_process_group:
+                try:
+                    self._signal_process_group(process, signal.SIGKILL)
+                except Exception:
+                    process.kill()
+            else:
+                process.kill()
             process.wait()
+
+    def _signal_process_group(self, process, sig):
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            return False
+        os.killpg(os.getpgid(pid), sig)
+        return True
