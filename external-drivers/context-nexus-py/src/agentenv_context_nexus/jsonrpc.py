@@ -16,6 +16,8 @@ def read_message(stream):
                 content_length = int(raw)
             except ValueError as exc:
                 raise ValueError(f"invalid Content-Length header {raw!r}") from exc
+            if content_length < 0:
+                raise ValueError(f"invalid Content-Length header {raw!r}")
     if content_length is None:
         raise ValueError("missing Content-Length header")
     payload = stream.read(content_length)
@@ -46,5 +48,5 @@ class JsonRpcServer:
             response = self._handler.handle(request)
             if response is not None:
                 write_message(stdout, response)
-            if request.get("method") == "shutdown" and "error" not in response:
+            if request.get("method") == "shutdown" and (response is None or "error" not in response):
                 return
