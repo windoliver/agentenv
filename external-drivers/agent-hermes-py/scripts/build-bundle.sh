@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "${DIST_DIR}" "${TMP_ROOT}/agent-hermes/bin" "${TMP_ROOT}/agent-hermes/wheels"
-"${PYTHON}" -m pip wheel --wheel-dir "${TMP_ROOT}/agent-hermes/wheels" "${DRIVER_ROOT}"
+"${PYTHON}" -m pip wheel --wheel-dir "${TMP_ROOT}/agent-hermes/wheels" "${DRIVER_ROOT}" "hermes-agent[mcp]"
 cp "${DRIVER_ROOT}/manifest.json.in" "${TMP_ROOT}/agent-hermes/manifest.json"
 cp "${DRIVER_ROOT}/scripts/install-driver.sh" "${TMP_ROOT}/agent-hermes/install-driver.sh"
 chmod 0755 "${TMP_ROOT}/agent-hermes/install-driver.sh"

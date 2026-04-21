@@ -23,16 +23,14 @@ trap cleanup EXIT INT TERM
 if [ -z "${STAGED}" ]; then
     STAGED="${TMP_ROOT}/agent-hermes"
     mkdir -p "${STAGED}/bin" "${STAGED}/wheels"
-    "${PYTHON}" -m pip wheel --wheel-dir "${STAGED}/wheels" "${DRIVER_ROOT}"
+    "${PYTHON}" -m pip wheel --wheel-dir "${STAGED}/wheels" "${DRIVER_ROOT}" "hermes-agent[mcp]"
     cp "${DRIVER_ROOT}/manifest.json.in" "${STAGED}/manifest.json"
 else
     EXTERNAL_STAGED=1
 fi
 
 "${PYTHON}" -m venv "${STAGED}/venv"
-"${STAGED}/venv/bin/python" -m pip install --upgrade pip
-"${STAGED}/venv/bin/python" -m pip install "${STAGED}"/wheels/agentenv_agent_hermes-*.whl
-"${STAGED}/venv/bin/python" -m pip install "hermes-agent[mcp]"
+"${STAGED}/venv/bin/python" -m pip install --no-index --find-links "${STAGED}/wheels" agentenv-agent-hermes "hermes-agent[mcp]"
 
 cat > "${STAGED}/bin/agentenv-driver-hermes" <<'LAUNCHER'
 #!/bin/sh
