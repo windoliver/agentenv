@@ -1,4 +1,4 @@
-use agentenv_proto::{IssueSeverity, PreflightIssue};
+use agentenv_proto::{DriverKind, IssueSeverity, PreflightIssue};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ impl ExitClass {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightCheck {
-    pub kind: String,
+    pub kind: DriverKind,
     pub driver: String,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -103,6 +103,11 @@ impl AdmissionReport {
     }
 
     pub fn rejected(env: impl Into<String>, reason_code: ReasonCode) -> Self {
+        debug_assert!(
+            !matches!(reason_code, ReasonCode::Created | ReasonCode::Destroyed),
+            "rejected admission cannot report success reason code"
+        );
+
         Self {
             status: AdmissionStatus::Rejected,
             reason_code,
@@ -138,7 +143,13 @@ impl AdmissionReport {
 
     pub fn exit_class(&self) -> ExitClass {
         match self.reason_code {
-            ReasonCode::Created | ReasonCode::Destroyed => ExitClass::Success,
+            ReasonCode::Created | ReasonCode::Destroyed => {
+                if self.status == AdmissionStatus::Accepted {
+                    ExitClass::Success
+                } else {
+                    ExitClass::TerminalFailure
+                }
+            }
             ReasonCode::PreflightFailed => ExitClass::PreflightFailed,
             ReasonCode::MissingCredential => ExitClass::MissingCredential,
             ReasonCode::DriverCommandFailed | ReasonCode::CleanupFailed => {
@@ -152,18 +163,16 @@ impl AdmissionReport {
 
 #[cfg(test)]
 mod tests {
-    use agentenv_proto::{IssueSeverity, PreflightIssue};
+    use agentenv_proto::{DriverKind, IssueSeverity, PreflightIssue};
 
-    use super::{
-        AdmissionReport, AdmissionStatus, ExitClass, PreflightCheck, ReasonCode,
-    };
+    use super::{AdmissionReport, AdmissionStatus, ExitClass, PreflightCheck, ReasonCode};
 
     #[test]
     fn preflight_errors_reject_admission() {
         let report = AdmissionReport::from_checks(
             "demo",
             vec![PreflightCheck {
-                kind: "sandbox".to_owned(),
+                kind: DriverKind::Sandbox,
                 driver: "openshell".to_owned(),
                 ok: false,
                 issues: vec![PreflightIssue {
@@ -185,7 +194,7 @@ mod tests {
         let report = AdmissionReport::from_checks(
             "demo",
             vec![PreflightCheck {
-                kind: "agent".to_owned(),
+                kind: DriverKind::Agent,
                 driver: "codex".to_owned(),
                 ok: true,
                 issues: Vec::new(),
@@ -198,12 +207,50 @@ mod tests {
     }
 
     #[test]
+    fn rejected_created_is_not_success() {
+        let report = AdmissionReport {
+            status: AdmissionStatus::Rejected,
+            reason_code: ReasonCode::Created,
+            env: "demo".to_owned(),
+            checks: Vec::new(),
+        };
+
+        assert_eq!(report.status, AdmissionStatus::Rejected);
+        assert_ne!(report.exit_class(), ExitClass::Success);
+    }
+
+    #[test]
     fn reason_codes_are_stable_snake_case() {
-        assert_eq!(ReasonCode::MissingCredential.as_str(), "missing_credential");
-        assert_eq!(
-            ReasonCode::ReproduceBlueprintMissing.as_str(),
-            "reproduce_blueprint_missing"
-        );
+        let cases = [
+            (ReasonCode::Created, "created"),
+            (ReasonCode::Destroyed, "destroyed"),
+            (ReasonCode::InvalidBlueprint, "invalid_blueprint"),
+            (ReasonCode::EnvExists, "env_exists"),
+            (ReasonCode::EnvNotFound, "env_not_found"),
+            (ReasonCode::PreflightFailed, "preflight_failed"),
+            (ReasonCode::MissingCredential, "missing_credential"),
+            (ReasonCode::CapabilityMissing, "capability_missing"),
+            (ReasonCode::DriverUnhealthy, "driver_unhealthy"),
+            (ReasonCode::DriverCommandFailed, "driver_command_failed"),
+            (ReasonCode::CleanupFailed, "cleanup_failed"),
+            (
+                ReasonCode::NonInteractivePromptRequired,
+                "non_interactive_prompt_required",
+            ),
+            (
+                ReasonCode::ReproduceBlueprintMissing,
+                "reproduce_blueprint_missing",
+            ),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(code.as_str(), expected);
+            assert_eq!(
+                serde_json::to_value(code).expect("serialize reason code"),
+                serde_json::json!(expected)
+            );
+        }
+
         assert_eq!(ExitClass::MissingCredential.code(), 12);
         assert_eq!(ExitClass::RetryableFailure.code(), 20);
     }
