@@ -3,8 +3,9 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
 use agentenv_proto::{
-    assert_compatible_schema_version, schema_version_major, Capabilities, DriverKind, EmptyResult,
-    InitializeParams, InitializeResult, PreflightParams, PreflightResult,
+    assert_compatible_schema_version, schema_version_major, Capabilities, ContextHandleRequest,
+    ContextSpec, CredentialRequirementsParams, DriverKind, EmptyResult, InitializeParams,
+    InitializeResult, McpTransport, NetworkTarget, PreflightParams, PreflightResult,
     ERROR_SCHEMA_VERSION_INCOMPATIBLE, JSON_RPC_METHOD_NOT_FOUND, SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -262,6 +263,108 @@ pub fn run_standard_suite(driver_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn nexus_hub_conformance_spec() -> ContextSpec {
+    let mut config = std::collections::BTreeMap::new();
+    config.insert("mode".to_owned(), serde_json::json!("hub"));
+    config.insert(
+        "hub_url".to_owned(),
+        serde_json::json!("https://nexus.example.test"),
+    );
+    config.insert("zones".to_owned(), serde_json::json!(["eng"]));
+    ContextSpec { config }
+}
+
+pub fn run_context_suite(driver_path: &Path) -> Result<()> {
+    let mut client = RpcClient::spawn(driver_path)?;
+    let initialize_result: InitializeResult = client.call_success(
+        1,
+        "initialize",
+        &InitializeParams {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            core_version: "0.0.1".to_owned(),
+            workdir: "/tmp/agentenv".to_owned(),
+            log_level: agentenv_proto::LogLevel::Info,
+        },
+    )?;
+
+    assert_compatible_schema_version(&initialize_result.driver.protocol_version)
+        .context("initialize result must report a compatible protocol version")?;
+    if initialize_result.driver.kind != DriverKind::Context {
+        bail!("initialize must report DriverKind::Context");
+    }
+    if !matches!(initialize_result.capabilities, Capabilities::Context(_)) {
+        bail!("initialize must report context capabilities");
+    }
+
+    let credentials: agentenv_proto::CredentialRequirementsResult = client.call_success(
+        2,
+        "credential_requirements",
+        &CredentialRequirementsParams {},
+    )?;
+    if !credentials
+        .requirements
+        .iter()
+        .any(|requirement| requirement.name == "NEXUS_TOKEN")
+    {
+        bail!("context driver must declare NEXUS_TOKEN");
+    }
+
+    let handle: agentenv_proto::ContextHandle =
+        client.call_success(3, "provision", &nexus_hub_conformance_spec())?;
+    let endpoint: agentenv_proto::McpEndpoint = client.call_success(
+        4,
+        "mcp_endpoint",
+        &ContextHandleRequest {
+            handle: handle.handle.clone(),
+        },
+    )?;
+    if endpoint.transport != McpTransport::Http {
+        bail!("nexus context endpoint must use HTTP transport");
+    }
+
+    let rules: agentenv_proto::RequiredNetworkRulesResult = client.call_success(
+        5,
+        "required_network_rules",
+        &ContextHandleRequest {
+            handle: handle.handle.clone(),
+        },
+    )?;
+    if !rules.rules.iter().any(|rule| {
+        matches!(
+            &rule.target,
+            NetworkTarget::Host { host, .. } if host == "nexus.example.test"
+        )
+    }) {
+        bail!("hub mode must emit a network rule for nexus.example.test");
+    }
+
+    let status: agentenv_proto::ContextStatus = client.call_success(
+        6,
+        "status",
+        &ContextHandleRequest {
+            handle: handle.handle.clone(),
+        },
+    )?;
+    if !status.healthy {
+        bail!("context status must be healthy after hub provision");
+    }
+
+    let _: EmptyResult = client.call_success(
+        7,
+        "teardown",
+        &ContextHandleRequest {
+            handle: handle.handle,
+        },
+    )?;
+    let _: EmptyResult = client.call_success(8, "shutdown", &agentenv_proto::ShutdownParams {})?;
+    let status = client.wait_for_exit()?;
+    if !status.success() {
+        bail!("driver exited with status {status}");
+    }
+
+    Ok(())
+}
+
 pub async fn assert_agent_driver_contract<D: agentenv_core::driver::AgentDriver>(
     driver: &mut D,
     spec: agentenv_proto::AgentSpec,
@@ -392,10 +495,21 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        assert_agent_driver_contract, assert_sandbox_driver_contract, read_response_envelope,
-        write_framed_json,
+        assert_agent_driver_contract, assert_sandbox_driver_contract, nexus_hub_conformance_spec,
+        read_response_envelope, write_framed_json,
     };
     use serde_json::json;
+
+    #[test]
+    fn context_conformance_hub_spec_contains_required_config() {
+        let spec = nexus_hub_conformance_spec();
+
+        assert_eq!(spec.config["mode"], serde_json::json!("hub"));
+        assert_eq!(
+            spec.config["hub_url"],
+            serde_json::json!("https://nexus.example.test")
+        );
+    }
 
     #[test]
     fn response_reader_skips_notifications() {
