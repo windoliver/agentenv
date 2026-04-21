@@ -10,6 +10,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod builtin_factory;
+
 const SELF_ENV_SENTINEL: &str = "__self__";
 
 #[derive(Debug, Parser)]
