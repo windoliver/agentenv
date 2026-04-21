@@ -57,10 +57,18 @@ pub struct JsonRpcClientConfig {
 pub struct JsonRpcClient {
     child: Mutex<Option<Child>>,
     rpc: Mutex<()>,
+    state: Mutex<ClientState>,
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
     next_id: AtomicU64,
     timeout: Duration,
+}
+
+#[derive(Debug)]
+enum ClientState {
+    Open,
+    Closed,
+    Poisoned(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,6 +256,7 @@ impl JsonRpcClient {
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::inherit());
+        command.kill_on_drop(true);
         command.env_clear();
         command.env("PATH", std::env::var("PATH").unwrap_or_default());
         for (key, value) in &config.env {
@@ -271,6 +280,7 @@ impl JsonRpcClient {
         Ok(Self {
             child: Mutex::new(Some(child)),
             rpc: Mutex::new(()),
+            state: Mutex::new(ClientState::Open),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
             next_id: AtomicU64::new(1),
@@ -284,6 +294,59 @@ impl JsonRpcClient {
         R: DeserializeOwned,
     {
         let _rpc_guard = self.rpc.lock().await;
+        self.ensure_open().await?;
+        match tokio::time::timeout(self.timeout, self.call_inner(method, params)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.poison_and_terminate(format!("request `{method}` timed out"))
+                    .await?;
+                Err(JsonRpcError::Timeout(method.to_owned()))
+            }
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<(), JsonRpcError> {
+        let _rpc_guard = self.rpc.lock().await;
+        self.ensure_open().await?;
+        let _result: EmptyResult = match tokio::time::timeout(
+            self.timeout,
+            self.call_inner("shutdown", &ShutdownParams {}),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                self.poison_and_terminate("shutdown timed out".to_owned())
+                    .await?;
+                return Err(JsonRpcError::Timeout("shutdown".to_owned()));
+            }
+        };
+
+        let mut child = self.take_child().await?;
+        let wait_result = tokio::time::timeout(self.timeout, child.wait()).await;
+        let status = match wait_result {
+            Ok(status) => status?,
+            Err(_) => {
+                self.set_state(ClientState::Poisoned("shutdown timed out".to_owned()))
+                    .await;
+                Self::kill_and_reap_child(&mut child).await?;
+                return Err(JsonRpcError::Timeout("shutdown".to_owned()));
+            }
+        };
+        self.set_state(ClientState::Closed).await;
+        if !status.success() {
+            return Err(JsonRpcError::Protocol(format!(
+                "driver exited with non-zero status after shutdown: {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn call_inner<P, R>(&self, method: &str, params: &P) -> Result<R, JsonRpcError>
+    where
+        P: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -292,56 +355,80 @@ impl JsonRpcClient {
             "params": params,
         });
 
-        let fut = async {
-            {
-                let mut stdin = self.stdin.lock().await;
-                write_framed_json_async(&mut *stdin, &request).await?;
-            }
+        {
+            let mut stdin = self.stdin.lock().await;
+            write_framed_json_async(&mut *stdin, &request).await?;
+        }
 
-            loop {
-                let raw = {
-                    let mut stdout = self.stdout.lock().await;
-                    read_framed_json_async(&mut *stdout).await?
-                };
-                if raw.get("method").is_some() && raw.get("id").is_none() {
-                    continue;
-                }
-                let response: RpcResponseEnvelope = serde_json::from_value(raw)?;
-                if response.id.as_u64() != Some(id) {
-                    return Err(JsonRpcError::Protocol(format!(
-                        "received response id {} while waiting for {}",
-                        response.id, id
-                    )));
-                }
-                if let Some(error) = response.error {
-                    return Err(JsonRpcError::Remote {
-                        code: error.code,
-                        message: error.message,
-                    });
-                }
-                let result = response.result.ok_or_else(|| {
-                    JsonRpcError::Protocol(format!("missing result for `{method}`"))
-                })?;
-                return Ok(serde_json::from_value(result)?);
+        loop {
+            let raw = {
+                let mut stdout = self.stdout.lock().await;
+                read_framed_json_async(&mut *stdout).await?
+            };
+            if raw.get("method").is_some() && raw.get("id").is_none() {
+                continue;
             }
-        };
-
-        tokio::time::timeout(self.timeout, fut)
-            .await
-            .map_err(|_| JsonRpcError::Timeout(method.to_owned()))?
+            let response: RpcResponseEnvelope = serde_json::from_value(raw)?;
+            if response.id.as_u64() != Some(id) {
+                return Err(JsonRpcError::Protocol(format!(
+                    "received response id {} while waiting for {}",
+                    response.id, id
+                )));
+            }
+            if let Some(error) = response.error {
+                return Err(JsonRpcError::Remote {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            let result = response
+                .result
+                .ok_or_else(|| JsonRpcError::Protocol(format!("missing result for `{method}`")))?;
+            return Ok(serde_json::from_value(result)?);
+        }
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), JsonRpcError> {
-        let _result: EmptyResult = self.call("shutdown", &ShutdownParams {}).await?;
-        let mut child = self
-            .child
+    async fn ensure_open(&self) -> Result<(), JsonRpcError> {
+        let state = self.state.lock().await;
+        match &*state {
+            ClientState::Open => Ok(()),
+            ClientState::Closed => Err(JsonRpcError::Protocol(
+                "JSON-RPC client is closed".to_owned(),
+            )),
+            ClientState::Poisoned(reason) => Err(JsonRpcError::Protocol(format!(
+                "JSON-RPC client is poisoned: {reason}"
+            ))),
+        }
+    }
+
+    async fn set_state(&self, new_state: ClientState) {
+        let mut state = self.state.lock().await;
+        *state = new_state;
+    }
+
+    async fn take_child(&self) -> Result<Child, JsonRpcError> {
+        self.child
             .lock()
             .await
             .take()
-            .ok_or_else(|| JsonRpcError::Protocol("driver already shut down".to_owned()))?;
-        tokio::time::timeout(self.timeout, child.wait())
-            .await
-            .map_err(|_| JsonRpcError::Timeout("shutdown".to_owned()))??;
+            .ok_or_else(|| JsonRpcError::Protocol("driver already shut down".to_owned()))
+    }
+
+    async fn poison_and_terminate(&self, reason: String) -> Result<(), JsonRpcError> {
+        self.set_state(ClientState::Poisoned(reason)).await;
+        self.terminate_child().await
+    }
+
+    async fn terminate_child(&self) -> Result<(), JsonRpcError> {
+        if let Some(mut child) = self.child.lock().await.take() {
+            Self::kill_and_reap_child(&mut child).await?;
+        }
+        Ok(())
+    }
+
+    async fn kill_and_reap_child(child: &mut Child) -> Result<(), JsonRpcError> {
+        child.start_kill()?;
+        let _ = child.wait().await?;
         Ok(())
     }
 }
@@ -588,21 +675,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_returns_method_result() {
-        let driver =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mock-driver");
-        assert!(
-            driver.is_file(),
-            "run `cargo build -p driver-conformance --bin mock-driver` first"
-        );
-
-        let mut client = JsonRpcClient::spawn(JsonRpcClientConfig {
-            binary: driver,
-            args: Vec::new(),
-            env: Default::default(),
-            timeout: Duration::from_secs(5),
-        })
-        .await
-        .unwrap();
+        let mut client = spawn_fixture_client("normal", Duration::from_secs(5), &[]).await;
 
         let result: agentenv_proto::PreflightResult = client
             .call("preflight", &agentenv_proto::PreflightParams::default())
@@ -615,21 +688,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_surfaces_driver_error_code() {
-        let driver =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/mock-driver");
-        assert!(
-            driver.is_file(),
-            "run `cargo build -p driver-conformance --bin mock-driver` first"
-        );
-
-        let mut client = JsonRpcClient::spawn(JsonRpcClientConfig {
-            binary: driver,
-            args: Vec::new(),
-            env: Default::default(),
-            timeout: Duration::from_secs(5),
-        })
-        .await
-        .unwrap();
+        let mut client = spawn_fixture_client("normal", Duration::from_secs(5), &[]).await;
 
         let err = client
             .call::<_, serde_json::Value>("driver/unknown", &json!({}))
@@ -638,6 +697,80 @@ mod async_client_tests {
 
         assert!(err.to_string().contains("-32601"));
         client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_drops_child_process_on_drop() {
+        let pid_file = temp_fixture_path("drop");
+        let client = spawn_fixture_client(
+            "idle",
+            Duration::from_secs(5),
+            &[(
+                "JSONRPC_FIXTURE_PID_FILE",
+                pid_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        wait_for_file(&pid_file).await;
+        let pid = read_fixture_pid(&pid_file);
+
+        drop(client);
+
+        assert_process_exits(pid).await;
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_poisons_after_request_timeout() {
+        let client = spawn_fixture_client("slow_preflight", Duration::from_millis(100), &[]).await;
+
+        let err = client
+            .call::<_, agentenv_proto::PreflightResult>(
+                "preflight",
+                &agentenv_proto::PreflightParams::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::JsonRpcError::Timeout(ref method) if method == "preflight"));
+
+        let poisoned = client
+            .call::<_, agentenv_proto::PreflightResult>(
+                "preflight",
+                &agentenv_proto::PreflightParams::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            poisoned.to_string().contains("poisoned") || poisoned.to_string().contains("closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_shutdown_timeout_kills_and_reaps_child() {
+        let pid_file = temp_fixture_path("shutdown-timeout");
+        let mut client = spawn_fixture_client(
+            "shutdown_hang",
+            Duration::from_millis(100),
+            &[(
+                "JSONRPC_FIXTURE_PID_FILE",
+                pid_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        wait_for_file(&pid_file).await;
+        let pid = read_fixture_pid(&pid_file);
+
+        let err = client.shutdown().await.unwrap_err();
+        assert!(matches!(err, super::JsonRpcError::Timeout(ref method) if method == "shutdown"));
+        assert_process_exits(pid).await;
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_shutdown_reports_nonzero_exit_status() {
+        let mut client =
+            spawn_fixture_client("shutdown_nonzero", Duration::from_secs(5), &[]).await;
+        let err = client.shutdown().await.unwrap_err();
+        assert!(err.to_string().contains("exit status"));
+        assert!(err.to_string().contains("non-zero") || err.to_string().contains("status"));
     }
 
     #[tokio::test]
@@ -682,6 +815,175 @@ mod async_client_tests {
         let mut client =
             Arc::try_unwrap(client).unwrap_or_else(|_| panic!("all Arc clones dropped after join"));
         client.shutdown().await.unwrap();
+    }
+
+    async fn spawn_fixture_client(
+        mode: &str,
+        timeout: Duration,
+        env_pairs: &[(&str, &str)],
+    ) -> JsonRpcClient {
+        let driver = write_fixture_script();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("JSONRPC_FIXTURE_MODE".to_owned(), mode.to_owned());
+        for (key, value) in env_pairs {
+            env.insert((*key).to_owned(), (*value).to_owned());
+        }
+
+        JsonRpcClient::spawn(JsonRpcClientConfig {
+            binary: driver,
+            args: Vec::new(),
+            env,
+            timeout,
+        })
+        .await
+        .unwrap()
+    }
+
+    fn write_fixture_script() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "agentenv-jsonrpc-fixture-{}-{}.py",
+            std::process::id(),
+            unique
+        ));
+        let script = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+MODE = os.environ.get("JSONRPC_FIXTURE_MODE", "normal")
+PID_FILE = os.environ.get("JSONRPC_FIXTURE_PID_FILE")
+
+def write_pid():
+    if PID_FILE:
+        with open(PID_FILE, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+            handle.flush()
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\n", b"\r\n"):
+            break
+        key, value = line.decode("utf-8").split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    length = int(headers["content-length"])
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body)
+
+def write_message(message):
+    payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.flush()
+
+def response(request):
+    if request["method"] == "preflight":
+        if MODE == "slow_preflight":
+            time.sleep(1.0)
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"ok": True, "issues": []},
+        }
+    if request["method"] == "shutdown":
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {},
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "error": {"code": -32601, "message": "method not found"},
+    }
+
+write_pid()
+
+while True:
+    request = read_message()
+    if request is None:
+        break
+    write_message(response(request))
+    if request["method"] == "shutdown":
+        if MODE == "shutdown_hang":
+            while True:
+                time.sleep(1.0)
+        if MODE == "shutdown_nonzero":
+            sys.exit(7)
+        break
+    if MODE == "idle":
+        while True:
+            time.sleep(1.0)
+"#;
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = file.metadata().unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    fn temp_fixture_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentenv-jsonrpc-{}-{}-{}.pid",
+            label,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn read_fixture_pid(path: &PathBuf) -> u32 {
+        let pid = fs::read_to_string(path).unwrap();
+        pid.trim().parse::<u32>().unwrap()
+    }
+
+    async fn wait_for_file(path: &PathBuf) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if path.is_file() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("fixture file {} was not created", path.display());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn assert_process_exits(pid: u32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !process_is_alive(pid) {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("process {} did not exit in time", pid);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {} >/dev/null 2>&1", pid))
+            .status()
+            .unwrap();
+        status.success()
     }
 
     fn write_racy_driver_script() -> PathBuf {
