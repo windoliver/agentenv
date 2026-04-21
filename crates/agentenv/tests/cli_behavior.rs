@@ -163,6 +163,25 @@ fn list_json_returns_empty_rows_when_registry_missing() {
 }
 
 #[test]
+fn list_json_registry_error_uses_stable_error() {
+    let temp_dir = make_temp_dir("list-json-corrupt");
+    let env_dir = temp_dir.join(".agentenv").join("envs").join("demo");
+    fs::create_dir_all(&env_dir).unwrap();
+    fs::write(env_dir.join("state.json"), "{").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "driver_command_failed");
+}
+
+#[test]
 fn describe_json_missing_env_uses_stable_error() {
     let temp_dir = make_temp_dir("describe-json-missing");
 

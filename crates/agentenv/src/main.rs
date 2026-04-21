@@ -250,13 +250,18 @@ async fn run_enter(args: EnterArgs) -> Result<()> {
 
 fn run_list(args: ListArgs) -> Result<()> {
     let options = runtime_options(true)?;
-    let rows = agentenv_core::runtime::list_envs(&options)?;
-    if args.json {
-        render::print_json(&render::ListJson { envs: rows })?;
-    } else {
-        render::print_list_text(&rows);
+    match agentenv_core::runtime::list_envs(&options) {
+        Ok(rows) if args.json => render::print_json(&render::ListJson { envs: rows }),
+        Ok(rows) => {
+            render::print_list_text(&rows);
+            Ok(())
+        }
+        Err(error) if args.json => {
+            render::print_error_json(&error);
+            process::exit(render::exit_for_error(&error).code());
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 async fn run_destroy(args: DestroyArgs) -> Result<()> {

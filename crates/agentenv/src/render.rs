@@ -1,5 +1,6 @@
 use agentenv_core::{
     admission::{AdmissionReport, ExitClass, ReasonCode},
+    driver::DriverError,
     env::EnvError,
     runtime::{EnvDescription, EnvListRow, EnvStatusSummary, RuntimeError},
 };
@@ -34,6 +35,7 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
     match error {
         RuntimeError::Env(EnvError::NotFound { .. }) => ReasonCode::EnvNotFound,
         RuntimeError::Env(EnvError::AlreadyExists { .. }) => ReasonCode::EnvExists,
+        RuntimeError::Env(EnvError::InvalidName { .. }) => ReasonCode::InvalidBlueprint,
         RuntimeError::MissingCredential { .. } => ReasonCode::MissingCredential,
         RuntimeError::UnsupportedDriver { .. } | RuntimeError::MissingSelectedDriver { .. } => {
             ReasonCode::CapabilityMissing
@@ -41,13 +43,32 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         RuntimeError::Lifecycle(_) | RuntimeError::InvalidPolicyTier { .. } => {
             ReasonCode::InvalidBlueprint
         }
-        RuntimeError::Driver(_)
+        RuntimeError::Driver(error) => reason_for_driver_error(error),
+        RuntimeError::Env(EnvError::Io { .. })
+        | RuntimeError::Env(EnvError::Json { .. })
         | RuntimeError::CommandStatus { .. }
         | RuntimeError::MissingSandboxHandle { .. }
         | RuntimeError::ComponentConfigConversion { .. }
         | RuntimeError::InvalidDriverHandshake { .. }
-        | RuntimeError::StateNameMismatch { .. }
-        | RuntimeError::Env(_) => ReasonCode::DriverCommandFailed,
+        | RuntimeError::StateNameMismatch { .. } => ReasonCode::DriverCommandFailed,
+    }
+}
+
+fn reason_for_driver_error(error: &DriverError) -> ReasonCode {
+    match error {
+        DriverError::CapabilityMissing { .. } | DriverError::SchemaVersion(_) => {
+            ReasonCode::CapabilityMissing
+        }
+        DriverError::PreflightFailed { .. } => ReasonCode::PreflightFailed,
+        DriverError::CleanupFailed { .. } => ReasonCode::CleanupFailed,
+        DriverError::InvalidConfig { .. } | DriverError::InvalidInput { .. } => {
+            ReasonCode::InvalidBlueprint
+        }
+        DriverError::InvalidHandle { .. }
+        | DriverError::CommandSpawn { .. }
+        | DriverError::CommandFailed { .. }
+        | DriverError::PolicyTranslation { .. }
+        | DriverError::PolicyRequiresRecreate { .. } => ReasonCode::DriverCommandFailed,
     }
 }
 
