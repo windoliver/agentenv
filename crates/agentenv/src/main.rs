@@ -223,29 +223,101 @@ async fn run() -> Result<()> {
 }
 
 async fn run_create(args: CreateArgs) -> Result<()> {
-    let CreateArgs {
-        name,
-        blueprint,
-        reproduce,
-        preflight_only,
-        json,
-        non_interactive,
-    } = args;
-    let _ = (
-        name,
-        blueprint,
-        reproduce,
-        preflight_only,
-        json,
-        non_interactive,
-    );
-    bail!("create runtime wiring is not connected")
+    let options = runtime_options(args.non_interactive)?;
+    let cwd = std::env::current_dir().context("failed to determine current working directory")?;
+    let blueprint_path = match resolve_create_blueprint_path(
+        args.blueprint.as_deref(),
+        args.reproduce.as_deref(),
+        &cwd,
+    ) {
+        Ok(path) => path,
+        Err(error) if args.json => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "reason_code": "reproduce_blueprint_missing",
+                    "message": error.to_string(),
+                })
+            );
+            process::exit(agentenv_core::admission::ExitClass::TerminalFailure.code());
+        }
+        Err(error) => return Err(error),
+    };
+    let blueprint_yaml = read_text_file(&blueprint_path, "blueprint")?;
+    let factory = builtin_factory::BuiltInDriverFactory;
+
+    if args.preflight_only {
+        let resolved = agentenv_core::lifecycle::verify_blueprint_yaml(&blueprint_yaml)?;
+        let selection = agentenv_core::runtime::DriverSelection {
+            sandbox: resolved.sandbox.driver,
+            agent: resolved.agent.driver,
+            context: resolved.context.driver,
+            inference: resolved.inference.map(|driver| driver.driver),
+        };
+        match agentenv_core::runtime::run_preflight_only(&options, &factory, &args.name, &selection)
+            .await
+        {
+            Ok(report) if args.json => {
+                render::print_json(&report)?;
+                if report.status == agentenv_core::admission::AdmissionStatus::Rejected {
+                    process::exit(report.exit_class().code());
+                }
+                Ok(())
+            }
+            Ok(report) => {
+                render::print_admission_text(&report);
+                if report.status == agentenv_core::admission::AdmissionStatus::Rejected {
+                    process::exit(report.exit_class().code());
+                }
+                Ok(())
+            }
+            Err(error) if args.json => {
+                render::print_error_json(&error);
+                process::exit(render::exit_for_error(&error).code());
+            }
+            Err(error) => Err(error.into()),
+        }
+    } else {
+        let store = CredentialStore::from_default_paths().context("initialize credential store")?;
+        let mut provider = CliCredentialProvider {
+            store,
+            non_interactive: args.non_interactive,
+        };
+        match agentenv_core::runtime::create_env(
+            &options,
+            &factory,
+            &mut provider,
+            &args.name,
+            &blueprint_yaml,
+        )
+        .await
+        {
+            Ok(result) if args.json => render::print_json(&result.admission),
+            Ok(result) => {
+                render::print_admission_text(&result.admission);
+                println!("Next: agentenv enter {}", args.name);
+                Ok(())
+            }
+            Err(error) if args.json => {
+                render::print_error_json(&error);
+                process::exit(render::exit_for_error(&error).code());
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 async fn run_enter(args: EnterArgs) -> Result<()> {
-    let EnterArgs { name, detach } = args;
-    let _ = (name, detach);
-    bail!("enter runtime wiring is not connected")
+    let options = runtime_options(true)?;
+    let shell = agentenv_core::runtime::enter_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.name,
+        args.detach,
+    )
+    .await?;
+    println!("{}", shell.session_id);
+    Ok(())
 }
 
 fn run_list(args: ListArgs) -> Result<()> {
@@ -265,13 +337,19 @@ fn run_list(args: ListArgs) -> Result<()> {
 }
 
 async fn run_destroy(args: DestroyArgs) -> Result<()> {
-    let DestroyArgs {
-        name,
-        yes,
-        purge_credentials,
-    } = args;
-    let _ = (name, yes, purge_credentials);
-    bail!("destroy runtime wiring is not connected")
+    if !args.yes {
+        bail!("destroy requires --yes in this non-interactive implementation path");
+    }
+    let _ = args.purge_credentials;
+    let options = runtime_options(true)?;
+    let report = agentenv_core::runtime::destroy_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.name,
+    )
+    .await?;
+    render::print_admission_text(&report);
+    Ok(())
 }
 
 fn run_describe(args: DescribeArgs) -> Result<()> {
@@ -291,25 +369,61 @@ fn run_describe(args: DescribeArgs) -> Result<()> {
 }
 
 async fn run_status(args: StatusArgs) -> Result<()> {
-    let StatusArgs { name, json } = args;
-    let _ = (name, json);
-    bail!("status runtime wiring is not connected")
+    let options = runtime_options(true)?;
+    let status = agentenv_core::runtime::status_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.name,
+    )
+    .await?;
+    if args.json {
+        render::print_json(&render::StatusJson {
+            healthy: status.healthy,
+            status: status.clone(),
+        })?;
+    } else {
+        println!("healthy: {}", status.healthy);
+    }
+    if !status.healthy {
+        process::exit(agentenv_core::admission::ExitClass::Unhealthy.code());
+    }
+    Ok(())
 }
 
 async fn run_logs(args: LogsArgs) -> Result<()> {
-    let LogsArgs {
-        name,
-        follow,
-        driver,
-    } = args;
-    let _ = (name, follow, driver);
-    bail!("logs runtime wiring is not connected")
+    if args
+        .driver
+        .as_deref()
+        .is_some_and(|driver| driver != "sandbox")
+    {
+        bail!("only --driver sandbox is supported by the current log surface");
+    }
+    let options = runtime_options(true)?;
+    let logs = agentenv_core::runtime::logs_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.name,
+        args.follow,
+    )
+    .await?;
+    for entry in logs.entries {
+        println!("{} {:?} {}", entry.ts, entry.level, entry.msg);
+    }
+    Ok(())
 }
 
 async fn run_exec(args: ExecArgs) -> Result<()> {
-    let ExecArgs { name, cmd } = args;
-    let _ = (name, cmd);
-    bail!("exec runtime wiring is not connected")
+    let options = runtime_options(true)?;
+    let result = agentenv_core::runtime::exec_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.name,
+        args.cmd,
+    )
+    .await?;
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    process::exit(result.status);
 }
 
 fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::RuntimeOptions> {
@@ -319,6 +433,43 @@ fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::Runt
         log_level: agentenv_proto::LogLevel::Info,
         non_interactive,
     })
+}
+
+struct CliCredentialProvider {
+    store: CredentialStore,
+    non_interactive: bool,
+}
+
+impl agentenv_core::runtime::CredentialProvider for CliCredentialProvider {
+    fn resolve(
+        &mut self,
+        requirement: &agentenv_proto::CredentialRequirement,
+    ) -> agentenv_core::runtime::RuntimeResult<Option<agentenv_core::runtime::RuntimeSecret>> {
+        let name = &requirement.name;
+        match self.store.resolve(name, requirement) {
+            Ok(secret) => Ok(Some(agentenv_core::runtime::RuntimeSecret::new(
+                secret.expose_secret().to_owned(),
+            ))),
+            Err(_) if !requirement.required => Ok(None),
+            Err(_) if self.non_interactive => {
+                Err(agentenv_core::runtime::RuntimeError::MissingCredential {
+                    name: name.to_owned(),
+                })
+            }
+            Err(_) => Err(agentenv_core::runtime::RuntimeError::MissingCredential {
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    fn backend_name(&self, name: &str) -> agentenv_core::runtime::RuntimeResult<Option<String>> {
+        Ok(self
+            .store
+            .where_is(name)
+            .ok()
+            .flatten()
+            .map(|backend| backend.to_string()))
+    }
 }
 
 fn run_credentials(args: CredentialsArgs) -> Result<()> {
@@ -462,6 +613,65 @@ fn resolve_blueprint_path_in_dir(explicit: Option<&Path>, cwd: &Path) -> Result<
         "no blueprint provided. Pass `--blueprint <file>` or create `{}` in the current directory",
         default_path.display()
     );
+}
+
+fn resolve_create_blueprint_path(
+    explicit: Option<&Path>,
+    reproduce: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    match reproduce {
+        None => resolve_blueprint_path_in_dir(explicit, cwd),
+        Some(lockfile_path) => resolve_reproduce_blueprint_path(explicit, lockfile_path, cwd),
+    }
+}
+
+fn resolve_reproduce_blueprint_path(
+    explicit: Option<&Path>,
+    lockfile_path: &Path,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    let lock_yaml = read_text_file(lockfile_path, "lockfile")?;
+    let lockfile = agentenv_core::lockfile::Lockfile::from_yaml(&lock_yaml)
+        .with_context(|| format!("failed to parse lockfile `{}`", lockfile_path.display()))?;
+
+    let mut candidates = Vec::new();
+    if let Some(path) = explicit {
+        candidates.push(path.to_path_buf());
+    }
+    if let Some(stem) = lockfile_path.file_stem().and_then(|stem| stem.to_str()) {
+        let dir = lockfile_path.parent().unwrap_or_else(|| Path::new("."));
+        candidates.push(dir.join(format!("{stem}.blueprint.yaml")));
+        candidates.push(dir.join(format!("{stem}.yaml")));
+    }
+    candidates.push(cwd.join("agentenv.yaml"));
+
+    for candidate in candidates {
+        if candidate.is_file() && blueprint_matches_lockfile(&candidate, &lockfile)? {
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "no blueprint content matched lockfile `{}`",
+        lockfile_path.display()
+    );
+}
+
+fn blueprint_matches_lockfile(
+    path: &Path,
+    lockfile: &agentenv_core::lockfile::Lockfile,
+) -> Result<bool> {
+    let yaml = read_text_file(path, "blueprint")?;
+    let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(&yaml)
+        .with_context(|| format!("failed to freeze candidate blueprint `{}`", path.display()))?;
+    let candidate = agentenv_core::lockfile::Lockfile::from_yaml(&frozen).with_context(|| {
+        format!(
+            "failed to parse generated lockfile for `{}`",
+            path.display()
+        )
+    })?;
+    Ok(candidate.blueprint_hash == lockfile.blueprint_hash)
 }
 
 fn freeze_in_dir(

@@ -136,9 +136,9 @@ fn create_accepts_non_interactive_env_one() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_ne!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("create runtime wiring is not connected"));
+    assert!(stderr.contains("no blueprint provided"));
     assert!(!stderr.contains("invalid value"));
 }
 
@@ -196,6 +196,97 @@ fn describe_json_missing_env_uses_stable_error() {
     assert!(!output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(json["reason_code"], "env_not_found");
+}
+
+#[test]
+fn create_preflight_json_reports_unsupported_external_driver() {
+    let temp_dir = make_temp_dir("create-preflight-unsupported");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: hermes
+context:
+  driver: nexus
+policy:
+  tier: restricted
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--preflight-only")
+        .arg("--json")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("capability_missing") || stderr.contains("unsupported driver"));
+}
+
+#[test]
+fn exec_requires_command_after_separator() {
+    let output = Command::new(agentenv_bin())
+        .arg("exec")
+        .arg("demo")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+}
+
+#[test]
+fn create_reproduce_json_reports_missing_blueprint_content() {
+    let temp_dir = make_temp_dir("create-reproduce-missing-blueprint");
+    let lockfile = temp_dir.join("demo.lock.yaml");
+    fs::write(
+        &lockfile,
+        r#"
+version: 0.1.0
+protocol_version: "0.1"
+blueprint_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+drivers:
+  sandbox:
+    name: openshell
+    version: 0.0.1-alpha0
+  agent:
+    name: codex
+    version: 0.0.1-alpha0
+  context:
+    name: filesystem
+    version: 0.0.1-alpha0
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .arg("--reproduce")
+        .arg(&lockfile)
+        .arg("--json")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "reproduce_blueprint_missing");
 }
 
 #[test]
