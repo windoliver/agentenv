@@ -125,6 +125,24 @@ fn drivers_list_includes_override_manifest() {
 }
 
 #[test]
+fn create_accepts_non_interactive_env_one() {
+    let temp_dir = make_temp_dir("create-non-interactive-env");
+
+    let output = process::Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .env("HOME", temp_dir.join("home"))
+        .env("AGENTENV_NON_INTERACTIVE", "1")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("create runtime wiring is not connected"));
+    assert!(!stderr.contains("invalid value"));
+}
+
+#[test]
 fn drivers_list_reports_malformed_manifest_path() {
     let temp_dir = make_temp_dir("drivers-list-bad-manifest");
     let driver_root = temp_dir.join("bad-driver");

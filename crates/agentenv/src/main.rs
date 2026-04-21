@@ -61,7 +61,12 @@ struct CreateArgs {
     preflight_only: bool,
     #[arg(long)]
     json: bool,
-    #[arg(long, env = "AGENTENV_NON_INTERACTIVE")]
+    #[arg(
+        long,
+        env = "AGENTENV_NON_INTERACTIVE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     non_interactive: bool,
 }
 
