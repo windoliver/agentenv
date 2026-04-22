@@ -128,9 +128,13 @@ fn subprocess_entry(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use agentenv_core::runtime::{DriverFactory, DriverSelection};
 
     use super::BuiltInDriverFactory;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn builds_supported_reference_driver_set() {
@@ -147,6 +151,7 @@ mod tests {
 
     #[test]
     fn built_in_selection_ignores_unrelated_broken_installed_manifest() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let bad_driver = home.join(".agentenv").join("drivers").join("bad");
@@ -172,6 +177,17 @@ mod tests {
 
     #[test]
     fn unsupported_external_driver_is_explicit() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            (
+                "AGENTENV_DRIVER_PATH",
+                temp.path().join("missing-driver-path").into_os_string(),
+            ),
+        ]);
         let selection = DriverSelection {
             sandbox: "openshell".to_owned(),
             agent: "hermes".to_owned(),
@@ -185,6 +201,7 @@ mod tests {
 
     #[test]
     fn builds_subprocess_hermes_and_nexus_from_driver_path() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         std::fs::create_dir_all(&home).expect("home");
