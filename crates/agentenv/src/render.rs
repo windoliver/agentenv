@@ -71,6 +71,7 @@ fn reason_for_driver_error(error: &DriverError) -> ReasonCode {
         DriverError::InvalidHandle { .. }
         | DriverError::CommandSpawn { .. }
         | DriverError::CommandFailed { .. }
+        | DriverError::Subprocess { .. }
         | DriverError::PolicyTranslation { .. }
         | DriverError::PolicyRequiresRecreate { .. } => ReasonCode::DriverCommandFailed,
     }

@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use agentenv_core::agent_common::{
-    is_no_context_mcp_endpoint, npm_package_spec, version_probe, AgentMode, SharedAgentConfig,
+    is_no_context_mcp_endpoint, npm_global_install_command, npm_package_spec, version_probe,
+    AgentMode, SharedAgentConfig,
 };
 use agentenv_core::driver::{AgentDriver, DriverError, DriverResult};
 use agentenv_proto::{
@@ -57,7 +58,7 @@ impl AgentDriver for ClaudeDriver {
         Ok(InstallStepsResult {
             steps: vec![DockerfileFragment {
                 name: Some("install-claude".to_owned()),
-                content: format!("RUN npm install -g {package}"),
+                content: format!("RUN {}", npm_global_install_command(&package)),
             }],
         })
     }
@@ -258,7 +259,7 @@ mod tests {
         assert_eq!(install_steps.steps.len(), 1);
         assert_eq!(
             install_steps.steps[0].content,
-            "RUN npm install -g @anthropic-ai/claude-code"
+            "RUN npm install -g --no-audit --fetch-retries=5 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=20000 @anthropic-ai/claude-code"
         );
         assert_eq!(mcp_path.path, "~/.claude/agentenv-mcp.json");
     }
@@ -275,7 +276,7 @@ mod tests {
 
         assert_eq!(
             install_steps.steps[0].content,
-            "RUN npm install -g @anthropic-ai/claude-code@1.2.3"
+            "RUN npm install -g --no-audit --fetch-retries=5 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=20000 @anthropic-ai/claude-code@1.2.3"
         );
     }
 

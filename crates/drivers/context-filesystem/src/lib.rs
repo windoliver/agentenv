@@ -22,11 +22,13 @@ use agentenv_proto::{
     McpTransport, PreflightParams, PreflightResult, RequiredNetworkRulesResult, ShutdownParams,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "context-filesystem";
 const DRIVER_NAME: &str = "filesystem";
+const HANDLE_PREFIX: &str = "filesystem|v1|";
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 const MAX_TRAVERSAL_ENTRIES: usize = 100_000;
 const DEFAULT_LIMIT: usize = 100;
@@ -400,7 +402,7 @@ impl FilesystemMcpServer {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemConfig {
     pub root: PathBuf,
     pub readonly: bool,
@@ -414,7 +416,6 @@ struct FilesystemState {
 
 #[derive(Debug)]
 struct FilesystemStore {
-    next_id: u64,
     states: BTreeMap<String, FilesystemState>,
 }
 
@@ -427,7 +428,6 @@ impl Default for FilesystemContextDriver {
     fn default() -> Self {
         Self {
             store: Mutex::new(FilesystemStore {
-                next_id: 1,
                 states: BTreeMap::new(),
             }),
         }
@@ -449,17 +449,11 @@ impl ContextDriver for FilesystemContextDriver {
 
     async fn provision(&self, spec: ContextSpec) -> DriverResult<ContextHandle> {
         let config = filesystem_config_from_spec(&spec)?;
+        let handle = filesystem_handle_from_config(&config)?;
         let mut store = self.store()?;
-        let handle = loop {
-            let handle = format!("{DRIVER_NAME}|{}", store.next_id);
-            store.next_id += 1;
-            if let Entry::Vacant(entry) = store.states.entry(handle.clone()) {
-                entry.insert(FilesystemState {
-                    config: config.clone(),
-                });
-                break handle;
-            }
-        };
+        if let Entry::Vacant(entry) = store.states.entry(handle.clone()) {
+            entry.insert(FilesystemState { config });
+        }
 
         Ok(ContextHandle { handle })
     }
@@ -507,10 +501,9 @@ impl ContextDriver for FilesystemContextDriver {
 
     async fn teardown(&self, params: ContextHandleRequest) -> DriverResult<EmptyResult> {
         let mut store = self.store()?;
-        store
-            .states
-            .remove(&params.handle)
-            .ok_or_else(|| invalid_handle(&params.handle))?;
+        if store.states.remove(&params.handle).is_none() {
+            filesystem_config_from_handle(&params.handle)?;
+        }
 
         Ok(empty_result())
     }
@@ -523,11 +516,13 @@ impl ContextDriver for FilesystemContextDriver {
 impl FilesystemContextDriver {
     fn state(&self, handle: &str) -> DriverResult<FilesystemState> {
         let store = self.store()?;
-        store
-            .states
-            .get(handle)
-            .cloned()
-            .ok_or_else(|| invalid_handle(handle))
+        if let Some(state) = store.states.get(handle).cloned() {
+            return Ok(state);
+        }
+        drop(store);
+
+        let config = filesystem_config_from_handle(handle)?;
+        Ok(FilesystemState { config })
     }
 
     fn store(&self) -> DriverResult<MutexGuard<'_, FilesystemStore>> {
@@ -556,6 +551,30 @@ pub fn filesystem_config_from_spec(spec: &ContextSpec) -> DriverResult<Filesyste
         root,
         readonly: optional_bool(&spec.config, "readonly")?.unwrap_or(true),
         exclude: optional_string_list(&spec.config, "exclude")?,
+    })
+}
+
+fn filesystem_handle_from_config(config: &FilesystemConfig) -> DriverResult<String> {
+    let payload = serde_json::to_vec(config).map_err(|err| DriverError::InvalidConfig {
+        field: "mount".to_owned(),
+        message: format!("failed to serialize filesystem context handle: {err}"),
+    })?;
+
+    Ok(format!("{HANDLE_PREFIX}{}", encode_hex(&payload)))
+}
+
+fn filesystem_config_from_handle(handle: &str) -> DriverResult<FilesystemConfig> {
+    let payload = handle
+        .strip_prefix(HANDLE_PREFIX)
+        .ok_or_else(|| invalid_handle(handle))?;
+    let bytes =
+        decode_hex(payload).map_err(|message| invalid_handle_with_message(handle, message))?;
+
+    serde_json::from_slice(&bytes).map_err(|err| {
+        invalid_handle_with_message(
+            handle,
+            format!("invalid filesystem context handle payload: {err}"),
+        )
     })
 }
 
@@ -590,9 +609,49 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn invalid_handle(handle: &str) -> DriverError {
+    invalid_handle_with_message(handle, "unknown filesystem context handle".to_owned())
+}
+
+fn invalid_handle_with_message(handle: &str, message: String) -> DriverError {
     DriverError::InvalidHandle {
         handle: handle.to_owned(),
-        message: "unknown filesystem context handle".to_owned(),
+        message,
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
+    if !input.len().is_multiple_of(2) {
+        return Err("filesystem context handle payload has odd hex length".to_owned());
+    }
+
+    let mut bytes = Vec::with_capacity(input.len() / 2);
+    for chunk in input.as_bytes().chunks_exact(2) {
+        let high = hex_value(chunk[0])?;
+        let low = hex_value(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_value(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!(
+            "filesystem context handle payload contains non-hex byte `{}`",
+            byte as char
+        )),
     }
 }
 
@@ -721,6 +780,30 @@ mod tests {
 
         assert!(!status.healthy);
         assert!(status.detail.unwrap().contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn self_contained_handle_resolves_after_driver_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let driver = FilesystemContextDriver::default();
+        let handle = driver.provision(spec(tmp.path())).await.unwrap();
+        let restarted = FilesystemContextDriver::default();
+
+        let status = restarted
+            .status(ContextHandleRequest {
+                handle: handle.handle.clone(),
+            })
+            .await
+            .unwrap();
+        let endpoint = restarted
+            .mcp_endpoint(ContextHandleRequest {
+                handle: handle.handle,
+            })
+            .await
+            .unwrap();
+
+        assert!(status.healthy);
+        assert!(endpoint.url.contains(tmp.path().to_str().unwrap()));
     }
 
     #[tokio::test]

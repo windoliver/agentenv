@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::BTreeMap,
     net::SocketAddr,
     sync::{Mutex, MutexGuard},
     time::Duration,
@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 
 pub const CRATE_NAME: &str = "context-mcp-generic";
 const DRIVER_NAME: &str = "mcp-generic";
+const HANDLE_PREFIX: &str = "mcp-generic|v1|";
 const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
@@ -44,7 +45,6 @@ struct GenericMcpState {
 
 #[derive(Debug)]
 struct GenericMcpStore {
-    next_id: u64,
     states: BTreeMap<String, GenericMcpState>,
 }
 
@@ -64,7 +64,6 @@ impl Default for GenericMcpContextDriver {
     fn default() -> Self {
         Self {
             store: Mutex::new(GenericMcpStore {
-                next_id: 1,
                 states: BTreeMap::new(),
             }),
             probe: ProbeSettings {
@@ -88,11 +87,14 @@ impl GenericMcpContextDriver {
 
     fn state(&self, handle: &str) -> DriverResult<GenericMcpState> {
         let store = self.store()?;
-        store
-            .states
-            .get(handle)
-            .cloned()
-            .ok_or_else(|| invalid_handle(handle))
+        if let Some(state) = store.states.get(handle).cloned() {
+            return Ok(state);
+        }
+        drop(store);
+
+        Ok(GenericMcpState {
+            endpoint: endpoint_from_handle(handle)?,
+        })
     }
 
     fn store(&self) -> DriverResult<MutexGuard<'_, GenericMcpStore>> {
@@ -146,17 +148,12 @@ impl ContextDriver for GenericMcpContextDriver {
             }
         }
 
+        let handle = handle_from_endpoint(&endpoint)?;
         let mut store = self.store()?;
-        let handle = loop {
-            let handle = format!("{DRIVER_NAME}|{}", store.next_id);
-            store.next_id += 1;
-            if let Entry::Vacant(entry) = store.states.entry(handle.clone()) {
-                entry.insert(GenericMcpState {
-                    endpoint: endpoint.clone(),
-                });
-                break handle;
-            }
-        };
+        store
+            .states
+            .entry(handle.clone())
+            .or_insert_with(|| GenericMcpState { endpoint });
 
         Ok(ContextHandle { handle })
     }
@@ -200,16 +197,39 @@ impl ContextDriver for GenericMcpContextDriver {
 
     async fn teardown(&self, params: ContextHandleRequest) -> DriverResult<EmptyResult> {
         let mut store = self.store()?;
-        store
-            .states
-            .remove(&params.handle)
-            .ok_or_else(|| invalid_handle(&params.handle))?;
+        if store.states.remove(&params.handle).is_none() {
+            endpoint_from_handle(&params.handle)?;
+        }
         Ok(EmptyResult::default())
     }
 
     async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
         Ok(EmptyResult::default())
     }
+}
+
+fn handle_from_endpoint(endpoint: &McpEndpoint) -> DriverResult<String> {
+    let payload = serde_json::to_vec(endpoint).map_err(|err| DriverError::InvalidConfig {
+        field: "endpoint".to_owned(),
+        message: format!("failed to serialize generic MCP context handle: {err}"),
+    })?;
+
+    Ok(format!("{HANDLE_PREFIX}{}", encode_hex(&payload)))
+}
+
+fn endpoint_from_handle(handle: &str) -> DriverResult<McpEndpoint> {
+    let payload = handle
+        .strip_prefix(HANDLE_PREFIX)
+        .ok_or_else(|| invalid_handle(handle))?;
+    let bytes =
+        decode_hex(payload).map_err(|message| invalid_handle_with_message(handle, message))?;
+
+    serde_json::from_slice(&bytes).map_err(|err| {
+        invalid_handle_with_message(
+            handle,
+            format!("invalid generic MCP context handle payload: {err}"),
+        )
+    })
 }
 
 pub fn endpoint_from_spec(spec: &ContextSpec) -> DriverResult<McpEndpoint> {
@@ -399,9 +419,49 @@ fn is_auth_challenge(status: reqwest::StatusCode) -> bool {
 }
 
 fn invalid_handle(handle: &str) -> DriverError {
+    invalid_handle_with_message(handle, "unknown generic MCP context handle".to_owned())
+}
+
+fn invalid_handle_with_message(handle: &str, message: String) -> DriverError {
     DriverError::InvalidHandle {
         handle: handle.to_owned(),
-        message: "unknown generic MCP context handle".to_owned(),
+        message,
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
+    if !input.len().is_multiple_of(2) {
+        return Err("generic MCP context handle payload has odd hex length".to_owned());
+    }
+
+    let mut bytes = Vec::with_capacity(input.len() / 2);
+    for chunk in input.as_bytes().chunks_exact(2) {
+        let high = hex_value(chunk[0])?;
+        let low = hex_value(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_value(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!(
+            "generic MCP context handle payload contains non-hex byte `{}`",
+            byte as char
+        )),
     }
 }
 
@@ -586,6 +646,28 @@ mod tests {
         assert_eq!(host, "mcp.example.com");
         assert_eq!(port, &Some(8443));
         assert_eq!(scheme.as_deref(), Some("https"));
+    }
+
+    #[tokio::test]
+    async fn self_contained_handle_resolves_after_driver_restarts() {
+        let driver = GenericMcpContextDriver::new_for_tests_without_probe();
+        let handle = driver
+            .provision(spec(
+                "https://mcp.example.com:8443/sse?state=abc",
+                "http+sse",
+            ))
+            .await
+            .unwrap();
+        let restarted = GenericMcpContextDriver::new_for_tests_without_probe();
+
+        let request = ContextHandleRequest {
+            handle: handle.handle,
+        };
+        let endpoint = restarted.mcp_endpoint(request.clone()).await.unwrap();
+        let status = restarted.status(request).await.unwrap();
+
+        assert_eq!(endpoint.url, "https://mcp.example.com:8443/sse?state=abc");
+        assert!(status.healthy);
     }
 
     #[tokio::test]

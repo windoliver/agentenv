@@ -13,6 +13,7 @@ description = "Declarative environment manager for AI coding agents"
 [dependencies]
 agentenv-core = { path = "../agentenv-core" }
 agentenv-credstore = { path = "../agentenv-credstore" }
+agentenv-plugin = { path = "../agentenv-plugin" }
 agentenv-policy = { path = "../agentenv-policy" }
 agentenv-proto = { path = "../agentenv-proto" }
 agent-claude = { path = "../drivers/agent-claude" }
@@ -39,4 +40,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 assert_cmd = "=2.0.16"
 predicates = "3"
+reqwest = { workspace = true, features = ["blocking"] }
 tempfile = "=3.16.0"

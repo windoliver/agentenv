@@ -68,7 +68,7 @@ MCP is the only agent↔context protocol. Everything plugs in around it.
 
 > **Alpha.** Not production-ready. Interfaces may change.
 
-### Install
+### 1. Install `agentenv`
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/windoliver/agentenv/main/install.sh | sh
@@ -96,7 +96,9 @@ Or with Cargo:
 cargo install agentenv
 ```
 
-### Minimal `agentenv.yaml`
+### 2. Write `agentenv.yaml`
+
+This example creates a real OpenShell sandbox, installs Codex inside it, mounts a local project through the filesystem context driver, and passes `OPENAI_API_KEY` from your host environment.
 
 ```yaml
 version: 0.1.0
@@ -105,9 +107,11 @@ sandbox:
   driver: openshell
 
 agent:
-  driver: claude
+  driver: codex
   credentials:
-    ANTHROPIC_API_KEY: { source: env }
+    OPENAI_API_KEY:
+      source: env
+      required: true
 
 context:
   driver: filesystem
@@ -120,16 +124,59 @@ policy:
   tier: balanced
 ```
 
-### Create, enter, destroy
+### 3. Create, enter, inspect, clean up
 
 ```bash
+export OPENAI_API_KEY=sk-...
+
 agentenv create myapp
 agentenv enter myapp
-agentenv list
-agentenv freeze myapp > agentenv.lock
-agentenv reproduce agentenv.lock
-agentenv destroy myapp
 ```
+
+Useful lifecycle commands:
+
+```bash
+agentenv status myapp
+agentenv exec myapp -- printf "hello from sandbox\n"
+agentenv logs myapp
+agentenv logs myapp --follow
+agentenv describe myapp --json
+agentenv list
+agentenv freeze myapp --blueprint agentenv.yaml --out agentenv.lock
+agentenv reproduce agentenv.lock
+agentenv destroy myapp --yes
+```
+
+If you do not want to keep secrets in shell history, store them once:
+
+```bash
+agentenv credentials set OPENAI_API_KEY
+agentenv credentials where OPENAI_API_KEY
+```
+
+`agentenv create` also prompts for missing required credentials in interactive mode.
+
+### What `agentenv create` sets up for you
+
+For the built-in OpenShell path, the CLI is meant to work without a manual driver setup step:
+
+- Finds host tools in common locations, including `~/.local/bin`, `~/.orbstack/bin`, Homebrew, and Docker Desktop paths.
+- Installs the OpenShell CLI into `~/.local/bin` automatically if `openshell` is missing.
+- Starts OrbStack or Docker Desktop if the app is installed but the Docker API is not ready.
+- Installs the selected agent command inside the sandbox when needed.
+- Renders the MCP config and agent entrypoint so `agentenv enter myapp` opens the configured agent environment.
+- Applies the declared policy during sandbox creation and wires inference routing after create.
+
+If neither OrbStack nor Docker Desktop is installed, `agentenv create` stops with `container_runtime_missing`. Install one local container runtime once, then rerun the same command. After that, `agentenv` detects and starts it automatically.
+
+### Common fixes
+
+| Symptom | Fix |
+|---------|-----|
+| `openshell_bootstrap_failed` | Check host network access to GitHub plus `curl` and `sh`, then rerun `agentenv create`. |
+| `container_runtime_missing` | Install OrbStack or Docker Desktop once. |
+| `container_runtime_unavailable` | Open OrbStack or Docker Desktop and wait until Docker is running, then rerun `agentenv create`. |
+| `missing credential OPENAI_API_KEY` | Export it, run `agentenv credentials set OPENAI_API_KEY`, or omit `--non-interactive` and let create prompt. |
 
 ---
 

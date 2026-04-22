@@ -588,6 +588,192 @@ fn reproduce_succeeds_from_generated_lockfile() {
 }
 
 #[test]
+#[ignore = "requires real OpenShell, gateway, Docker, and OPENAI_API_KEY"]
+fn codex_filesystem_openshell_real_cli_lifecycle() {
+    if std::env::var_os("AGENTENV_RUN_OPEN_SHELL_TESTS").is_none() {
+        eprintln!("set AGENTENV_RUN_OPEN_SHELL_TESTS=1 to run OpenShell CLI integration");
+        return;
+    }
+    require_env_var("OPENAI_API_KEY");
+    require_openai_api_key_usable();
+
+    let temp_dir = make_temp_dir("codex-filesystem-openshell-real");
+    let home = temp_dir.join("home");
+    let mount = home.join("projects");
+    fs::create_dir_all(&mount).unwrap();
+    fs::write(mount.join("README.md"), "agentenv real e2e\n").unwrap();
+    let blueprint = temp_dir.join("codex-filesystem-openshell.yaml");
+    fs::write(
+        &blueprint,
+        format!(
+            r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+context:
+  driver: filesystem
+  mount: {}
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+state:
+  persist_home: true
+"#,
+            mount.display()
+        ),
+    )
+    .unwrap();
+
+    let name = "codex-filesystem-openshell-real";
+    let mut created = false;
+    let result = (|| -> Result<(), String> {
+        let create = agentenv_with_home(&home)
+            .arg("create")
+            .arg(name)
+            .arg("--blueprint")
+            .arg(&blueprint)
+            .arg("--non-interactive")
+            .output()
+            .unwrap();
+        require_agentenv_success("create", &create)?;
+        created = true;
+
+        let status = agentenv_with_home(&home)
+            .arg("status")
+            .arg(name)
+            .arg("--json")
+            .output()
+            .unwrap();
+        require_agentenv_success("status --json", &status)?;
+        let status_json: serde_json::Value =
+            serde_json::from_slice(&status.stdout).map_err(|err| {
+                format!(
+                    "status JSON parse failed: {err}\n{}",
+                    output_summary(&status)
+                )
+            })?;
+        if status_json["healthy"] != serde_json::Value::Bool(true) {
+            return Err(format!(
+                "status JSON did not report healthy=true:\n{}",
+                String::from_utf8_lossy(&status.stdout)
+            ));
+        }
+
+        let logs = agentenv_with_home(&home)
+            .arg("logs")
+            .arg(name)
+            .output()
+            .unwrap();
+        require_agentenv_success("logs", &logs)?;
+
+        let exec = agentenv_with_home(&home)
+            .arg("exec")
+            .arg(name)
+            .arg("--")
+            .arg("printf")
+            .arg("agentenv-real-e2e-ok")
+            .output()
+            .unwrap();
+        require_agentenv_success("exec", &exec)?;
+        if String::from_utf8_lossy(&exec.stdout) != "agentenv-real-e2e-ok" {
+            return Err(format!("exec output mismatch:\n{}", output_summary(&exec)));
+        }
+
+        let enter = agentenv_with_home(&home)
+            .arg("enter")
+            .arg(name)
+            .arg("--detach")
+            .output()
+            .unwrap();
+        require_agentenv_success("enter --detach", &enter)?;
+        if String::from_utf8_lossy(&enter.stdout).trim().is_empty() {
+            return Err(format!(
+                "enter --detach did not print a shell session:\n{}",
+                output_summary(&enter)
+            ));
+        }
+
+        let describe = agentenv_with_home(&home)
+            .arg("describe")
+            .arg(name)
+            .arg("--json")
+            .output()
+            .unwrap();
+        require_agentenv_success("describe --json", &describe)?;
+        let describe_json: serde_json::Value =
+            serde_json::from_slice(&describe.stdout).map_err(|err| {
+                format!(
+                    "describe JSON parse failed: {err}\n{}",
+                    output_summary(&describe)
+                )
+            })?;
+        if describe_json["state"]["drivers"]["agent"]["name"]
+            != serde_json::Value::String("codex".to_owned())
+        {
+            return Err(format!(
+                "describe JSON did not report codex agent:\n{}",
+                String::from_utf8_lossy(&describe.stdout)
+            ));
+        }
+
+        let list = agentenv_with_home(&home)
+            .arg("list")
+            .arg("--json")
+            .output()
+            .unwrap();
+        require_agentenv_success("list --json", &list)?;
+        let list_json: serde_json::Value = serde_json::from_slice(&list.stdout)
+            .map_err(|err| format!("list JSON parse failed: {err}\n{}", output_summary(&list)))?;
+        let listed = list_json["envs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == serde_json::Value::String(name.to_owned()));
+        if !listed {
+            return Err(format!(
+                "list JSON did not include environment `{name}`:\n{}",
+                String::from_utf8_lossy(&list.stdout)
+            ));
+        }
+
+        let destroy = agentenv_with_home(&home)
+            .arg("destroy")
+            .arg(name)
+            .arg("--yes")
+            .output()
+            .unwrap();
+        require_agentenv_success("destroy", &destroy)?;
+        created = false;
+        if home.join(".agentenv").join("envs").join(name).exists() {
+            return Err("destroy succeeded but env registry directory still exists".to_owned());
+        }
+
+        Ok(())
+    })();
+
+    if created {
+        let _ = agentenv_with_home(&home)
+            .arg("destroy")
+            .arg(name)
+            .arg("--yes")
+            .output();
+    }
+
+    if let Err(message) = result {
+        panic!("{message}");
+    }
+}
+
+#[test]
 #[ignore = "requires OpenShell and external reference blueprint dependencies"]
 fn reference_blueprints_create_status_destroy_roundtrip() {
     if std::env::var_os("AGENTENV_RUN_OPEN_SHELL_TESTS").is_none() {
@@ -608,6 +794,7 @@ fn reference_blueprints_create_status_destroy_roundtrip() {
             .unwrap()
             .replace(".yaml", "")
             .replace('+', "-");
+        fs::create_dir_all(temp_dir.join("projects")).unwrap();
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(blueprint);
@@ -619,14 +806,15 @@ fn reference_blueprints_create_status_destroy_roundtrip() {
             .arg(&path)
             .arg("--non-interactive")
             .env("HOME", &temp_dir)
+            .env("AGENTENV_DISABLE_KEYRING", "1")
             .output()
             .unwrap();
         if !create.status.success() {
-            let stderr = String::from_utf8_lossy(&create.stderr);
-            if reference_blueprint_skip_reason(&stderr) {
+            let output = output_summary(&create);
+            if reference_blueprint_skip_reason(&output) {
                 continue;
             }
-            panic!("create failed for {blueprint}: {stderr}");
+            panic!("create failed for {blueprint}: {output}");
         }
 
         let status = Command::new(agentenv_bin())
@@ -660,10 +848,68 @@ fn fixture_blueprint() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../blueprints/claude+filesystem+openshell.yaml")
 }
 
+fn agentenv_with_home(home: &Path) -> Command {
+    let mut command = Command::new(agentenv_bin());
+    command
+        .env("HOME", home)
+        .env("AGENTENV_DISABLE_KEYRING", "1");
+    command
+}
+
+fn require_env_var(name: &str) {
+    if std::env::var_os(name).is_none() {
+        panic!("{name} must be set for real OpenShell E2E");
+    }
+}
+
+fn require_openai_api_key_usable() {
+    let key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .expect("OPENAI_API_KEY must be non-empty for real OpenShell E2E");
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("OpenAI probe client should build");
+    let response = client
+        .get("https://api.openai.com/v1/models")
+        .bearer_auth(key.trim())
+        .send()
+        .unwrap_or_else(|err| panic!("OpenAI API key probe failed to send request: {err}"));
+    if !response.status().is_success() {
+        panic!("OpenAI API key probe returned HTTP {}", response.status());
+    }
+}
+
+fn require_agentenv_success(label: &str, output: &process::Output) -> Result<(), String> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} failed:\n{}", output_summary(output)))
+    }
+}
+
+fn output_summary(output: &process::Output) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_owned()),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 fn reference_blueprint_skip_reason(stderr: &str) -> bool {
     [
         "unsupported driver",
         "OpenShell binary not found",
+        "OpenShell CLI binary",
+        "openshell_missing",
+        "preflight_failed",
         "gateway",
         "missing credential",
         "missing_credential",

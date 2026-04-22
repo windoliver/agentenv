@@ -218,6 +218,58 @@ impl<'a> CreateEnvRollback<'a> {
 }
 
 static CREATE_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
+const AGENT_ENTRYPOINT_PATH: &str = "/sandbox/.agentenv/bin/agentenv-agent";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnterResult {
+    Attached(agentenv_proto::ExecResult),
+    Detached(agentenv_proto::ShellHandle),
+}
+
+pub struct RunningLogStream {
+    _set: DriverSet,
+}
+
+struct AgentSandboxSetup {
+    install_commands: Vec<AgentInstallCommand>,
+    can_skip_install_if_probe_passes: bool,
+    mcp_config_host_path: PathBuf,
+    mcp_config_sandbox_path: String,
+    entrypoint_host_path: PathBuf,
+    health_probe: agentenv_proto::AgentHealthCheckProbe,
+}
+
+struct AgentInstallCommand {
+    cmd: String,
+    env: BTreeMap<String, String>,
+}
+
+fn create_policy_for_agent_install(
+    policy: &agentenv_proto::NetworkPolicy,
+    setup: &AgentSandboxSetup,
+) -> agentenv_proto::NetworkPolicy {
+    if setup.install_commands.is_empty() {
+        return policy.clone();
+    }
+
+    let mut install_policy = policy.clone();
+    let npm_rule = agent_install_npm_registry_rule();
+    if !install_policy.network.allow.contains(&npm_rule) {
+        install_policy.network.allow.push(npm_rule);
+    }
+    install_policy
+}
+
+fn agent_install_npm_registry_rule() -> agentenv_proto::NetworkRule {
+    agentenv_proto::NetworkRule {
+        target: agentenv_proto::NetworkTarget::Host {
+            host: "registry.npmjs.org".to_owned(),
+            port: Some(443),
+            scheme: Some("https".to_owned()),
+            http_access: Some(agentenv_proto::HttpAccessLevel::Full),
+        },
+    }
+}
 
 pub async fn initialize_sandbox_driver(
     options: &RuntimeOptions,
@@ -381,7 +433,7 @@ pub async fn create_env(
         )?;
         let mut requirements = set
             .agent
-            .credential_requirements(agent_spec)
+            .credential_requirements(agent_spec.clone())
             .await?
             .requirements;
         requirements.extend(
@@ -440,6 +492,13 @@ pub async fn create_env(
                 handle: context_handle.handle.clone(),
             })
             .await?;
+        let agent_setup = prepare_agent_sandbox_setup(
+            &temp_workspace,
+            set.agent.as_ref(),
+            agent_spec.clone(),
+            vec![context_endpoint.clone()],
+        )
+        .await?;
         let context_network_rules = set
             .context
             .required_network_rules(agentenv_proto::ContextHandleRequest {
@@ -483,16 +542,29 @@ pub async fn create_env(
         })?;
         policy.network.allow.extend(context_network_rules.rules);
 
+        let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
+        let restore_policy_after_install = create_policy != policy;
+
         let sandbox_handle = set
             .sandbox
             .create(agentenv_proto::SandboxSpec {
                 image: None,
                 env,
-                policy: Some(policy),
+                policy: Some(create_policy),
                 metadata: BTreeMap::new(),
             })
             .await?;
-        rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle.handle.clone());
+        let sandbox_handle_value = sandbox_handle.handle.clone();
+        rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle_value.clone());
+        install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
+        if restore_policy_after_install {
+            set.sandbox
+                .apply_policy(agentenv_proto::ApplyPolicyParams {
+                    handle: sandbox_handle_value.clone(),
+                    policy: policy.clone(),
+                })
+                .await?;
+        }
 
         let now = now_utc_string();
         let drivers = crate::env::StateDriverSet {
@@ -730,18 +802,32 @@ pub async fn enter_env(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
     name: &str,
-    _detach: bool,
-) -> RuntimeResult<agentenv_proto::ShellHandle> {
+    detach: bool,
+) -> RuntimeResult<EnterResult> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
     let mut set = factory.build(&selection)?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
-    set.sandbox
-        .connect(agentenv_proto::ConnectParams { handle })
-        .await
-        .map_err(Into::into)
+    if detach {
+        let shell = set
+            .sandbox
+            .connect(agentenv_proto::ConnectParams { handle })
+            .await?;
+        return Ok(EnterResult::Detached(shell));
+    }
+
+    let result = set
+        .sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle,
+            cmd: AGENT_ENTRYPOINT_PATH.to_owned(),
+            tty: true,
+            env: BTreeMap::new(),
+        })
+        .await?;
+    Ok(EnterResult::Attached(result))
 }
 
 pub async fn status_env(
@@ -799,6 +885,13 @@ pub async fn logs_env(
     name: &str,
     follow: bool,
 ) -> RuntimeResult<agentenv_proto::LogsResult> {
+    if follow {
+        let _guard = start_logs_stream_env(options, factory, name).await?;
+        return Ok(agentenv_proto::LogsResult {
+            entries: Vec::new(),
+        });
+    }
+
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
@@ -813,6 +906,25 @@ pub async fn logs_env(
         })
         .await
         .map_err(Into::into)
+}
+
+pub async fn start_logs_stream_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+) -> RuntimeResult<RunningLogStream> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+    set.sandbox
+        .logs_stream(agentenv_proto::LogsStreamParams {
+            handle,
+            since: None,
+        })
+        .await?;
+    Ok(RunningLogStream { _set: set })
 }
 
 pub async fn destroy_env(
@@ -1028,6 +1140,288 @@ pub fn inference_spec(extra: BTreeMap<String, serde_yaml::Value>) -> RuntimeResu
     Ok(InferenceSpec {
         config: component_spec(extra)?.into_iter().collect(),
     })
+}
+
+async fn prepare_agent_sandbox_setup(
+    temp_workspace: &Path,
+    agent: &dyn AgentDriver,
+    spec: AgentSpec,
+    endpoints: Vec<agentenv_proto::McpEndpoint>,
+) -> RuntimeResult<AgentSandboxSetup> {
+    let can_skip_install_if_probe_passes = spec.version.is_none();
+    let install_steps = agent.install_steps(spec.clone()).await?;
+    let install_commands = install_commands_from_steps(install_steps.steps)?;
+    let mcp_config_path = agent
+        .mcp_config_path(agentenv_proto::McpConfigPathParams::default())
+        .await?;
+    let mcp_config = agent
+        .render_mcp_config(agentenv_proto::RenderMcpConfigParams { endpoints })
+        .await?;
+    let entrypoint = agent.render_entrypoint(spec.clone()).await?;
+    let health_probe = agent.health_check_probe(spec).await?;
+
+    let agent_dir = temp_workspace.join("agent-assets");
+    fs::create_dir_all(&agent_dir).map_err(|source| crate::env::EnvError::Io {
+        path: agent_dir.clone(),
+        source,
+    })?;
+    let mcp_config_host_path = agent_dir.join("mcp-config");
+    fs::write(&mcp_config_host_path, mcp_config.content).map_err(|source| {
+        crate::env::EnvError::Io {
+            path: mcp_config_host_path.clone(),
+            source,
+        }
+    })?;
+    let entrypoint_host_path = agent_dir.join("entrypoint");
+    fs::write(&entrypoint_host_path, entrypoint.content).map_err(|source| {
+        crate::env::EnvError::Io {
+            path: entrypoint_host_path.clone(),
+            source,
+        }
+    })?;
+
+    Ok(AgentSandboxSetup {
+        install_commands,
+        can_skip_install_if_probe_passes,
+        mcp_config_host_path,
+        mcp_config_sandbox_path: normalize_agent_sandbox_path(&mcp_config_path.path)?,
+        entrypoint_host_path,
+        health_probe,
+    })
+}
+
+async fn install_agent_in_sandbox(
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+    setup: &AgentSandboxSetup,
+) -> RuntimeResult<()> {
+    let skip_install = setup.can_skip_install_if_probe_passes
+        && !setup.install_commands.is_empty()
+        && agent_health_probe_succeeds(sandbox, handle, setup).await?;
+    if !skip_install {
+        for command in &setup.install_commands {
+            let result = sandbox
+                .exec(agentenv_proto::ExecParams {
+                    handle: handle.to_owned(),
+                    cmd: command.cmd.clone(),
+                    tty: false,
+                    env: command.env.clone(),
+                })
+                .await?;
+            ensure_command_success(&command.cmd, &result, &[0])?;
+        }
+    }
+
+    copy_agent_file_into_sandbox(
+        sandbox,
+        handle,
+        &setup.mcp_config_host_path,
+        &setup.mcp_config_sandbox_path,
+        "0600",
+    )
+    .await?;
+    copy_agent_file_into_sandbox(
+        sandbox,
+        handle,
+        &setup.entrypoint_host_path,
+        AGENT_ENTRYPOINT_PATH,
+        "0755",
+    )
+    .await?;
+
+    let result = sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle: handle.to_owned(),
+            cmd: setup.health_probe.cmd.clone(),
+            tty: setup.health_probe.tty,
+            env: setup.health_probe.env.clone(),
+        })
+        .await?;
+    ensure_command_success(
+        &setup.health_probe.cmd,
+        &result,
+        &setup.health_probe.success_exit_codes,
+    )
+}
+
+async fn agent_health_probe_succeeds(
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+    setup: &AgentSandboxSetup,
+) -> RuntimeResult<bool> {
+    let result = sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle: handle.to_owned(),
+            cmd: setup.health_probe.cmd.clone(),
+            tty: setup.health_probe.tty,
+            env: setup.health_probe.env.clone(),
+        })
+        .await?;
+    Ok(command_status_succeeded(
+        result.status,
+        &setup.health_probe.success_exit_codes,
+    ))
+}
+
+async fn copy_agent_file_into_sandbox(
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+    host_path: &Path,
+    sandbox_path: &str,
+    mode: &str,
+) -> RuntimeResult<()> {
+    let parent = sandbox_parent_dir(sandbox_path)?;
+    let mkdir = format!("mkdir -p {}", shell_quote(&parent));
+    let result = sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle: handle.to_owned(),
+            cmd: mkdir.clone(),
+            tty: false,
+            env: BTreeMap::new(),
+        })
+        .await?;
+    ensure_command_success(&mkdir, &result, &[0])?;
+
+    sandbox
+        .copy_in(agentenv_proto::CopyInParams {
+            handle: handle.to_owned(),
+            src_host_path: host_path.display().to_string(),
+            dst_sandbox_path: sandbox_path.to_owned(),
+        })
+        .await?;
+
+    let chmod = format!("chmod {mode} {}", shell_quote(sandbox_path));
+    let result = sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle: handle.to_owned(),
+            cmd: chmod.clone(),
+            tty: false,
+            env: BTreeMap::new(),
+        })
+        .await?;
+    ensure_command_success(&chmod, &result, &[0])
+}
+
+fn ensure_command_success(
+    command: &str,
+    result: &agentenv_proto::ExecResult,
+    success_exit_codes: &[i32],
+) -> RuntimeResult<()> {
+    if command_status_succeeded(result.status, success_exit_codes) {
+        Ok(())
+    } else {
+        Err(RuntimeError::Driver(
+            crate::driver::DriverError::CommandFailed {
+                command: command.to_owned(),
+                status: Some(result.status),
+                stdout: result.stdout.clone(),
+                stderr: result.stderr.clone(),
+            },
+        ))
+    }
+}
+
+fn command_status_succeeded(status: i32, success_exit_codes: &[i32]) -> bool {
+    if success_exit_codes.is_empty() {
+        status == 0
+    } else {
+        success_exit_codes.contains(&status)
+    }
+}
+
+fn install_commands_from_steps(
+    steps: Vec<agentenv_proto::DockerfileFragment>,
+) -> RuntimeResult<Vec<AgentInstallCommand>> {
+    let mut commands = Vec::new();
+    let mut env = BTreeMap::new();
+    for step in steps {
+        for line in step.content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("ARG ") {
+                let (key, value) = parse_dockerfile_arg(rest)?;
+                env.insert(key, value);
+                continue;
+            }
+            if let Some(command) = line.strip_prefix("RUN ") {
+                commands.push(AgentInstallCommand {
+                    cmd: command.to_owned(),
+                    env: env.clone(),
+                });
+                continue;
+            }
+            return Err(RuntimeError::Driver(
+                crate::driver::DriverError::InvalidInput {
+                    message: format!("unsupported agent install Dockerfile instruction `{line}`"),
+                },
+            ));
+        }
+    }
+    Ok(commands)
+}
+
+fn parse_dockerfile_arg(input: &str) -> RuntimeResult<(String, String)> {
+    let (key, value) = input
+        .split_once('=')
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .unwrap_or((input.trim(), ""));
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(RuntimeError::Driver(
+            crate::driver::DriverError::InvalidInput {
+                message: format!("invalid agent install ARG name `{key}`"),
+            },
+        ));
+    }
+    Ok((key.to_owned(), unquote_dockerfile_arg(value)))
+}
+
+fn unquote_dockerfile_arg(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(
+            (bytes[0], bytes[value.len() - 1]),
+            (b'"', b'"') | (b'\'', b'\'')
+        ) {
+            return value[1..value.len() - 1].to_owned();
+        }
+    }
+    value.to_owned()
+}
+
+fn normalize_agent_sandbox_path(path: &str) -> RuntimeResult<String> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        return Ok(format!("/sandbox/{rest}"));
+    }
+    if path.starts_with('/') {
+        return Ok(path.to_owned());
+    }
+    Err(RuntimeError::Driver(
+        crate::driver::DriverError::InvalidInput {
+            message: format!("agent sandbox path `{path}` must be absolute or start with `~/`"),
+        },
+    ))
+}
+
+fn sandbox_parent_dir(path: &str) -> RuntimeResult<String> {
+    Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.display().to_string())
+        .ok_or_else(|| {
+            RuntimeError::Driver(crate::driver::DriverError::InvalidInput {
+                message: format!("agent sandbox path `{path}` has no parent directory"),
+            })
+        })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn empty_state(name: &str, selection: DriverSelection) -> crate::env::EnvStateFile {
@@ -1322,7 +1716,7 @@ mod tests {
         fs,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1421,6 +1815,372 @@ mod tests {
                 context: Box::new(FailingTeardownContextDriver),
                 inference: None,
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct AgentSetupTracker {
+        copied_paths: Mutex<Vec<String>>,
+        exec_cmds: Mutex<Vec<String>>,
+        create_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
+        applied_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
+        preinstall_probe_succeeds: AtomicBool,
+    }
+
+    struct AgentSetupFactory {
+        tracker: Arc<AgentSetupTracker>,
+    }
+
+    impl DriverFactory for AgentSetupFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(AgentSetupSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                agent: Box::new(AgentSetupAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct AgentSetupAgentDriver;
+
+    #[async_trait]
+    impl crate::driver::AgentDriver for AgentSetupAgentDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = super::tests_support::TinyAgentDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            super::tests_support::TinyAgentDriver
+                .preflight(params)
+                .await
+        }
+
+        async fn install_steps(
+            &self,
+            _spec: agentenv_proto::AgentSpec,
+        ) -> DriverResult<agentenv_proto::InstallStepsResult> {
+            Ok(agentenv_proto::InstallStepsResult {
+                steps: vec![agentenv_proto::DockerfileFragment {
+                    name: Some("install-agent".to_owned()),
+                    content: "RUN printf agent-installed > /tmp/agent-installed".to_owned(),
+                }],
+            })
+        }
+
+        async fn mcp_config_path(
+            &self,
+            _params: agentenv_proto::McpConfigPathParams,
+        ) -> DriverResult<agentenv_proto::McpConfigPathResult> {
+            Ok(agentenv_proto::McpConfigPathResult {
+                path: "~/.codex/config.toml".to_owned(),
+            })
+        }
+
+        async fn render_mcp_config(
+            &self,
+            _params: agentenv_proto::RenderMcpConfigParams,
+        ) -> DriverResult<agentenv_proto::RenderMcpConfigResult> {
+            Ok(agentenv_proto::RenderMcpConfigResult {
+                content: "[mcp_servers.endpoint_0]\ncommand = \"agentenv-fs-mcp\"\n".to_owned(),
+            })
+        }
+
+        async fn render_entrypoint(
+            &self,
+            _spec: agentenv_proto::AgentSpec,
+        ) -> DriverResult<agentenv_proto::RenderEntrypointResult> {
+            Ok(agentenv_proto::RenderEntrypointResult {
+                content: "#!/usr/bin/env sh\nexec codex \"$@\"\n".to_owned(),
+            })
+        }
+
+        async fn credential_requirements(
+            &self,
+            _spec: agentenv_proto::AgentSpec,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            Ok(agentenv_proto::CredentialRequirementsResult {
+                requirements: Vec::new(),
+            })
+        }
+
+        async fn health_check_probe(
+            &self,
+            _spec: agentenv_proto::AgentSpec,
+        ) -> DriverResult<agentenv_proto::AgentHealthCheckProbe> {
+            Ok(agentenv_proto::AgentHealthCheckProbe {
+                cmd: "agentenv-agent --version".to_owned(),
+                tty: false,
+                env: BTreeMap::new(),
+                success_exit_codes: vec![0],
+            })
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = super::tests_support::TinyAgentDriver;
+            inner.shutdown(params).await
+        }
+    }
+
+    struct AgentSetupSandboxDriver {
+        tracker: Arc<AgentSetupTracker>,
+    }
+
+    #[async_trait]
+    impl SandboxDriver for AgentSetupSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = TinySandboxDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            if let Some(policy) = spec.policy.clone() {
+                self.tracker
+                    .create_policies
+                    .lock()
+                    .expect("create policy tracker")
+                    .push(policy);
+            }
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            self.tracker
+                .exec_cmds
+                .lock()
+                .expect("exec tracker")
+                .push(params.cmd.clone());
+            if params.cmd == "agentenv-agent --version" {
+                let copied_paths = self.tracker.copied_paths.lock().expect("copy tracker");
+                if !copied_paths.contains(&super::AGENT_ENTRYPOINT_PATH.to_owned())
+                    && !self
+                        .tracker
+                        .preinstall_probe_succeeds
+                        .load(Ordering::SeqCst)
+                {
+                    return Ok(agentenv_proto::ExecResult {
+                        status: 127,
+                        stdout: String::new(),
+                        stderr: "agentenv-agent: not found".to_owned(),
+                    });
+                }
+            }
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            self.tracker
+                .copied_paths
+                .lock()
+                .expect("copy tracker")
+                .push(params.dst_sandbox_path.clone());
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            self.tracker
+                .applied_policies
+                .lock()
+                .expect("apply policy tracker")
+                .push(params.policy.clone());
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinySandboxDriver;
+            inner.shutdown(params).await
+        }
+    }
+
+    #[derive(Default)]
+    struct StreamTracker {
+        logs_called: AtomicBool,
+        logs_stream_called: AtomicBool,
+    }
+
+    struct StreamFactory {
+        tracker: Arc<StreamTracker>,
+    }
+
+    impl DriverFactory for StreamFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(StreamTrackingSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct StreamTrackingSandboxDriver {
+        tracker: Arc<StreamTracker>,
+    }
+
+    #[async_trait]
+    impl SandboxDriver for StreamTrackingSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = TinySandboxDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            _params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            self.tracker.logs_called.store(true, Ordering::SeqCst);
+            Ok(agentenv_proto::LogsResult {
+                entries: Vec::new(),
+            })
+        }
+
+        async fn logs_stream(
+            &self,
+            _params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            self.tracker
+                .logs_stream_called
+                .store(true, Ordering::SeqCst);
+            Ok(EmptyResult {})
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinySandboxDriver;
+            inner.shutdown(params).await
         }
     }
 
@@ -2847,6 +3607,126 @@ policy:
     }
 
     #[tokio::test]
+    async fn create_env_installs_agent_config_entrypoint_and_probe() {
+        let root = unique_root("agentenv-agent-setup");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        let copied_paths = tracker.copied_paths.lock().expect("copy tracker").clone();
+        assert!(copied_paths.contains(&"/sandbox/.codex/config.toml".to_owned()));
+        assert!(copied_paths.contains(&super::AGENT_ENTRYPOINT_PATH.to_owned()));
+        let exec_cmds = tracker.exec_cmds.lock().expect("exec tracker").clone();
+        assert!(exec_cmds
+            .iter()
+            .any(|cmd| cmd.contains("printf agent-installed")));
+        assert!(exec_cmds
+            .iter()
+            .any(|cmd| cmd.contains("chmod 0755") && cmd.contains(super::AGENT_ENTRYPOINT_PATH)));
+        assert!(exec_cmds
+            .iter()
+            .any(|cmd| cmd == "agentenv-agent --version"));
+        let create_policies = tracker
+            .create_policies
+            .lock()
+            .expect("create policy tracker")
+            .clone();
+        assert_eq!(create_policies.len(), 1);
+        assert!(create_policies[0]
+            .network
+            .allow
+            .contains(&super::agent_install_npm_registry_rule()));
+        let applied_policies = tracker
+            .applied_policies
+            .lock()
+            .expect("apply policy tracker")
+            .clone();
+        assert_eq!(applied_policies.len(), 1);
+        assert!(!applied_policies[0]
+            .network
+            .allow
+            .contains(&super::agent_install_npm_registry_rule()));
+        assert!(
+            !options
+                .root
+                .join("envs")
+                .join("demo")
+                .join("agent")
+                .exists(),
+            "rendered agent files can contain credentials and must not persist in the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_skips_agent_install_when_probe_already_passes() {
+        let root = unique_root("agentenv-agent-preinstalled");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        tracker
+            .preinstall_probe_succeeds
+            .store(true, Ordering::SeqCst);
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        let exec_cmds = tracker.exec_cmds.lock().expect("exec tracker").clone();
+        assert!(exec_cmds
+            .iter()
+            .any(|cmd| cmd == "agentenv-agent --version"));
+        assert!(!exec_cmds
+            .iter()
+            .any(|cmd| cmd.contains("printf agent-installed")));
+    }
+
+    #[tokio::test]
     async fn create_env_preserves_existing_hidden_env_name_during_reservation() {
         let root = unique_root("agentenv-hidden-reservation");
         let hidden_env_dir = root.join("envs").join(".demo.creating");
@@ -3303,12 +4183,61 @@ policy:
     #[tokio::test]
     async fn enter_env_returns_shell_handle() {
         let (options, factory) = command_test_runtime("enter").await;
-        let shell = super::enter_env(&options, &factory, "demo", false)
+        let shell = super::enter_env(&options, &factory, "demo", true)
             .await
             .unwrap();
 
+        let super::EnterResult::Detached(shell) = shell else {
+            panic!("detached enter should return a shell handle");
+        };
         assert_eq!(shell.session_id, "sh-1");
         assert!(shell.tty);
+    }
+
+    #[tokio::test]
+    async fn enter_env_attaches_to_agent_entrypoint_when_not_detached() {
+        let root = unique_root("agentenv-enter-attached");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+        tracker.exec_cmds.lock().expect("exec tracker").clear();
+
+        let result = super::enter_env(&options, &factory, "demo", false)
+            .await
+            .unwrap();
+
+        let super::EnterResult::Attached(result) = result else {
+            panic!("attached enter should return an exec result");
+        };
+        assert_eq!(result.status, 0);
+        assert_eq!(
+            tracker.exec_cmds.lock().expect("exec tracker").as_slice(),
+            &[super::AGENT_ENTRYPOINT_PATH.to_owned()]
+        );
     }
 
     #[tokio::test]
@@ -3319,6 +4248,23 @@ policy:
             .unwrap();
 
         assert!(logs.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_logs_stream_env_uses_sandbox_streaming_path() {
+        let (options, _) = command_test_runtime("logs-stream").await;
+        let tracker = Arc::new(StreamTracker::default());
+        let factory = StreamFactory {
+            tracker: Arc::clone(&tracker),
+        };
+
+        let guard = super::start_logs_stream_env(&options, &factory, "demo")
+            .await
+            .unwrap();
+
+        assert!(tracker.logs_stream_called.load(Ordering::SeqCst));
+        assert!(!tracker.logs_called.load(Ordering::SeqCst));
+        drop(guard);
     }
 
     #[tokio::test]

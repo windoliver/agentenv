@@ -298,6 +298,7 @@ async fn run_create(args: CreateArgs) -> Result<()> {
         let mut provider = CliCredentialProvider {
             store,
             non_interactive: args.non_interactive,
+            prompter: Box::new(TerminalCredentialPrompter),
         };
         match agentenv_core::runtime::create_env(
             &options,
@@ -330,15 +331,26 @@ async fn run_create(args: CreateArgs) -> Result<()> {
 
 async fn run_enter(args: EnterArgs) -> Result<()> {
     let options = runtime_options(true)?;
-    let shell = agentenv_core::runtime::enter_env(
+    match agentenv_core::runtime::enter_env(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
         args.detach,
     )
-    .await?;
-    println!("{}", shell.session_id);
-    Ok(())
+    .await?
+    {
+        agentenv_core::runtime::EnterResult::Detached(shell) => {
+            println!("{}", shell.session_id);
+            Ok(())
+        }
+        agentenv_core::runtime::EnterResult::Attached(result) => {
+            print!("{}", result.stdout);
+            eprint!("{}", result.stderr);
+            io::stdout().flush().context("flush forwarded stdout")?;
+            io::stderr().flush().context("flush forwarded stderr")?;
+            process::exit(result.status);
+        }
+    }
 }
 
 fn run_list(args: ListArgs) -> Result<()> {
@@ -424,6 +436,18 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
     let options = runtime_options(true)?;
     if let Some(driver) = args.driver.as_deref().filter(|driver| *driver != "sandbox") {
         print_event_logs(&options, &args.name, Some(driver), args.follow)?;
+        return Ok(());
+    }
+    if args.follow {
+        let _guard = agentenv_core::runtime::start_logs_stream_env(
+            &options,
+            &builtin_factory::BuiltInDriverFactory,
+            &args.name,
+        )
+        .await?;
+        tokio::signal::ctrl_c()
+            .await
+            .context("wait for log stream interrupt")?;
         return Ok(());
     }
     let logs = agentenv_core::runtime::logs_env(
@@ -623,6 +647,40 @@ fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::Runt
 struct CliCredentialProvider {
     store: CredentialStore,
     non_interactive: bool,
+    prompter: Box<dyn CredentialPrompter>,
+}
+
+trait CredentialPrompter {
+    fn prompt(
+        &mut self,
+        requirement: &agentenv_proto::CredentialRequirement,
+    ) -> agentenv_core::runtime::RuntimeResult<SecretString>;
+}
+
+struct TerminalCredentialPrompter;
+
+impl CredentialPrompter for TerminalCredentialPrompter {
+    fn prompt(
+        &mut self,
+        requirement: &agentenv_proto::CredentialRequirement,
+    ) -> agentenv_core::runtime::RuntimeResult<SecretString> {
+        let mut prompt = format!("Enter value for `{}`", requirement.name);
+        if !requirement.description.trim().is_empty() {
+            prompt.push_str(&format!(" ({})", requirement.description));
+        }
+        prompt.push_str(": ");
+        let value = rpassword::prompt_password(prompt).map_err(|source| {
+            agentenv_core::runtime::RuntimeError::Driver(
+                agentenv_core::driver::DriverError::InvalidInput {
+                    message: format!(
+                        "failed to prompt for credential `{}`: {source}",
+                        requirement.name
+                    ),
+                },
+            )
+        })?;
+        Ok(SecretString::new(value))
+    }
 }
 
 impl agentenv_core::runtime::CredentialProvider for CliCredentialProvider {
@@ -644,15 +702,19 @@ impl agentenv_core::runtime::CredentialProvider for CliCredentialProvider {
                 })
             }
             Err(CredentialStoreError::MissingCredential { .. }) => {
-                Err(agentenv_core::runtime::RuntimeError::MissingCredential {
-                    name: name.to_owned(),
-                })
+                let prompted = self.prompter.prompt(requirement)?;
+                self.store
+                    .store(name, &prompted)
+                    .map_err(credential_store_runtime_error)?;
+                let resolved = self
+                    .store
+                    .resolve(name, requirement)
+                    .map_err(credential_store_runtime_error)?;
+                Ok(Some(agentenv_core::runtime::RuntimeSecret::new(
+                    resolved.expose_secret().to_owned(),
+                )))
             }
-            Err(error) => Err(agentenv_core::runtime::RuntimeError::Driver(
-                agentenv_core::driver::DriverError::InvalidInput {
-                    message: error.to_string(),
-                },
-            )),
+            Err(error) => Err(credential_store_runtime_error(error)),
         }
     }
 
@@ -664,6 +726,14 @@ impl agentenv_core::runtime::CredentialProvider for CliCredentialProvider {
             .flatten()
             .map(|backend| backend.to_string()))
     }
+}
+
+fn credential_store_runtime_error(
+    error: CredentialStoreError,
+) -> agentenv_core::runtime::RuntimeError {
+    agentenv_core::runtime::RuntimeError::Driver(agentenv_core::driver::DriverError::InvalidInput {
+        message: error.to_string(),
+    })
 }
 
 fn run_credentials(args: CredentialsArgs) -> Result<()> {
@@ -1045,6 +1115,9 @@ mod tests {
         let mut provider = CliCredentialProvider {
             store,
             non_interactive: true,
+            prompter: Box::new(StaticCredentialPrompt {
+                value: SecretString::new("unused"),
+            }),
         };
         let requirement = CredentialRequirement {
             name,
@@ -1065,22 +1138,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interactive_provider_prompts_and_stores_missing_required_credential() {
+        let store_root = make_temp_dir("interactive-credential-prompt");
+        let name = format!("AGENTENV_PROMPTED_TOKEN_{}", unique_test_suffix());
+        let store = CredentialStore::new(CredentialStoreConfig::from_root_dir(&store_root))
+            .expect("credential store");
+        let mut provider = CliCredentialProvider {
+            store,
+            non_interactive: false,
+            prompter: Box::new(StaticCredentialPrompt {
+                value: SecretString::new("sk-from-prompt"),
+            }),
+        };
+        let requirement = CredentialRequirement {
+            name: name.clone(),
+            kind: CredentialKind::ApiKey,
+            required: true,
+            description: "prompted test token".to_owned(),
+            validator: Some(ValidatorSpec::Regex {
+                pattern: "^sk-".to_owned(),
+            }),
+        };
+
+        let secret = CredentialProvider::resolve(&mut provider, &requirement)
+            .expect("prompted credential should resolve")
+            .expect("required credential should be present");
+
+        assert_eq!(secret.expose_secret(), "sk-from-prompt");
+        let stored = provider
+            .store
+            .resolve(&name, &requirement)
+            .expect("prompted credential should be stored");
+        assert_eq!(stored.expose_secret(), "sk-from-prompt");
+    }
+
+    struct StaticCredentialPrompt {
+        value: SecretString,
+    }
+
+    impl super::CredentialPrompter for StaticCredentialPrompt {
+        fn prompt(
+            &mut self,
+            _requirement: &CredentialRequirement,
+        ) -> agentenv_core::runtime::RuntimeResult<SecretString> {
+            Ok(self.value.clone())
+        }
+    }
+
     fn fixture_blueprint() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../blueprints/claude+filesystem+openshell.yaml")
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
-        let unique = format!(
-            "{prefix}-{}-{}",
+        let unique = format!("{prefix}-{}", unique_test_suffix());
+        let path = env::temp_dir().join(unique);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn unique_test_suffix() -> String {
+        format!(
+            "{}-{}",
             process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        );
-        let path = env::temp_dir().join(unique);
-        fs::create_dir_all(&path).unwrap();
-        path
+        )
     }
 }

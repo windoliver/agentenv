@@ -2,16 +2,11 @@
 # Uses two subprocess (Python) drivers: agent-hermes and context-nexus.
 # Installed driver directories are expected at ~/.agentenv/drivers/agent-hermes/
 # and ~/.agentenv/drivers/context-nexus/.
-# Current supported flow:
+# Supported flows:
 #   agentenv drivers list
-#
-# Limitation: full agentenv create execution for this blueprint still needs
-# subprocess AgentDriver host integration in agentenv-core.
-#
-# Future usage after that integration lands:
-#   export NEXUS_HUB_URL=https://nexus.company.com
-#   export NEXUS_TOKEN=...
 #   agentenv create research --blueprint blueprints/hermes+nexus+openshell.yaml
+#   agentenv status research
+#   agentenv destroy research --yes
 
 version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0

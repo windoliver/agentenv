@@ -4,13 +4,13 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parents[1]
 
 
-def test_readme_documents_install_tests_and_host_limit():
+def test_readme_documents_install_tests_and_cli_lifecycle():
     text = (ROOT / "README.md").read_text()
 
     assert "scripts/install-driver.sh" in text
     assert "scripts/run-tests.sh" in text
     assert "agentenv create" in text
-    assert "subprocess AgentDriver host integration" in text
+    assert "agentenv destroy" in text
 
 
 def test_reference_blueprint_names_external_driver_directory():
@@ -18,4 +18,4 @@ def test_reference_blueprint_names_external_driver_directory():
 
     assert "agent-hermes" in text
     assert "agentenv drivers list" in text
-    assert "subprocess AgentDriver host integration" in text
+    assert "agentenv destroy" in text
