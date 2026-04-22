@@ -107,12 +107,30 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn spawn(driver_path: &Path) -> Result<Self> {
-        let mut child = Command::new(driver_path)
+        let mut command = Command::new(driver_path);
+        Self::spawn_command(
+            &mut command,
+            format!("spawn driver `{}`", driver_path.display()),
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    fn spawn_shell_script(script_path: &Path) -> Result<Self> {
+        let mut command = Command::new("/bin/sh");
+        command.arg(script_path);
+        Self::spawn_command(
+            &mut command,
+            format!("spawn driver script `{}`", script_path.display()),
+        )
+    }
+
+    fn spawn_command(command: &mut Command, context: String) -> Result<Self> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("spawn driver `{}`", driver_path.display()))?;
+            .with_context(|| context)?;
 
         let stdin = child
             .stdin
@@ -812,7 +830,8 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&script_path, permissions).expect("make sleeping script executable");
 
-        let mut client = RpcClient::spawn(&script_path).expect("spawn sleeping script");
+        let mut client =
+            RpcClient::spawn_shell_script(&script_path).expect("spawn sleeping script");
         let err = client
             .wait_for_exit_timeout(Duration::from_millis(20))
             .expect_err("sleeping script should time out");
@@ -852,7 +871,7 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&script_path, permissions).expect("make silent script executable");
 
-        let mut client = RpcClient::spawn(&script_path).expect("spawn silent script");
+        let mut client = RpcClient::spawn_shell_script(&script_path).expect("spawn silent script");
         let err = client
             .call_success_timeout::<_, EmptyResult>(
                 1,
@@ -909,7 +928,8 @@ mod tests {
         fs::set_permissions(&script_path, permissions)
             .expect("make inherited-stdout script executable");
 
-        let mut client = RpcClient::spawn(&script_path).expect("spawn inherited-stdout script");
+        let mut client =
+            RpcClient::spawn_shell_script(&script_path).expect("spawn inherited-stdout script");
         let wait_started = Instant::now();
         while !pid_path.exists() {
             assert!(
