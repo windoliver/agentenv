@@ -843,8 +843,20 @@ pub async fn reproduce_env(
     }
 
     check_required_lockfile_credentials(credentials, &lockfile)?;
+    let credential_aliases = credential_aliases_from_portable_lockfile(&lockfile);
     let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
-    create_env(options, factory, credentials, name, &blueprint_yaml).await
+    let mut aliased_credentials = ReproducedCredentialProvider {
+        inner: credentials,
+        aliases: credential_aliases,
+    };
+    create_env(
+        options,
+        factory,
+        &mut aliased_credentials,
+        name,
+        &blueprint_yaml,
+    )
+    .await
 }
 
 fn validate_frozen_lockfile_pins(
@@ -927,6 +939,47 @@ fn check_required_lockfile_credentials(
     }
 
     Ok(())
+}
+
+fn credential_aliases_from_portable_lockfile(
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> BTreeMap<String, String> {
+    lockfile
+        .credentials
+        .iter()
+        .filter_map(|(name, credential)| {
+            credential
+                .reference
+                .as_ref()
+                .filter(|reference| *reference != name)
+                .map(|reference| (name.clone(), reference.clone()))
+        })
+        .collect()
+}
+
+struct ReproducedCredentialProvider<'a> {
+    inner: &'a mut dyn CredentialProvider,
+    aliases: BTreeMap<String, String>,
+}
+
+impl CredentialProvider for ReproducedCredentialProvider<'_> {
+    fn resolve(
+        &mut self,
+        requirement: &agentenv_proto::CredentialRequirement,
+    ) -> RuntimeResult<Option<RuntimeSecret>> {
+        let Some(reference) = self.aliases.get(&requirement.name) else {
+            return self.inner.resolve(requirement);
+        };
+
+        let mut aliased_requirement = requirement.clone();
+        aliased_requirement.name = reference.clone();
+        self.inner.resolve(&aliased_requirement)
+    }
+
+    fn backend_name(&self, name: &str) -> RuntimeResult<Option<String>> {
+        let reference = self.aliases.get(name).map_or(name, String::as_str);
+        self.inner.backend_name(reference)
+    }
 }
 
 fn blueprint_yaml_from_portable_lockfile(
