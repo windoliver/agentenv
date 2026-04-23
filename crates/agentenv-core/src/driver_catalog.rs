@@ -156,6 +156,10 @@ impl DriverCatalog {
             registry.register_version(entry.kind, entry.name.clone(), entry.version.clone());
         }
     }
+
+    pub fn registry_entries(&self) -> impl Iterator<Item = &DiscoveredDriver> {
+        self.registry_entries.iter()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

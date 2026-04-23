@@ -23,6 +23,20 @@ fn driver_root_digest_is_stable_across_file_creation_order() {
 }
 
 #[test]
+fn driver_root_digest_delimits_file_payloads_from_later_entries() {
+    let one_file = tempfile_dir("driver-root-one-file");
+    let two_files = tempfile_dir("driver-root-two-files");
+    write_bytes(&one_file, "a", b"payloadfile\0b\0tail");
+    write_bytes(&two_files, "a", b"payload");
+    write_bytes(&two_files, "b", b"tail");
+
+    let one_file_digest = digest_driver_root(&one_file).unwrap();
+    let two_files_digest = digest_driver_root(&two_files).unwrap();
+
+    assert_ne!(one_file_digest, two_files_digest);
+}
+
+#[test]
 #[cfg(unix)]
 fn driver_root_digest_hashes_symlink_metadata_without_following() {
     let root = tempfile_dir("driver-root-symlink");
@@ -49,6 +63,20 @@ fn driver_root_digest_changes_when_symlink_target_text_changes() {
     let right_digest = digest_driver_root(&right).unwrap();
 
     assert_ne!(left_digest, right_digest);
+}
+
+#[test]
+#[cfg(unix)]
+fn driver_root_digest_does_not_collapse_backslash_filename() {
+    let backslash_name = tempfile_dir("driver-root-backslash-name");
+    let nested_name = tempfile_dir("driver-root-nested-name");
+    write_file(&backslash_name, "a\\b", "same bytes\n");
+    write_file(&nested_name, "a/b", "same bytes\n");
+
+    let backslash_digest = digest_driver_root(&backslash_name).unwrap();
+    let nested_digest = digest_driver_root(&nested_name).unwrap();
+
+    assert_ne!(backslash_digest, nested_digest);
 }
 
 #[test]
@@ -106,6 +134,39 @@ fn discover_driver_artifacts_hashes_built_ins_from_override_binary() {
 }
 
 #[test]
+fn discover_driver_artifacts_includes_shadowed_subprocess_digest() {
+    let installed = tempfile_dir("shadowed-installed-drivers");
+    let override_parent = tempfile_dir("shadowing-override-drivers");
+    let installed_root = installed.join("context-demo");
+    let override_root = override_parent.join("context-demo");
+    let built_in_binary = installed.join("agentenv-test-binary");
+    write_file(&installed, "agentenv-test-binary", "fake agentenv binary\n");
+    write_driver_manifest(&installed_root, "demo-context", "context", "1.0.0");
+    write_driver_manifest(&override_root, "demo-context", "context", "2.0.0");
+
+    let artifacts = discover_driver_artifacts(
+        DriverDiscoveryConfig::new(installed, vec![override_parent]),
+        Some(built_in_binary),
+    )
+    .unwrap();
+
+    let mut demo_versions: Vec<_> = artifacts
+        .iter()
+        .filter(|item| item.kind == DriverKind::Context && item.name == "demo-context")
+        .map(|item| (item.version.to_string(), item.source))
+        .collect();
+    demo_versions.sort();
+
+    assert_eq!(
+        demo_versions,
+        vec![
+            ("1.0.0".to_string(), DriverSource::InstalledSubprocess),
+            ("2.0.0".to_string(), DriverSource::DevelopmentOverride),
+        ]
+    );
+}
+
+#[test]
 fn digest_driver_root_rejects_missing_root() {
     let root = tempfile_dir("missing-driver-root");
     fs::remove_dir(&root).unwrap();
@@ -129,7 +190,28 @@ fn tempfile_dir(prefix: &str) -> std::path::PathBuf {
 }
 
 fn write_file(root: &std::path::Path, relative: &str, contents: &str) {
+    write_bytes(root, relative, contents.as_bytes());
+}
+
+fn write_bytes(root: &std::path::Path, relative: &str, contents: &[u8]) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
+}
+
+fn write_driver_manifest(root: &std::path::Path, name: &str, kind: &str, version: &str) {
+    write_file(root, "bin/driver", "#!/bin/sh\nexit 0\n");
+    write_file(
+        root,
+        "manifest.json",
+        &format!(
+            r#"{{
+          "schema_version": "1.0",
+          "name": "{name}",
+          "kind": "{kind}",
+          "version": "{version}",
+          "binary": "./bin/driver"
+        }}"#
+        ),
+    );
 }

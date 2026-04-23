@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -9,7 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    driver_catalog::{DriverCatalog, DriverDiscoveryConfig, DriverSource},
+    driver_catalog::{DiscoveredDriver, DriverCatalog, DriverDiscoveryConfig, DriverSource},
     registry::DriverKind,
 };
 
@@ -60,7 +61,18 @@ pub fn discover_driver_artifacts(
     let built_in_digest = digest_file(&built_in_path)?;
 
     let mut artifacts = Vec::new();
-    for entry in catalog.entries {
+    let mut seen = BTreeSet::new();
+    for entry in catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.source == DriverSource::BuiltIn)
+        .chain(catalog.registry_entries())
+    {
+        let key = artifact_key(entry);
+        if !seen.insert(key) {
+            continue;
+        }
+
         let (digest, install_hint) = match entry.source {
             DriverSource::BuiltIn => (built_in_digest.clone(), None),
             DriverSource::InstalledSubprocess | DriverSource::DevelopmentOverride => {
@@ -77,8 +89,8 @@ pub fn discover_driver_artifacts(
 
         artifacts.push(DriverArtifact {
             kind: entry.kind,
-            name: entry.name,
-            version: entry.version,
+            name: entry.name.clone(),
+            version: entry.version.clone(),
             source: entry.source,
             digest,
             install_hint,
@@ -99,26 +111,33 @@ pub fn discover_driver_artifacts(
 pub fn digest_driver_root(root: &Path) -> Result<String, DriverArtifactError> {
     let mut entries = Vec::new();
     collect_entries(root, root, &mut entries)?;
-    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    entries.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
 
     let mut hasher = Sha256::new();
     for entry in entries {
-        let path = root.join(&entry.relative);
-        hasher.update(entry.kind.marker());
-        hasher.update([0]);
-        hasher.update(entry.relative.as_bytes());
-        hasher.update([0]);
+        update_field(&mut hasher, b"entry");
+        update_field(&mut hasher, entry.kind.marker());
+        update_field(&mut hasher, &entry.sort_key);
 
         match entry.kind {
             ArtifactEntryKind::Directory => {}
-            ArtifactEntryKind::File => hash_file_bytes(&path, &mut hasher)?,
+            ArtifactEntryKind::File => {
+                let metadata =
+                    fs::metadata(&entry.path).map_err(|source| DriverArtifactError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    })?;
+                update_payload_len(&mut hasher, metadata.len());
+                hash_file_bytes(&entry.path, &mut hasher)?;
+            }
             ArtifactEntryKind::Symlink => {
-                let target = fs::read_link(&path).map_err(|source| DriverArtifactError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-                hasher.update(target.to_string_lossy().as_bytes());
-                hasher.update([0]);
+                let target =
+                    fs::read_link(&entry.path).map_err(|source| DriverArtifactError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    })?;
+                let target_bytes = path_bytes(&target);
+                update_field(&mut hasher, &target_bytes);
             }
         }
     }
@@ -132,9 +151,20 @@ pub fn digest_file(path: &Path) -> Result<String, DriverArtifactError> {
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
+fn artifact_key(entry: &DiscoveredDriver) -> (DriverKind, String, Version, DriverSource, PathBuf) {
+    (
+        entry.kind,
+        entry.name.clone(),
+        entry.version.clone(),
+        entry.source,
+        entry.manifest_path.clone().unwrap_or_default(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArtifactEntry {
-    relative: String,
+    path: PathBuf,
+    sort_key: Vec<u8>,
     kind: ArtifactEntryKind,
 }
 
@@ -185,8 +215,10 @@ fn collect_entries(
             continue;
         };
 
+        let relative = normalized_relative_path(root, &path)?;
         entries.push(ArtifactEntry {
-            relative: normalized_relative_path(root, &path)?,
+            path: path.clone(),
+            sort_key: path_bytes(&relative),
             kind,
         });
 
@@ -198,15 +230,13 @@ fn collect_entries(
     Ok(())
 }
 
-fn normalized_relative_path(root: &Path, path: &Path) -> Result<String, DriverArtifactError> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| DriverArtifactError::PathEscapesRoot {
+fn normalized_relative_path(root: &Path, path: &Path) -> Result<PathBuf, DriverArtifactError> {
+    path.strip_prefix(root).map(Path::to_path_buf).map_err(|_| {
+        DriverArtifactError::PathEscapesRoot {
             root: root.to_path_buf(),
             path: path.to_path_buf(),
-        })?;
-
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+        }
+    })
 }
 
 fn hash_file_bytes(path: &Path, hasher: &mut Sha256) -> Result<(), DriverArtifactError> {
@@ -230,4 +260,49 @@ fn hash_file_bytes(path: &Path, hasher: &mut Sha256) -> Result<(), DriverArtifac
     }
 
     Ok(())
+}
+
+fn update_field(hasher: &mut Sha256, bytes: &[u8]) {
+    update_payload_len(hasher, bytes.len() as u64);
+    hasher.update(bytes);
+}
+
+fn update_payload_len(hasher: &mut Sha256, len: u64) {
+    hasher.update(len.to_be_bytes());
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for component in path.components() {
+        let (tag, value) = component_parts(component);
+        bytes.push(tag);
+        update_component_bytes(&mut bytes, value);
+    }
+    bytes
+}
+
+#[cfg(not(unix))]
+fn component_parts(component: std::path::Component<'_>) -> (u8, &std::ffi::OsStr) {
+    match component {
+        std::path::Component::Prefix(prefix) => (b'p', prefix.as_os_str()),
+        std::path::Component::RootDir => (b'r', std::ffi::OsStr::new("")),
+        std::path::Component::CurDir => (b'c', std::ffi::OsStr::new("")),
+        std::path::Component::ParentDir => (b'u', std::ffi::OsStr::new("")),
+        std::path::Component::Normal(value) => (b'n', value),
+    }
+}
+
+#[cfg(not(unix))]
+fn update_component_bytes(bytes: &mut Vec<u8>, value: &std::ffi::OsStr) {
+    let encoded = value.as_encoded_bytes();
+    bytes.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(encoded);
 }
