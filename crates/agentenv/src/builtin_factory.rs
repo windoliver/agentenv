@@ -4,7 +4,10 @@ use agentenv_core::{
     driver::{DriverError, InferenceDriver},
     driver_catalog::{DiscoveredDriver, DriverCatalog, DriverSource},
     registry::DriverKind as CatalogKind,
-    runtime::{DriverFactory, DriverSelection, DriverSet, RuntimeError, RuntimeResult},
+    runtime::{
+        DriverFactory, DriverPinIdentity, DriverPinSet, DriverSelection, DriverSet, RuntimeError,
+        RuntimeResult,
+    },
 };
 
 #[allow(dead_code)]
@@ -96,6 +99,153 @@ impl DriverFactory for BuiltInDriverFactory {
             },
         })
     }
+
+    fn build_pinned(
+        &self,
+        selection: &DriverSelection,
+        pins: &DriverPinSet,
+    ) -> RuntimeResult<DriverSet> {
+        let mut catalog = None;
+        Ok(DriverSet {
+            sandbox: build_pinned_sandbox(selection, pins)?,
+            agent: build_pinned_agent(selection, pins.get("agent"), &mut catalog)?,
+            context: build_pinned_context(selection, pins.get("context"), &mut catalog)?,
+            inference: build_pinned_inference(selection)?,
+        })
+    }
+}
+
+fn build_pinned_sandbox(
+    selection: &DriverSelection,
+    _pins: &DriverPinSet,
+) -> RuntimeResult<Box<dyn agentenv_core::driver::SandboxDriver>> {
+    match selection.sandbox.as_str() {
+        "openshell" | "sandbox-openshell" => {
+            Ok(Box::new(sandbox_openshell::OpenShellDriver::default()))
+        }
+        other => Err(RuntimeError::UnsupportedDriver {
+            kind: "sandbox",
+            name: other.to_owned(),
+        }),
+    }
+}
+
+fn build_pinned_agent(
+    selection: &DriverSelection,
+    pin: Option<&DriverPinIdentity>,
+    catalog: &mut Option<DriverCatalog>,
+) -> RuntimeResult<Box<dyn agentenv_core::driver::AgentDriver>> {
+    match pin {
+        Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
+            let Some(source) = subprocess_source_from_pin(&pin.source) else {
+                return Err(RuntimeError::UnsupportedDriver {
+                    kind: "agent",
+                    name: pin.name.clone(),
+                });
+            };
+            match exact_subprocess_entry(
+                catalog,
+                CatalogKind::Agent,
+                &pin.name,
+                &pin.version,
+                source,
+            )? {
+                Some(entry) => Ok(Box::new(
+                    agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
+                        entry,
+                        SUBPROCESS_DRIVER_TIMEOUT,
+                    )?,
+                )),
+                None => Err(RuntimeError::UnsupportedDriver {
+                    kind: "agent",
+                    name: pin.name.clone(),
+                }),
+            }
+        }
+        _ => match selection.agent.as_str() {
+            "claude" | "agent-claude" => Ok(Box::new(agent_claude::ClaudeDriver)),
+            "codex" | "agent-codex" => Ok(Box::new(agent_codex::CodexDriver)),
+            "openclaw" | "agent-openclaw" => Ok(Box::new(agent_openclaw::OpenClawDriver)),
+            other => Err(RuntimeError::UnsupportedDriver {
+                kind: "agent",
+                name: other.to_owned(),
+            }),
+        },
+    }
+}
+
+fn build_pinned_context(
+    selection: &DriverSelection,
+    pin: Option<&DriverPinIdentity>,
+    catalog: &mut Option<DriverCatalog>,
+) -> RuntimeResult<Box<dyn agentenv_core::driver::ContextDriver>> {
+    match pin {
+        Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
+            let Some(source) = subprocess_source_from_pin(&pin.source) else {
+                return Err(RuntimeError::UnsupportedDriver {
+                    kind: "context",
+                    name: pin.name.clone(),
+                });
+            };
+            match exact_subprocess_entry(
+                catalog,
+                CatalogKind::Context,
+                &pin.name,
+                &pin.version,
+                source,
+            )? {
+                Some(entry) => Ok(Box::new(
+                    agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
+                        entry,
+                        SUBPROCESS_DRIVER_TIMEOUT,
+                    )?,
+                )),
+                None => Err(RuntimeError::UnsupportedDriver {
+                    kind: "context",
+                    name: pin.name.clone(),
+                }),
+            }
+        }
+        _ => match selection.context.as_str() {
+            "filesystem" | "context-filesystem" => Ok(Box::new(
+                context_filesystem::FilesystemContextDriver::default(),
+            )),
+            "mcp-generic" | "context-mcp-generic" => Ok(Box::new(
+                context_mcp_generic::GenericMcpContextDriver::default(),
+            )),
+            "none" | "context-none" => Ok(Box::new(context_none::NoneContextDriver)),
+            other => Err(RuntimeError::UnsupportedDriver {
+                kind: "context",
+                name: other.to_owned(),
+            }),
+        },
+    }
+}
+
+fn build_pinned_inference(
+    selection: &DriverSelection,
+) -> RuntimeResult<Option<Box<dyn InferenceDriver>>> {
+    match selection.inference.as_deref() {
+        None => Ok(None),
+        Some("passthrough" | "inference-passthrough") => Ok(Some(Box::new(
+            inference_passthrough::PassthroughInferenceDriver,
+        )
+            as Box<dyn InferenceDriver>)),
+        Some("openai" | "inference-openai") => Ok(Some(Box::new(
+            inference_openai::OpenAiInferenceDriver,
+        ) as Box<dyn InferenceDriver>)),
+        Some("anthropic" | "inference-anthropic") => Ok(Some(Box::new(
+            inference_anthropic::AnthropicInferenceDriver,
+        )
+            as Box<dyn InferenceDriver>)),
+        Some("ollama" | "inference-ollama") => Ok(Some(Box::new(
+            inference_ollama::OllamaInferenceDriver,
+        ) as Box<dyn InferenceDriver>)),
+        Some(other) => Err(RuntimeError::UnsupportedDriver {
+            kind: "inference",
+            name: other.to_owned(),
+        }),
+    }
 }
 
 fn discover_catalog() -> RuntimeResult<DriverCatalog> {
@@ -126,11 +276,53 @@ fn subprocess_entry(
         .cloned())
 }
 
+fn exact_subprocess_entry(
+    catalog: &mut Option<DriverCatalog>,
+    kind: CatalogKind,
+    name: &str,
+    version: &str,
+    source: DriverSource,
+) -> RuntimeResult<Option<DiscoveredDriver>> {
+    if catalog.is_none() {
+        *catalog = Some(discover_catalog()?);
+    }
+    let Some(catalog) = catalog.as_ref() else {
+        return Ok(None);
+    };
+    Ok(catalog
+        .registry_entries()
+        .find(|entry| {
+            entry.kind == kind
+                && entry.name == name
+                && entry.version.to_string() == version
+                && entry.source == source
+        })
+        .cloned())
+}
+
+fn subprocess_source_from_pin(
+    source: &agentenv_core::lockfile::DriverSourcePin,
+) -> Option<DriverSource> {
+    match source {
+        agentenv_core::lockfile::DriverSourcePin::BuiltIn => None,
+        agentenv_core::lockfile::DriverSourcePin::Installed => {
+            Some(DriverSource::InstalledSubprocess)
+        }
+        agentenv_core::lockfile::DriverSourcePin::Override => {
+            Some(DriverSource::DevelopmentOverride)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use agentenv_core::runtime::{DriverFactory, DriverSelection};
+    use agentenv_core::{
+        driver_catalog::DriverSource,
+        registry::DriverKind as CatalogKind,
+        runtime::{DriverFactory, DriverSelection},
+    };
 
     use super::BuiltInDriverFactory;
 
@@ -224,6 +416,50 @@ mod tests {
 
         let set = BuiltInDriverFactory.build(&selection).unwrap();
         drop(set);
+    }
+
+    #[test]
+    fn pinned_subprocess_selection_uses_exact_installed_source_when_override_shares_name_version() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let installed = home
+            .join(".agentenv")
+            .join("drivers")
+            .join("agent-hermes-installed");
+        let override_driver = temp.path().join("agent-hermes-override");
+        write_manifest(&installed, "agent", "hermes", "agentenv-driver-hermes");
+        write_manifest(
+            &override_driver,
+            "agent",
+            "hermes",
+            "agentenv-driver-hermes",
+        );
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            ("AGENTENV_DRIVER_PATH", override_driver.into_os_string()),
+        ]);
+        let mut catalog = None;
+
+        let selected = super::exact_subprocess_entry(
+            &mut catalog,
+            CatalogKind::Agent,
+            "hermes",
+            "0.1.0",
+            DriverSource::InstalledSubprocess,
+        )
+        .expect("exact selection")
+        .expect("installed hermes selected");
+
+        assert_eq!(selected.source, DriverSource::InstalledSubprocess);
+        assert_eq!(
+            selected
+                .manifest_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .expect("manifest parent"),
+            installed.as_path()
+        );
     }
 
     fn write_manifest(root: &std::path::Path, kind: &str, name: &str, binary_name: &str) {

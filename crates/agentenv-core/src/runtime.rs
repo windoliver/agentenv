@@ -37,6 +37,61 @@ pub struct DriverSelection {
     pub inference: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverPinIdentity {
+    pub kind: DriverKind,
+    pub name: String,
+    pub version: String,
+    pub source: crate::lockfile::DriverSourcePin,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DriverPinSet {
+    pins: BTreeMap<String, DriverPinIdentity>,
+}
+
+impl DriverPinSet {
+    pub fn from_portable_lockfile(
+        lockfile: &crate::lockfile::PortableLockfile,
+    ) -> RuntimeResult<Self> {
+        let mut pins = BTreeMap::new();
+        for (role, pin) in &lockfile.drivers {
+            let kind = parse_driver_kind(&pin.kind).ok_or_else(|| {
+                RuntimeError::PortableLockfileVerification {
+                    details: format!(
+                        "pinned {role} driver has unsupported kind `{}` and cannot be materialized",
+                        pin.kind
+                    ),
+                }
+            })?;
+            pins.insert(
+                role.clone(),
+                DriverPinIdentity {
+                    kind,
+                    name: pin.name.clone(),
+                    version: pin.version.clone(),
+                    source: pin.source.clone(),
+                    digest: pin.digest.clone(),
+                },
+            );
+        }
+        Ok(Self { pins })
+    }
+
+    pub fn get(&self, role: &str) -> Option<&DriverPinIdentity> {
+        self.pins.get(role)
+    }
+
+    pub fn roles(&self) -> impl Iterator<Item = &str> {
+        self.pins.keys().map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
+}
+
 pub struct DriverSet {
     pub sandbox: Box<dyn SandboxDriver>,
     pub agent: Box<dyn AgentDriver>,
@@ -46,6 +101,14 @@ pub struct DriverSet {
 
 pub trait DriverFactory {
     fn build(&self, selection: &DriverSelection) -> RuntimeResult<DriverSet>;
+
+    fn build_pinned(
+        &self,
+        selection: &DriverSelection,
+        _pins: &DriverPinSet,
+    ) -> RuntimeResult<DriverSet> {
+        self.build(selection)
+    }
 }
 
 pub trait CredentialProvider {
@@ -60,7 +123,9 @@ struct CreateEnvInput<'a> {
     name: &'a str,
     blueprint_yaml: &'a str,
     lock_yaml: Option<String>,
+    resolved_blueprint: Option<crate::lifecycle::ResolvedBlueprint>,
     resolved_policy: Option<agentenv_proto::NetworkPolicy>,
+    driver_pins: Option<DriverPinSet>,
 }
 
 #[derive(Clone)]
@@ -350,7 +415,17 @@ pub async fn run_preflight_only(
     env: &str,
     selection: &DriverSelection,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
-    let mut set = factory.build(selection)?;
+    run_preflight_with_pins(options, factory, env, selection, None).await
+}
+
+async fn run_preflight_with_pins(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    env: &str,
+    selection: &DriverSelection,
+    pins: Option<&DriverPinSet>,
+) -> RuntimeResult<crate::admission::AdmissionReport> {
+    let mut set = build_driver_set(factory, selection, pins)?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
     initialize_agent_driver(options, set.agent.as_mut()).await?;
     initialize_context_driver(options, set.context.as_mut()).await?;
@@ -402,6 +477,17 @@ pub async fn run_preflight_only(
     Ok(crate::admission::AdmissionReport::from_checks(env, checks))
 }
 
+fn build_driver_set(
+    factory: &dyn DriverFactory,
+    selection: &DriverSelection,
+    pins: Option<&DriverPinSet>,
+) -> RuntimeResult<DriverSet> {
+    match pins {
+        Some(pins) if !pins.is_empty() => factory.build_pinned(selection, pins),
+        _ => factory.build(selection),
+    }
+}
+
 pub async fn create_env(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
@@ -417,7 +503,9 @@ pub async fn create_env(
             name,
             blueprint_yaml,
             lock_yaml: None,
+            resolved_blueprint: None,
             resolved_policy: None,
+            driver_pins: None,
         },
     )
     .await
@@ -441,7 +529,10 @@ async fn create_env_with_input(
         .into());
     }
 
-    let resolved = crate::lifecycle::verify_blueprint_yaml(blueprint_yaml)?;
+    let resolved = match input.resolved_blueprint {
+        Some(resolved) => resolved,
+        None => crate::lifecycle::verify_blueprint_yaml(blueprint_yaml)?,
+    };
     let lock_yaml = match input.lock_yaml {
         Some(lock_yaml) => lock_yaml,
         None => crate::lifecycle::freeze_from_blueprint_yaml(blueprint_yaml)?,
@@ -455,7 +546,14 @@ async fn create_env_with_input(
             .as_ref()
             .map(|driver| driver.driver.clone()),
     };
-    let admission = run_preflight_only(options, factory, name, &selection).await?;
+    let admission = run_preflight_with_pins(
+        options,
+        factory,
+        name,
+        &selection,
+        input.driver_pins.as_ref(),
+    )
+    .await?;
     if admission.status == crate::admission::AdmissionStatus::Rejected {
         return Ok(CreateResult {
             admission,
@@ -464,7 +562,7 @@ async fn create_env_with_input(
         });
     }
 
-    let mut set = factory.build(&selection)?;
+    let mut set = build_driver_set(factory, &selection, input.driver_pins.as_ref())?;
     let temp_workspace = create_temp_workspace(&options.root, env_name.as_str());
     let temp_paths = crate::env::EnvPaths::new(temp_workspace.clone(), env_name.clone());
     let mut rollback = CreateEnvRollback::new(temp_workspace.clone());
@@ -593,7 +691,9 @@ async fn create_env_with_input(
                 })
             })?,
         };
-        policy.network.allow.extend(context_network_rules.rules);
+        if input.resolved_policy.is_none() {
+            policy.network.allow.extend(context_network_rules.rules);
+        }
 
         let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
         let restore_policy_after_install = create_policy != policy;
@@ -919,13 +1019,17 @@ pub async fn reproduce_env(
     }
 
     check_required_lockfile_credentials(credentials, &lockfile)?;
-    let credential_aliases = credential_aliases_from_portable_lockfile(&lockfile);
+    let credential_bindings = credential_bindings_from_portable_lockfile(&lockfile);
     let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
+    let artifact_registry = registry_from_driver_artifacts(&driver_artifacts);
+    let resolved_blueprint =
+        crate::lifecycle::verify_blueprint_yaml_with_registry(&blueprint_yaml, &artifact_registry)?;
+    let driver_pins = DriverPinSet::from_portable_lockfile(&lockfile)?;
     lockfile.name = name.to_owned();
     let persisted_lock_yaml = lockfile.to_yaml_deterministic()?;
     let mut aliased_credentials = ReproducedCredentialProvider {
         inner: credentials,
-        aliases: credential_aliases,
+        bindings: credential_bindings,
     };
     create_env_with_input(
         options,
@@ -935,10 +1039,36 @@ pub async fn reproduce_env(
             name,
             blueprint_yaml: &blueprint_yaml,
             lock_yaml: Some(persisted_lock_yaml),
+            resolved_blueprint: Some(resolved_blueprint),
             resolved_policy: Some(lockfile.policy.resolved.clone()),
+            driver_pins: Some(driver_pins),
         },
     )
     .await
+}
+
+fn registry_from_driver_artifacts(
+    artifacts: &[crate::driver_artifact::DriverArtifact],
+) -> crate::registry::DriverRegistry {
+    let mut registry = crate::registry::DriverRegistry::default();
+    for artifact in artifacts {
+        registry.register_version(
+            artifact.kind,
+            artifact.name.clone(),
+            artifact.version.clone(),
+        );
+    }
+    registry
+}
+
+fn parse_driver_kind(kind: &str) -> Option<DriverKind> {
+    match kind {
+        "sandbox" => Some(DriverKind::Sandbox),
+        "agent" => Some(DriverKind::Agent),
+        "context" => Some(DriverKind::Context),
+        "inference" => Some(DriverKind::Inference),
+        _ => None,
+    }
 }
 
 fn validate_frozen_lockfile_pins(
@@ -1011,11 +1141,14 @@ fn check_required_lockfile_credentials(
                     name: reference.to_owned(),
                 });
             }
-            "credstore" if credentials.backend_name(reference)?.is_none() => {
-                return Err(RuntimeError::MissingCredential {
-                    name: reference.to_owned(),
-                });
-            }
+            "credstore" => match credentials.backend_name(reference)? {
+                Some(backend) if is_credstore_backend(&backend) => {}
+                _ => {
+                    return Err(RuntimeError::MissingCredential {
+                        name: reference.to_owned(),
+                    });
+                }
+            },
             _ => {}
         }
     }
@@ -1023,25 +1156,38 @@ fn check_required_lockfile_credentials(
     Ok(())
 }
 
-fn credential_aliases_from_portable_lockfile(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReproducedCredentialBinding {
+    source: String,
+    reference: String,
+}
+
+fn credential_bindings_from_portable_lockfile(
     lockfile: &crate::lockfile::PortableLockfile,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<String, ReproducedCredentialBinding> {
     lockfile
         .credentials
         .iter()
-        .filter_map(|(name, credential)| {
-            credential
-                .reference
-                .as_ref()
-                .filter(|reference| *reference != name)
-                .map(|reference| (name.clone(), reference.clone()))
+        .map(|(name, credential)| {
+            let reference = credential.reference.clone().unwrap_or_else(|| name.clone());
+            (
+                name.clone(),
+                ReproducedCredentialBinding {
+                    source: credential.source.clone(),
+                    reference,
+                },
+            )
         })
         .collect()
 }
 
+fn is_credstore_backend(backend: &str) -> bool {
+    matches!(backend, "keyring" | "file")
+}
+
 struct ReproducedCredentialProvider<'a> {
     inner: &'a mut dyn CredentialProvider,
-    aliases: BTreeMap<String, String>,
+    bindings: BTreeMap<String, ReproducedCredentialBinding>,
 }
 
 impl CredentialProvider for ReproducedCredentialProvider<'_> {
@@ -1049,17 +1195,38 @@ impl CredentialProvider for ReproducedCredentialProvider<'_> {
         &mut self,
         requirement: &agentenv_proto::CredentialRequirement,
     ) -> RuntimeResult<Option<RuntimeSecret>> {
-        let Some(reference) = self.aliases.get(&requirement.name) else {
+        let Some(binding) = self.bindings.get(&requirement.name) else {
             return self.inner.resolve(requirement);
         };
 
         let mut aliased_requirement = requirement.clone();
-        aliased_requirement.name = reference.clone();
-        self.inner.resolve(&aliased_requirement)
+        aliased_requirement.name = binding.reference.clone();
+        match binding.source.as_str() {
+            "env" => match std::env::var(&binding.reference) {
+                Ok(value) => Ok(Some(RuntimeSecret::new(value))),
+                Err(_) if requirement.required => Err(RuntimeError::MissingCredential {
+                    name: binding.reference.clone(),
+                }),
+                Err(_) => Ok(None),
+            },
+            "credstore" => match self.inner.backend_name(&binding.reference)? {
+                Some(backend) if is_credstore_backend(&backend) => {
+                    self.inner.resolve(&aliased_requirement)
+                }
+                _ if requirement.required => Err(RuntimeError::MissingCredential {
+                    name: binding.reference.clone(),
+                }),
+                _ => Ok(None),
+            },
+            _ => self.inner.resolve(&aliased_requirement),
+        }
     }
 
     fn backend_name(&self, name: &str) -> RuntimeResult<Option<String>> {
-        let reference = self.aliases.get(name).map_or(name, String::as_str);
+        let reference = self
+            .bindings
+            .get(name)
+            .map_or(name, |binding| binding.reference.as_str());
         self.inner.backend_name(reference)
     }
 }
@@ -2062,7 +2229,7 @@ mod tests {
         collections::BTreeMap,
         fs,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex,
         },
         time::{SystemTime, UNIX_EPOCH},
@@ -2188,6 +2355,146 @@ mod tests {
                 context: Box::new(TinyContextDriver),
                 inference: None,
             })
+        }
+    }
+
+    struct RequiredRuleFactory {
+        tracker: Arc<AgentSetupTracker>,
+        required_rule: agentenv_proto::NetworkRule,
+    }
+
+    impl DriverFactory for RequiredRuleFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(AgentSetupSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                agent: Box::new(AgentSetupAgentDriver),
+                context: Box::new(RequiredRuleContextDriver {
+                    required_rule: self.required_rule.clone(),
+                }),
+                inference: None,
+            })
+        }
+    }
+
+    struct RequiredRuleContextDriver {
+        required_rule: agentenv_proto::NetworkRule,
+    }
+
+    #[async_trait]
+    impl ContextDriver for RequiredRuleContextDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            TinyContextDriver.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinyContextDriver.preflight(params).await
+        }
+
+        async fn provision(
+            &self,
+            params: agentenv_proto::ContextSpec,
+        ) -> DriverResult<agentenv_proto::ContextHandle> {
+            TinyContextDriver.provision(params).await
+        }
+
+        async fn mcp_endpoint(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::McpEndpoint> {
+            TinyContextDriver.mcp_endpoint(params).await
+        }
+
+        async fn required_network_rules(
+            &self,
+            _params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::RequiredNetworkRulesResult> {
+            Ok(agentenv_proto::RequiredNetworkRulesResult {
+                rules: vec![self.required_rule.clone()],
+            })
+        }
+
+        async fn credential_requirements(
+            &self,
+            params: agentenv_proto::CredentialRequirementsParams,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            TinyContextDriver.credential_requirements(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::ContextStatus> {
+            TinyContextDriver.status(params).await
+        }
+
+        async fn teardown(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<EmptyResult> {
+            TinyContextDriver.teardown(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            TinyContextDriver.shutdown(params).await
+        }
+    }
+
+    #[derive(Default)]
+    struct PinTrackingFactory {
+        normal_builds: AtomicU64,
+        pinned_builds: AtomicU64,
+        pin_roles: Mutex<Vec<String>>,
+    }
+
+    impl DriverFactory for PinTrackingFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            self.normal_builds.fetch_add(1, Ordering::SeqCst);
+            Ok(DriverSet {
+                sandbox: Box::new(TinySandboxDriver),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+
+        fn build_pinned(
+            &self,
+            _selection: &super::DriverSelection,
+            pins: &super::DriverPinSet,
+        ) -> super::RuntimeResult<DriverSet> {
+            self.pinned_builds.fetch_add(1, Ordering::SeqCst);
+            self.pin_roles
+                .lock()
+                .expect("pin roles")
+                .extend(pins.roles().map(str::to_owned));
+            Ok(DriverSet {
+                sandbox: Box::new(TinySandboxDriver),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct BackendOnlyCredentialProvider {
+        backend: Option<String>,
+    }
+
+    impl super::CredentialProvider for BackendOnlyCredentialProvider {
+        fn resolve(
+            &mut self,
+            _requirement: &agentenv_proto::CredentialRequirement,
+        ) -> super::RuntimeResult<Option<RuntimeSecret>> {
+            Ok(None)
+        }
+
+        fn backend_name(&self, _name: &str) -> super::RuntimeResult<Option<String>> {
+            Ok(self.backend.clone())
         }
     }
 
@@ -4122,12 +4429,21 @@ policy:
             .network
             .allow
             .push(pinned_rule.clone());
+        let context_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "context-required.example".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        };
         let lockfile_yaml = lockfile
             .to_yaml_deterministic()
             .expect("render portable lockfile");
         let tracker = Arc::new(AgentSetupTracker::default());
-        let factory = AgentSetupFactory {
+        let factory = RequiredRuleFactory {
             tracker: Arc::clone(&tracker),
+            required_rule: context_rule.clone(),
         };
         let mut credentials = super::tests_support::EmptyCredentialProvider;
 
@@ -4145,6 +4461,10 @@ policy:
             create_policies[0].network.allow.contains(&pinned_rule),
             "sandbox create policy should include the pinned lockfile policy"
         );
+        assert!(
+            !create_policies[0].network.allow.contains(&context_rule),
+            "sandbox create policy should not add context-required rules during reproduce"
+        );
         let applied_policies = tracker
             .applied_policies
             .lock()
@@ -4154,6 +4474,144 @@ policy:
         assert!(
             applied_policies[0].network.allow.contains(&pinned_rule),
             "post-install restored policy should include the pinned lockfile policy"
+        );
+        assert!(
+            !applied_policies[0].network.allow.contains(&context_rule),
+            "post-install restored policy should not add context-required rules during reproduce"
+        );
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_passes_driver_pins_to_factory_and_create_uses_normal_build() {
+        let root = unique_root("agentenv-reproduce-pinned-factory");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "created", yaml)
+            .await
+            .expect("create env");
+
+        assert_eq!(factory.normal_builds.load(Ordering::SeqCst), 2);
+        assert_eq!(factory.pinned_builds.load(Ordering::SeqCst), 0);
+
+        super::reproduce_env(
+            &options,
+            &factory,
+            &mut credentials,
+            "reproduced",
+            &lockfile_yaml,
+        )
+        .await
+        .expect("reproduce env");
+
+        assert_eq!(
+            factory.normal_builds.load(Ordering::SeqCst),
+            2,
+            "portable reproduce must not use normal factory resolution"
+        );
+        assert_eq!(factory.pinned_builds.load(Ordering::SeqCst), 2);
+        let mut roles = factory.pin_roles.lock().expect("pin roles").clone();
+        roles.sort();
+        roles.dedup();
+        assert_eq!(roles, vec!["agent", "context", "sandbox"]);
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_rejects_required_credstore_credential_satisfied_only_by_env() {
+        let root = unique_root("agentenv-reproduce-strict-credstore");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+  credentials:
+    api_token:
+      source: credstore
+      value: stored_api_token
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = BackendOnlyCredentialProvider {
+            backend: Some("env".to_owned()),
+        };
+
+        let err =
+            super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+                .await
+                .expect_err("credstore pin must not be satisfied by env");
+
+        assert!(matches!(
+            err,
+            RuntimeError::MissingCredential { ref name } if name == "stored_api_token"
+        ));
+        assert_eq!(
+            factory.normal_builds.load(Ordering::SeqCst)
+                + factory.pinned_builds.load(Ordering::SeqCst),
+            0,
+            "credential preflight should fail before driver materialization"
         );
     }
 
