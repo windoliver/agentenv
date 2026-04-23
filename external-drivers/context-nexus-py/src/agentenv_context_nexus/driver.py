@@ -232,6 +232,8 @@ class NexusContextDriver:
         try:
             _handle, state = self._lookup(params)
         except KeyError as exc:
+            if _is_hub_handle(exc.args[0]):
+                return success(request_id, {"healthy": True, "detail": "hub mode (persisted)"})
             return error(request_id, ERROR_RESOURCE_NOT_FOUND, f"unknown context handle `{exc.args[0]}`")
         if state.process is None:
             return success(request_id, {"healthy": True, "detail": "hub mode"})
@@ -244,6 +246,8 @@ class NexusContextDriver:
         try:
             handle, state = self._lookup(params)
         except KeyError as exc:
+            if _is_hub_handle(exc.args[0]):
+                return success(request_id, {})
             return error(request_id, ERROR_RESOURCE_NOT_FOUND, f"unknown context handle `{exc.args[0]}`")
         self._stop_process(state.process)
         self._handles.pop(handle, None)
@@ -281,3 +285,7 @@ class NexusContextDriver:
             return False
         os.killpg(os.getpgid(pid), sig)
         return True
+
+
+def _is_hub_handle(handle):
+    return isinstance(handle, str) and handle.startswith("nexus-hub-")

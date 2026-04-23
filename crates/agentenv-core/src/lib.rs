@@ -1,16 +1,19 @@
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod agent_common;
 pub mod blueprint;
 pub mod context_common;
 pub mod digest;
 pub mod driver;
 pub mod driver_catalog;
+pub mod env;
 pub mod error;
 pub mod inference;
 pub mod lifecycle;
 pub mod lockfile;
 pub mod registry;
+pub mod runtime;
 pub mod security;
 
 /// Placeholder surface for the M1 workspace scaffold.

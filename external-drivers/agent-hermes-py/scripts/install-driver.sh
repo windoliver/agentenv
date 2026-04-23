@@ -22,6 +22,42 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+rewrite_venv_shebangs() {
+    old_python=$1
+    new_python=$2
+    "${PYTHON}" - "${old_python}" "${new_python}" <<'PY'
+from pathlib import Path
+import sys
+
+old_bin = Path(sys.argv[1]).parent
+new_bin = Path(sys.argv[2]).parent
+old_bins = {str(old_bin), str(old_bin.resolve(strict=False))}
+
+for path in new_bin.iterdir():
+    if not path.is_file():
+        continue
+    try:
+        data = path.read_bytes()
+    except OSError:
+        continue
+    first_line_end = data.find(b"\n")
+    if first_line_end == -1:
+        first_line_end = len(data)
+    first_line = data[:first_line_end]
+    if not first_line.startswith(b"#!"):
+        continue
+    interpreter = Path(first_line[2:].decode())
+    interpreter_bins = {
+        str(interpreter.parent),
+        str(interpreter.parent.resolve(strict=False)),
+    }
+    if old_bins.isdisjoint(interpreter_bins):
+        continue
+    replacement = b"#!" + str(new_bin / interpreter.name).encode()
+    path.write_bytes(replacement + data[first_line_end:])
+PY
+}
+
 if [ -z "${STAGED}" ]; then
     STAGED="${TMP_ROOT}/agent-hermes"
     mkdir -p "${STAGED}/bin" "${STAGED}/wheels"
@@ -47,6 +83,7 @@ if [ "${EXTERNAL_STAGED}" -eq 1 ]; then
     exit 0
 fi
 
+OLD_VENV_PYTHON="${STAGED}/venv/bin/python"
 mkdir -p "$(dirname "${INSTALL_ROOT}")"
 BACKUP="${INSTALL_ROOT}.backup.$$"
 rm -rf "${BACKUP}"
@@ -54,6 +91,7 @@ if [ -e "${INSTALL_ROOT}" ]; then
     mv "${INSTALL_ROOT}" "${BACKUP}"
 fi
 if mv "${STAGED}" "${INSTALL_ROOT}"; then
+    rewrite_venv_shebangs "${OLD_VENV_PYTHON}" "${INSTALL_ROOT}/venv/bin/python"
     rm -rf "${BACKUP}"
 else
     rm -rf "${INSTALL_ROOT}"

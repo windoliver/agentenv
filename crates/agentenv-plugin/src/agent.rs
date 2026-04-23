@@ -1,54 +1,50 @@
 use std::time::Duration;
 use std::{fmt, fmt::Formatter};
 
-use agentenv_core::driver::{ensure_protocol_compatible, ContextDriver, DriverError, DriverResult};
+use agentenv_core::driver::{ensure_protocol_compatible, AgentDriver, DriverError, DriverResult};
 use agentenv_core::driver_catalog::DiscoveredDriver;
 use agentenv_core::registry::DriverKind as CatalogKind;
 use agentenv_proto::{
-    Capabilities, ContextHandle, ContextHandleRequest, ContextSpec, ContextStatus,
-    CredentialRequirementsParams, CredentialRequirementsResult, EmptyResult, InitializeParams,
-    InitializeResult, McpEndpoint, PreflightParams, PreflightResult, RequiredNetworkRulesResult,
-    ShutdownParams,
+    AgentHealthCheckProbe, AgentSpec, Capabilities, CredentialRequirementsResult, EmptyResult,
+    InitializeParams, InitializeResult, InstallStepsResult, McpConfigPathParams,
+    McpConfigPathResult, PreflightParams, PreflightResult, RenderEntrypointResult,
+    RenderMcpConfigParams, RenderMcpConfigResult, ShutdownParams,
 };
 use async_trait::async_trait;
 
 use crate::jsonrpc::{JsonRpcClient, JsonRpcClientConfig, JsonRpcError};
 
-pub struct SubprocessContextDriver {
+pub struct SubprocessAgentDriver {
     name: String,
     entry: DiscoveredDriver,
     timeout: Duration,
     client: Option<JsonRpcClient>,
 }
 
-impl fmt::Debug for SubprocessContextDriver {
+impl fmt::Debug for SubprocessAgentDriver {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SubprocessContextDriver")
+        f.debug_struct("SubprocessAgentDriver")
             .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
-impl SubprocessContextDriver {
-    pub async fn from_discovered(entry: DiscoveredDriver, timeout: Duration) -> DriverResult<Self> {
-        Self::from_discovered_unstarted(entry, timeout)
-    }
-
+impl SubprocessAgentDriver {
     pub fn from_discovered_unstarted(
         entry: DiscoveredDriver,
         timeout: Duration,
     ) -> DriverResult<Self> {
-        if entry.kind != CatalogKind::Context {
+        if entry.kind != CatalogKind::Agent {
             return Err(DriverError::Subprocess {
                 driver: entry.name,
-                message: format!("expected context driver entry, got {}", entry.kind),
+                message: format!("expected agent driver entry, got {}", entry.kind),
             });
         }
 
         if entry.binary.is_none() {
             return Err(DriverError::Subprocess {
                 driver: entry.name.clone(),
-                message: "discovered subprocess context driver is missing binary".to_owned(),
+                message: "discovered subprocess agent driver is missing binary".to_owned(),
             });
         }
 
@@ -67,42 +63,40 @@ impl SubprocessContextDriver {
             .clone()
             .ok_or_else(|| DriverError::Subprocess {
                 driver: self.name.clone(),
-                message: "discovered subprocess context driver is missing binary".to_owned(),
+                message: "discovered subprocess agent driver is missing binary".to_owned(),
             })?;
-        let client = JsonRpcClient::spawn(JsonRpcClientConfig {
+        JsonRpcClient::spawn(JsonRpcClientConfig {
             binary,
             args: self.entry.args.clone(),
             env: self.entry.env.clone(),
             timeout: self.timeout,
         })
         .await
-        .map_err(|err| map_jsonrpc_error(&self.name, err))?;
-
-        Ok(client)
+        .map_err(|err| map_jsonrpc_error(&self.name, err))
     }
 
     fn client(&self) -> DriverResult<&JsonRpcClient> {
         self.client.as_ref().ok_or_else(|| DriverError::Subprocess {
             driver: self.name.clone(),
-            message: "subprocess context driver used before initialize".to_owned(),
+            message: "subprocess agent driver used before initialize".to_owned(),
         })
     }
 }
 
-pub fn validate_context_initialize(result: &InitializeResult) -> DriverResult<()> {
+pub fn validate_agent_initialize(result: &InitializeResult) -> DriverResult<()> {
     ensure_protocol_compatible(result)?;
 
-    if result.driver.kind != agentenv_proto::DriverKind::Context {
+    if result.driver.kind != agentenv_proto::DriverKind::Agent {
         return Err(DriverError::Subprocess {
             driver: result.driver.name.clone(),
-            message: format!("expected context driver kind, got {:?}", result.driver.kind),
+            message: format!("expected agent driver kind, got {:?}", result.driver.kind),
         });
     }
 
-    if !matches!(result.capabilities, Capabilities::Context(_)) {
+    if !matches!(result.capabilities, Capabilities::Agent(_)) {
         return Err(DriverError::Subprocess {
             driver: result.driver.name.clone(),
-            message: "expected context driver capabilities".to_owned(),
+            message: "expected agent driver capabilities".to_owned(),
         });
     }
 
@@ -117,7 +111,7 @@ fn map_jsonrpc_error(driver: &str, err: JsonRpcError) -> DriverError {
 }
 
 #[async_trait]
-impl ContextDriver for SubprocessContextDriver {
+impl AgentDriver for SubprocessAgentDriver {
     async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
         if self.client.is_none() {
             self.client = Some(self.spawn_client().await?);
@@ -127,7 +121,7 @@ impl ContextDriver for SubprocessContextDriver {
             .call("initialize", &params)
             .await
             .map_err(|err| map_jsonrpc_error(&self.name, err))?;
-        validate_context_initialize(&result)?;
+        validate_agent_initialize(&result)?;
         Ok(result)
     }
 
@@ -138,50 +132,53 @@ impl ContextDriver for SubprocessContextDriver {
             .map_err(|err| map_jsonrpc_error(&self.name, err))
     }
 
-    async fn provision(&self, spec: ContextSpec) -> DriverResult<ContextHandle> {
+    async fn install_steps(&self, spec: AgentSpec) -> DriverResult<InstallStepsResult> {
         self.client()?
-            .call("provision", &spec)
+            .call("install_steps", &spec)
             .await
             .map_err(|err| map_jsonrpc_error(&self.name, err))
     }
 
-    async fn mcp_endpoint(&self, params: ContextHandleRequest) -> DriverResult<McpEndpoint> {
-        self.client()?
-            .call("mcp_endpoint", &params)
-            .await
-            .map_err(|err| map_jsonrpc_error(&self.name, err))
-    }
-
-    async fn required_network_rules(
+    async fn mcp_config_path(
         &self,
-        params: ContextHandleRequest,
-    ) -> DriverResult<RequiredNetworkRulesResult> {
+        params: McpConfigPathParams,
+    ) -> DriverResult<McpConfigPathResult> {
         self.client()?
-            .call("required_network_rules", &params)
+            .call("mcp_config_path", &params)
+            .await
+            .map_err(|err| map_jsonrpc_error(&self.name, err))
+    }
+
+    async fn render_mcp_config(
+        &self,
+        params: RenderMcpConfigParams,
+    ) -> DriverResult<RenderMcpConfigResult> {
+        self.client()?
+            .call("render_mcp_config", &params)
+            .await
+            .map_err(|err| map_jsonrpc_error(&self.name, err))
+    }
+
+    async fn render_entrypoint(&self, spec: AgentSpec) -> DriverResult<RenderEntrypointResult> {
+        self.client()?
+            .call("render_entrypoint", &spec)
             .await
             .map_err(|err| map_jsonrpc_error(&self.name, err))
     }
 
     async fn credential_requirements(
         &self,
-        params: CredentialRequirementsParams,
+        spec: AgentSpec,
     ) -> DriverResult<CredentialRequirementsResult> {
         self.client()?
-            .call("credential_requirements", &params)
+            .call("credential_requirements", &spec)
             .await
             .map_err(|err| map_jsonrpc_error(&self.name, err))
     }
 
-    async fn status(&self, params: ContextHandleRequest) -> DriverResult<ContextStatus> {
+    async fn health_check_probe(&self, spec: AgentSpec) -> DriverResult<AgentHealthCheckProbe> {
         self.client()?
-            .call("status", &params)
-            .await
-            .map_err(|err| map_jsonrpc_error(&self.name, err))
-    }
-
-    async fn teardown(&self, params: ContextHandleRequest) -> DriverResult<EmptyResult> {
-        self.client()?
-            .call("teardown", &params)
+            .call("health_check_probe", &spec)
             .await
             .map_err(|err| map_jsonrpc_error(&self.name, err))
     }
@@ -206,17 +203,15 @@ mod tests {
     use agentenv_core::driver_catalog::{DiscoveredDriver, DriverSource};
     use agentenv_core::registry::DriverKind as CatalogKind;
     use agentenv_proto::{
-        Capabilities, ContextCapabilities, DriverInfo, DriverKind, InitializeResult, SCHEMA_VERSION,
+        AgentCapabilities, Capabilities, DriverInfo, DriverKind, InitializeResult, SCHEMA_VERSION,
     };
     use semver::Version;
     use serde_json::Value;
 
-    use super::SubprocessContextDriver;
-
     fn mock_entry() -> DiscoveredDriver {
         DiscoveredDriver {
-            kind: CatalogKind::Context,
-            name: "nexus".to_owned(),
+            kind: CatalogKind::Agent,
+            name: "hermes".to_owned(),
             version: Version::parse("0.1.0").unwrap(),
             source: DriverSource::DevelopmentOverride,
             description: None,
@@ -228,56 +223,56 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn constructor_rejects_built_in_entries_without_binary() {
+    #[test]
+    fn constructor_rejects_built_in_entries_without_binary() {
         let mut entry = mock_entry();
         entry.binary = None;
 
-        let err = SubprocessContextDriver::from_discovered(entry, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let err =
+            super::SubprocessAgentDriver::from_discovered_unstarted(entry, Duration::from_secs(1))
+                .unwrap_err();
 
         assert!(err.to_string().contains("binary"));
     }
 
     #[test]
-    fn initialize_result_validator_accepts_context_driver() {
+    fn initialize_result_validator_accepts_agent_driver() {
         let init = InitializeResult {
             driver: DriverInfo {
-                name: "nexus".to_owned(),
-                kind: DriverKind::Context,
-                version: "0.1.0".to_owned(),
-                protocol_version: SCHEMA_VERSION.to_owned(),
-            },
-            capabilities: Capabilities::Context(ContextCapabilities {
-                is_remote: true,
-                is_shared: true,
-                supports_zones: true,
-                supports_snapshots: true,
-            }),
-        };
-
-        super::validate_context_initialize(&init).unwrap();
-    }
-
-    #[test]
-    fn initialize_result_validator_rejects_agent_driver() {
-        let init = InitializeResult {
-            driver: DriverInfo {
-                name: "bad".to_owned(),
+                name: "hermes".to_owned(),
                 kind: DriverKind::Agent,
                 version: "0.1.0".to_owned(),
                 protocol_version: SCHEMA_VERSION.to_owned(),
             },
-            capabilities: Capabilities::Context(ContextCapabilities {
-                is_remote: true,
-                is_shared: true,
-                supports_zones: true,
-                supports_snapshots: true,
+            capabilities: Capabilities::Agent(AgentCapabilities {
+                supports_mcp: true,
+                supports_slash_commands: true,
+                supports_tui: true,
+                supports_headless: true,
             }),
         };
 
-        let err = super::validate_context_initialize(&init).unwrap_err();
-        assert!(err.to_string().contains("context"));
+        super::validate_agent_initialize(&init).unwrap();
+    }
+
+    #[test]
+    fn initialize_result_validator_rejects_context_driver() {
+        let init = InitializeResult {
+            driver: DriverInfo {
+                name: "bad".to_owned(),
+                kind: DriverKind::Context,
+                version: "0.1.0".to_owned(),
+                protocol_version: SCHEMA_VERSION.to_owned(),
+            },
+            capabilities: Capabilities::Agent(AgentCapabilities {
+                supports_mcp: true,
+                supports_slash_commands: true,
+                supports_tui: true,
+                supports_headless: true,
+            }),
+        };
+
+        let err = super::validate_agent_initialize(&init).unwrap_err();
+        assert!(err.to_string().contains("expected agent driver kind"));
     }
 }

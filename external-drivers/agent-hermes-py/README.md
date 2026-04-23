@@ -37,6 +37,12 @@ external-drivers/agent-hermes-py/scripts/run-tests.sh
 
 The tests exercise protocol framing, driver methods, packaging files, and the real subprocess entrypoint. They do not require model API credentials.
 
-## Current Host Limit
+## agentenv CLI
 
-This package is standalone. The current agentenv core can discover the installed manifest with `agentenv drivers list`, but full `agentenv create` execution still needs subprocess AgentDriver host integration in `agentenv-core`.
+After installing this driver and a compatible context driver, `agentenv` can discover Hermes with `agentenv drivers list` and run it through the normal environment lifecycle:
+
+```bash
+agentenv create research --blueprint blueprints/hermes+nexus+openshell.yaml
+agentenv status research
+agentenv destroy research --yes
+```

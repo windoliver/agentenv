@@ -13,13 +13,32 @@ description = "Declarative environment manager for AI coding agents"
 [dependencies]
 agentenv-core = { path = "../agentenv-core" }
 agentenv-credstore = { path = "../agentenv-credstore" }
+agentenv-plugin = { path = "../agentenv-plugin" }
+agentenv-policy = { path = "../agentenv-policy" }
+agentenv-proto = { path = "../agentenv-proto" }
+agent-claude = { path = "../drivers/agent-claude" }
+agent-codex = { path = "../drivers/agent-codex" }
+agent-openclaw = { path = "../drivers/agent-openclaw" }
 anyhow.workspace = true
 clap.workspace = true
+context-filesystem = { path = "../drivers/context-filesystem" }
+context-mcp-generic = { path = "../drivers/context-mcp-generic" }
+context-none = { path = "../drivers/context-none" }
+dirs.workspace = true
+inference-anthropic = { path = "../drivers/inference-anthropic" }
+inference-ollama = { path = "../drivers/inference-ollama" }
+inference-openai = { path = "../drivers/inference-openai" }
+inference-passthrough = { path = "../drivers/inference-passthrough" }
 rpassword = "7"
+sandbox-openshell = { path = "../drivers/sandbox-openshell" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 assert_cmd = "=2.0.16"
 predicates = "3"
+reqwest = { workspace = true, features = ["blocking"] }
 tempfile = "=3.16.0"

@@ -336,3 +336,14 @@ def test_handle_methods_report_unknown_string_handles_as_not_found():
         response = call(driver, method, {"handle": "missing"})
 
         assert response["error"]["code"] == ERROR_RESOURCE_NOT_FOUND
+
+
+def test_persisted_hub_handle_status_and_teardown_are_idempotent():
+    driver = NexusContextDriver()
+    handle = "nexus-hub-f912adec5261615d"
+
+    status = call(driver, "status", {"handle": handle})
+    teardown = call(driver, "teardown", {"handle": handle})
+
+    assert status["result"] == {"healthy": True, "detail": "hub mode (persisted)"}
+    assert teardown["result"] == {}

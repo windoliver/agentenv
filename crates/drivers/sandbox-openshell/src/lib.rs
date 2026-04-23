@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -19,7 +21,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use serde_json::Value;
 
 use agentenv_core::driver::{DriverError, DriverResult, SandboxDriver};
-use agentenv_policy::{OpenShellTranslator, PolicyError, PolicyTranslator, TranslatedPolicy};
+use agentenv_policy::{
+    InferenceUpdate, OpenShellTranslator, PolicyError, PolicyTranslator, TranslatedPolicy,
+};
 use agentenv_proto::{
     assert_compatible_schema_version, ApplyPolicyParams, ApplyPolicyResult, Capabilities,
     ConnectParams, CopyInParams, CopyOutParams, DestroyParams, DriverInfo, DriverKind, EmptyResult,
@@ -36,8 +40,17 @@ pub const CRATE_NAME: &str = "sandbox-openshell";
 
 const DEFAULT_OPEN_SHELL_AGENT_BINARIES: [&str; 3] = ["claude", "codex", "openclaw"];
 const DEFAULT_OPEN_SHELL_SUPPORT_BINARIES: [&str; 1] = ["curl"];
+const DEFAULT_OPEN_SHELL_NPM_INSTALL_BINARIES: [&str; 4] = [
+    "/usr/local/bin/npm",
+    "/usr/local/bin/node",
+    "/usr/bin/npm",
+    "/usr/bin/node",
+];
 const OPEN_SHELL_BINARY: &str = "openshell";
+const OPEN_SHELL_INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh";
 const MINIMUM_SUPPORTED_OPEN_SHELL_VERSION: Version = Version::new(0, 0, 30);
+const CONTAINER_RUNTIME_WAIT_ATTEMPTS: usize = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDisposition {
@@ -60,6 +73,14 @@ struct CommandOutput {
 trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput>;
 
+    fn uses_host_environment(&self) -> bool {
+        false
+    }
+
+    fn status(&self, program: &str, request: &CommandRequest) -> io::Result<Option<i32>> {
+        self.run(program, request).map(|output| output.status)
+    }
+
     #[allow(dead_code)]
     fn spawn(&self, program: &str, request: &CommandRequest)
         -> io::Result<Box<dyn SpawnedCommand>>;
@@ -77,6 +98,10 @@ struct ProcessSpawnedCommand {
 }
 
 impl CommandRunner for ProcessCommandRunner {
+    fn uses_host_environment(&self) -> bool {
+        true
+    }
+
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput> {
         let output = Command::new(program)
             .args(&request.args)
@@ -88,6 +113,14 @@ impl CommandRunner for ProcessCommandRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn status(&self, program: &str, request: &CommandRequest) -> io::Result<Option<i32>> {
+        Command::new(program)
+            .args(&request.args)
+            .envs(&request.env)
+            .status()
+            .map(|status| status.code())
     }
 
     fn spawn(
@@ -161,6 +194,7 @@ struct RecordingCommandRunner {
     scripts: Mutex<VecDeque<CommandScript>>,
     calls: Mutex<Vec<CommandCall>>,
     spawn_calls: Mutex<Vec<CommandCall>>,
+    status_calls: Mutex<Vec<CommandCall>>,
 }
 
 #[cfg(test)]
@@ -170,6 +204,7 @@ impl RecordingCommandRunner {
             scripts: Mutex::new(scripts.into_iter().collect()),
             calls: Mutex::new(Vec::new()),
             spawn_calls: Mutex::new(Vec::new()),
+            status_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -179,6 +214,13 @@ impl RecordingCommandRunner {
 
     fn spawn_calls(&self) -> Vec<CommandCall> {
         self.spawn_calls.lock().expect("spawn calls mutex").clone()
+    }
+
+    fn status_calls(&self) -> Vec<CommandCall> {
+        self.status_calls
+            .lock()
+            .expect("status calls mutex")
+            .clone()
     }
 }
 
@@ -278,11 +320,38 @@ impl CommandRunner for RecordingCommandRunner {
             CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
         }
     }
+
+    fn status(&self, program: &str, request: &CommandRequest) -> io::Result<Option<i32>> {
+        self.status_calls
+            .lock()
+            .expect("status calls mutex")
+            .push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+
+        let script = self
+            .scripts
+            .lock()
+            .expect("scripts mutex")
+            .pop_front()
+            .expect("unexpected command invocation");
+
+        assert_eq!(script.program, program);
+        assert_eq!(script.request, *request);
+
+        match script.result {
+            CommandScriptResult::Output(output) => Ok(output.status),
+            CommandScriptResult::Error { kind, message } => Err(io::Error::new(kind, message)),
+        }
+    }
 }
 
 pub struct OpenShellDriver {
     binary: String,
     runner: Arc<dyn CommandRunner>,
+    host_bootstrap: bool,
+    runtime_app_override: Option<String>,
     current_policies: Mutex<BTreeMap<String, NetworkPolicy>>,
     log_streams: Mutex<Vec<LogStream>>,
 }
@@ -297,6 +366,8 @@ impl Default for OpenShellDriver {
         Self {
             binary: OPEN_SHELL_BINARY.to_owned(),
             runner: Arc::new(ProcessCommandRunner),
+            host_bootstrap: true,
+            runtime_app_override: None,
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
         }
@@ -309,6 +380,35 @@ impl OpenShellDriver {
         Self {
             binary: OPEN_SHELL_BINARY.to_owned(),
             runner,
+            host_bootstrap: false,
+            runtime_app_override: None,
+            current_policies: Mutex::new(BTreeMap::new()),
+            log_streams: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_host_command_runner(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            binary: OPEN_SHELL_BINARY.to_owned(),
+            runner,
+            host_bootstrap: true,
+            runtime_app_override: None,
+            current_policies: Mutex::new(BTreeMap::new()),
+            log_streams: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_host_command_runner_and_runtime_app(
+        runner: Arc<dyn CommandRunner>,
+        runtime_app: impl Into<String>,
+    ) -> Self {
+        Self {
+            binary: OPEN_SHELL_BINARY.to_owned(),
+            runner,
+            host_bootstrap: true,
+            runtime_app_override: Some(runtime_app.into()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
         }
@@ -347,17 +447,46 @@ impl SandboxDriver for OpenShellDriver {
         let version_output = match self.run_command_request(command_request(&["--version"])) {
             Ok(output) => output,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(preflight_failure(
-                    "openshell_missing",
-                    format!(
-                        "OpenShell CLI binary `{}` was not found on PATH",
-                        self.binary
-                    ),
-                    Some(format!(
-                        "Install OpenShell and ensure `{}` is available on your PATH",
-                        self.binary
-                    )),
-                ));
+                if self.host_bootstrap {
+                    if let Err(install_error) = self.install_openshell_cli() {
+                        return Ok(preflight_failure(
+                            "openshell_bootstrap_failed",
+                            format!(
+                                "OpenShell CLI binary `{}` was not found and automatic install failed: {install_error}",
+                                self.binary
+                            ),
+                            Some(
+                                "Check that `curl`, `sh`, and network access to github.com are available, then retry `agentenv create`"
+                                    .to_owned(),
+                            ),
+                        ));
+                    }
+                    match self.run_command_request(command_request(&["--version"])) {
+                        Ok(output) => output,
+                        Err(retry_err) => {
+                            return Ok(preflight_failure(
+                                "openshell_bootstrap_failed",
+                                format!(
+                                    "OpenShell was installed but `{}` --version still failed: {retry_err}",
+                                    self.binary
+                                ),
+                                Some("Ensure `~/.local/bin/openshell` is executable, then retry `agentenv create`".to_owned()),
+                            ));
+                        }
+                    }
+                } else {
+                    return Ok(preflight_failure(
+                        "openshell_missing",
+                        format!(
+                            "OpenShell CLI binary `{}` was not found on PATH",
+                            self.binary
+                        ),
+                        Some(format!(
+                            "Install OpenShell and ensure `{}` is available on your PATH",
+                            self.binary
+                        )),
+                    ));
+                }
             }
             Err(err) => {
                 return Ok(preflight_failure(
@@ -409,13 +538,12 @@ impl SandboxDriver for OpenShellDriver {
             ));
         }
 
-        let gateway_output = match self.run_command_request(command_request(&["gateway", "status"]))
-        {
+        let gateway_output = match self.run_command_request(command_request(&["status"])) {
             Ok(output) => output,
             Err(err) => {
                 return Ok(preflight_failure(
                     "openshell_gateway_down",
-                    format!("failed to run `{} gateway status`: {err}", self.binary),
+                    format!("failed to run `{} status`: {err}", self.binary),
                     None,
                 ));
             }
@@ -425,13 +553,19 @@ impl SandboxDriver for OpenShellDriver {
             return Ok(preflight_failure(
                 "openshell_gateway_down",
                 format!(
-                    "`{} gateway status` failed with {}: {}",
+                    "`{} status` failed with {}: {}",
                     self.binary,
                     status_label(gateway_output.status),
                     render_command_output(&gateway_output)
                 ),
                 None,
             ));
+        }
+
+        if self.host_bootstrap {
+            if let Err(issue) = self.ensure_container_runtime_ready() {
+                return Ok(issue);
+            }
         }
 
         Ok(PreflightResult {
@@ -442,7 +576,6 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
         let spec = _spec;
-        let policy = spec.policy;
         let image = spec.image.unwrap_or_else(|| "openclaw".to_owned());
         let name = match spec.metadata.get("name") {
             Some(Value::String(value)) if !value.is_empty() => value.clone(),
@@ -463,12 +596,21 @@ impl SandboxDriver for OpenShellDriver {
             }
         };
 
+        let initial_policy = spec
+            .policy
+            .map(|policy| {
+                self.write_policy_temp_file(&policy)
+                    .map(|(temp_policy_file, inference_update)| {
+                        (policy, temp_policy_file, inference_update)
+                    })
+            })
+            .transpose()?;
+
         let mut args = vec![
             "sandbox".to_owned(),
             "create".to_owned(),
             "--name".to_owned(),
             name.clone(),
-            "--keep".to_owned(),
             "--no-auto-providers".to_owned(),
             "--from".to_owned(),
             image,
@@ -477,6 +619,12 @@ impl SandboxDriver for OpenShellDriver {
             args.push("--remote".to_owned());
             args.push(remote);
         }
+        if let Some((_, temp_policy_file, _)) = &initial_policy {
+            args.push("--policy".to_owned());
+            args.push(temp_policy_file.path().to_string_lossy().into_owned());
+        }
+        args.push("--".to_owned());
+        args.push("true".to_owned());
 
         let request = CommandRequest {
             args,
@@ -484,17 +632,20 @@ impl SandboxDriver for OpenShellDriver {
         };
         let _output = self.run_checked_command(request)?;
 
-        if let Some(policy) = policy {
-            if let Err(err) = self.apply_policy_to_handle(&name, policy) {
-                return Err(self.rollback_created_sandbox(&name, err));
+        if let Some((policy, _temp_policy_file, inference_update)) = initial_policy {
+            if let Some(inference_update) = inference_update {
+                if let Err(err) = self.run_inference_update(inference_update) {
+                    return Err(self.rollback_created_sandbox(&name, err));
+                }
             }
+            self.store_current_policy(name.clone(), policy);
         }
 
         Ok(SandboxHandle { handle: name })
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle> {
-        let request = command_request(&["sandbox", "connect", &params.handle, "--", "true"]);
+        let request = command_request(&["sandbox", "exec", "--name", &params.handle, "--", "true"]);
         let _output = self.run_checked_command(request)?;
 
         Ok(ShellHandle {
@@ -508,14 +659,30 @@ impl SandboxDriver for OpenShellDriver {
         let request = CommandRequest {
             args: vec![
                 "sandbox".to_owned(),
-                "connect".to_owned(),
+                "exec".to_owned(),
+                "--name".to_owned(),
                 params.handle,
                 "--".to_owned(),
+                "sh".to_owned(),
+                "-lc".to_owned(),
                 params.cmd,
             ],
             env: params.env,
         };
         let command = command_string(&self.binary, &request.args);
+        if params.tty {
+            let status = self.run_interactive_request(request).map_err(|source| {
+                DriverError::CommandSpawn {
+                    command: command.clone(),
+                    source,
+                }
+            })?;
+            return Ok(ExecResult {
+                status: status.unwrap_or(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
         let output =
             self.run_command_request(request)
                 .map_err(|source| DriverError::CommandSpawn {
@@ -639,14 +806,138 @@ impl SandboxDriver for OpenShellDriver {
 
 impl OpenShellDriver {
     fn run_command_request(&self, request: CommandRequest) -> io::Result<CommandOutput> {
-        self.runner.run(&self.binary, &request)
+        self.run_host_command(&self.binary, request)
+    }
+
+    fn run_interactive_request(&self, request: CommandRequest) -> io::Result<Option<i32>> {
+        let program = self.effective_program(&self.binary);
+        let request = self.prepare_host_request(request);
+        self.runner.status(&program, &request)
     }
 
     fn spawn_command_request(
         &self,
         request: CommandRequest,
     ) -> io::Result<Box<dyn SpawnedCommand>> {
-        self.runner.spawn(&self.binary, &request)
+        let program = self.effective_program(&self.binary);
+        let request = self.prepare_host_request(request);
+        self.runner.spawn(&program, &request)
+    }
+
+    fn run_host_command(
+        &self,
+        program: &str,
+        request: CommandRequest,
+    ) -> io::Result<CommandOutput> {
+        let program = self.effective_program(program);
+        let request = self.prepare_host_request(request);
+        self.runner.run(&program, &request)
+    }
+
+    fn effective_program(&self, program: &str) -> String {
+        if !self.host_bootstrap || !self.runner.uses_host_environment() {
+            return program.to_owned();
+        }
+        resolve_executable(program, &host_path_entries()).unwrap_or_else(|| program.to_owned())
+    }
+
+    fn prepare_host_request(&self, mut request: CommandRequest) -> CommandRequest {
+        if !self.host_bootstrap {
+            return request;
+        }
+        let path = host_command_path(&request.env);
+        request.env.insert("PATH".to_owned(), path);
+        request
+    }
+
+    fn install_openshell_cli(&self) -> Result<(), DriverError> {
+        let request = install_openshell_command_request();
+        let output = self
+            .run_host_command("sh", request.clone())
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string("sh", &request.args),
+                source,
+            })?;
+        if output.status.is_none_or(|status| status != 0) {
+            return Err(DriverError::CommandFailed {
+                command: command_string("sh", &request.args),
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_container_runtime_ready(&self) -> Result<(), PreflightResult> {
+        if self.docker_info_ok() {
+            return Ok(());
+        }
+
+        if !self.launchable_container_runtime_exists() {
+            return Err(preflight_failure(
+                "container_runtime_missing",
+                "No local container runtime was found for OpenShell sandbox creation".to_owned(),
+                Some(
+                    "Install OrbStack or Docker Desktop once, then retry `agentenv create`; agentenv will auto-detect common runtime paths afterward"
+                        .to_owned(),
+                ),
+            ));
+        }
+
+        let runtime_app = self.preferred_runtime_app();
+        let launch = self.run_host_command("open", command_request(&["-a", runtime_app.as_str()]));
+        if let Err(err) = launch {
+            return Err(preflight_failure(
+                "container_runtime_unavailable",
+                format!("failed to launch {runtime_app}: {err}"),
+                Some("Start OrbStack or Docker Desktop, then retry `agentenv create`".to_owned()),
+            ));
+        }
+
+        for _ in 0..CONTAINER_RUNTIME_WAIT_ATTEMPTS {
+            if self.docker_info_ok() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        Err(preflight_failure(
+            "container_runtime_unavailable",
+            "Container runtime was launched but Docker did not become ready".to_owned(),
+            Some("Open OrbStack or Docker Desktop and wait until it reports running, then retry `agentenv create`".to_owned()),
+        ))
+    }
+
+    fn docker_info_ok(&self) -> bool {
+        match self.run_host_command(
+            "docker",
+            command_request(&["info", "--format", "{{.ServerVersion}}"]),
+        ) {
+            Ok(output) => output.status == Some(0),
+            Err(_) => false,
+        }
+    }
+
+    fn preferred_runtime_app(&self) -> String {
+        if let Some(app) = self.configured_runtime_app() {
+            return app;
+        }
+        if orb_stack_app_exists() {
+            "OrbStack".to_owned()
+        } else {
+            "Docker".to_owned()
+        }
+    }
+
+    fn launchable_container_runtime_exists(&self) -> bool {
+        self.configured_runtime_app().is_some() || orb_stack_app_exists() || docker_app_exists()
+    }
+
+    fn configured_runtime_app(&self) -> Option<String> {
+        self.runtime_app_override
+            .clone()
+            .or_else(configured_runtime_app)
     }
 
     fn run_checked_command(&self, request: CommandRequest) -> Result<CommandOutput, DriverError> {
@@ -777,16 +1068,11 @@ impl OpenShellDriver {
         }
     }
 
-    fn apply_policy_to_handle(
+    fn write_policy_temp_file(
         &self,
-        handle: &str,
-        policy: NetworkPolicy,
-    ) -> DriverResult<ApplyPolicyResult> {
-        if let Some(current) = self.current_policy_for_handle(handle) {
-            classify_policy_update(&current, &policy).map_err(driver_error_from_policy_error)?;
-        }
-
-        let translated = translate_policy_for_openshell(&policy).map_err(|err| {
+        policy: &NetworkPolicy,
+    ) -> DriverResult<(TempPolicyFile, Option<InferenceUpdate>)> {
+        let translated = translate_policy_for_openshell(policy).map_err(|err| {
             DriverError::PolicyTranslation {
                 message: err.to_string(),
             }
@@ -796,6 +1082,41 @@ impl OpenShellDriver {
                 message: format!("failed to write translated policy to temp file: {err}"),
             }
         })?;
+
+        Ok((temp_policy_file, translated.inference_update))
+    }
+
+    fn run_inference_update(&self, inference_update: InferenceUpdate) -> DriverResult<()> {
+        let mut args = vec![
+            "inference".to_owned(),
+            "set".to_owned(),
+            "--provider".to_owned(),
+            inference_update.provider,
+            "--model".to_owned(),
+            inference_update.model,
+        ];
+        if let Some(timeout_seconds) = inference_update.timeout_seconds {
+            args.push("--timeout".to_owned());
+            args.push(timeout_seconds.to_string());
+        }
+
+        self.run_policy_command(CommandRequest {
+            args,
+            env: BTreeMap::new(),
+        })?;
+        Ok(())
+    }
+
+    fn apply_policy_to_handle(
+        &self,
+        handle: &str,
+        policy: NetworkPolicy,
+    ) -> DriverResult<ApplyPolicyResult> {
+        if let Some(current) = self.current_policy_for_handle(handle) {
+            classify_policy_update(&current, &policy).map_err(driver_error_from_policy_error)?;
+        }
+
+        let (temp_policy_file, inference_update) = self.write_policy_temp_file(&policy)?;
 
         let policy_args = vec![
             "policy".to_owned(),
@@ -810,24 +1131,8 @@ impl OpenShellDriver {
             env: BTreeMap::new(),
         })?;
 
-        if let Some(inference_update) = translated.inference_update {
-            let mut args = vec![
-                "inference".to_owned(),
-                "set".to_owned(),
-                "--provider".to_owned(),
-                inference_update.provider,
-                "--model".to_owned(),
-                inference_update.model,
-            ];
-            if let Some(timeout_seconds) = inference_update.timeout_seconds {
-                args.push("--timeout".to_owned());
-                args.push(timeout_seconds.to_string());
-            }
-
-            self.run_policy_command(CommandRequest {
-                args,
-                env: BTreeMap::new(),
-            })?;
+        if let Some(inference_update) = inference_update {
+            self.run_inference_update(inference_update)?;
         }
 
         self.store_current_policy(handle.to_owned(), policy);
@@ -952,6 +1257,94 @@ fn command_request_with_env(args: &[&str], env: BTreeMap<String, String>) -> Com
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         env,
     }
+}
+
+fn install_openshell_command_request() -> CommandRequest {
+    let script = format!(
+        "mkdir -p \"$HOME/.local/bin\" && curl -LsSf {OPEN_SHELL_INSTALL_URL} | OPENSHELL_INSTALL_DIR=\"$HOME/.local/bin\" sh"
+    );
+    command_request(&["-c", &script])
+}
+
+fn host_command_path(request_env: &BTreeMap<String, String>) -> String {
+    let base = request_env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let mut entries = host_path_entries();
+    entries.extend(std::env::split_paths(&base));
+    dedup_join_paths(entries).unwrap_or(base)
+}
+
+fn host_path_entries() -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        entries.push(home.join(".local/bin"));
+        entries.push(home.join(".orbstack/bin"));
+    }
+    entries.extend([
+        PathBuf::from("/Applications/OrbStack.app/Contents/MacOS/xbin"),
+        PathBuf::from("/Applications/OrbStack.app/Contents/MacOS/bin"),
+        PathBuf::from("/Applications/Docker.app/Contents/Resources/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+    ]);
+    entries
+}
+
+fn dedup_join_paths(entries: Vec<PathBuf>) -> Option<String> {
+    let mut seen = Vec::<PathBuf>::new();
+    for entry in entries {
+        if !entry.as_os_str().is_empty() && !seen.contains(&entry) {
+            seen.push(entry);
+        }
+    }
+    std::env::join_paths(seen)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn resolve_executable(program: &str, extra_path_entries: &[PathBuf]) -> Option<String> {
+    if program.contains(std::path::MAIN_SEPARATOR) {
+        let candidate = PathBuf::from(program);
+        return is_executable_candidate(&candidate).then(|| program.to_owned());
+    }
+
+    let mut entries = extra_path_entries.to_vec();
+    if let Some(path) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&path));
+    }
+    for dir in entries {
+        for candidate in executable_candidates(&dir, program) {
+            if is_executable_candidate(&candidate) {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+fn configured_runtime_app() -> Option<String> {
+    std::env::var("AGENTENV_OPENSHELL_RUNTIME_APP")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn orb_stack_app_exists() -> bool {
+    Path::new("/Applications/OrbStack.app").exists()
+        || std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .is_some_and(|home| home.join("Applications/OrbStack.app").exists())
+}
+
+fn docker_app_exists() -> bool {
+    Path::new("/Applications/Docker.app").exists()
+        || std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .is_some_and(|home| home.join("Applications/Docker.app").exists())
 }
 
 fn command_string(program: &str, args: &[String]) -> String {
@@ -1206,7 +1599,29 @@ fn translate_policy_for_openshell(policy: &NetworkPolicy) -> Result<TranslatedPo
         return translate_for_openshell_with_binaries(policy, std::iter::empty::<String>());
     }
 
-    translate_for_openshell(policy)
+    let mut binaries = resolve_default_open_shell_binary_paths()?;
+    if policy_allows_full_npm_registry(policy) {
+        binaries.extend(
+            DEFAULT_OPEN_SHELL_NPM_INSTALL_BINARIES
+                .iter()
+                .map(|path| (*path).to_owned()),
+        );
+    }
+    translate_for_openshell_with_binaries(policy, binaries)
+}
+
+fn policy_allows_full_npm_registry(policy: &NetworkPolicy) -> bool {
+    policy.network.allow.iter().any(|rule| {
+        matches!(
+            &rule.target,
+            agentenv_proto::NetworkTarget::Host {
+                host,
+                port: Some(443),
+                scheme: Some(scheme),
+                http_access: Some(agentenv_proto::HttpAccessLevel::Full),
+            } if host == "registry.npmjs.org" && scheme == "https"
+        )
+    })
 }
 
 fn resolve_default_open_shell_binary_paths() -> Result<Vec<String>, PolicyError> {
@@ -1308,7 +1723,7 @@ mod driver_tests {
     use super::{
         command_request, command_request_with_env, extract_semver_token, CommandCall,
         CommandOutput, CommandRunner, CommandScript, CommandScriptResult, OpenShellDriver,
-        RecordingCommandRunner,
+        RecordingCommandRunner, OPEN_SHELL_INSTALL_URL,
     };
 
     #[derive(Debug, Default)]
@@ -1801,6 +2216,30 @@ mod driver_tests {
     }
 
     #[test]
+    fn full_npm_registry_policy_includes_sandbox_installer_binaries() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+        use agentenv_proto::{HttpAccessLevel, NetworkRule, NetworkTarget};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (_tempdir, _path_guard) = set_fake_openshell_path();
+        let registry = PresetRegistry::load_builtin().expect("load presets");
+        let mut policy = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
+        policy.network.allow.push(NetworkRule {
+            target: NetworkTarget::Host {
+                host: "registry.npmjs.org".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: Some(HttpAccessLevel::Full),
+            },
+        });
+
+        let translated = super::translate_policy_for_openshell(&policy).expect("translate policy");
+
+        assert!(translated.policy_yaml.contains("/usr/local/bin/npm"));
+        assert!(translated.policy_yaml.contains("/usr/local/bin/node"));
+    }
+
+    #[test]
     fn apply_policy_allows_empty_network_policy_without_host_agent_binaries() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
@@ -1989,7 +2428,7 @@ mod driver_tests {
     }
 
     #[test]
-    fn create_applies_initial_policy_after_sandbox_create() {
+    fn create_passes_initial_policy_to_sandbox_create() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
@@ -2004,36 +2443,25 @@ mod driver_tests {
         let runner = Arc::new(FlexibleCommandRunner::new(vec![
             FlexibleCommandExpectation::success(
                 "openshell",
-                |call| {
-                    assert_eq!(
-                        call.request,
-                        command_request(&[
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &[
                             "sandbox",
                             "create",
                             "--name",
                             "devbox",
-                            "--keep",
                             "--no-auto-providers",
                             "--from",
                             "openclaw",
-                        ])
-                    );
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                move |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["policy", "set", "devbox", "--policy"],
-                        &["--wait"],
+                            "--policy",
+                        ],
+                        &["--", "true"],
                     );
                     let policy_path = PathBuf::from(
                         call.request
                             .args
-                            .get(4)
+                            .get(8)
                             .expect("policy path should be present"),
                     );
                     *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
@@ -2062,7 +2490,7 @@ mod driver_tests {
             .expect("create");
 
         assert_eq!(result.handle, "devbox");
-        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(runner.calls().len(), 1);
         let stored_policy = driver
             .current_policies
             .lock()
@@ -2081,58 +2509,77 @@ mod driver_tests {
     }
 
     #[test]
-    fn create_rolls_back_sandbox_when_initial_policy_apply_fails() {
+    fn create_rolls_back_sandbox_when_initial_inference_update_fails() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
-        let (policy, tempdir, _path_guard) = {
+        let (mut policy, tempdir, _path_guard) = {
             let registry = PresetRegistry::load_builtin().expect("load presets");
             let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
             let (tempdir, path_guard) = set_fake_openshell_path();
             (policy, tempdir, path_guard)
         };
+        policy
+            .inference
+            .routes
+            .push(agentenv_proto::InferenceRoute {
+                matcher: "default".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+                base_url: Some("https://api.openai.com/v1".to_owned()),
+                timeout_seconds: Some(30),
+            });
         let capture = Arc::new(Mutex::new(None::<PathBuf>));
         let capture_for_check = capture.clone();
         let runner = Arc::new(FlexibleCommandRunner::new(vec![
             FlexibleCommandExpectation::success(
                 "openshell",
-                |call| {
-                    assert_eq!(
-                        call.request,
-                        command_request(&[
+                move |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &[
                             "sandbox",
                             "create",
                             "--name",
                             "devbox",
-                            "--keep",
                             "--no-auto-providers",
                             "--from",
                             "openclaw",
-                        ])
+                            "--policy",
+                        ],
+                        &["--", "true"],
                     );
+                    let policy_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(8)
+                            .expect("policy path should be present"),
+                    );
+                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
                 },
                 "",
                 "",
             ),
             FlexibleCommandExpectation::output(
                 "openshell",
-                move |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["policy", "set", "devbox", "--policy"],
-                        &["--wait"],
+                |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "inference".to_owned(),
+                            "set".to_owned(),
+                            "--provider".to_owned(),
+                            "openai".to_owned(),
+                            "--model".to_owned(),
+                            "gpt-5".to_owned(),
+                            "--timeout".to_owned(),
+                            "30".to_owned(),
+                        ]
                     );
-                    let policy_path = PathBuf::from(
-                        call.request
-                            .args
-                            .get(4)
-                            .expect("policy path should be present"),
-                    );
-                    *capture_for_check.lock().expect("capture mutex") = Some(policy_path);
                 },
                 Some(1),
                 "",
-                "policy set failed",
+                "inference set failed",
             ),
             FlexibleCommandExpectation::success(
                 "openshell",
@@ -2163,11 +2610,11 @@ mod driver_tests {
                     })
                     .await
             })
-            .expect_err("create should fail when initial policy apply fails");
+            .expect_err("create should fail when initial inference update fails");
 
         match err {
             agentenv_core::driver::DriverError::CommandFailed { command, .. } => {
-                assert!(command.contains("policy set"));
+                assert!(command.contains("inference set"));
             }
             other => panic!("expected CommandFailed, got {other:?}"),
         }
@@ -2183,32 +2630,43 @@ mod driver_tests {
     }
 
     #[test]
-    fn create_reports_cleanup_failure_when_initial_policy_rollback_fails() {
+    fn create_reports_cleanup_failure_when_initial_inference_rollback_fails() {
         use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
-        let (policy, tempdir, _path_guard) = {
+        let (mut policy, tempdir, _path_guard) = {
             let registry = PresetRegistry::load_builtin().expect("load presets");
             let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
             let (tempdir, path_guard) = set_fake_openshell_path();
             (policy, tempdir, path_guard)
         };
+        policy
+            .inference
+            .routes
+            .push(agentenv_proto::InferenceRoute {
+                matcher: "default".to_owned(),
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+                base_url: Some("https://api.openai.com/v1".to_owned()),
+                timeout_seconds: Some(30),
+            });
         let runner = Arc::new(FlexibleCommandRunner::new(vec![
             FlexibleCommandExpectation::success(
                 "openshell",
                 |call| {
-                    assert_eq!(
-                        call.request,
-                        command_request(&[
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &[
                             "sandbox",
                             "create",
                             "--name",
                             "devbox",
-                            "--keep",
                             "--no-auto-providers",
                             "--from",
                             "openclaw",
-                        ])
+                            "--policy",
+                        ],
+                        &["--", "true"],
                     );
                 },
                 "",
@@ -2217,15 +2675,23 @@ mod driver_tests {
             FlexibleCommandExpectation::output(
                 "openshell",
                 |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["policy", "set", "devbox", "--policy"],
-                        &["--wait"],
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "inference".to_owned(),
+                            "set".to_owned(),
+                            "--provider".to_owned(),
+                            "openai".to_owned(),
+                            "--model".to_owned(),
+                            "gpt-5".to_owned(),
+                            "--timeout".to_owned(),
+                            "30".to_owned(),
+                        ]
                     );
                 },
                 Some(1),
                 "",
-                "policy set failed",
+                "inference set failed",
             ),
             FlexibleCommandExpectation::output(
                 "openshell",
@@ -2257,11 +2723,11 @@ mod driver_tests {
                     })
                     .await
             })
-            .expect_err("create should fail when policy apply and rollback fail");
+            .expect_err("create should fail when inference update and rollback fail");
 
         match err {
             agentenv_core::driver::DriverError::CleanupFailed { message } => {
-                assert!(message.contains("policy set failed"));
+                assert!(message.contains("inference set failed"));
                 assert!(message.contains("delete failed"));
             }
             other => panic!("expected CleanupFailed, got {other:?}"),
@@ -2406,10 +2872,10 @@ mod driver_tests {
     }
 
     #[tokio::test]
-    async fn preflight_passes_when_cli_version_and_gateway_are_valid() {
+    async fn preflight_passes_when_cli_version_and_status_are_valid() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             CommandScript::success("openshell", &["--version"], "openshell 0.0.31", ""),
-            CommandScript::success("openshell", &["gateway", "status"], "", ""),
+            CommandScript::success("openshell", &["status"], "", ""),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
@@ -2429,7 +2895,7 @@ mod driver_tests {
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
-                    request: command_request(&["gateway", "status"]),
+                    request: command_request(&["status"]),
                 },
             ]
         );
@@ -2439,7 +2905,7 @@ mod driver_tests {
     async fn openshell_driver_satisfies_sandbox_conformance_contract() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             CommandScript::success("openshell", &["--version"], "openshell 0.0.31", ""),
-            CommandScript::success("openshell", &["gateway", "status"], "", ""),
+            CommandScript::success("openshell", &["status"], "", ""),
         ]));
         let mut driver = OpenShellDriver::with_command_runner(runner.clone());
 
@@ -2474,7 +2940,7 @@ mod driver_tests {
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
-                    request: command_request(&["gateway", "status"]),
+                    request: command_request(&["status"]),
                 },
             ]
         );
@@ -2517,6 +2983,120 @@ mod driver_tests {
     }
 
     #[tokio::test]
+    async fn preflight_installs_missing_openshell_and_retries_with_local_runtime_path() {
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::error(
+                "openshell",
+                |call| assert_eq!(call.request.args, vec!["--version"]),
+                io::ErrorKind::NotFound,
+                "openshell was not found",
+            ),
+            FlexibleCommandExpectation::success(
+                "sh",
+                |call| {
+                    assert_eq!(call.request.args[0], "-c");
+                    assert!(call.request.args[1].contains(OPEN_SHELL_INSTALL_URL));
+                    assert!(call.request.args[1].contains("OPENSHELL_INSTALL_DIR"));
+                    assert!(call.request.env.contains_key("PATH"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| assert_eq!(call.request.args, vec!["--version"]),
+                "openshell 0.0.34",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| assert_eq!(call.request.args, vec!["status"]),
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "docker",
+                |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec!["info", "--format", "{{.ServerVersion}}"]
+                    )
+                },
+                "29.4.0",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_host_command_runner(runner.clone());
+
+        let result = driver
+            .preflight(PreflightParams::default())
+            .await
+            .expect("preflight");
+
+        assert!(result.ok);
+        assert!(result.issues.is_empty());
+        assert_eq!(runner.calls().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn preflight_launches_configured_runtime_when_docker_is_not_ready() {
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| assert_eq!(call.request.args, vec!["--version"]),
+                "openshell 0.0.34",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| assert_eq!(call.request.args, vec!["status"]),
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "docker",
+                |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec!["info", "--format", "{{.ServerVersion}}"]
+                    )
+                },
+                Some(1),
+                "",
+                "Cannot connect to Docker daemon",
+            ),
+            FlexibleCommandExpectation::success(
+                "open",
+                |call| assert_eq!(call.request.args, vec!["-a", "OrbStack"]),
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "docker",
+                |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec!["info", "--format", "{{.ServerVersion}}"]
+                    )
+                },
+                "29.4.0",
+                "",
+            ),
+        ]));
+        let driver =
+            OpenShellDriver::with_host_command_runner_and_runtime_app(runner.clone(), "OrbStack");
+
+        let result = driver
+            .preflight(PreflightParams::default())
+            .await
+            .expect("preflight");
+
+        assert!(result.ok);
+        assert!(result.issues.is_empty());
+        assert_eq!(runner.calls().len(), 5);
+    }
+
+    #[tokio::test]
     async fn preflight_rejects_old_cli_version() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
             "openshell",
@@ -2549,15 +3129,15 @@ mod driver_tests {
     }
 
     #[tokio::test]
-    async fn preflight_reports_gateway_down() {
+    async fn preflight_reports_status_failure() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             CommandScript::success("openshell", &["--version"], "openshell 0.0.31", ""),
             CommandScript::output(
                 "openshell",
-                &["gateway", "status"],
+                &["status"],
                 Some(1),
                 "",
-                "gateway not running",
+                "gateway status failed",
             ),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
@@ -2573,7 +3153,7 @@ mod driver_tests {
             .iter()
             .find(|issue| issue.code == "openshell_gateway_down")
             .expect("gateway issue");
-        assert!(issue.message.contains("gateway not running"));
+        assert!(issue.message.contains("gateway status failed"));
         assert_eq!(
             runner.calls(),
             vec![
@@ -2583,7 +3163,7 @@ mod driver_tests {
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
-                    request: command_request(&["gateway", "status"]),
+                    request: command_request(&["status"]),
                 },
             ]
         );
@@ -2600,12 +3180,13 @@ mod driver_tests {
                     "create",
                     "--name",
                     "named-sandbox",
-                    "--keep",
                     "--no-auto-providers",
                     "--from",
                     "custom-image",
                     "--remote",
                     "tcp://sandbox.example",
+                    "--",
+                    "true",
                 ],
                 env.clone(),
             ),
@@ -2653,12 +3234,13 @@ mod driver_tests {
                         "create",
                         "--name",
                         "named-sandbox",
-                        "--keep",
                         "--no-auto-providers",
                         "--from",
                         "custom-image",
                         "--remote",
                         "tcp://sandbox.example",
+                        "--",
+                        "true",
                     ],
                     env
                 ),
@@ -2699,10 +3281,11 @@ mod driver_tests {
                 "create",
                 "--name",
                 &result.handle,
-                "--keep",
                 "--no-auto-providers",
                 "--from",
                 "openclaw",
+                "--",
+                "true",
             ])
         );
     }
@@ -2738,7 +3321,9 @@ mod driver_tests {
         let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript {
             program: "openshell".to_owned(),
             request: command_request_with_env(
-                &["sandbox", "connect", "sb-1", "--", "echo hi"],
+                &[
+                    "sandbox", "exec", "--name", "sb-1", "--", "sh", "-lc", "echo hi",
+                ],
                 env.clone(),
             ),
             result: CommandScriptResult::Output(CommandOutput {
@@ -2774,9 +3359,68 @@ mod driver_tests {
             vec![CommandCall {
                 program: "openshell".to_owned(),
                 request: command_request_with_env(
-                    &["sandbox", "connect", "sb-1", "--", "echo hi"],
+                    &["sandbox", "exec", "--name", "sb-1", "--", "sh", "-lc", "echo hi",],
                     env,
                 ),
+            }]
+        );
+    }
+
+    #[test]
+    fn exec_with_tty_uses_interactive_status_path() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "openshell",
+            &[
+                "sandbox",
+                "exec",
+                "--name",
+                "sb-1",
+                "--",
+                "sh",
+                "-lc",
+                "/usr/local/bin/agentenv-agent",
+            ],
+            Some(3),
+            "",
+            "",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .exec(ExecParams {
+                        handle: "sb-1".to_owned(),
+                        cmd: "/usr/local/bin/agentenv-agent".to_owned(),
+                        tty: true,
+                        env: BTreeMap::new(),
+                    })
+                    .await
+            })
+            .expect("exec");
+
+        assert_eq!(result.status, 3);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "");
+        assert!(runner.calls().is_empty());
+        assert_eq!(
+            runner.status_calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request(&[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "/usr/local/bin/agentenv-agent",
+                ]),
             }]
         );
     }

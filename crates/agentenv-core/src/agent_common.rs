@@ -25,6 +25,12 @@ pub fn npm_package_spec(package: &str, version: Option<&str>) -> Result<String, 
     }
 }
 
+pub fn npm_global_install_command(package: &str) -> String {
+    format!(
+        "npm install -g --no-audit --fetch-retries=5 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=20000 {package}"
+    )
+}
+
 pub fn version_probe(binary: &str) -> AgentHealthCheckProbe {
     AgentHealthCheckProbe {
         cmd: format!("{binary} --version"),
@@ -46,7 +52,9 @@ fn is_safe_npm_version(version: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{npm_package_spec, version_probe, AgentMode, SharedAgentConfig};
+    use super::{
+        npm_global_install_command, npm_package_spec, version_probe, AgentMode, SharedAgentConfig,
+    };
 
     #[test]
     fn shared_agent_config_defaults_to_tui() {
@@ -79,5 +87,13 @@ mod tests {
         let err = npm_package_spec("@openai/codex", Some("1.2.3;curl")).unwrap_err();
 
         assert!(err.contains("safe npm package version"));
+    }
+
+    #[test]
+    fn npm_global_install_command_uses_retryable_non_auditing_install() {
+        assert_eq!(
+            npm_global_install_command("@openai/codex"),
+            "npm install -g --no-audit --fetch-retries=5 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=20000 @openai/codex"
+        );
     }
 }

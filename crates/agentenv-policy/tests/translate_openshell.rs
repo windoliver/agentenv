@@ -3,8 +3,8 @@ use agentenv_policy::{
     PresetRegistry, Tier,
 };
 use agentenv_proto::{
-    FilesystemPolicy, InferencePolicy, InferenceRoute, NetworkAccessPolicy, NetworkPolicy,
-    NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy,
+    FilesystemPolicy, HttpAccessLevel, InferencePolicy, InferenceRoute, NetworkAccessPolicy,
+    NetworkPolicy, NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy,
 };
 
 #[test]
@@ -282,6 +282,28 @@ fn readwrite_presets_translate_to_read_write_access() {
     );
 }
 
+#[test]
+fn full_npm_registry_access_translates_to_l4_passthrough() {
+    let mut policy = supported_policy();
+    policy.network.allow = vec![NetworkRule {
+        target: NetworkTarget::Host {
+            host: "registry.npmjs.org".to_owned(),
+            port: Some(443),
+            scheme: Some("https".to_owned()),
+            http_access: Some(HttpAccessLevel::Full),
+        },
+    }];
+    policy.network.approval_required.clear();
+
+    let translated = translator().translate(&policy).expect("translate policy");
+    let endpoint = endpoint_for_host(&translated.policy_yaml, "registry.npmjs.org")
+        .expect("npm endpoint should exist");
+
+    assert!(endpoint.get("protocol").is_none());
+    assert!(endpoint.get("enforcement").is_none());
+    assert!(endpoint.get("access").is_none());
+}
+
 fn translator() -> OpenShellTranslator {
     OpenShellTranslator::new([
         "/usr/local/bin/claude",
@@ -341,6 +363,11 @@ fn host_rule(host: &str) -> NetworkRule {
 }
 
 fn endpoint_access(policy_yaml: &str, host: &str) -> Option<String> {
+    endpoint_for_host(policy_yaml, host)
+        .and_then(|endpoint| endpoint["access"].as_str().map(ToOwned::to_owned))
+}
+
+fn endpoint_for_host(policy_yaml: &str, host: &str) -> Option<serde_yaml::Mapping> {
     let document: serde_yaml::Value = serde_yaml::from_str(policy_yaml).expect("parse yaml");
     let policies = document["network_policies"]
         .as_mapping()
@@ -352,7 +379,7 @@ fn endpoint_access(policy_yaml: &str, host: &str) -> Option<String> {
             .expect("endpoints sequence");
         for endpoint in endpoints {
             if endpoint["host"].as_str() == Some(host) {
-                return endpoint["access"].as_str().map(ToOwned::to_owned);
+                return endpoint.as_mapping().cloned();
             }
         }
     }

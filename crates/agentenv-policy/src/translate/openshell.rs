@@ -197,20 +197,35 @@ fn build_endpoint(rule: &NetworkRule) -> crate::PolicyResult<(String, EndpointDo
 
             Ok((
                 host.clone(),
-                EndpointDocument {
-                    host: host.clone(),
-                    port: 443,
-                    protocol: "rest",
-                    enforcement: "enforce",
-                    access: openshell_access(http_access.unwrap_or(HttpAccessLevel::ReadOnly)),
-                    deny_rules: Vec::new(),
-                },
+                endpoint_document(host, http_access.unwrap_or(HttpAccessLevel::ReadOnly)),
             ))
         }
         _ => Err(crate::PolicyError::TranslationUnsupported {
             translator: "openshell",
             message: format!("unsupported allow rule: {:?}", rule.target),
         }),
+    }
+}
+
+fn endpoint_document(host: &str, access: HttpAccessLevel) -> EndpointDocument {
+    if host == "registry.npmjs.org" && access == HttpAccessLevel::Full {
+        return EndpointDocument {
+            host: host.to_owned(),
+            port: 443,
+            protocol: None,
+            enforcement: None,
+            access: None,
+            deny_rules: Vec::new(),
+        };
+    }
+
+    EndpointDocument {
+        host: host.to_owned(),
+        port: 443,
+        protocol: Some("rest"),
+        enforcement: Some("enforce"),
+        access: Some(openshell_access(access)),
+        deny_rules: Vec::new(),
     }
 }
 
@@ -296,9 +311,12 @@ struct OpenShellNetworkPolicy {
 struct EndpointDocument {
     host: String,
     port: u16,
-    protocol: &'static str,
-    enforcement: &'static str,
-    access: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enforcement: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     deny_rules: Vec<DenyRuleDocument>,
 }
