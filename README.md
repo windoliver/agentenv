@@ -142,8 +142,9 @@ agentenv logs myapp
 agentenv logs myapp --follow
 agentenv describe myapp --json
 agentenv list
-agentenv freeze myapp --blueprint agentenv.yaml --out agentenv.lock
-agentenv reproduce agentenv.lock
+agentenv freeze myapp --output agentenv.lock
+agentenv verify agentenv.lock
+agentenv reproduce agentenv.lock --name myapp-copy
 agentenv destroy myapp --yes
 ```
 
