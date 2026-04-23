@@ -123,6 +123,14 @@ pub enum RuntimeError {
     MissingSandboxHandle { name: String },
     #[error("state name `{actual}` does not match env `{expected}`")]
     StateNameMismatch { expected: String, actual: String },
+    #[error("frozen lockfile {role} driver pin `{actual_name}` version `{actual_version}` does not match persisted env state `{expected_name}` version `{expected_version}`")]
+    FrozenLockfileDriverMismatch {
+        role: &'static str,
+        expected_name: String,
+        expected_version: String,
+        actual_name: String,
+        actual_version: String,
+    },
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -789,13 +797,68 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
         crate::driver_artifact::discover_driver_artifacts(discovery_config, None)?;
     let lockfile = crate::portable_lockfile::build_portable_lockfile(
         crate::portable_lockfile::PortableLockfileInput {
-            name: description.state.name,
+            name: description.state.name.clone(),
             blueprint_yaml: description.blueprint_yaml,
             driver_artifacts,
         },
     )?;
+    validate_frozen_lockfile_pins(&description.state, &lockfile)?;
 
     Ok(lockfile.to_yaml_deterministic()?)
+}
+
+fn validate_frozen_lockfile_pins(
+    state: &crate::env::EnvStateFile,
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> RuntimeResult<()> {
+    validate_frozen_lockfile_pin("sandbox", &state.drivers.sandbox, lockfile)?;
+    validate_frozen_lockfile_pin("agent", &state.drivers.agent, lockfile)?;
+    validate_frozen_lockfile_pin("context", &state.drivers.context, lockfile)?;
+
+    match state.drivers.inference.as_ref() {
+        Some(record) => validate_frozen_lockfile_pin("inference", record, lockfile)?,
+        None if lockfile.drivers.contains_key("inference") => {
+            let pin = &lockfile.drivers["inference"];
+            return Err(RuntimeError::FrozenLockfileDriverMismatch {
+                role: "inference",
+                expected_name: "<none>".to_owned(),
+                expected_version: "<none>".to_owned(),
+                actual_name: pin.name.clone(),
+                actual_version: pin.version.clone(),
+            });
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
+fn validate_frozen_lockfile_pin(
+    role: &'static str,
+    state_record: &crate::env::DriverRecord,
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> RuntimeResult<()> {
+    let Some(pin) = lockfile.drivers.get(role) else {
+        return Err(RuntimeError::FrozenLockfileDriverMismatch {
+            role,
+            expected_name: state_record.name.clone(),
+            expected_version: state_record.version.clone(),
+            actual_name: "<missing>".to_owned(),
+            actual_version: "<missing>".to_owned(),
+        });
+    };
+
+    if pin.name != state_record.name || pin.version != state_record.version {
+        return Err(RuntimeError::FrozenLockfileDriverMismatch {
+            role,
+            expected_name: state_record.name.clone(),
+            expected_version: state_record.version.clone(),
+            actual_name: pin.name.clone(),
+            actual_version: pin.version.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 pub async fn exec_env(

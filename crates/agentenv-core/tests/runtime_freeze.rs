@@ -5,7 +5,7 @@ use agentenv_core::{
         DriverHandles, DriverRecord, EndpointState, EnvPaths, EnvPhase, EnvStateFile,
         StateDriverSet, STATE_VERSION,
     },
-    runtime::{freeze_env_lockfile, RuntimeOptions},
+    runtime::{freeze_env_lockfile, RuntimeError, RuntimeOptions},
 };
 use agentenv_proto::LogLevel;
 
@@ -41,6 +41,43 @@ fn runtime_freeze_reads_persisted_env_and_returns_portable_lockfile() {
     assert!(rendered.contains("name: passthrough"));
     assert!(rendered.contains("digest: sha256:"));
     assert!(!rendered.contains("sk-known-secret"));
+}
+
+#[test]
+fn runtime_freeze_rejects_lockfile_pin_that_differs_from_persisted_state() {
+    let root = tempfile_dir("runtime-freeze-mismatch");
+    let env_name = agentenv_core::env::validate_env_name("demo").unwrap();
+    let paths = EnvPaths::new(root.join(".agentenv"), env_name);
+    fs::create_dir_all(paths.env_dir()).unwrap();
+    fs::write(paths.blueprint_path(), blueprint_yaml()).unwrap();
+    fs::write(paths.lock_path(), legacy_lock_yaml()).unwrap();
+    let mut state = state_file("demo");
+    state.drivers.agent.version = "9.9.9".to_owned();
+    agentenv_core::env::write_state(&paths, &state).unwrap();
+
+    let error = freeze_env_lockfile(
+        &RuntimeOptions {
+            root: root.join(".agentenv"),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        },
+        "demo",
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeError::FrozenLockfileDriverMismatch {
+            role,
+            expected_name,
+            expected_version,
+            actual_name,
+            ..
+        } if role == "agent"
+            && expected_name == "codex"
+            && expected_version == "9.9.9"
+            && actual_name == "codex"
+    ));
 }
 
 fn blueprint_yaml() -> &'static str {

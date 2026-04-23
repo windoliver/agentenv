@@ -47,9 +47,13 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         RuntimeError::Lifecycle(_) | RuntimeError::InvalidPolicyTier { .. } => {
             ReasonCode::InvalidBlueprint
         }
+        RuntimeError::Lockfile(_)
+        | RuntimeError::PortableLockfile(_)
+        | RuntimeError::FrozenLockfileDriverMismatch { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Driver(error) => reason_for_driver_error(error),
         RuntimeError::Env(EnvError::Io { .. })
         | RuntimeError::Env(EnvError::Json { .. })
+        | RuntimeError::DriverArtifact(_)
         | RuntimeError::CommandStatus { .. }
         | RuntimeError::MissingSandboxHandle { .. }
         | RuntimeError::ComponentConfigConversion { .. }
