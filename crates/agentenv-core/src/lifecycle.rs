@@ -474,6 +474,41 @@ fn canonical_blueprint_hash(blueprint: &CanonicalBlueprint) -> Result<String, Li
     Ok(sha256_hex(rendered.as_bytes()))
 }
 
+pub(crate) fn portable_canonical_blueprint(
+    resolved: &ResolvedBlueprint,
+) -> Result<crate::lockfile::PortableComposition, LifecycleError> {
+    let canonical = canonical_blueprint(resolved)?;
+    Ok(crate::lockfile::PortableComposition {
+        version: canonical.version,
+        min_agentenv_version: canonical.min_agentenv_version,
+        sandbox: portable_component(canonical.sandbox),
+        agent: portable_component(canonical.agent),
+        context: portable_component(canonical.context),
+        inference: canonical.inference.map(portable_component),
+        policy: canonical.policy,
+        state: canonical.state,
+    })
+}
+
+pub(crate) fn portable_blueprint_hash(
+    composition: &crate::lockfile::PortableComposition,
+) -> Result<String, LifecycleError> {
+    let value =
+        serde_yaml::to_value(composition).map_err(LifecycleError::CanonicalBlueprintSerialize)?;
+    let rendered = serde_yaml::to_string(&canonicalize_yaml_value(value))
+        .map_err(LifecycleError::CanonicalBlueprintSerialize)?;
+    Ok(sha256_hex(rendered.as_bytes()))
+}
+
+fn portable_component(component: CanonicalComponent) -> crate::lockfile::PortableComponent {
+    crate::lockfile::PortableComponent {
+        driver: component.driver,
+        version: component.version,
+        credentials: component.credentials,
+        extra: component.extra,
+    }
+}
+
 fn verify_component_digest(path: &str, component: &ComponentSection) -> Result<(), LifecycleError> {
     if component.extra.contains_key("image") {
         let digest =

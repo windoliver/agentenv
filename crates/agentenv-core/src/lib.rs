@@ -13,6 +13,7 @@ pub mod error;
 pub mod inference;
 pub mod lifecycle;
 pub mod lockfile;
+pub mod portable_lockfile;
 pub mod registry;
 pub mod runtime;
 pub mod security;
