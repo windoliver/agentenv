@@ -36,6 +36,7 @@ pub enum PortableVerifyIssueKind {
     DriverDigestMismatch,
     ArtifactMapMismatch,
     CredentialMapMismatch,
+    PolicyDeclarationMismatch,
     PolicyDrift,
     PolicyRecomputeFailed,
 }
@@ -378,6 +379,15 @@ fn expected_driver_pins(
 }
 
 fn verify_policy(lockfile: &PortableLockfile, report: &mut PortableVerifyReport) {
+    if lockfile.policy.declared != lockfile.composition.policy {
+        report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::PolicyDeclarationMismatch,
+            role: None,
+            message: "policy.declared does not match composition.policy".to_owned(),
+        });
+        return;
+    }
+
     let recomputed = parse_tier(&lockfile.policy.declared.tier).and_then(|tier| {
         let presets = parse_presets(&lockfile.policy.declared.presets)?;
         let registry = PresetRegistry::load_builtin()?;

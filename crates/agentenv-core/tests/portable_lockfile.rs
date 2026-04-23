@@ -476,11 +476,55 @@ fn portable_lockfile_verify_rejects_credential_map_mismatch() {
 }
 
 #[test]
+fn portable_lockfile_verify_rejects_policy_declared_composition_mismatch() {
+    let mut lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: no_inference_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build restricted lockfile");
+    let open_lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: open_policy_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build open lockfile");
+    lockfile.policy = open_lockfile.policy;
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.role.is_none()
+            && issue
+                .message
+                .contains("policy.declared does not match composition.policy")
+    }));
+}
+
+#[test]
 fn portable_lockfile_verify_reports_policy_drift_as_warning() {
-    let rendered = reference_portable_lockfile_yaml().replace(
-        "declared:\n    tier: balanced",
-        "declared:\n    tier: restricted",
-    );
+    let mut lockfile = reference_portable_lockfile();
+    lockfile
+        .policy
+        .resolved
+        .network
+        .allow
+        .push(agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "pinned-drift.example".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        });
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render drifted lockfile");
 
     let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
         .expect("verify portable lockfile");
@@ -704,6 +748,23 @@ context:
   driver: filesystem
 policy:
   tier: restricted
+  presets: []
+"#
+    .to_owned()
+}
+
+fn open_policy_yaml() -> String {
+    r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+policy:
+  tier: open
   presets: []
 "#
     .to_owned()
