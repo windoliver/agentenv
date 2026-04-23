@@ -107,20 +107,26 @@ impl DriverFactory for BuiltInDriverFactory {
     ) -> RuntimeResult<DriverSet> {
         let mut catalog = None;
         Ok(DriverSet {
-            sandbox: build_pinned_sandbox(selection, pins)?,
+            sandbox: build_pinned_sandbox(selection, pins.get("sandbox"))?,
             agent: build_pinned_agent(selection, pins.get("agent"), &mut catalog)?,
             context: build_pinned_context(selection, pins.get("context"), &mut catalog)?,
-            inference: build_pinned_inference(selection)?,
+            inference: build_pinned_inference(selection, pins.get("inference"))?,
         })
     }
 }
 
 fn build_pinned_sandbox(
     selection: &DriverSelection,
-    _pins: &DriverPinSet,
+    pin: Option<&DriverPinIdentity>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::SandboxDriver>> {
     match selection.sandbox.as_str() {
         "openshell" | "sandbox-openshell" => {
+            validate_builtin_pin(
+                "sandbox",
+                agentenv_proto::DriverKind::Sandbox,
+                &["openshell", "sandbox-openshell"],
+                pin,
+            )?;
             Ok(Box::new(sandbox_openshell::OpenShellDriver::default()))
         }
         other => Err(RuntimeError::UnsupportedDriver {
@@ -163,9 +169,33 @@ fn build_pinned_agent(
             }
         }
         _ => match selection.agent.as_str() {
-            "claude" | "agent-claude" => Ok(Box::new(agent_claude::ClaudeDriver)),
-            "codex" | "agent-codex" => Ok(Box::new(agent_codex::CodexDriver)),
-            "openclaw" | "agent-openclaw" => Ok(Box::new(agent_openclaw::OpenClawDriver)),
+            "claude" | "agent-claude" => {
+                validate_builtin_pin(
+                    "agent",
+                    agentenv_proto::DriverKind::Agent,
+                    &["claude", "agent-claude"],
+                    pin,
+                )?;
+                Ok(Box::new(agent_claude::ClaudeDriver))
+            }
+            "codex" | "agent-codex" => {
+                validate_builtin_pin(
+                    "agent",
+                    agentenv_proto::DriverKind::Agent,
+                    &["codex", "agent-codex"],
+                    pin,
+                )?;
+                Ok(Box::new(agent_codex::CodexDriver))
+            }
+            "openclaw" | "agent-openclaw" => {
+                validate_builtin_pin(
+                    "agent",
+                    agentenv_proto::DriverKind::Agent,
+                    &["openclaw", "agent-openclaw"],
+                    pin,
+                )?;
+                Ok(Box::new(agent_openclaw::OpenClawDriver))
+            }
             other => Err(RuntimeError::UnsupportedDriver {
                 kind: "agent",
                 name: other.to_owned(),
@@ -207,13 +237,37 @@ fn build_pinned_context(
             }
         }
         _ => match selection.context.as_str() {
-            "filesystem" | "context-filesystem" => Ok(Box::new(
-                context_filesystem::FilesystemContextDriver::default(),
-            )),
-            "mcp-generic" | "context-mcp-generic" => Ok(Box::new(
-                context_mcp_generic::GenericMcpContextDriver::default(),
-            )),
-            "none" | "context-none" => Ok(Box::new(context_none::NoneContextDriver)),
+            "filesystem" | "context-filesystem" => {
+                validate_builtin_pin(
+                    "context",
+                    agentenv_proto::DriverKind::Context,
+                    &["filesystem", "context-filesystem"],
+                    pin,
+                )?;
+                Ok(Box::new(
+                    context_filesystem::FilesystemContextDriver::default(),
+                ))
+            }
+            "mcp-generic" | "context-mcp-generic" => {
+                validate_builtin_pin(
+                    "context",
+                    agentenv_proto::DriverKind::Context,
+                    &["mcp-generic", "context-mcp-generic"],
+                    pin,
+                )?;
+                Ok(Box::new(
+                    context_mcp_generic::GenericMcpContextDriver::default(),
+                ))
+            }
+            "none" | "context-none" => {
+                validate_builtin_pin(
+                    "context",
+                    agentenv_proto::DriverKind::Context,
+                    &["none", "context-none"],
+                    pin,
+                )?;
+                Ok(Box::new(context_none::NoneContextDriver))
+            }
             other => Err(RuntimeError::UnsupportedDriver {
                 kind: "context",
                 name: other.to_owned(),
@@ -224,28 +278,90 @@ fn build_pinned_context(
 
 fn build_pinned_inference(
     selection: &DriverSelection,
+    pin: Option<&DriverPinIdentity>,
 ) -> RuntimeResult<Option<Box<dyn InferenceDriver>>> {
     match selection.inference.as_deref() {
-        None => Ok(None),
-        Some("passthrough" | "inference-passthrough") => Ok(Some(Box::new(
-            inference_passthrough::PassthroughInferenceDriver,
-        )
-            as Box<dyn InferenceDriver>)),
-        Some("openai" | "inference-openai") => Ok(Some(Box::new(
-            inference_openai::OpenAiInferenceDriver,
-        ) as Box<dyn InferenceDriver>)),
-        Some("anthropic" | "inference-anthropic") => Ok(Some(Box::new(
-            inference_anthropic::AnthropicInferenceDriver,
-        )
-            as Box<dyn InferenceDriver>)),
-        Some("ollama" | "inference-ollama") => Ok(Some(Box::new(
-            inference_ollama::OllamaInferenceDriver,
-        ) as Box<dyn InferenceDriver>)),
+        None => match pin {
+            Some(pin) => Err(RuntimeError::UnsupportedDriver {
+                kind: "inference",
+                name: pin.name.clone(),
+            }),
+            None => Ok(None),
+        },
+        Some("passthrough" | "inference-passthrough") => {
+            validate_builtin_pin(
+                "inference",
+                agentenv_proto::DriverKind::Inference,
+                &["passthrough", "inference-passthrough"],
+                pin,
+            )?;
+            Ok(Some(
+                Box::new(inference_passthrough::PassthroughInferenceDriver)
+                    as Box<dyn InferenceDriver>,
+            ))
+        }
+        Some("openai" | "inference-openai") => {
+            validate_builtin_pin(
+                "inference",
+                agentenv_proto::DriverKind::Inference,
+                &["openai", "inference-openai"],
+                pin,
+            )?;
+            Ok(Some(
+                Box::new(inference_openai::OpenAiInferenceDriver) as Box<dyn InferenceDriver>
+            ))
+        }
+        Some("anthropic" | "inference-anthropic") => {
+            validate_builtin_pin(
+                "inference",
+                agentenv_proto::DriverKind::Inference,
+                &["anthropic", "inference-anthropic"],
+                pin,
+            )?;
+            Ok(Some(
+                Box::new(inference_anthropic::AnthropicInferenceDriver) as Box<dyn InferenceDriver>,
+            ))
+        }
+        Some("ollama" | "inference-ollama") => {
+            validate_builtin_pin(
+                "inference",
+                agentenv_proto::DriverKind::Inference,
+                &["ollama", "inference-ollama"],
+                pin,
+            )?;
+            Ok(Some(
+                Box::new(inference_ollama::OllamaInferenceDriver) as Box<dyn InferenceDriver>
+            ))
+        }
         Some(other) => Err(RuntimeError::UnsupportedDriver {
             kind: "inference",
             name: other.to_owned(),
         }),
     }
+}
+
+fn validate_builtin_pin(
+    role: &'static str,
+    expected_kind: agentenv_proto::DriverKind,
+    expected_names: &[&str],
+    pin: Option<&DriverPinIdentity>,
+) -> RuntimeResult<()> {
+    let Some(pin) = pin else {
+        return Ok(());
+    };
+
+    if pin.kind != expected_kind
+        || pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn
+        || !expected_names.contains(&pin.name.as_str())
+        || pin.version != env!("CARGO_PKG_VERSION")
+    {
+        return Err(RuntimeError::UnsupportedDriver {
+            kind: role,
+            name: pin.name.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 fn discover_catalog() -> RuntimeResult<DriverCatalog> {
@@ -316,12 +432,20 @@ fn subprocess_source_from_pin(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::BTreeMap, sync::Mutex};
 
     use agentenv_core::{
         driver_catalog::DriverSource,
+        lockfile::{
+            DriverSourcePin, PortableComponent, PortableComposition, PortableDriverPin,
+            PortableLockfile, PortablePolicy,
+        },
         registry::DriverKind as CatalogKind,
-        runtime::{DriverFactory, DriverSelection},
+        runtime::{DriverFactory, DriverPinSet, DriverSelection},
+    };
+    use agentenv_proto::{
+        DriverKind as ProtoDriverKind, FilesystemPolicy, InferencePolicy, NetworkAccessPolicy,
+        NetworkPolicy, PolicyReloadability, ProcessPolicy, SCHEMA_VERSION,
     };
 
     use super::BuiltInDriverFactory;
@@ -460,6 +584,154 @@ mod tests {
                 .expect("manifest parent"),
             installed.as_path()
         );
+    }
+
+    #[test]
+    fn pinned_build_rejects_non_builtin_sandbox_pin() {
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: None,
+        };
+        let pins = pin_set(
+            "sandbox",
+            ProtoDriverKind::Sandbox,
+            "openshell",
+            env!("CARGO_PKG_VERSION"),
+            DriverSourcePin::Installed,
+        );
+
+        let err = BuiltInDriverFactory
+            .build_pinned(&selection, &pins)
+            .expect_err("non-built-in sandbox pin cannot be materialized");
+
+        assert!(err.to_string().contains("unsupported driver"));
+    }
+
+    #[test]
+    fn pinned_build_rejects_builtin_inference_version_mismatch() {
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: Some("passthrough".to_owned()),
+        };
+        let pins = pin_set(
+            "inference",
+            ProtoDriverKind::Inference,
+            "passthrough",
+            "9.9.9",
+            DriverSourcePin::BuiltIn,
+        );
+
+        let err = BuiltInDriverFactory
+            .build_pinned(&selection, &pins)
+            .expect_err("mismatched built-in inference pin cannot be materialized");
+
+        assert!(err.to_string().contains("unsupported driver"));
+    }
+
+    fn pin_set(
+        role: &str,
+        kind: ProtoDriverKind,
+        name: &str,
+        version: &str,
+        source: DriverSourcePin,
+    ) -> DriverPinSet {
+        let mut drivers = BTreeMap::new();
+        drivers.insert(
+            role.to_owned(),
+            PortableDriverPin {
+                kind: proto_kind_label(kind).to_owned(),
+                name: name.to_owned(),
+                version: version.to_owned(),
+                source,
+                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+            },
+        );
+        let lockfile = PortableLockfile {
+            version: agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION.to_owned(),
+            driver_protocol_version: SCHEMA_VERSION.to_owned(),
+            name: "demo".to_owned(),
+            blueprint_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_owned(),
+            composition: PortableComposition {
+                version: "0.1.0".to_owned(),
+                min_agentenv_version: "0.0.1-alpha0".to_owned(),
+                sandbox: portable_component("openshell"),
+                agent: portable_component("codex"),
+                context: portable_component("filesystem"),
+                inference: None,
+                policy: agentenv_core::blueprint::PolicySection {
+                    tier: "restricted".to_owned(),
+                    presets: Vec::new(),
+                    overrides: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+                state: None,
+            },
+            policy: PortablePolicy {
+                declared: agentenv_core::blueprint::PolicySection {
+                    tier: "restricted".to_owned(),
+                    presets: Vec::new(),
+                    overrides: Vec::new(),
+                    extra: BTreeMap::new(),
+                },
+                resolved: empty_policy(),
+            },
+            drivers,
+            artifacts: BTreeMap::new(),
+            credentials: BTreeMap::new(),
+        };
+        DriverPinSet::from_portable_lockfile(&lockfile).expect("pin set")
+    }
+
+    fn proto_kind_label(kind: ProtoDriverKind) -> &'static str {
+        match kind {
+            ProtoDriverKind::Sandbox => "sandbox",
+            ProtoDriverKind::Agent => "agent",
+            ProtoDriverKind::Context => "context",
+            ProtoDriverKind::Inference => "inference",
+        }
+    }
+
+    fn portable_component(driver: &str) -> PortableComponent {
+        PortableComponent {
+            driver: driver.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            credentials: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn empty_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            network: NetworkAccessPolicy {
+                reloadability: PolicyReloadability::HotReload,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                approval_required: Vec::new(),
+            },
+            filesystem: FilesystemPolicy {
+                reloadability: PolicyReloadability::LockedAtCreate,
+                read_only: Vec::new(),
+                read_write: Vec::new(),
+            },
+            process: ProcessPolicy {
+                reloadability: PolicyReloadability::LockedAtCreate,
+                run_as_user: "sandbox".to_owned(),
+                run_as_group: "sandbox".to_owned(),
+                profile: "restricted".to_owned(),
+                allow_syscalls: Vec::new(),
+                deny_syscalls: Vec::new(),
+            },
+            inference: InferencePolicy {
+                reloadability: PolicyReloadability::HotReload,
+                routes: Vec::new(),
+            },
+        }
     }
 
     fn write_manifest(root: &std::path::Path, kind: &str, name: &str, binary_name: &str) {
