@@ -59,6 +59,7 @@ pub trait CredentialProvider {
 struct CreateEnvInput<'a> {
     name: &'a str,
     blueprint_yaml: &'a str,
+    lock_yaml: Option<String>,
     resolved_policy: Option<agentenv_proto::NetworkPolicy>,
 }
 
@@ -415,6 +416,7 @@ pub async fn create_env(
         CreateEnvInput {
             name,
             blueprint_yaml,
+            lock_yaml: None,
             resolved_policy: None,
         },
     )
@@ -440,7 +442,10 @@ async fn create_env_with_input(
     }
 
     let resolved = crate::lifecycle::verify_blueprint_yaml(blueprint_yaml)?;
-    let lock_yaml = crate::lifecycle::freeze_from_blueprint_yaml(blueprint_yaml)?;
+    let lock_yaml = match input.lock_yaml {
+        Some(lock_yaml) => lock_yaml,
+        None => crate::lifecycle::freeze_from_blueprint_yaml(blueprint_yaml)?,
+    };
     let selection = DriverSelection {
         sandbox: resolved.sandbox.driver.clone(),
         agent: resolved.agent.driver.clone(),
@@ -829,6 +834,29 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     discovery_config.installed_root = options.root.join("drivers");
     let driver_artifacts =
         crate::driver_artifact::discover_driver_artifacts(discovery_config, None)?;
+
+    if let crate::lockfile::LockfileDocument::Portable(mut lockfile) =
+        crate::lockfile::LockfileDocument::from_yaml(&description.lock_yaml)?
+    {
+        let report = crate::portable_lockfile::verify_portable_lockfile_yaml(
+            &description.lock_yaml,
+            &driver_artifacts,
+        )?;
+        if !report.errors.is_empty() {
+            let details = report
+                .errors
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(RuntimeError::PortableLockfileVerification { details });
+        }
+
+        validate_frozen_lockfile_pins(&description.state, &lockfile)?;
+        lockfile.name = description.state.name.clone();
+        return Ok(lockfile.to_yaml_deterministic()?);
+    }
+
     let lockfile = crate::portable_lockfile::build_portable_lockfile(
         crate::portable_lockfile::PortableLockfileInput {
             name: description.state.name.clone(),
@@ -849,7 +877,7 @@ pub async fn reproduce_env(
     lockfile_yaml: &str,
 ) -> RuntimeResult<CreateResult> {
     let document = crate::lockfile::LockfileDocument::from_yaml(lockfile_yaml)?;
-    let lockfile = match document {
+    let mut lockfile = match document {
         crate::lockfile::LockfileDocument::Legacy(_) => {
             return Err(RuntimeError::LegacyLockfileReproduce);
         }
@@ -875,6 +903,8 @@ pub async fn reproduce_env(
     check_required_lockfile_credentials(credentials, &lockfile)?;
     let credential_aliases = credential_aliases_from_portable_lockfile(&lockfile);
     let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
+    lockfile.name = name.to_owned();
+    let persisted_lock_yaml = lockfile.to_yaml_deterministic()?;
     let mut aliased_credentials = ReproducedCredentialProvider {
         inner: credentials,
         aliases: credential_aliases,
@@ -886,6 +916,7 @@ pub async fn reproduce_env(
         CreateEnvInput {
             name,
             blueprint_yaml: &blueprint_yaml,
+            lock_yaml: Some(persisted_lock_yaml),
             resolved_policy: Some(lockfile.policy.resolved.clone()),
         },
     )
@@ -4106,6 +4137,84 @@ policy:
             applied_policies[0].network.allow.contains(&pinned_rule),
             "post-install restored policy should include the pinned lockfile policy"
         );
+    }
+
+    #[tokio::test]
+    async fn freeze_after_reproduce_preserves_lockfile_resolved_policy() {
+        let root = unique_root("agentenv-freeze-reproduced-pinned-policy");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "source-demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile
+            .policy
+            .resolved
+            .network
+            .allow
+            .push(agentenv_proto::NetworkRule {
+                target: NetworkTarget::Host {
+                    host: "frozen-pinned.example".to_owned(),
+                    port: Some(443),
+                    scheme: Some("https".to_owned()),
+                    http_access: None,
+                },
+            });
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(
+            &options,
+            &TinyFactory,
+            &mut credentials,
+            "renamed-demo",
+            &lockfile_yaml,
+        )
+        .await
+        .expect("reproduce env");
+
+        let persisted_lock =
+            fs::read_to_string(root.join("envs").join("renamed-demo").join("lock.yaml"))
+                .expect("read persisted lockfile");
+        assert!(persisted_lock.contains("version: 0.2.0"));
+        assert!(persisted_lock.contains("name: renamed-demo"));
+        assert!(!persisted_lock.contains("name: source-demo"));
+        assert!(persisted_lock.contains("frozen-pinned.example"));
+
+        let frozen = super::freeze_env_lockfile(&options, "renamed-demo").expect("freeze env");
+
+        assert!(frozen.contains("name: renamed-demo"));
+        assert!(frozen.contains("resolved:"));
+        assert!(frozen.contains("frozen-pinned.example"));
     }
 
     #[tokio::test]
