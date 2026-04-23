@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use agentenv_policy::{compose_policy, PresetRegistry, PresetSelection, Tier};
 use agentenv_proto::{NetworkPolicy, NetworkRule, NetworkTarget, SCHEMA_VERSION};
+use semver::Version;
 use thiserror::Error;
 
 use crate::{
@@ -12,7 +13,8 @@ use crate::{
         verify_blueprint_yaml_with_registry,
     },
     lockfile::{
-        CredentialRef, DriverSourcePin, PortableDriverPin, PortableLockfile, PortablePolicy,
+        CredentialRef, DriverSourcePin, LockfileDocument, PortableDriverPin, PortableLockfile,
+        PortablePolicy,
     },
     registry::{DriverKind, DriverRegistry},
 };
@@ -22,6 +24,35 @@ pub struct PortableLockfileInput {
     pub name: String,
     pub blueprint_yaml: String,
     pub driver_artifacts: Vec<DriverArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortableVerifyIssueKind {
+    LegacyLockfile,
+    BlueprintHashMismatch,
+    MissingDriverArtifact,
+    DriverDigestMismatch,
+    PolicyDrift,
+    PolicyRecomputeFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableVerifyIssue {
+    pub kind: PortableVerifyIssueKind,
+    pub role: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PortableVerifyReport {
+    pub errors: Vec<PortableVerifyIssue>,
+    pub warnings: Vec<PortableVerifyIssue>,
+}
+
+impl PortableVerifyReport {
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty() && self.warnings.is_empty()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -94,6 +125,153 @@ pub fn build_portable_lockfile_from_blueprint(
     input: PortableLockfileInput,
 ) -> Result<PortableLockfile, PortableLockfileError> {
     build_portable_lockfile(input)
+}
+
+pub fn verify_portable_lockfile_yaml(
+    lockfile_yaml: &str,
+    driver_artifacts: &[DriverArtifact],
+) -> Result<PortableVerifyReport, PortableLockfileError> {
+    let document = LockfileDocument::from_yaml(lockfile_yaml)?;
+    let lockfile = match document {
+        LockfileDocument::Legacy(_) => {
+            return Ok(PortableVerifyReport {
+                errors: Vec::new(),
+                warnings: vec![PortableVerifyIssue {
+                    kind: PortableVerifyIssueKind::LegacyLockfile,
+                    role: None,
+                    message: "legacy 0.1.0 lockfiles are not self-contained for reproduction"
+                        .to_owned(),
+                }],
+            });
+        }
+        LockfileDocument::Portable(lockfile) => lockfile,
+    };
+
+    let mut report = PortableVerifyReport::default();
+    verify_blueprint_hash(&lockfile, &mut report);
+    verify_driver_pins(&lockfile, driver_artifacts, &mut report);
+    verify_policy(&lockfile, &mut report);
+    Ok(report)
+}
+
+fn verify_blueprint_hash(lockfile: &PortableLockfile, report: &mut PortableVerifyReport) {
+    match portable_blueprint_hash(&lockfile.composition) {
+        Ok(actual) if actual == lockfile.blueprint_hash => {}
+        Ok(actual) => report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::BlueprintHashMismatch,
+            role: None,
+            message: format!(
+                "portable blueprint hash mismatch: expected `{}`, computed `{actual}`",
+                lockfile.blueprint_hash
+            ),
+        }),
+        Err(error) => report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::BlueprintHashMismatch,
+            role: None,
+            message: format!("failed to recompute portable blueprint hash: {error}"),
+        }),
+    }
+}
+
+fn verify_driver_pins(
+    lockfile: &PortableLockfile,
+    driver_artifacts: &[DriverArtifact],
+    report: &mut PortableVerifyReport,
+) {
+    for (role, pin) in &lockfile.drivers {
+        let Some(kind) = parse_driver_kind(&pin.kind) else {
+            report.errors.push(PortableVerifyIssue {
+                kind: PortableVerifyIssueKind::MissingDriverArtifact,
+                role: Some(role.clone()),
+                message: format!(
+                    "pinned {role} driver has unsupported kind `{}` and cannot be matched",
+                    pin.kind
+                ),
+            });
+            continue;
+        };
+
+        let Ok(version) = Version::parse(&pin.version) else {
+            report.errors.push(PortableVerifyIssue {
+                kind: PortableVerifyIssueKind::MissingDriverArtifact,
+                role: Some(role.clone()),
+                message: format!(
+                    "pinned {role} driver `{}` has invalid version `{}` and cannot be matched",
+                    pin.name, pin.version
+                ),
+            });
+            continue;
+        };
+
+        let artifact = driver_artifacts.iter().find(|artifact| {
+            artifact.kind == kind
+                && artifact.name == pin.name
+                && artifact.version == version
+                && source_pin(artifact.source) == pin.source
+        });
+
+        let Some(artifact) = artifact else {
+            report.errors.push(PortableVerifyIssue {
+                kind: PortableVerifyIssueKind::MissingDriverArtifact,
+                role: Some(role.clone()),
+                message: format!(
+                    "missing local artifact for {role} driver `{}` version `{}` from `{}`",
+                    pin.name,
+                    pin.version,
+                    pin.source.as_str()
+                ),
+            });
+            continue;
+        };
+
+        if artifact.digest != pin.digest {
+            report.errors.push(PortableVerifyIssue {
+                kind: PortableVerifyIssueKind::DriverDigestMismatch,
+                role: Some(role.clone()),
+                message: format!(
+                    "digest mismatch for {role} driver `{}` version `{}`: expected `{}`, found `{}`",
+                    pin.name, pin.version, pin.digest, artifact.digest
+                ),
+            });
+        }
+    }
+}
+
+fn verify_policy(lockfile: &PortableLockfile, report: &mut PortableVerifyReport) {
+    let recomputed = parse_tier(&lockfile.policy.declared.tier).and_then(|tier| {
+        let presets = parse_presets(&lockfile.policy.declared.presets)?;
+        let registry = PresetRegistry::load_builtin()?;
+        compose_policy(
+            tier,
+            &presets,
+            policy_overrides(&lockfile.policy.declared.overrides),
+            &registry,
+        )
+    });
+
+    match recomputed {
+        Ok(policy) if policy == lockfile.policy.resolved => {}
+        Ok(_) => report.warnings.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::PolicyDrift,
+            role: None,
+            message: "recomputed policy differs from the policy pinned in the lockfile".to_owned(),
+        }),
+        Err(error) => report.warnings.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::PolicyRecomputeFailed,
+            role: None,
+            message: format!("failed to recompute declared policy: {error}"),
+        }),
+    }
+}
+
+fn parse_driver_kind(value: &str) -> Option<DriverKind> {
+    match value {
+        "sandbox" => Some(DriverKind::Sandbox),
+        "agent" => Some(DriverKind::Agent),
+        "context" => Some(DriverKind::Context),
+        "inference" => Some(DriverKind::Inference),
+        _ => None,
+    }
 }
 
 fn driver_pins(

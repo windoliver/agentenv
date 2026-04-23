@@ -2,7 +2,10 @@ use agentenv_core::{
     driver_artifact::DriverArtifact,
     driver_catalog::DriverSource,
     lockfile::{DriverSourcePin, LockfileDocument},
-    portable_lockfile::{build_portable_lockfile, PortableLockfileError, PortableLockfileInput},
+    portable_lockfile::{
+        build_portable_lockfile, verify_portable_lockfile_yaml, PortableLockfileError,
+        PortableLockfileInput, PortableVerifyIssueKind,
+    },
     registry::DriverKind,
 };
 use agentenv_proto::NetworkTarget;
@@ -216,6 +219,122 @@ fn portable_lockfile_document_round_trips_builder_output() {
     assert!(matches!(parsed, LockfileDocument::Portable(_)));
 }
 
+#[test]
+fn portable_lockfile_verify_reports_missing_driver_artifact() {
+    let rendered = reference_portable_lockfile_yaml();
+    let report = verify_portable_lockfile_yaml(
+        &rendered,
+        &built_in_artifacts()
+            .into_iter()
+            .filter(|artifact| artifact.kind != DriverKind::Agent)
+            .collect::<Vec<_>>(),
+    )
+    .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::MissingDriverArtifact
+            && issue.role.as_deref() == Some("agent")
+    }));
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn portable_lockfile_verify_reports_driver_digest_mismatch() {
+    let rendered = reference_portable_lockfile_yaml();
+    let mut artifacts = built_in_artifacts();
+    let agent_artifact = artifacts
+        .iter_mut()
+        .find(|artifact| artifact.kind == DriverKind::Agent)
+        .expect("agent artifact");
+    agent_artifact.digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+
+    let report =
+        verify_portable_lockfile_yaml(&rendered, &artifacts).expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::DriverDigestMismatch
+            && issue.role.as_deref() == Some("agent")
+    }));
+}
+
+#[test]
+fn portable_lockfile_verify_reports_successful_verification() {
+    let rendered = reference_portable_lockfile_yaml();
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(report.is_ok());
+    assert!(report.errors.is_empty());
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn portable_lockfile_verify_reports_blueprint_hash_mismatch() {
+    let lockfile = reference_portable_lockfile();
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render portable lockfile")
+        .replace(
+            &format!("blueprint_hash: {}", lockfile.blueprint_hash),
+            "blueprint_hash: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        );
+
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::BlueprintHashMismatch && issue.role.is_none()
+    }));
+}
+
+#[test]
+fn portable_lockfile_verify_reports_policy_drift_as_warning() {
+    let rendered = reference_portable_lockfile_yaml().replace(
+        "declared:\n    tier: balanced",
+        "declared:\n    tier: restricted",
+    );
+
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(report.errors.is_empty());
+    assert!(!report.is_ok());
+    assert!(report.warnings.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::PolicyDrift && issue.role.is_none()
+    }));
+}
+
+#[test]
+fn portable_lockfile_verify_reports_legacy_lockfile_warning() {
+    let report = verify_portable_lockfile_yaml(&legacy_lockfile_yaml(), &built_in_artifacts())
+        .expect("verify legacy lockfile");
+
+    assert!(report.errors.is_empty());
+    assert!(!report.is_ok());
+    assert!(report.warnings.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::LegacyLockfile && issue.role.is_none()
+    }));
+}
+
+fn reference_portable_lockfile() -> agentenv_core::lockfile::PortableLockfile {
+    build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: reference_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build lockfile")
+}
+
+fn reference_portable_lockfile_yaml() -> String {
+    reference_portable_lockfile()
+        .to_yaml_deterministic()
+        .expect("render lockfile")
+}
+
 fn reference_yaml() -> String {
     r#"
 version: 0.1.0
@@ -338,4 +457,23 @@ fn built_in_artifacts() -> Vec<DriverArtifact> {
         install_hint: None,
     })
     .collect()
+}
+
+fn legacy_lockfile_yaml() -> String {
+    r#"
+version: 0.1.0
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  sandbox:
+    name: openshell
+    version: 0.0.1-alpha0
+  agent:
+    name: codex
+    version: 0.0.1-alpha0
+  context:
+    name: filesystem
+    version: 0.0.1-alpha0
+"#
+    .to_owned()
 }
