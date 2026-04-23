@@ -101,6 +101,10 @@ pub enum RuntimeError {
     InvalidPolicyTier { tier: String },
     #[error("missing credential `{name}`")]
     MissingCredential { name: String },
+    #[error("legacy 0.1.0 lockfiles are not portable; use `agentenv create --reproduce <lockfile>` with a companion blueprint")]
+    LegacyLockfileReproduce,
+    #[error("lockfile verification failed: {details}")]
+    PortableLockfileVerification { details: String },
     #[error("command exited with status {status}")]
     CommandStatus { status: i32 },
     #[error("failed to convert component config key `{key}`: {source}")]
@@ -807,6 +811,42 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     Ok(lockfile.to_yaml_deterministic()?)
 }
 
+pub async fn reproduce_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    credentials: &mut dyn CredentialProvider,
+    name: &str,
+    lockfile_yaml: &str,
+) -> RuntimeResult<CreateResult> {
+    let document = crate::lockfile::LockfileDocument::from_yaml(lockfile_yaml)?;
+    let lockfile = match document {
+        crate::lockfile::LockfileDocument::Legacy(_) => {
+            return Err(RuntimeError::LegacyLockfileReproduce);
+        }
+        crate::lockfile::LockfileDocument::Portable(lockfile) => lockfile,
+    };
+
+    let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+    discovery_config.installed_root = options.root.join("drivers");
+    let driver_artifacts =
+        crate::driver_artifact::discover_driver_artifacts(discovery_config, None)?;
+    let report =
+        crate::portable_lockfile::verify_portable_lockfile_yaml(lockfile_yaml, &driver_artifacts)?;
+    if !report.errors.is_empty() {
+        let details = report
+            .errors
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(RuntimeError::PortableLockfileVerification { details });
+    }
+
+    check_required_lockfile_credentials(credentials, &lockfile)?;
+    let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
+    create_env(options, factory, credentials, name, &blueprint_yaml).await
+}
+
 fn validate_frozen_lockfile_pins(
     state: &crate::env::EnvStateFile,
     lockfile: &crate::lockfile::PortableLockfile,
@@ -859,6 +899,88 @@ fn validate_frozen_lockfile_pin(
     }
 
     Ok(())
+}
+
+fn check_required_lockfile_credentials(
+    credentials: &mut dyn CredentialProvider,
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> RuntimeResult<()> {
+    for (name, credential) in &lockfile.credentials {
+        if credential.required == Some(false) {
+            continue;
+        }
+
+        let requirement = agentenv_proto::CredentialRequirement {
+            name: name.clone(),
+            description: String::new(),
+            kind: agentenv_proto::CredentialKind::ApiKey,
+            required: true,
+            validator: None,
+        };
+        if credentials.resolve(&requirement)?.is_none() {
+            return Err(RuntimeError::MissingCredential { name: name.clone() });
+        }
+    }
+
+    Ok(())
+}
+
+fn blueprint_yaml_from_portable_lockfile(
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> RuntimeResult<String> {
+    let composition = &lockfile.composition;
+    let blueprint = crate::blueprint::Blueprint {
+        version: composition.version.clone(),
+        min_agentenv_version: composition.min_agentenv_version.clone(),
+        sandbox: blueprint_component_from_portable(&composition.sandbox),
+        agent: blueprint_component_from_portable(&composition.agent),
+        context: blueprint_component_from_portable(&composition.context),
+        inference: composition
+            .inference
+            .as_ref()
+            .map(blueprint_component_from_portable),
+        policy: composition.policy.clone(),
+        state: composition.state.clone(),
+    };
+
+    serde_yaml::to_string(&blueprint).map_err(RuntimeError::lockfile_serialize)
+}
+
+fn blueprint_component_from_portable(
+    component: &crate::lockfile::PortableComponent,
+) -> crate::blueprint::ComponentSection {
+    crate::blueprint::ComponentSection {
+        driver: component.driver.clone(),
+        version: Some(component.version.clone()),
+        credentials: if component.credentials.is_empty() {
+            None
+        } else {
+            Some(
+                component
+                    .credentials
+                    .iter()
+                    .map(|(name, credential)| {
+                        (
+                            name.clone(),
+                            crate::blueprint::CredentialRef {
+                                source: credential.source.clone(),
+                                required: credential.required,
+                                value: credential.reference.clone(),
+                                extra: BTreeMap::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        },
+        extra: component.extra.clone(),
+    }
+}
+
+impl RuntimeError {
+    fn lockfile_serialize(source: serde_yaml::Error) -> Self {
+        Self::Lockfile(crate::lockfile::LockfileError::Serialize(source))
+    }
 }
 
 pub async fn exec_env(

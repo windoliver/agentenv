@@ -41,6 +41,76 @@ fn freeze_persisted_env_writes_default_lockfile() {
 }
 
 #[test]
+fn reproduce_portable_lockfile_reports_missing_required_credential() {
+    let temp_dir = make_temp_dir("reproduce-portable-missing-credential");
+    let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let lockfile = temp_dir.join("agentenv.lock");
+    let freeze = Command::new(agentenv_bin())
+        .arg("freeze")
+        .arg("demo")
+        .arg("--output")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        output_summary(&freeze)
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("reproduce")
+        .arg(&lockfile)
+        .arg("--name")
+        .arg("demo-copy")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPENAI_API_KEY"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing credential") || stderr.contains("missing_credential"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown field `driver_protocol_version`"),
+        "portable lockfile was parsed as legacy: {stderr}"
+    );
+}
+
+#[test]
 fn verify_blueprint_succeeds_on_reference_blueprint() {
     let output = Command::new(agentenv_bin())
         .arg("verify-blueprint")
