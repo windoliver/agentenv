@@ -30,6 +30,7 @@ pub struct PortableLockfileInput {
 pub enum PortableVerifyIssueKind {
     LegacyLockfile,
     BlueprintHashMismatch,
+    CompositionInvalid,
     DriverPinMismatch,
     MissingDriverArtifact,
     DriverDigestMismatch,
@@ -160,6 +161,7 @@ pub fn verify_portable_lockfile_yaml(
 
     let mut report = PortableVerifyReport::default();
     verify_blueprint_hash(&lockfile, &mut report);
+    verify_composition(&lockfile, driver_artifacts, &mut report);
     verify_driver_pins(&lockfile, driver_artifacts, &mut report);
     verify_artifacts(&lockfile, &mut report);
     verify_credentials(&lockfile, &mut report);
@@ -182,6 +184,33 @@ fn verify_blueprint_hash(lockfile: &PortableLockfile, report: &mut PortableVerif
             kind: PortableVerifyIssueKind::BlueprintHashMismatch,
             role: None,
             message: format!("failed to recompute portable blueprint hash: {error}"),
+        }),
+    }
+}
+
+fn verify_composition(
+    lockfile: &PortableLockfile,
+    driver_artifacts: &[DriverArtifact],
+    report: &mut PortableVerifyReport,
+) {
+    let result = blueprint_yaml_from_portable_composition(&lockfile.composition).and_then(|yaml| {
+        let registry = registry_from_artifacts(driver_artifacts);
+        let resolved = verify_blueprint_yaml_with_registry(&yaml, &registry)?;
+        portable_canonical_blueprint(&resolved)
+    });
+
+    match result {
+        Ok(composition) if composition == lockfile.composition => {}
+        Ok(_) => report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::CompositionInvalid,
+            role: None,
+            message: "portable composition does not round-trip through blueprint resolution"
+                .to_owned(),
+        }),
+        Err(error) => report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::CompositionInvalid,
+            role: None,
+            message: format!("portable composition is invalid: {error}"),
         }),
     }
 }
@@ -499,6 +528,58 @@ fn collect_portable_credentials(
         credentials.extend(inference.credentials.clone());
     }
     credentials
+}
+
+fn blueprint_yaml_from_portable_composition(
+    composition: &crate::lockfile::PortableComposition,
+) -> Result<String, crate::lifecycle::LifecycleError> {
+    let blueprint = crate::blueprint::Blueprint {
+        version: composition.version.clone(),
+        min_agentenv_version: composition.min_agentenv_version.clone(),
+        sandbox: blueprint_component_from_portable(&composition.sandbox),
+        agent: blueprint_component_from_portable(&composition.agent),
+        context: blueprint_component_from_portable(&composition.context),
+        inference: composition
+            .inference
+            .as_ref()
+            .map(blueprint_component_from_portable),
+        policy: composition.policy.clone(),
+        state: composition.state.clone(),
+    };
+
+    serde_yaml::to_string(&blueprint)
+        .map_err(crate::lifecycle::LifecycleError::CanonicalBlueprintSerialize)
+}
+
+fn blueprint_component_from_portable(
+    component: &crate::lockfile::PortableComponent,
+) -> crate::blueprint::ComponentSection {
+    crate::blueprint::ComponentSection {
+        driver: component.driver.clone(),
+        version: Some(component.version.clone()),
+        credentials: if component.credentials.is_empty() {
+            None
+        } else {
+            Some(
+                component
+                    .credentials
+                    .iter()
+                    .map(|(name, credential)| {
+                        (
+                            name.clone(),
+                            crate::blueprint::CredentialRef {
+                                source: credential.source.clone(),
+                                required: credential.required,
+                                value: credential.reference.clone(),
+                                extra: BTreeMap::new(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        },
+        extra: component.extra.clone(),
+    }
 }
 
 fn parse_tier(value: &str) -> Result<Tier, agentenv_policy::PolicyError> {

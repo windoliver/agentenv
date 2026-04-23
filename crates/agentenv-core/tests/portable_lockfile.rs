@@ -10,6 +10,7 @@ use agentenv_core::{
 };
 use agentenv_proto::NetworkTarget;
 use semver::Version;
+use sha2::{Digest, Sha256};
 
 #[test]
 fn portable_lockfile_builder_is_byte_identical_for_repeated_calls() {
@@ -370,6 +371,46 @@ fn portable_lockfile_verify_reports_blueprint_hash_mismatch() {
 }
 
 #[test]
+fn portable_lockfile_verify_rejects_invalid_composition() {
+    let mut lockfile = reference_portable_lockfile();
+    lockfile.composition.context.extra.insert(
+        "hub_url".to_owned(),
+        serde_yaml::Value::String("http://169.254.169.254/latest".to_owned()),
+    );
+    lockfile.blueprint_hash = portable_blueprint_hash_for_test(&lockfile.composition);
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.role.is_none() && issue.message.contains("portable composition is invalid")
+    }));
+}
+
+#[test]
+fn portable_lockfile_parse_rejects_unknown_resolved_policy_field() {
+    let rendered = reference_portable_lockfile_yaml().replace(
+        "network:\n      reloadability: hot_reload",
+        "network:\n      reloadability: hot_reload\n      unexpected: true",
+    );
+
+    let error = LockfileDocument::from_yaml(&rendered)
+        .expect_err("unknown resolved policy fields should be rejected");
+
+    assert!(
+        error.to_string().contains("unknown field")
+            || error
+                .to_string()
+                .contains("unexpected resolved policy field"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn portable_lockfile_verify_rejects_artifact_map_mismatch() {
     let mut lockfile = build_portable_lockfile(PortableLockfileInput {
         name: "demo".to_owned(),
@@ -478,6 +519,91 @@ fn reference_portable_lockfile_yaml() -> String {
     reference_portable_lockfile()
         .to_yaml_deterministic()
         .expect("render lockfile")
+}
+
+fn portable_blueprint_hash_for_test(
+    composition: &agentenv_core::lockfile::PortableComposition,
+) -> String {
+    let value = serde_yaml::to_value(composition).expect("serialize composition");
+    let rendered =
+        serde_yaml::to_string(&canonicalize_yaml_value_for_test(value)).expect("render yaml");
+    let digest = Sha256::digest(rendered.as_bytes());
+    hex::encode(digest)
+}
+
+fn canonicalize_yaml_value_for_test(value: serde_yaml::Value) -> serde_yaml::Value {
+    match value {
+        serde_yaml::Value::Sequence(items) => serde_yaml::Value::Sequence(
+            items
+                .into_iter()
+                .map(canonicalize_yaml_value_for_test)
+                .collect::<Vec<_>>(),
+        ),
+        serde_yaml::Value::Mapping(map) => {
+            let mut entries = map
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        canonicalize_yaml_value_for_test(key),
+                        canonicalize_yaml_value_for_test(value),
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|(left_key, _), (right_key, _)| {
+                canonical_yaml_sort_key_for_test(left_key)
+                    .cmp(&canonical_yaml_sort_key_for_test(right_key))
+            });
+
+            let mut canonical = serde_yaml::Mapping::new();
+            for (key, value) in entries {
+                canonical.insert(key, value);
+            }
+            serde_yaml::Value::Mapping(canonical)
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            serde_yaml::Value::Tagged(Box::new(serde_yaml::value::TaggedValue {
+                tag: tagged.tag,
+                value: canonicalize_yaml_value_for_test(tagged.value),
+            }))
+        }
+        other => other,
+    }
+}
+
+fn canonical_yaml_sort_key_for_test(value: &serde_yaml::Value) -> String {
+    match value {
+        serde_yaml::Value::Null => "n:null".to_owned(),
+        serde_yaml::Value::Bool(boolean) => format!("b:{boolean}"),
+        serde_yaml::Value::Number(number) => format!("d:{number}"),
+        serde_yaml::Value::String(string) => format!("s:{string}"),
+        serde_yaml::Value::Sequence(items) => {
+            let mut rendered = String::from("q:[");
+            for item in items {
+                rendered.push_str(&canonical_yaml_sort_key_for_test(item));
+                rendered.push(',');
+            }
+            rendered.push(']');
+            rendered
+        }
+        serde_yaml::Value::Mapping(map) => {
+            let mut rendered = String::from("m:{");
+            for (key, value) in map {
+                rendered.push_str(&canonical_yaml_sort_key_for_test(key));
+                rendered.push('=');
+                rendered.push_str(&canonical_yaml_sort_key_for_test(value));
+                rendered.push(',');
+            }
+            rendered.push('}');
+            rendered
+        }
+        serde_yaml::Value::Tagged(tagged) => {
+            format!(
+                "t:{}:{}",
+                tagged.tag,
+                canonical_yaml_sort_key_for_test(&tagged.value)
+            )
+        }
+    }
 }
 
 fn reference_yaml() -> String {

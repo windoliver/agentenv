@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use agentenv_proto::{assert_compatible_schema_version, NetworkPolicy};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::Value;
 use thiserror::Error;
 
@@ -90,11 +90,33 @@ pub struct PortableComponent {
     pub extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortablePolicy {
     pub declared: crate::blueprint::PolicySection,
     pub resolved: NetworkPolicy,
+}
+
+impl<'de> Deserialize<'de> for PortablePolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawPortablePolicy {
+            declared: crate::blueprint::PolicySection,
+            resolved: Value,
+        }
+
+        let raw = RawPortablePolicy::deserialize(deserializer)?;
+        validate_resolved_policy_value(&raw.resolved).map_err(serde::de::Error::custom)?;
+        let resolved = serde_yaml::from_value(raw.resolved).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            declared: raw.declared,
+            resolved,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,4 +335,155 @@ fn validate_credentials(
     }
 
     Ok(())
+}
+
+fn validate_resolved_policy_value(value: &Value) -> Result<(), String> {
+    validate_mapping_keys(
+        value,
+        "policy.resolved",
+        &["network", "filesystem", "process", "inference"],
+    )?;
+    validate_child_mapping_keys(
+        value,
+        "network",
+        "policy.resolved.network",
+        &["reloadability", "allow", "deny", "approval_required"],
+    )?;
+    validate_rule_list(value, "network", "allow", "policy.resolved.network.allow")?;
+    validate_rule_list(value, "network", "deny", "policy.resolved.network.deny")?;
+    validate_rule_list(
+        value,
+        "network",
+        "approval_required",
+        "policy.resolved.network.approval_required",
+    )?;
+    validate_child_mapping_keys(
+        value,
+        "filesystem",
+        "policy.resolved.filesystem",
+        &["reloadability", "read_only", "read_write"],
+    )?;
+    validate_child_mapping_keys(
+        value,
+        "process",
+        "policy.resolved.process",
+        &[
+            "reloadability",
+            "run_as_user",
+            "run_as_group",
+            "profile",
+            "allow_syscalls",
+            "deny_syscalls",
+        ],
+    )?;
+    validate_child_mapping_keys(
+        value,
+        "inference",
+        "policy.resolved.inference",
+        &["reloadability", "routes"],
+    )?;
+    validate_inference_routes(value)?;
+    Ok(())
+}
+
+fn validate_mapping_keys(value: &Value, path: &str, allowed: &[&str]) -> Result<(), String> {
+    let Some(mapping) = value.as_mapping() else {
+        return Ok(());
+    };
+
+    for key in mapping.keys() {
+        let Some(key) = key.as_str() else {
+            return Err(format!("{path} contains a non-string key"));
+        };
+        if !allowed.contains(&key) {
+            return Err(format!("unexpected resolved policy field `{path}.{key}`"));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_child_mapping_keys(
+    parent: &Value,
+    child: &str,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let Some(value) = mapping_value(parent, child) else {
+        return Ok(());
+    };
+    validate_mapping_keys(value, path, allowed)
+}
+
+fn validate_rule_list(
+    policy: &Value,
+    section: &str,
+    field: &str,
+    path: &str,
+) -> Result<(), String> {
+    let Some(value) =
+        mapping_value(policy, section).and_then(|section| mapping_value(section, field))
+    else {
+        return Ok(());
+    };
+    let Value::Sequence(rules) = value else {
+        return Ok(());
+    };
+
+    for (index, rule) in rules.iter().enumerate() {
+        let rule_path = format!("{path}[{index}]");
+        validate_mapping_keys(rule, &rule_path, &["target"])?;
+        let Some(target) = mapping_value(rule, "target") else {
+            continue;
+        };
+        validate_network_target(target, &format!("{rule_path}.target"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_network_target(target: &Value, path: &str) -> Result<(), String> {
+    let kind = mapping_value(target, "kind").and_then(Value::as_str);
+    let allowed = match kind {
+        Some("host") => &["kind", "host", "port", "scheme", "http_access"][..],
+        Some("cidr") => &["kind", "cidr"][..],
+        Some("port") => &["kind", "port", "protocol"][..],
+        Some("url_pattern") => &["kind", "pattern"][..],
+        Some("http_method_path") => &["kind", "host", "method", "path"][..],
+        _ => return validate_mapping_keys(target, path, &["kind"]),
+    };
+    validate_mapping_keys(target, path, allowed)
+}
+
+fn validate_inference_routes(policy: &Value) -> Result<(), String> {
+    let Some(value) =
+        mapping_value(policy, "inference").and_then(|inference| mapping_value(inference, "routes"))
+    else {
+        return Ok(());
+    };
+    let Value::Sequence(routes) = value else {
+        return Ok(());
+    };
+
+    for (index, route) in routes.iter().enumerate() {
+        validate_mapping_keys(
+            route,
+            &format!("policy.resolved.inference.routes[{index}]"),
+            &[
+                "matcher",
+                "provider",
+                "model",
+                "base_url",
+                "timeout_seconds",
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn mapping_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .as_mapping()
+        .and_then(|mapping| mapping.get(Value::String(key.to_owned())))
 }
