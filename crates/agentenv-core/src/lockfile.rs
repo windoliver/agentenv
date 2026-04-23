@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use agentenv_proto::NetworkPolicy;
+use agentenv_proto::{assert_compatible_schema_version, NetworkPolicy};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use thiserror::Error;
@@ -249,6 +249,12 @@ impl PortableLockfile {
             });
         }
 
+        assert_compatible_schema_version(&self.driver_protocol_version).map_err(|_| {
+            LockfileError::UnsupportedProtocolVersion {
+                version: self.driver_protocol_version.clone(),
+            }
+        })?;
+
         parse_sha256_hex(&self.blueprint_hash)
             .map_err(|source| LockfileError::InvalidBlueprintHash { source })?;
 
@@ -274,6 +280,13 @@ impl PortableLockfile {
                     source,
                 }
             })?;
+        }
+
+        validate_credentials(&self.composition.sandbox.credentials)?;
+        validate_credentials(&self.composition.agent.credentials)?;
+        validate_credentials(&self.composition.context.credentials)?;
+        if let Some(inference) = &self.composition.inference {
+            validate_credentials(&inference.credentials)?;
         }
 
         validate_credentials(&self.credentials)

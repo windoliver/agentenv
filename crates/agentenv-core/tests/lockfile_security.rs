@@ -420,3 +420,146 @@ credentials:
     let error = LockfileDocument::from_yaml(yaml).unwrap_err();
     assert!(error.to_string().contains("value"), "error was {error}");
 }
+
+#[test]
+fn lockfile_security_portable_v2_rejects_nested_component_credentials_without_references() {
+    let yaml = r#"
+version: 0.2.0
+driver_protocol_version: "1.0"
+name: demo
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+composition:
+  version: 0.1.0
+  min_agentenv_version: 0.0.1-alpha0
+  sandbox:
+    driver: openshell
+    version: 0.0.1-alpha0
+    credentials:
+      SANDBOX_TOKEN:
+        source: env
+  agent:
+    driver: codex
+    version: 0.0.1-alpha0
+  context:
+    driver: filesystem
+    version: 0.0.1-alpha0
+  policy:
+    tier: restricted
+    presets: []
+policy:
+  declared:
+    tier: restricted
+    presets: []
+    overrides: []
+  resolved:
+    network:
+      reloadability: hot_reload
+    filesystem:
+      reloadability: locked_at_create
+    process:
+      reloadability: locked_at_create
+      run_as_user: sandbox
+      run_as_group: sandbox
+      profile: restricted
+    inference:
+      reloadability: hot_reload
+drivers:
+  sandbox:
+    kind: sandbox
+    name: openshell
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  agent:
+    kind: agent
+    name: codex
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  context:
+    kind: context
+    name: filesystem
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+"#;
+
+    let error = LockfileDocument::from_yaml(yaml).unwrap_err();
+    assert!(
+        error.to_string().contains("SANDBOX_TOKEN"),
+        "error was {error}"
+    );
+    assert!(
+        error.to_string().contains("reference-only credentials"),
+        "error was {error}"
+    );
+}
+
+#[test]
+fn lockfile_security_portable_v2_rejects_incompatible_driver_protocol_version() {
+    let yaml = r#"
+version: 0.2.0
+driver_protocol_version: "2.0"
+name: demo
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+composition:
+  version: 0.1.0
+  min_agentenv_version: 0.0.1-alpha0
+  sandbox:
+    driver: openshell
+    version: 0.0.1-alpha0
+  agent:
+    driver: codex
+    version: 0.0.1-alpha0
+  context:
+    driver: filesystem
+    version: 0.0.1-alpha0
+  policy:
+    tier: restricted
+    presets: []
+policy:
+  declared:
+    tier: restricted
+    presets: []
+    overrides: []
+  resolved:
+    network:
+      reloadability: hot_reload
+    filesystem:
+      reloadability: locked_at_create
+    process:
+      reloadability: locked_at_create
+      run_as_user: sandbox
+      run_as_group: sandbox
+      profile: restricted
+    inference:
+      reloadability: hot_reload
+drivers:
+  sandbox:
+    kind: sandbox
+    name: openshell
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  agent:
+    kind: agent
+    name: codex
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  context:
+    kind: context
+    name: filesystem
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+"#;
+
+    let error = LockfileDocument::from_yaml(yaml).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported protocol version `2.0`"),
+        "error was {error}"
+    );
+}
