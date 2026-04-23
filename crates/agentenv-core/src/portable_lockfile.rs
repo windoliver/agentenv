@@ -7,11 +7,14 @@ use thiserror::Error;
 use crate::{
     driver_artifact::DriverArtifact,
     driver_catalog::DriverSource,
-    lifecycle::{portable_blueprint_hash, portable_canonical_blueprint, verify_blueprint_yaml},
+    lifecycle::{
+        portable_blueprint_hash, portable_canonical_blueprint, portable_collect_artifacts,
+        verify_blueprint_yaml_with_registry,
+    },
     lockfile::{
         CredentialRef, DriverSourcePin, PortableDriverPin, PortableLockfile, PortablePolicy,
     },
-    registry::DriverKind,
+    registry::{DriverKind, DriverRegistry},
 };
 
 #[derive(Debug, Clone)]
@@ -35,12 +38,19 @@ pub enum PortableLockfileError {
         name: String,
         version: String,
     },
+    #[error("ambiguous artifacts for {kind} driver `{name}` version `{version}`")]
+    AmbiguousDriverArtifact {
+        kind: DriverKind,
+        name: String,
+        version: String,
+    },
 }
 
 pub fn build_portable_lockfile(
     input: PortableLockfileInput,
 ) -> Result<PortableLockfile, PortableLockfileError> {
-    let resolved = verify_blueprint_yaml(&input.blueprint_yaml)?;
+    let registry = registry_from_artifacts(&input.driver_artifacts);
+    let resolved = verify_blueprint_yaml_with_registry(&input.blueprint_yaml, &registry)?;
     let composition = portable_canonical_blueprint(&resolved)?;
     let blueprint_hash = portable_blueprint_hash(&composition)?;
     let policy = PortablePolicy {
@@ -53,9 +63,7 @@ pub fn build_portable_lockfile(
         )?,
     };
     let credentials = collect_portable_credentials(&composition);
-    let artifacts = crate::lifecycle::freeze_from_blueprint_yaml(&input.blueprint_yaml)
-        .and_then(|yaml| crate::lockfile::Lockfile::from_yaml(&yaml).map_err(Into::into))?
-        .artifacts;
+    let artifacts = portable_collect_artifacts(&composition)?;
 
     Ok(PortableLockfile {
         version: crate::lockfile::PORTABLE_LOCKFILE_VERSION.to_owned(),
@@ -68,6 +76,18 @@ pub fn build_portable_lockfile(
         artifacts,
         credentials,
     })
+}
+
+fn registry_from_artifacts(artifacts: &[DriverArtifact]) -> DriverRegistry {
+    let mut registry = DriverRegistry::default();
+    for artifact in artifacts {
+        registry.register_version(
+            artifact.kind,
+            artifact.name.clone(),
+            artifact.version.clone(),
+        );
+    }
+    registry
 }
 
 pub fn build_portable_lockfile_from_blueprint(
@@ -96,18 +116,32 @@ fn insert_driver_pin(
     component: &crate::lifecycle::ResolvedComponent,
     artifacts: &[DriverArtifact],
 ) -> Result<(), PortableLockfileError> {
-    let artifact = artifacts
+    let matches = artifacts
         .iter()
-        .find(|item| {
+        .filter(|item| {
             item.kind == component.kind
                 && item.name == component.driver
                 && item.version == component.version
         })
-        .ok_or_else(|| PortableLockfileError::MissingDriverArtifact {
-            kind: component.kind,
-            name: component.driver.clone(),
-            version: component.version.to_string(),
-        })?;
+        .collect::<Vec<_>>();
+
+    let artifact = match matches.as_slice() {
+        [artifact] => *artifact,
+        [] => {
+            return Err(PortableLockfileError::MissingDriverArtifact {
+                kind: component.kind,
+                name: component.driver.clone(),
+                version: component.version.to_string(),
+            });
+        }
+        _ => {
+            return Err(PortableLockfileError::AmbiguousDriverArtifact {
+                kind: component.kind,
+                name: component.driver.clone(),
+                version: component.version.to_string(),
+            });
+        }
+    };
 
     pins.insert(
         role.to_owned(),

@@ -195,6 +195,20 @@ pub fn resolve_blueprint_with_registry(
 
 pub fn verify_blueprint_yaml(yaml: &str) -> Result<ResolvedBlueprint, LifecycleError> {
     let resolved = resolve_blueprint(yaml)?;
+    verify_resolved_blueprint(resolved)
+}
+
+pub(crate) fn verify_blueprint_yaml_with_registry(
+    yaml: &str,
+    registry: &DriverRegistry,
+) -> Result<ResolvedBlueprint, LifecycleError> {
+    let resolved = resolve_blueprint_with_registry(yaml, registry)?;
+    verify_resolved_blueprint(resolved)
+}
+
+fn verify_resolved_blueprint(
+    resolved: ResolvedBlueprint,
+) -> Result<ResolvedBlueprint, LifecycleError> {
     validate_blueprint_urls(&resolved.blueprint)?;
     let canonical = canonical_blueprint(&resolved)?;
     collect_credentials(&canonical)?;
@@ -500,6 +514,31 @@ pub(crate) fn portable_blueprint_hash(
     Ok(sha256_hex(rendered.as_bytes()))
 }
 
+pub(crate) fn portable_collect_artifacts(
+    composition: &crate::lockfile::PortableComposition,
+) -> Result<BTreeMap<String, String>, LifecycleError> {
+    let mut artifacts = BTreeMap::new();
+
+    if let Some((name, digest)) = portable_explicit_image_artifact("sandbox", &composition.sandbox)?
+    {
+        artifacts.insert(name, digest);
+    }
+    if let Some((name, digest)) = portable_explicit_image_artifact("agent", &composition.agent)? {
+        artifacts.insert(name, digest);
+    }
+    if let Some((name, digest)) = portable_explicit_image_artifact("context", &composition.context)?
+    {
+        artifacts.insert(name, digest);
+    }
+    if let Some(inference) = composition.inference.as_ref() {
+        if let Some((name, digest)) = portable_explicit_image_artifact("inference", inference)? {
+            artifacts.insert(name, digest);
+        }
+    }
+
+    Ok(artifacts)
+}
+
 fn portable_component(component: CanonicalComponent) -> crate::lockfile::PortableComponent {
     crate::lockfile::PortableComponent {
         driver: component.driver,
@@ -507,6 +546,30 @@ fn portable_component(component: CanonicalComponent) -> crate::lockfile::Portabl
         credentials: component.credentials,
         extra: component.extra,
     }
+}
+
+fn portable_explicit_image_artifact(
+    role: &str,
+    component: &crate::lockfile::PortableComponent,
+) -> Result<Option<(String, String)>, LifecycleError> {
+    if !component.extra.contains_key("image") {
+        return Ok(None);
+    }
+
+    let digest = component
+        .extra
+        .get("digest")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| LifecycleError::MissingDigest {
+            path: format!("{role}.digest"),
+        })?;
+
+    parse_sha256_digest(digest).map_err(|source| LifecycleError::InvalidDigest {
+        path: format!("{role}.digest"),
+        source,
+    })?;
+
+    Ok(Some((format!("{role}-image"), digest.to_string())))
 }
 
 fn verify_component_digest(path: &str, component: &ComponentSection) -> Result<(), LifecycleError> {

@@ -148,6 +148,60 @@ fn portable_lockfile_builder_reports_missing_driver_artifact() {
 }
 
 #[test]
+fn portable_lockfile_builder_resolves_external_driver_from_artifacts() {
+    let lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: external_context_yaml(),
+        driver_artifacts: artifacts_with_external_context(),
+    })
+    .expect("build lockfile with external context driver");
+
+    assert_eq!(lockfile.composition.context.driver, "demo-context");
+    assert_eq!(lockfile.composition.context.version, "1.2.3");
+    assert_eq!(
+        lockfile.drivers["context"].source,
+        DriverSourcePin::Installed
+    );
+    assert_eq!(
+        lockfile.drivers["context"].digest,
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    );
+}
+
+#[test]
+fn portable_lockfile_builder_rejects_ambiguous_driver_artifacts() {
+    let mut artifacts = built_in_artifacts();
+    artifacts.push(DriverArtifact {
+        kind: DriverKind::Agent,
+        name: "codex".to_owned(),
+        version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version is semver"),
+        source: DriverSource::InstalledSubprocess,
+        digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            .to_owned(),
+        install_hint: Some("/tmp/demo-driver".to_owned()),
+    });
+
+    let error = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: reference_yaml(),
+        driver_artifacts: artifacts,
+    })
+    .expect_err("ambiguous artifacts should fail");
+
+    assert!(matches!(
+        error,
+        PortableLockfileError::AmbiguousDriverArtifact {
+            kind: DriverKind::Agent,
+            ref name,
+            ref version,
+        } if name == "codex" && version == env!("CARGO_PKG_VERSION")
+    ));
+    assert!(error
+        .to_string()
+        .contains("ambiguous artifacts for agent driver `codex`"));
+}
+
+#[test]
 fn portable_lockfile_document_round_trips_builder_output() {
     let rendered = build_portable_lockfile(PortableLockfileInput {
         name: "demo".to_owned(),
@@ -228,6 +282,41 @@ policy:
   presets: []
 "#
     .to_owned()
+}
+
+fn external_context_yaml() -> String {
+    r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: demo-context
+  version: 1.2.3
+policy:
+  tier: restricted
+  presets: []
+"#
+    .to_owned()
+}
+
+fn artifacts_with_external_context() -> Vec<DriverArtifact> {
+    let mut artifacts = built_in_artifacts()
+        .into_iter()
+        .filter(|artifact| artifact.kind != DriverKind::Context)
+        .collect::<Vec<_>>();
+    artifacts.push(DriverArtifact {
+        kind: DriverKind::Context,
+        name: "demo-context".to_owned(),
+        version: Version::parse("1.2.3").expect("test version is semver"),
+        source: DriverSource::InstalledSubprocess,
+        digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            .to_owned(),
+        install_hint: Some("/tmp/demo-context".to_owned()),
+    });
+    artifacts
 }
 
 fn built_in_artifacts() -> Vec<DriverArtifact> {
