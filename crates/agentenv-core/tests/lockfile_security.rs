@@ -1,6 +1,6 @@
 use agentenv_core::{
     digest::{parse_sha256_digest, sha256_hex},
-    lockfile::Lockfile,
+    lockfile::{Lockfile, LockfileDocument, PortableLockfile},
 };
 
 fn fixture(path: &str) -> String {
@@ -255,4 +255,168 @@ credentials:
         .unwrap();
 
     assert_eq!(rendered_a, rendered_b);
+}
+
+#[test]
+fn lockfile_security_parses_portable_v2_document() {
+    let yaml = r#"
+version: 0.2.0
+driver_protocol_version: "1.0"
+name: demo
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+composition:
+  version: 0.1.0
+  min_agentenv_version: 0.0.1-alpha0
+  sandbox:
+    driver: openshell
+    version: 0.0.1-alpha0
+  agent:
+    driver: codex
+    version: 0.0.1-alpha0
+  context:
+    driver: filesystem
+    version: 0.0.1-alpha0
+    mount: ~/projects
+  inference:
+    driver: passthrough
+    version: 0.0.1-alpha0
+  policy:
+    tier: balanced
+    presets:
+      - github_read
+  state:
+    persist_home: true
+policy:
+  declared:
+    tier: balanced
+    presets:
+      - github_read
+    overrides: []
+  resolved:
+    network:
+      reloadability: hot_reload
+    filesystem:
+      reloadability: locked_at_create
+      read_only:
+        - /usr
+      read_write:
+        - /sandbox
+    process:
+      reloadability: locked_at_create
+      run_as_user: sandbox
+      run_as_group: sandbox
+      profile: balanced
+    inference:
+      reloadability: hot_reload
+drivers:
+  sandbox:
+    kind: sandbox
+    name: openshell
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  agent:
+    kind: agent
+    name: codex
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  context:
+    kind: context
+    name: filesystem
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  inference:
+    kind: inference
+    name: passthrough
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+credentials:
+  OPENAI_API_KEY:
+    source: env
+    reference: OPENAI_API_KEY
+    required: true
+"#;
+
+    let document = LockfileDocument::from_yaml(yaml).unwrap();
+    let LockfileDocument::Portable(lockfile) = document else {
+        panic!("expected portable lockfile");
+    };
+
+    assert_eq!(lockfile.version, "0.2.0");
+    assert_eq!(lockfile.driver_protocol_version, "1.0");
+    assert_eq!(lockfile.name, "demo");
+    assert_eq!(lockfile.drivers["sandbox"].source.as_str(), "built-in");
+    let _: PortableLockfile = lockfile;
+}
+
+#[test]
+fn lockfile_security_portable_v2_rejects_credential_value_fields() {
+    let yaml = r#"
+version: 0.2.0
+driver_protocol_version: "1.0"
+name: demo
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+composition:
+  version: 0.1.0
+  min_agentenv_version: 0.0.1-alpha0
+  sandbox:
+    driver: openshell
+    version: 0.0.1-alpha0
+  agent:
+    driver: codex
+    version: 0.0.1-alpha0
+  context:
+    driver: filesystem
+    version: 0.0.1-alpha0
+  policy:
+    tier: restricted
+    presets: []
+policy:
+  declared:
+    tier: restricted
+    presets: []
+    overrides: []
+  resolved:
+    network:
+      reloadability: hot_reload
+    filesystem:
+      reloadability: locked_at_create
+    process:
+      reloadability: locked_at_create
+      run_as_user: sandbox
+      run_as_group: sandbox
+      profile: restricted
+    inference:
+      reloadability: hot_reload
+drivers:
+  sandbox:
+    kind: sandbox
+    name: openshell
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  agent:
+    kind: agent
+    name: codex
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  context:
+    kind: context
+    name: filesystem
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+credentials:
+  OPENAI_API_KEY:
+    source: env
+    reference: OPENAI_API_KEY
+    value: sk-known-secret
+"#;
+
+    let error = LockfileDocument::from_yaml(yaml).unwrap_err();
+    assert!(error.to_string().contains("value"), "error was {error}");
 }
