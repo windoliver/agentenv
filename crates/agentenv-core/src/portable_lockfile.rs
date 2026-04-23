@@ -30,6 +30,7 @@ pub struct PortableLockfileInput {
 pub enum PortableVerifyIssueKind {
     LegacyLockfile,
     BlueprintHashMismatch,
+    DriverPinMismatch,
     MissingDriverArtifact,
     DriverDigestMismatch,
     PolicyDrift,
@@ -51,6 +52,14 @@ pub struct PortableVerifyReport {
 
 impl PortableVerifyReport {
     pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    pub fn is_clean(&self) -> bool {
         self.errors.is_empty() && self.warnings.is_empty()
     }
 }
@@ -178,63 +187,161 @@ fn verify_driver_pins(
     driver_artifacts: &[DriverArtifact],
     report: &mut PortableVerifyReport,
 ) {
-    for (role, pin) in &lockfile.drivers {
-        let Some(kind) = parse_driver_kind(&pin.kind) else {
-            report.errors.push(PortableVerifyIssue {
-                kind: PortableVerifyIssueKind::MissingDriverArtifact,
-                role: Some(role.clone()),
-                message: format!(
-                    "pinned {role} driver has unsupported kind `{}` and cannot be matched",
-                    pin.kind
-                ),
-            });
-            continue;
-        };
+    let expected = expected_driver_pins(lockfile);
 
-        let Ok(version) = Version::parse(&pin.version) else {
+    for role in lockfile.drivers.keys() {
+        if !expected.contains_key(role.as_str()) {
             report.errors.push(PortableVerifyIssue {
-                kind: PortableVerifyIssueKind::MissingDriverArtifact,
+                kind: PortableVerifyIssueKind::DriverPinMismatch,
                 role: Some(role.clone()),
-                message: format!(
-                    "pinned {role} driver `{}` has invalid version `{}` and cannot be matched",
-                    pin.name, pin.version
-                ),
-            });
-            continue;
-        };
-
-        let artifact = driver_artifacts.iter().find(|artifact| {
-            artifact.kind == kind
-                && artifact.name == pin.name
-                && artifact.version == version
-                && source_pin(artifact.source) == pin.source
-        });
-
-        let Some(artifact) = artifact else {
-            report.errors.push(PortableVerifyIssue {
-                kind: PortableVerifyIssueKind::MissingDriverArtifact,
-                role: Some(role.clone()),
-                message: format!(
-                    "missing local artifact for {role} driver `{}` version `{}` from `{}`",
-                    pin.name,
-                    pin.version,
-                    pin.source.as_str()
-                ),
-            });
-            continue;
-        };
-
-        if artifact.digest != pin.digest {
-            report.errors.push(PortableVerifyIssue {
-                kind: PortableVerifyIssueKind::DriverDigestMismatch,
-                role: Some(role.clone()),
-                message: format!(
-                    "digest mismatch for {role} driver `{}` version `{}`: expected `{}`, found `{}`",
-                    pin.name, pin.version, pin.digest, artifact.digest
-                ),
+                message: format!("unexpected driver pin role `{role}`"),
             });
         }
     }
+
+    for (role, expected_pin) in expected {
+        let Some(pin) = lockfile.drivers.get(role) else {
+            report.errors.push(PortableVerifyIssue {
+                kind: PortableVerifyIssueKind::DriverPinMismatch,
+                role: Some(role.to_owned()),
+                message: format!("missing driver pin for composition role `{role}`"),
+            });
+            continue;
+        };
+
+        if pin.kind != expected_pin.kind.to_string()
+            || pin.name != expected_pin.name
+            || pin.version != expected_pin.version
+        {
+            report.errors.push(PortableVerifyIssue {
+                kind: PortableVerifyIssueKind::DriverPinMismatch,
+                role: Some(role.to_owned()),
+                message: format!(
+                    "driver pin for role `{role}` does not match composition: expected {} driver `{}` version `{}`, found {} driver `{}` version `{}`",
+                    expected_pin.kind,
+                    expected_pin.name,
+                    expected_pin.version,
+                    pin.kind,
+                    pin.name,
+                    pin.version
+                ),
+            });
+            continue;
+        }
+
+        verify_driver_artifact(role, pin, driver_artifacts, report);
+    }
+}
+
+fn verify_driver_artifact(
+    role: &str,
+    pin: &PortableDriverPin,
+    driver_artifacts: &[DriverArtifact],
+    report: &mut PortableVerifyReport,
+) {
+    let role = role.to_owned();
+    let Some(kind) = parse_driver_kind(&pin.kind) else {
+        report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::MissingDriverArtifact,
+            role: Some(role.clone()),
+            message: format!(
+                "pinned {role} driver has unsupported kind `{}` and cannot be matched",
+                pin.kind
+            ),
+        });
+        return;
+    };
+
+    let Ok(version) = Version::parse(&pin.version) else {
+        report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::MissingDriverArtifact,
+            role: Some(role.clone()),
+            message: format!(
+                "pinned {role} driver `{}` has invalid version `{}` and cannot be matched",
+                pin.name, pin.version
+            ),
+        });
+        return;
+    };
+
+    let artifact = driver_artifacts.iter().find(|artifact| {
+        artifact.kind == kind
+            && artifact.name == pin.name
+            && artifact.version == version
+            && source_pin(artifact.source) == pin.source
+    });
+
+    let Some(artifact) = artifact else {
+        report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::MissingDriverArtifact,
+            role: Some(role.clone()),
+            message: format!(
+                "missing local artifact for {role} driver `{}` version `{}` from `{}`",
+                pin.name,
+                pin.version,
+                pin.source.as_str()
+            ),
+        });
+        return;
+    };
+
+    if artifact.digest != pin.digest {
+        report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::DriverDigestMismatch,
+            role: Some(role.clone()),
+            message: format!(
+                "digest mismatch for {role} driver `{}` version `{}`: expected `{}`, found `{}`",
+                pin.name, pin.version, pin.digest, artifact.digest
+            ),
+        });
+    }
+}
+
+struct ExpectedDriverPin<'a> {
+    kind: DriverKind,
+    name: &'a str,
+    version: &'a str,
+}
+
+fn expected_driver_pins(
+    lockfile: &PortableLockfile,
+) -> BTreeMap<&'static str, ExpectedDriverPin<'_>> {
+    let mut expected = BTreeMap::new();
+    expected.insert(
+        "agent",
+        ExpectedDriverPin {
+            kind: DriverKind::Agent,
+            name: &lockfile.composition.agent.driver,
+            version: &lockfile.composition.agent.version,
+        },
+    );
+    expected.insert(
+        "context",
+        ExpectedDriverPin {
+            kind: DriverKind::Context,
+            name: &lockfile.composition.context.driver,
+            version: &lockfile.composition.context.version,
+        },
+    );
+    expected.insert(
+        "sandbox",
+        ExpectedDriverPin {
+            kind: DriverKind::Sandbox,
+            name: &lockfile.composition.sandbox.driver,
+            version: &lockfile.composition.sandbox.version,
+        },
+    );
+    if let Some(inference) = &lockfile.composition.inference {
+        expected.insert(
+            "inference",
+            ExpectedDriverPin {
+                kind: DriverKind::Inference,
+                name: &inference.driver,
+                version: &inference.version,
+            },
+        );
+    }
+    expected
 }
 
 fn verify_policy(lockfile: &PortableLockfile, report: &mut PortableVerifyReport) {

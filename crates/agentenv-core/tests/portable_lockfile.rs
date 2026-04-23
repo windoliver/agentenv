@@ -261,6 +261,84 @@ fn portable_lockfile_verify_reports_driver_digest_mismatch() {
 }
 
 #[test]
+fn portable_lockfile_verify_rejects_driver_pin_that_disagrees_with_composition() {
+    let mut lockfile = reference_portable_lockfile();
+    let mut artifacts = built_in_artifacts();
+    artifacts.push(DriverArtifact {
+        kind: DriverKind::Agent,
+        name: "claude".to_owned(),
+        version: Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version is semver"),
+        source: DriverSource::BuiltIn,
+        digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+            .to_owned(),
+        install_hint: None,
+    });
+
+    let pin = lockfile.drivers.get_mut("agent").expect("agent pin exists");
+    pin.name = "claude".to_owned();
+    pin.digest =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333".to_owned();
+
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+    let report =
+        verify_portable_lockfile_yaml(&rendered, &artifacts).expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::DriverPinMismatch
+            && issue.role.as_deref() == Some("agent")
+    }));
+}
+
+#[test]
+fn portable_lockfile_verify_rejects_unexpected_driver_role() {
+    let mut lockfile = reference_portable_lockfile();
+    let agent_pin = lockfile.drivers["agent"].clone();
+    lockfile.drivers.insert("extra".to_owned(), agent_pin);
+
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::DriverPinMismatch
+            && issue.role.as_deref() == Some("extra")
+    }));
+}
+
+#[test]
+fn portable_lockfile_verify_rejects_unexpected_inference_pin() {
+    let mut lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: no_inference_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build lockfile");
+    let inference_pin = reference_portable_lockfile().drivers["inference"].clone();
+    assert!(lockfile.composition.inference.is_none());
+    lockfile
+        .drivers
+        .insert("inference".to_owned(), inference_pin);
+
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.kind == PortableVerifyIssueKind::DriverPinMismatch
+            && issue.role.as_deref() == Some("inference")
+    }));
+}
+
+#[test]
 fn portable_lockfile_verify_reports_successful_verification() {
     let rendered = reference_portable_lockfile_yaml();
     let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
@@ -302,7 +380,8 @@ fn portable_lockfile_verify_reports_policy_drift_as_warning() {
         .expect("verify portable lockfile");
 
     assert!(report.errors.is_empty());
-    assert!(!report.is_ok());
+    assert!(report.is_ok());
+    assert!(!report.warnings.is_empty());
     assert!(report.warnings.iter().any(|issue| {
         issue.kind == PortableVerifyIssueKind::PolicyDrift && issue.role.is_none()
     }));
@@ -314,7 +393,8 @@ fn portable_lockfile_verify_reports_legacy_lockfile_warning() {
         .expect("verify legacy lockfile");
 
     assert!(report.errors.is_empty());
-    assert!(!report.is_ok());
+    assert!(report.is_ok());
+    assert!(!report.warnings.is_empty());
     assert!(report.warnings.iter().any(|issue| {
         issue.kind == PortableVerifyIssueKind::LegacyLockfile && issue.role.is_none()
     }));
@@ -414,6 +494,23 @@ agent:
 context:
   driver: demo-context
   version: 1.2.3
+policy:
+  tier: restricted
+  presets: []
+"#
+    .to_owned()
+}
+
+fn no_inference_yaml() -> String {
+    r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
 policy:
   tier: restricted
   presets: []
