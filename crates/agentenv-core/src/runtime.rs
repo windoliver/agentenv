@@ -910,15 +910,19 @@ fn check_required_lockfile_credentials(
             continue;
         }
 
-        let requirement = agentenv_proto::CredentialRequirement {
-            name: name.clone(),
-            description: String::new(),
-            kind: agentenv_proto::CredentialKind::ApiKey,
-            required: true,
-            validator: None,
-        };
-        if credentials.resolve(&requirement)?.is_none() {
-            return Err(RuntimeError::MissingCredential { name: name.clone() });
+        let reference = credential.reference.as_deref().unwrap_or(name);
+        match credential.source.as_str() {
+            "env" if std::env::var_os(reference).is_none() => {
+                return Err(RuntimeError::MissingCredential {
+                    name: reference.to_owned(),
+                });
+            }
+            "credstore" if credentials.backend_name(reference)?.is_none() => {
+                return Err(RuntimeError::MissingCredential {
+                    name: reference.to_owned(),
+                });
+            }
+            _ => {}
         }
     }
 

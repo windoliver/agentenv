@@ -111,6 +111,104 @@ policy:
 }
 
 #[test]
+fn reproduce_portable_lockfile_honors_required_credential_reference() {
+    let temp_dir = make_temp_dir("reproduce-portable-credential-reference");
+    let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      value: CUSTOM_OPENAI_KEY
+      required: true
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let lockfile = temp_dir.join("agentenv.lock");
+    let freeze = Command::new(agentenv_bin())
+        .arg("freeze")
+        .arg("demo")
+        .arg("--output")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        output_summary(&freeze)
+    );
+    let rendered = fs::read_to_string(&lockfile).unwrap();
+    assert!(rendered.contains("OPENAI_API_KEY"));
+    assert!(rendered.contains("reference: CUSTOM_OPENAI_KEY"));
+
+    let missing = Command::new(agentenv_bin())
+        .arg("reproduce")
+        .arg(&lockfile)
+        .arg("--name")
+        .arg("demo-missing-reference")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CUSTOM_OPENAI_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("CUSTOM_OPENAI_KEY"),
+        "stderr was: {missing_stderr}"
+    );
+
+    fs::create_dir_all(
+        temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("demo-reference-present"),
+    )
+    .unwrap();
+    let present = Command::new(agentenv_bin())
+        .arg("reproduce")
+        .arg(&lockfile)
+        .arg("--name")
+        .arg("demo-reference-present")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .env("CUSTOM_OPENAI_KEY", "sk-reference-present")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    let present_stderr = String::from_utf8_lossy(&present.stderr);
+    assert!(
+        !present_stderr.contains("missing credential `OPENAI_API_KEY`"),
+        "credential precheck used the lockfile key instead of reference: {present_stderr}"
+    );
+    assert!(
+        present_stderr.contains("already exists"),
+        "expected reproduce to pass credential precheck and fail on existing env: {present_stderr}"
+    );
+}
+
+#[test]
 fn verify_blueprint_succeeds_on_reference_blueprint() {
     let output = Command::new(agentenv_bin())
         .arg("verify-blueprint")
