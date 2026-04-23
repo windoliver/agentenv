@@ -56,6 +56,12 @@ pub trait CredentialProvider {
     fn backend_name(&self, name: &str) -> RuntimeResult<Option<String>>;
 }
 
+struct CreateEnvInput<'a> {
+    name: &'a str,
+    blueprint_yaml: &'a str,
+    resolved_policy: Option<agentenv_proto::NetworkPolicy>,
+}
+
 #[derive(Clone)]
 pub struct RuntimeSecret(String);
 
@@ -402,6 +408,27 @@ pub async fn create_env(
     name: &str,
     blueprint_yaml: &str,
 ) -> RuntimeResult<CreateResult> {
+    create_env_with_input(
+        options,
+        factory,
+        credentials,
+        CreateEnvInput {
+            name,
+            blueprint_yaml,
+            resolved_policy: None,
+        },
+    )
+    .await
+}
+
+async fn create_env_with_input(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    credentials: &mut dyn CredentialProvider,
+    input: CreateEnvInput<'_>,
+) -> RuntimeResult<CreateResult> {
+    let name = input.name;
+    let blueprint_yaml = input.blueprint_yaml;
     let env_name = crate::env::validate_env_name(name)?;
     let paths = crate::env::EnvPaths::new(options.root.clone(), env_name.clone());
     let env_dir = paths.env_dir();
@@ -543,21 +570,24 @@ pub async fn create_env(
             _ => (None, None),
         };
 
-        let mut policy = compose_policy(
-            parse_tier(&resolved.blueprint.policy.tier)?,
-            &parse_presets(&resolved.blueprint.policy.presets)?,
-            policy_overrides(&resolved.blueprint.policy.overrides)?,
-            &PresetRegistry::load_builtin().map_err(|err| {
+        let mut policy = match input.resolved_policy.as_ref() {
+            Some(policy) => policy.clone(),
+            None => compose_policy(
+                parse_tier(&resolved.blueprint.policy.tier)?,
+                &parse_presets(&resolved.blueprint.policy.presets)?,
+                policy_overrides(&resolved.blueprint.policy.overrides)?,
+                &PresetRegistry::load_builtin().map_err(|err| {
+                    RuntimeError::Driver(crate::driver::DriverError::PolicyTranslation {
+                        message: err.to_string(),
+                    })
+                })?,
+            )
+            .map_err(|err| {
                 RuntimeError::Driver(crate::driver::DriverError::PolicyTranslation {
                     message: err.to_string(),
                 })
             })?,
-        )
-        .map_err(|err| {
-            RuntimeError::Driver(crate::driver::DriverError::PolicyTranslation {
-                message: err.to_string(),
-            })
-        })?;
+        };
         policy.network.allow.extend(context_network_rules.rules);
 
         let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
@@ -849,12 +879,15 @@ pub async fn reproduce_env(
         inner: credentials,
         aliases: credential_aliases,
     };
-    create_env(
+    create_env_with_input(
         options,
         factory,
         &mut aliased_credentials,
-        name,
-        &blueprint_yaml,
+        CreateEnvInput {
+            name,
+            blueprint_yaml: &blueprint_yaml,
+            resolved_policy: Some(lockfile.policy.resolved.clone()),
+        },
     )
     .await
 }
@@ -3989,6 +4022,90 @@ policy:
         assert!(!exec_cmds
             .iter()
             .any(|cmd| cmd.contains("printf agent-installed")));
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_uses_lockfile_resolved_policy_for_sandbox() {
+        let root = unique_root("agentenv-reproduce-pinned-policy");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        let pinned_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "pinned.example".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        };
+        lockfile
+            .policy
+            .resolved
+            .network
+            .allow
+            .push(pinned_rule.clone());
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+            .await
+            .expect("reproduce env");
+
+        let create_policies = tracker
+            .create_policies
+            .lock()
+            .expect("create policy tracker")
+            .clone();
+        assert_eq!(create_policies.len(), 1);
+        assert!(
+            create_policies[0].network.allow.contains(&pinned_rule),
+            "sandbox create policy should include the pinned lockfile policy"
+        );
+        let applied_policies = tracker
+            .applied_policies
+            .lock()
+            .expect("apply policy tracker")
+            .clone();
+        assert_eq!(applied_policies.len(), 1);
+        assert!(
+            applied_policies[0].network.allow.contains(&pinned_rule),
+            "post-install restored policy should include the pinned lockfile policy"
+        );
     }
 
     #[tokio::test]
