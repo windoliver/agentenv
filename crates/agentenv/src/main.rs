@@ -44,12 +44,13 @@ enum Commands {
     VerifyBlueprint {
         file: PathBuf,
     },
+    Verify {
+        lockfile: PathBuf,
+    },
     Freeze {
-        env: String,
+        name: String,
         #[arg(long, value_name = "FILE")]
-        blueprint: Option<PathBuf>,
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
+        output: Option<PathBuf>,
     },
     Reproduce {
         lockfile: PathBuf,
@@ -217,11 +218,8 @@ async fn run() -> Result<()> {
         Some(Commands::Credentials(command)) => run_credentials(command),
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
-        Some(Commands::Freeze {
-            env,
-            blueprint,
-            out,
-        }) => freeze(&env, blueprint.as_deref(), out.as_deref()),
+        Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
+        Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
         Some(Commands::Reproduce { lockfile }) => reproduce(&lockfile),
         None => {
             let mut command = Cli::command();
@@ -832,20 +830,66 @@ fn verify_blueprint(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn freeze(env: &str, blueprint: Option<&Path>, out: Option<&Path>) -> Result<()> {
-    let cwd = std::env::current_dir().context("failed to determine current working directory")?;
-    let lockfile = freeze_in_dir(env, blueprint, out, &cwd)?;
+fn freeze(name: &str, output: Option<&Path>) -> Result<()> {
+    let options = runtime_options(true)?;
+    let lockfile = agentenv_core::runtime::freeze_env_lockfile(&options, name)
+        .with_context(|| format!("failed to freeze environment `{name}`"))?;
 
-    if let Some(out_path) = out {
-        println!(
-            "Lockfile written for environment `{env}`: {}",
-            out_path.display()
-        );
-        return Ok(());
+    match output {
+        Some(path) if path == Path::new("-") => {
+            print!("{lockfile}");
+        }
+        Some(path) => {
+            fs::write(path, &lockfile)
+                .with_context(|| format!("failed to write lockfile to `{}`", path.display()))?;
+            println!("Lockfile written for environment `{name}`: {}", path.display());
+        }
+        None => {
+            let path = Path::new("agentenv.lock");
+            fs::write(path, &lockfile)
+                .with_context(|| format!("failed to write lockfile to `{}`", path.display()))?;
+            println!("Lockfile written for environment `{name}`: {}", path.display());
+        }
     }
 
-    print!("{lockfile}");
     Ok(())
+}
+
+fn verify_lockfile(path: &Path) -> Result<()> {
+    let lockfile_yaml = read_text_file(path, "lockfile")?;
+    let options = runtime_options(true)?;
+    let driver_artifacts = discover_runtime_driver_artifacts(&options)?;
+    let report = agentenv_core::portable_lockfile::verify_portable_lockfile_yaml(
+        &lockfile_yaml,
+        &driver_artifacts,
+    )
+    .with_context(|| format!("failed to verify lockfile `{}`", path.display()))?;
+
+    for warning in &report.warnings {
+        eprintln!("warning: {}", warning.message);
+    }
+
+    if !report.is_ok() {
+        let details = report
+            .errors
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("lockfile verification failed: {details}");
+    }
+
+    println!("Lockfile verified: {}", path.display());
+    Ok(())
+}
+
+fn discover_runtime_driver_artifacts(
+    options: &agentenv_core::runtime::RuntimeOptions,
+) -> Result<Vec<agentenv_core::driver_artifact::DriverArtifact>> {
+    let mut discovery_config = agentenv_core::driver_catalog::DriverDiscoveryConfig::from_env();
+    discovery_config.installed_root = options.root.join("drivers");
+    agentenv_core::driver_artifact::discover_driver_artifacts(discovery_config, None)
+        .context("failed to discover driver artifacts")
 }
 
 fn reproduce(path: &Path) -> Result<()> {
@@ -938,32 +982,6 @@ fn blueprint_matches_lockfile(
     Ok(candidate.blueprint_hash == lockfile.blueprint_hash)
 }
 
-fn freeze_in_dir(
-    env: &str,
-    blueprint: Option<&Path>,
-    out: Option<&Path>,
-    cwd: &Path,
-) -> Result<String> {
-    let blueprint_path = resolve_blueprint_path_in_dir(blueprint, cwd)?;
-    let blueprint_yaml = read_text_file(&blueprint_path, "blueprint")?;
-    let env_state = agentenv_core::lifecycle::create_from_blueprint_yaml(env, &blueprint_yaml)
-        .with_context(|| {
-            format!(
-                "failed to create environment `{env}` from blueprint `{}`",
-                blueprint_path.display()
-            )
-        })?;
-    let lockfile = agentenv_core::lifecycle::freeze_env(&env_state)
-        .with_context(|| format!("failed to freeze environment `{env}`"))?;
-
-    if let Some(out_path) = out {
-        fs::write(out_path, &lockfile)
-            .with_context(|| format!("failed to write lockfile to `{}`", out_path.display()))?;
-    }
-
-    Ok(lockfile)
-}
-
 fn derive_reproduced_env_name(path: &Path) -> String {
     let file_name = path
         .file_name()
@@ -992,7 +1010,7 @@ fn read_text_file(path: &Path, description: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentenv_core::{lockfile::Lockfile, runtime::CredentialProvider};
+    use agentenv_core::runtime::CredentialProvider;
     use agentenv_credstore::CredentialStoreConfig;
     use agentenv_proto::{CredentialKind, CredentialRequirement, ValidatorSpec};
     use std::{
@@ -1022,6 +1040,7 @@ mod tests {
                 "credentials".to_string(),
                 "drivers".to_string(),
                 "verify-blueprint".to_string(),
+                "verify".to_string(),
                 "freeze".to_string(),
                 "reproduce".to_string(),
             ]
@@ -1029,51 +1048,12 @@ mod tests {
     }
 
     #[test]
-    fn freeze_default_path_failure_when_blueprint_missing() {
-        let temp_dir = make_temp_dir("freeze-missing-blueprint");
-
-        let err = freeze_in_dir("demo", None, None, &temp_dir).unwrap_err();
-
-        assert!(
-            err.to_string().contains("no blueprint provided"),
-            "unexpected error: {err:#}"
-        );
-    }
-
-    #[test]
-    fn freeze_success_with_blueprint_writes_lockfile() {
-        let temp_dir = make_temp_dir("freeze-success");
-        let out_path = temp_dir.join("demo.lock.yaml");
-
-        freeze_in_dir(
-            "demo",
-            Some(&fixture_blueprint()),
-            Some(&out_path),
-            &temp_dir,
-        )
-        .unwrap();
-
-        let rendered = fs::read_to_string(&out_path).unwrap();
-        let lockfile = Lockfile::from_yaml(&rendered).unwrap();
-        assert_eq!(rendered, lockfile.to_yaml_deterministic().unwrap());
-
-        assert_eq!(lockfile.version, "0.1.0");
-        assert_eq!(lockfile.protocol_version, "0.1");
-        assert!(!lockfile.blueprint_hash.is_empty());
-    }
-
-    #[test]
     fn reproduce_success_from_generated_lockfile() {
         let temp_dir = make_temp_dir("reproduce-success");
         let out_path = temp_dir.join("demo.lock.yaml");
-
-        freeze_in_dir(
-            "demo",
-            Some(&fixture_blueprint()),
-            Some(&out_path),
-            &temp_dir,
-        )
-        .unwrap();
+        let yaml = fs::read_to_string(fixture_blueprint()).unwrap();
+        let rendered = agentenv_core::lifecycle::freeze_from_blueprint_yaml(&yaml).unwrap();
+        fs::write(&out_path, rendered).unwrap();
 
         reproduce(&out_path).unwrap();
     }
