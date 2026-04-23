@@ -88,7 +88,13 @@ pub enum RuntimeError {
     #[error(transparent)]
     Driver(#[from] DriverError),
     #[error(transparent)]
+    DriverArtifact(#[from] crate::driver_artifact::DriverArtifactError),
+    #[error(transparent)]
     Lifecycle(#[from] crate::lifecycle::LifecycleError),
+    #[error(transparent)]
+    Lockfile(#[from] crate::lockfile::LockfileError),
+    #[error(transparent)]
+    PortableLockfile(#[from] crate::portable_lockfile::PortableLockfileError),
     #[error("unsupported driver `{name}` for {kind}")]
     UnsupportedDriver { kind: &'static str, name: String },
     #[error("unknown policy tier `{tier}`")]
@@ -773,6 +779,23 @@ pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDe
         blueprint_yaml,
         lock_yaml,
     })
+}
+
+pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResult<String> {
+    let description = describe_env(options, name)?;
+    let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+    discovery_config.installed_root = options.root.join("drivers");
+    let driver_artifacts =
+        crate::driver_artifact::discover_driver_artifacts(discovery_config, None)?;
+    let lockfile = crate::portable_lockfile::build_portable_lockfile(
+        crate::portable_lockfile::PortableLockfileInput {
+            name: description.state.name,
+            blueprint_yaml: description.blueprint_yaml,
+            driver_artifacts,
+        },
+    )?;
+
+    Ok(lockfile.to_yaml_deterministic()?)
 }
 
 pub async fn exec_env(
