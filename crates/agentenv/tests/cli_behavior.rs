@@ -768,6 +768,84 @@ fn verify_accepts_generated_portable_lockfile() {
 }
 
 #[test]
+fn freeze_and_verify_do_not_print_known_secret() {
+    let temp_dir = make_temp_dir("freeze-verify-secret-redaction");
+    let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+      note: sk-known-secret
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let lockfile = temp_dir.join("secret-free.agentenv.lock");
+    let freeze = Command::new(agentenv_bin())
+        .arg("freeze")
+        .arg("demo")
+        .arg("--output")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        output_summary(&freeze)
+    );
+    let freeze_output = output_summary(&freeze);
+    assert!(
+        !freeze_output.contains("sk-known-secret"),
+        "freeze output leaked secret metadata:\n{freeze_output}"
+    );
+
+    let rendered = fs::read_to_string(&lockfile).unwrap();
+    assert!(
+        !rendered.contains("sk-known-secret"),
+        "lockfile leaked secret metadata:\n{rendered}"
+    );
+
+    let verify = Command::new(agentenv_bin())
+        .arg("verify")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "verify failed: {}",
+        output_summary(&verify)
+    );
+    let verify_output = output_summary(&verify);
+    assert!(
+        !verify_output.contains("sk-known-secret"),
+        "verify output leaked secret metadata:\n{verify_output}"
+    );
+}
+
+#[test]
 #[ignore = "requires real OpenShell, gateway, Docker, and OPENAI_API_KEY"]
 fn codex_filesystem_openshell_real_cli_lifecycle() {
     if std::env::var_os("AGENTENV_RUN_OPEN_SHELL_TESTS").is_none() {
