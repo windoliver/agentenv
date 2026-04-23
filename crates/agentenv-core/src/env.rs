@@ -6,8 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agentenv_proto::McpEndpoint;
-use agentenv_proto::McpTransport;
+use agentenv_proto::{McpEndpoint, McpTransport, NetworkPolicy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -208,6 +207,8 @@ pub struct EnvStateFile {
     pub drivers: StateDriverSet,
     pub handles: DriverHandles,
     pub endpoints: EndpointState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_policy: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_names: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -426,6 +427,7 @@ mod tests {
                 context_mcp: Some(context_mcp),
                 inference: Some("http://inference.local".to_owned()),
             },
+            resolved_policy: None,
             credential_names: vec!["OPENAI_API_KEY".to_owned()],
             health: BTreeMap::from([(
                 "sandbox".to_owned(),

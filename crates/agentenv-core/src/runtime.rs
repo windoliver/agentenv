@@ -754,6 +754,7 @@ async fn create_env_with_input(
                 context_mcp: Some(crate::env::PersistedMcpEndpoint::from_mcp(context_endpoint)),
                 inference: inference_endpoint,
             },
+            resolved_policy: Some(policy.clone()),
             credential_names,
             health: BTreeMap::new(),
             first_enter_hint_shown: false,
@@ -971,11 +972,14 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
         }
 
         validate_frozen_lockfile_pins(&description.state, &lockfile)?;
+        if let Some(resolved_policy) = description.state.resolved_policy.clone() {
+            lockfile.policy.resolved = resolved_policy;
+        }
         lockfile.name = description.state.name.clone();
         return Ok(lockfile.to_yaml_deterministic()?);
     }
 
-    let lockfile = crate::portable_lockfile::build_portable_lockfile(
+    let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
         crate::portable_lockfile::PortableLockfileInput {
             name: description.state.name.clone(),
             blueprint_yaml: description.blueprint_yaml,
@@ -983,6 +987,9 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
         },
     )?;
     validate_frozen_lockfile_pins(&description.state, &lockfile)?;
+    if let Some(resolved_policy) = description.state.resolved_policy {
+        lockfile.policy.resolved = resolved_policy;
+    }
 
     Ok(lockfile.to_yaml_deterministic()?)
 }
@@ -1958,6 +1965,7 @@ fn empty_state(name: &str, selection: DriverSelection) -> crate::env::EnvStateFi
         drivers,
         handles: crate::env::DriverHandles::default(),
         endpoints: crate::env::EndpointState::default(),
+        resolved_policy: None,
         credential_names: Vec::new(),
         health: BTreeMap::new(),
         first_enter_hint_shown: false,
@@ -2272,6 +2280,7 @@ mod tests {
             },
             handles: crate::env::DriverHandles::default(),
             endpoints: crate::env::EndpointState::default(),
+            resolved_policy: None,
             credential_names: Vec::new(),
             health: BTreeMap::new(),
             first_enter_hint_shown: false,
@@ -4691,6 +4700,105 @@ policy:
         assert!(frozen.contains("name: renamed-demo"));
         assert!(frozen.contains("resolved:"));
         assert!(frozen.contains("frozen-pinned.example"));
+    }
+
+    #[tokio::test]
+    async fn freeze_preserves_created_context_required_policy_for_reproduce() {
+        let root = unique_root("agentenv-freeze-context-required-policy");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let frozen_context_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "frozen-context.example".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        };
+        let recomputed_context_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "recomputed-context.example".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        };
+        let create_tracker = Arc::new(AgentSetupTracker::default());
+        let create_factory = RequiredRuleFactory {
+            tracker: Arc::clone(&create_tracker),
+            required_rule: frozen_context_rule.clone(),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &create_factory,
+            &mut credentials,
+            "source-demo",
+            yaml,
+        )
+        .await
+        .expect("create env");
+
+        let frozen = super::freeze_env_lockfile(&options, "source-demo").expect("freeze env");
+        let crate::lockfile::LockfileDocument::Portable(lockfile) =
+            crate::lockfile::LockfileDocument::from_yaml(&frozen).expect("parse frozen lockfile")
+        else {
+            panic!("freeze should render a portable lockfile");
+        };
+        assert!(lockfile
+            .policy
+            .resolved
+            .network
+            .allow
+            .contains(&frozen_context_rule));
+
+        let reproduce_tracker = Arc::new(AgentSetupTracker::default());
+        let reproduce_factory = RequiredRuleFactory {
+            tracker: Arc::clone(&reproduce_tracker),
+            required_rule: recomputed_context_rule.clone(),
+        };
+        super::reproduce_env(
+            &options,
+            &reproduce_factory,
+            &mut credentials,
+            "replayed-demo",
+            &frozen,
+        )
+        .await
+        .expect("reproduce env");
+
+        let create_policies = reproduce_tracker
+            .create_policies
+            .lock()
+            .expect("create policy tracker")
+            .clone();
+        assert_eq!(create_policies.len(), 1);
+        assert!(create_policies[0]
+            .network
+            .allow
+            .contains(&frozen_context_rule));
+        assert!(!create_policies[0]
+            .network
+            .allow
+            .contains(&recomputed_context_rule));
     }
 
     #[tokio::test]
