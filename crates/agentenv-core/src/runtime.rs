@@ -838,6 +838,24 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     if let crate::lockfile::LockfileDocument::Portable(mut lockfile) =
         crate::lockfile::LockfileDocument::from_yaml(&description.lock_yaml)?
     {
+        let expected_lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: description.state.name.clone(),
+                blueprint_yaml: description.blueprint_yaml.clone(),
+                driver_artifacts: driver_artifacts.clone(),
+            },
+        )?;
+        if lockfile.composition != expected_lockfile.composition
+            || lockfile.blueprint_hash != expected_lockfile.blueprint_hash
+            || lockfile.policy.declared != expected_lockfile.composition.policy
+        {
+            return Err(RuntimeError::PortableLockfileVerification {
+                details:
+                    "portable lockfile composition does not match env blueprint or declared policy"
+                        .to_owned(),
+            });
+        }
+
         let report = crate::portable_lockfile::verify_portable_lockfile_yaml(
             &description.lock_yaml,
             &driver_artifacts,
@@ -4215,6 +4233,82 @@ policy:
         assert!(frozen.contains("name: renamed-demo"));
         assert!(frozen.contains("resolved:"));
         assert!(frozen.contains("frozen-pinned.example"));
+    }
+
+    #[tokio::test]
+    async fn freeze_env_rejects_portable_lockfile_with_stale_composition() {
+        let root = unique_root("agentenv-freeze-stale-portable-composition");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let blueprint_a = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ./current
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let blueprint_b = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ./stale
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+        super::create_env(
+            &options,
+            &TinyFactory,
+            &mut credentials,
+            "demo",
+            blueprint_a,
+        )
+        .await
+        .expect("create env");
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let stale_lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: blueprint_b.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build stale lockfile")
+        .to_yaml_deterministic()
+        .expect("render stale lockfile");
+        fs::write(
+            root.join("envs").join("demo").join("lock.yaml"),
+            stale_lockfile,
+        )
+        .expect("write stale persisted lockfile");
+
+        let err = super::freeze_env_lockfile(&options, "demo").expect_err("freeze should fail");
+
+        assert!(
+            err.to_string()
+                .contains("portable lockfile composition does not match env blueprint"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

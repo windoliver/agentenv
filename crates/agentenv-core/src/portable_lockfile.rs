@@ -33,6 +33,8 @@ pub enum PortableVerifyIssueKind {
     DriverPinMismatch,
     MissingDriverArtifact,
     DriverDigestMismatch,
+    ArtifactMapMismatch,
+    CredentialMapMismatch,
     PolicyDrift,
     PolicyRecomputeFailed,
 }
@@ -159,6 +161,8 @@ pub fn verify_portable_lockfile_yaml(
     let mut report = PortableVerifyReport::default();
     verify_blueprint_hash(&lockfile, &mut report);
     verify_driver_pins(&lockfile, driver_artifacts, &mut report);
+    verify_artifacts(&lockfile, &mut report);
+    verify_credentials(&lockfile, &mut report);
     verify_policy(&lockfile, &mut report);
     Ok(report)
 }
@@ -368,6 +372,41 @@ fn verify_policy(lockfile: &PortableLockfile, report: &mut PortableVerifyReport)
             role: None,
             message: format!("failed to recompute declared policy: {error}"),
         }),
+    }
+}
+
+fn verify_artifacts(lockfile: &PortableLockfile, report: &mut PortableVerifyReport) {
+    match portable_collect_artifacts(&lockfile.composition) {
+        Ok(expected) if expected == lockfile.artifacts => {}
+        Ok(expected) => report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::ArtifactMapMismatch,
+            role: None,
+            message: format!(
+                "artifact map does not match composition: expected {} artifact(s), found {}",
+                expected.len(),
+                lockfile.artifacts.len()
+            ),
+        }),
+        Err(error) => report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::ArtifactMapMismatch,
+            role: None,
+            message: format!("failed to derive artifact map from composition: {error}"),
+        }),
+    }
+}
+
+fn verify_credentials(lockfile: &PortableLockfile, report: &mut PortableVerifyReport) {
+    let expected = collect_portable_credentials(&lockfile.composition);
+    if expected != lockfile.credentials {
+        report.errors.push(PortableVerifyIssue {
+            kind: PortableVerifyIssueKind::CredentialMapMismatch,
+            role: None,
+            message: format!(
+                "credential map does not match composition: expected {} credential(s), found {}",
+                expected.len(),
+                lockfile.credentials.len()
+            ),
+        });
     }
 }
 

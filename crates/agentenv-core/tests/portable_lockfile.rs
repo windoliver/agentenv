@@ -370,6 +370,71 @@ fn portable_lockfile_verify_reports_blueprint_hash_mismatch() {
 }
 
 #[test]
+fn portable_lockfile_verify_rejects_artifact_map_mismatch() {
+    let mut lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: image_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build image lockfile");
+    lockfile.artifacts.clear();
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.role.is_none()
+            && issue
+                .message
+                .contains("artifact map does not match composition")
+    }));
+}
+
+#[test]
+fn portable_lockfile_verify_rejects_credential_map_mismatch() {
+    let mut lockfile = reference_portable_lockfile();
+    lockfile.credentials.clear();
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.role.is_none()
+            && issue
+                .message
+                .contains("credential map does not match composition")
+    }));
+
+    let mut lockfile = reference_portable_lockfile();
+    lockfile
+        .credentials
+        .get_mut("OPENAI_API_KEY")
+        .expect("top-level credential")
+        .reference = Some("OTHER_OPENAI_API_KEY".to_owned());
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render tampered lockfile");
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+
+    assert!(!report.is_ok());
+    assert!(report.errors.iter().any(|issue| {
+        issue.role.is_none()
+            && issue
+                .message
+                .contains("credential map does not match composition")
+    }));
+}
+
+#[test]
 fn portable_lockfile_verify_reports_policy_drift_as_warning() {
     let rendered = reference_portable_lockfile_yaml().replace(
         "declared:\n    tier: balanced",
