@@ -6,6 +6,7 @@ pub mod blueprint;
 pub mod context_common;
 pub mod digest;
 pub mod driver;
+pub mod driver_artifact;
 pub mod driver_catalog;
 pub mod env;
 pub mod error;
