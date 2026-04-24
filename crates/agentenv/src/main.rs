@@ -336,6 +336,7 @@ async fn run_enter(args: EnterArgs) -> Result<()> {
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
         args.detach,
+        false,
     )
     .await?
     {
