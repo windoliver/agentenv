@@ -237,6 +237,53 @@ fn sessions_list_json_returns_empty_when_registry_missing() {
 }
 
 #[test]
+fn sessions_list_json_missing_env_uses_stable_error() {
+    let temp_dir = make_temp_dir("sessions-list-json-missing");
+    let output = Command::new(agentenv_bin())
+        .arg("sessions")
+        .arg("list")
+        .arg("missing")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(10));
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["reason_code"], "env_not_found");
+}
+
+#[test]
+fn enter_help_includes_new_flag() {
+    let output = Command::new(agentenv_bin())
+        .arg("enter")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("--new"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn sessions_help_includes_list_and_kill_commands() {
+    let output = Command::new(agentenv_bin())
+        .arg("sessions")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("list"), "stdout was: {stdout}");
+    assert!(stdout.contains("kill"), "stdout was: {stdout}");
+}
+
+#[test]
 fn list_json_registry_error_uses_stable_error() {
     let temp_dir = make_temp_dir("list-json-corrupt");
     let env_dir = temp_dir.join(".agentenv").join("envs").join("demo");

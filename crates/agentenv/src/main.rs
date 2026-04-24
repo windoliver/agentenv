@@ -415,18 +415,24 @@ async fn run_sessions(args: SessionsArgs) -> Result<()> {
 
 async fn run_sessions_list(args: SessionsListArgs) -> Result<()> {
     let options = runtime_options(true)?;
-    let rows = agentenv_core::runtime::list_sessions_env(
+    match agentenv_core::runtime::list_sessions_env(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         args.env.as_deref(),
     )
-    .await?;
-    if args.json {
-        render::print_json(&render::SessionsJson { sessions: rows })?;
-    } else {
-        render::print_sessions_text(&rows);
+    .await
+    {
+        Ok(rows) if args.json => render::print_json(&render::SessionsJson { sessions: rows }),
+        Ok(rows) => {
+            render::print_sessions_text(&rows);
+            Ok(())
+        }
+        Err(error) if args.json => {
+            render::print_error_json(&error);
+            exit_process(render::exit_for_error(&error).code());
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 async fn run_sessions_kill(args: SessionsKillArgs) -> Result<()> {
