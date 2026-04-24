@@ -1,13 +1,14 @@
 use agentenv_proto::{
     assert_compatible_schema_version, AgentSpec, ApplyPolicyParams, ApplyPolicyResult,
-    ConnectParams, ContextHandleRequest, ContextSpec, ContextStatus, CredentialRequirementsParams,
-    CredentialRequirementsResult, DestroyParams, EmptyResult, EndpointInSandboxResult, ExecParams,
-    ExecResult, InferenceHandleRequest, InferenceSpec, InitializeParams, InitializeResult,
-    InstallStepsResult, LogsParams, LogsResult, LogsStreamParams, McpConfigPathParams,
-    McpConfigPathResult, McpEndpoint, PreflightParams, PreflightResult, RenderEntrypointResult,
-    RenderMcpConfigParams, RenderMcpConfigResult, RequiredNetworkRulesResult, SandboxHandle,
-    SandboxSpec, SandboxStatus, SandboxStatusParams, SchemaVersionError, ShellHandle,
-    ShutdownParams, StopParams,
+    AttachSessionParams, ConnectParams, ContextHandleRequest, ContextSpec, ContextStatus,
+    CreateSessionParams, CredentialRequirementsParams, CredentialRequirementsResult, DestroyParams,
+    EmptyResult, EndpointInSandboxResult, ExecParams, ExecResult, InferenceHandleRequest,
+    InferenceSpec, InitializeParams, InitializeResult, InstallStepsResult, KillSessionParams,
+    ListSessionsParams, ListSessionsResult, LogsParams, LogsResult, LogsStreamParams,
+    McpConfigPathParams, McpConfigPathResult, McpEndpoint, PreflightParams, PreflightResult,
+    RenderEntrypointResult, RenderMcpConfigParams, RenderMcpConfigResult,
+    RequiredNetworkRulesResult, SandboxHandle, SandboxSpec, SandboxStatus, SandboxStatusParams,
+    SchemaVersionError, SessionHandle, ShellHandle, ShutdownParams, StopParams,
 };
 use async_trait::async_trait;
 use std::fmt;
@@ -72,6 +73,12 @@ pub fn require_capability(capability: &str, supported: bool) -> DriverResult<()>
         Err(DriverError::CapabilityMissing {
             capability: capability.to_owned(),
         })
+    }
+}
+
+pub fn persistent_sessions_missing() -> DriverError {
+    DriverError::CapabilityMissing {
+        capability: "supports_persistent_sessions".to_owned(),
     }
 }
 
@@ -178,6 +185,18 @@ pub trait SandboxDriver: Send + Sync {
     async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult>;
     async fn create(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle>;
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle>;
+    async fn create_session(&self, _params: CreateSessionParams) -> DriverResult<SessionHandle> {
+        Err(persistent_sessions_missing())
+    }
+    async fn attach_session(&self, _params: AttachSessionParams) -> DriverResult<ExecResult> {
+        Err(persistent_sessions_missing())
+    }
+    async fn list_sessions(&self, _params: ListSessionsParams) -> DriverResult<ListSessionsResult> {
+        Err(persistent_sessions_missing())
+    }
+    async fn kill_session(&self, _params: KillSessionParams) -> DriverResult<EmptyResult> {
+        Err(persistent_sessions_missing())
+    }
     async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult>;
     async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult>;
     async fn copy_out(&self, params: agentenv_proto::CopyOutParams) -> DriverResult<EmptyResult>;
@@ -255,11 +274,137 @@ pub trait InferenceDriver: Send + Sync {
 #[cfg(test)]
 mod tests {
     use agentenv_proto::{
-        schema_version_major, Capabilities, DriverInfo, DriverKind, InitializeResult,
-        SandboxCapabilities, SCHEMA_VERSION,
+        schema_version_major, ApplyPolicyParams, ApplyPolicyResult, Capabilities, ConnectParams,
+        CopyInParams, CopyOutParams, DestroyParams, DriverInfo, DriverKind, EmptyResult,
+        ExecParams, ExecResult, InitializeParams, InitializeResult, LogsParams, LogsResult,
+        LogsStreamParams, PreflightParams, PreflightResult, SandboxCapabilities, SandboxHandle,
+        SandboxPhase, SandboxSpec, SandboxStatus, SandboxStatusParams, ShellHandle, ShutdownParams,
+        StopParams, SCHEMA_VERSION,
     };
 
-    use super::{ensure_protocol_compatible, require_capability, DriverError};
+    use super::{
+        ensure_protocol_compatible, require_capability, DriverError, DriverResult, SandboxDriver,
+    };
+
+    struct MinimalSandboxDriver;
+
+    #[async_trait::async_trait]
+    impl SandboxDriver for MinimalSandboxDriver {
+        async fn initialize(
+            &mut self,
+            _params: InitializeParams,
+        ) -> DriverResult<InitializeResult> {
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "minimal-sandbox".to_owned(),
+                    kind: DriverKind::Sandbox,
+                    version: "0.0.1".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Sandbox(SandboxCapabilities {
+                    supports_hot_reload_policy: true,
+                    supports_filesystem_lockdown: true,
+                    supports_syscall_filter: true,
+                    supports_native_inference_routing: true,
+                    supports_remote_host: false,
+                    supports_persistent_sessions: false,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
+            Ok(SandboxHandle {
+                handle: "sb-1".to_owned(),
+            })
+        }
+
+        async fn connect(&self, _params: ConnectParams) -> DriverResult<ShellHandle> {
+            Ok(ShellHandle {
+                session_id: "session-1".to_owned(),
+                tty: true,
+                working_dir: None,
+            })
+        }
+
+        async fn exec(&self, _params: ExecParams) -> DriverResult<ExecResult> {
+            Ok(ExecResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn copy_in(&self, _params: CopyInParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn copy_out(&self, _params: CopyOutParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn apply_policy(
+            &self,
+            _params: ApplyPolicyParams,
+        ) -> DriverResult<ApplyPolicyResult> {
+            Ok(ApplyPolicyResult { hot_reloaded: true })
+        }
+
+        async fn status(&self, _params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
+            Ok(SandboxStatus {
+                phase: SandboxPhase::Running,
+                healthy: true,
+                last_ping: None,
+            })
+        }
+
+        async fn logs(&self, _params: LogsParams) -> DriverResult<LogsResult> {
+            Ok(LogsResult {
+                entries: Vec::new(),
+            })
+        }
+
+        async fn logs_stream(&self, _params: LogsStreamParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn stop(&self, _params: StopParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn destroy(&self, _params: DestroyParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+
+        async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_session_methods_default_to_capability_missing() {
+        let driver = MinimalSandboxDriver;
+        let err = driver
+            .create_session(agentenv_proto::CreateSessionParams {
+                handle: "sb-1".to_owned(),
+                name: "demo".to_owned(),
+                command: "agentenv-agent".to_owned(),
+                detached: true,
+                metadata: Default::default(),
+            })
+            .await
+            .expect_err("default session implementation should reject");
+
+        assert!(
+            matches!(err, DriverError::CapabilityMissing { capability } if capability == "supports_persistent_sessions")
+        );
+    }
 
     #[test]
     fn compatibility_guard_rejects_mismatched_protocol_major() {
