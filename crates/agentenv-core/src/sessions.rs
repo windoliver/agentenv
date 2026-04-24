@@ -78,9 +78,12 @@ pub fn write_sessions(
     sessions: &SessionStateFile,
 ) -> Result<(), crate::env::EnvError> {
     let path = sessions_path(paths);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|source| crate::env::EnvError::Io {
-        path: parent.to_path_buf(),
+    let parent = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    std::fs::create_dir_all(&parent).map_err(|source| crate::env::EnvError::Io {
+        path: parent.clone(),
         source,
     })?;
     let rendered =
@@ -111,24 +114,31 @@ pub fn write_sessions(
             path: temp_path.clone(),
             source,
         })?;
-    tmp_file
-        .write_all(rendered)
-        .map_err(|source| crate::env::EnvError::Io {
+
+    let write_result = (|| -> std::io::Result<()> {
+        tmp_file.write_all(rendered)?;
+        tmp_file.sync_all()
+    })();
+    if let Err(source) = write_result {
+        drop(tmp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(crate::env::EnvError::Io {
             path: temp_path.clone(),
             source,
-        })?;
-    tmp_file
-        .sync_all()
-        .map_err(|source| crate::env::EnvError::Io {
-            path: temp_path.clone(),
-            source,
-        })?;
+        });
+    }
     drop(tmp_file);
 
     fs::rename(&temp_path, &path).map_err(|source| {
         let _ = fs::remove_file(&temp_path);
         crate::env::EnvError::Io { path, source }
-    })
+    })?;
+    fs::File::open(&parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| crate::env::EnvError::Io {
+            path: parent,
+            source,
+        })
 }
 
 pub fn upsert_session(file: &mut SessionStateFile, session: PersistedSession, make_default: bool) {
