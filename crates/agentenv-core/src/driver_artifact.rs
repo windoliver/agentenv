@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    driver_catalog::{DiscoveredDriver, DriverCatalog, DriverDiscoveryConfig, DriverSource},
+    driver_catalog::{
+        built_in_driver_entries, DiscoveredDriver, DriverCatalog, DriverDiscoveryConfig,
+        DriverSource,
+    },
     registry::DriverKind,
 };
 
@@ -63,12 +66,8 @@ pub fn discover_driver_artifacts(
 
     let mut artifacts = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in catalog
-        .entries
-        .iter()
-        .filter(|entry| entry.source == DriverSource::BuiltIn)
-        .chain(catalog.registry_entries())
-    {
+    let built_in_entries = built_in_driver_entries();
+    for entry in built_in_entries.iter().chain(catalog.registry_entries()) {
         let key = artifact_key(entry);
         if !seen.insert(key) {
             continue;

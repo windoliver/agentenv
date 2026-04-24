@@ -115,6 +115,31 @@ pub struct DiscoveredDriver {
     pub capabilities_preview: Value,
 }
 
+pub(crate) fn built_in_driver_entries() -> Vec<DiscoveredDriver> {
+    let version =
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be valid semver");
+    let mut entries = Vec::new();
+
+    for spec in built_in_driver_specs() {
+        for name in spec.names {
+            entries.push(DiscoveredDriver {
+                kind: spec.kind,
+                name: (*name).to_string(),
+                version: version.clone(),
+                source: DriverSource::BuiltIn,
+                description: None,
+                binary: None,
+                manifest_path: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                capabilities_preview: Value::Null,
+            });
+        }
+    }
+
+    entries
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverCatalog {
     pub entries: Vec<DiscoveredDriver>,
@@ -195,27 +220,8 @@ struct CatalogBuilder {
 
 impl CatalogBuilder {
     fn add_built_ins(&mut self) {
-        let version =
-            Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be valid semver");
-
-        for spec in built_in_driver_specs() {
-            for name in spec.names {
-                self.entries.insert(
-                    (spec.kind, (*name).to_string()),
-                    DiscoveredDriver {
-                        kind: spec.kind,
-                        name: (*name).to_string(),
-                        version: version.clone(),
-                        source: DriverSource::BuiltIn,
-                        description: None,
-                        binary: None,
-                        manifest_path: None,
-                        args: Vec::new(),
-                        env: BTreeMap::new(),
-                        capabilities_preview: Value::Null,
-                    },
-                );
-            }
+        for entry in built_in_driver_entries() {
+            self.entries.insert((entry.kind, entry.name.clone()), entry);
         }
     }
 

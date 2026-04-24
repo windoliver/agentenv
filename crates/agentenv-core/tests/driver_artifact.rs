@@ -205,6 +205,43 @@ fn discover_driver_artifacts_includes_shadowed_subprocess_digest() {
 }
 
 #[test]
+fn discover_driver_artifacts_keeps_built_in_when_shadowed_by_override() {
+    let installed = tempfile_dir("built-in-shadow-installed");
+    let override_parent = tempfile_dir("built-in-shadow-override");
+    let override_root = override_parent.join("agent-codex");
+    let built_in_binary = installed.join("agentenv-test-binary");
+    write_file(&installed, "agentenv-test-binary", "fake agentenv binary\n");
+    write_driver_manifest(&override_root, "codex", "agent", env!("CARGO_PKG_VERSION"));
+
+    let artifacts = discover_driver_artifacts(
+        DriverDiscoveryConfig::new(installed, vec![override_parent]),
+        Some(built_in_binary.clone()),
+    )
+    .unwrap();
+
+    let mut codex_sources: Vec<_> = artifacts
+        .iter()
+        .filter(|item| item.kind == DriverKind::Agent && item.name == "codex")
+        .map(|item| item.source)
+        .collect();
+    codex_sources.sort();
+
+    assert_eq!(
+        codex_sources,
+        vec![DriverSource::BuiltIn, DriverSource::DevelopmentOverride]
+    );
+    let built_in = artifacts
+        .iter()
+        .find(|item| {
+            item.kind == DriverKind::Agent
+                && item.name == "codex"
+                && item.source == DriverSource::BuiltIn
+        })
+        .expect("missing built-in codex artifact");
+    assert_eq!(built_in.digest, digest_file(&built_in_binary).unwrap());
+}
+
+#[test]
 fn digest_driver_root_rejects_missing_root() {
     let root = tempfile_dir("missing-driver-root");
     fs::remove_dir(&root).unwrap();
