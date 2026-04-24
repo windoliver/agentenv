@@ -207,6 +207,36 @@ fn list_json_returns_empty_rows_when_registry_missing() {
 }
 
 #[test]
+fn resume_missing_env_uses_stable_error() {
+    let temp_dir = make_temp_dir("resume-missing");
+    let output = Command::new(agentenv_bin())
+        .arg("resume")
+        .arg("missing")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("env `missing` not found"));
+}
+
+#[test]
+fn sessions_list_json_returns_empty_when_registry_missing() {
+    let temp_dir = make_temp_dir("sessions-list-empty");
+    let output = Command::new(agentenv_bin())
+        .arg("sessions")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn list_json_registry_error_uses_stable_error() {
     let temp_dir = make_temp_dir("list-json-corrupt");
     let env_dir = temp_dir.join(".agentenv").join("envs").join("demo");

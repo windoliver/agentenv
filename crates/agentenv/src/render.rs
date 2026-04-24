@@ -2,7 +2,7 @@ use agentenv_core::{
     admission::{AdmissionReport, ExitClass, ReasonCode},
     driver::DriverError,
     env::EnvError,
-    runtime::{EnvDescription, EnvListRow, EnvStatusSummary, RuntimeError},
+    runtime::{EnvDescription, EnvListRow, EnvStatusSummary, RuntimeError, SessionListRow},
 };
 use serde::Serialize;
 
@@ -102,6 +102,11 @@ pub struct ListJson {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SessionsJson {
+    pub sessions: Vec<SessionListRow>,
+}
+
+#[derive(Debug, Serialize)]
 #[allow(dead_code)]
 pub struct StatusJson {
     pub healthy: bool,
@@ -123,6 +128,24 @@ pub fn print_list_text(rows: &[EnvListRow]) {
             row.inference.as_deref().unwrap_or("-"),
             row.status,
             row.created_at
+        );
+    }
+}
+
+pub fn print_sessions_text(rows: &[SessionListRow]) {
+    println!(
+        "{:<20} {:<26} {:<20} {:<10} {:<28} UPDATED",
+        "ENV", "SESSION", "NAME", "STATUS", "COMMAND"
+    );
+    for row in rows {
+        println!(
+            "{:<20} {:<26} {:<20} {:<10} {:<28} {}",
+            row.env,
+            row.session_id,
+            row.name,
+            format!("{:?}", row.status).to_lowercase(),
+            row.command,
+            row.updated_at
         );
     }
 }

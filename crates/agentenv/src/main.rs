@@ -33,6 +33,8 @@ struct Cli {
 enum Commands {
     Create(CreateArgs),
     Enter(EnterArgs),
+    Resume(ResumeArgs),
+    Sessions(SessionsArgs),
     List(ListArgs),
     Destroy(DestroyArgs),
     Describe(DescribeArgs),
@@ -81,6 +83,38 @@ struct EnterArgs {
     name: String,
     #[arg(long)]
     detach: bool,
+    #[arg(long)]
+    new: bool,
+}
+
+#[derive(Debug, Args)]
+struct ResumeArgs {
+    name: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SessionsArgs {
+    #[command(subcommand)]
+    command: SessionsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    List(SessionsListArgs),
+    Kill(SessionsKillArgs),
+}
+
+#[derive(Debug, Args)]
+struct SessionsListArgs {
+    env: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionsKillArgs {
+    session_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -208,6 +242,8 @@ async fn run() -> Result<()> {
     match cli.command {
         Some(Commands::Create(args)) => run_create(args).await,
         Some(Commands::Enter(args)) => run_enter(args).await,
+        Some(Commands::Resume(args)) => run_resume(args).await,
+        Some(Commands::Sessions(args)) => run_sessions(args).await,
         Some(Commands::List(args)) => run_list(args),
         Some(Commands::Destroy(args)) => run_destroy(args).await,
         Some(Commands::Describe(args)) => run_describe(args),
@@ -336,7 +372,7 @@ async fn run_enter(args: EnterArgs) -> Result<()> {
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
         args.detach,
-        false,
+        args.new,
     )
     .await?
     {
@@ -352,6 +388,57 @@ async fn run_enter(args: EnterArgs) -> Result<()> {
             process::exit(result.status);
         }
     }
+}
+
+async fn run_resume(args: ResumeArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    let result = agentenv_core::runtime::resume_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.name,
+        args.session_id.as_deref(),
+    )
+    .await?;
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    io::stdout().flush().context("flush forwarded stdout")?;
+    io::stderr().flush().context("flush forwarded stderr")?;
+    process::exit(result.status);
+}
+
+async fn run_sessions(args: SessionsArgs) -> Result<()> {
+    match args.command {
+        SessionsCommand::List(args) => run_sessions_list(args).await,
+        SessionsCommand::Kill(args) => run_sessions_kill(args).await,
+    }
+}
+
+async fn run_sessions_list(args: SessionsListArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    let rows = agentenv_core::runtime::list_sessions_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        args.env.as_deref(),
+    )
+    .await?;
+    if args.json {
+        render::print_json(&render::SessionsJson { sessions: rows })?;
+    } else {
+        render::print_sessions_text(&rows);
+    }
+    Ok(())
+}
+
+async fn run_sessions_kill(args: SessionsKillArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    agentenv_core::runtime::kill_session_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.session_id,
+    )
+    .await?;
+    println!("killed: {}", args.session_id);
+    Ok(())
 }
 
 fn run_list(args: ListArgs) -> Result<()> {
