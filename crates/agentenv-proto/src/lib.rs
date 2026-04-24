@@ -10,7 +10,7 @@ pub use types::*;
 mod tests {
     use super::{
         assert_compatible_schema_version, is_compatible_schema_version, AgentHealthCheckProbe,
-        SchemaVersionError, SCHEMA_VERSION,
+        SandboxCapabilities, SchemaVersionError, SessionHandle, SessionStatus, SCHEMA_VERSION,
     };
 
     #[test]
@@ -43,8 +43,41 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_1_0() {
-        assert_eq!(SCHEMA_VERSION, "1.0");
+    fn schema_version_is_1_1() {
+        assert_eq!(SCHEMA_VERSION, "1.1");
+    }
+
+    #[test]
+    fn sandbox_capabilities_default_missing_persistent_sessions_to_false() {
+        let capabilities: SandboxCapabilities = serde_json::from_value(serde_json::json!({
+            "supports_hot_reload_policy": true,
+            "supports_filesystem_lockdown": true,
+            "supports_syscall_filter": true,
+            "supports_native_inference_routing": true,
+            "supports_remote_host": false
+        }))
+        .expect("legacy sandbox capabilities should deserialize");
+
+        assert!(!capabilities.supports_persistent_sessions);
+    }
+
+    #[test]
+    fn session_handle_round_trips() {
+        let handle = SessionHandle {
+            session_id: "01HSESSION".to_owned(),
+            name: "demo".to_owned(),
+            status: SessionStatus::Detached,
+            created_at: "2026-04-24T17:00:00Z".to_owned(),
+            updated_at: "2026-04-24T17:01:00Z".to_owned(),
+            command: "/sandbox/.agentenv/bin/agentenv-agent".to_owned(),
+            working_dir: Some("/sandbox".to_owned()),
+        };
+
+        let encoded = serde_json::to_value(&handle).expect("serialize session handle");
+        assert_eq!(encoded["status"], "detached");
+        let decoded: SessionHandle =
+            serde_json::from_value(encoded).expect("deserialize session handle");
+        assert_eq!(decoded, handle);
     }
 
     #[test]

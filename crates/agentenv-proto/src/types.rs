@@ -115,6 +115,8 @@ pub struct SandboxCapabilities {
     pub supports_syscall_filter: bool,
     pub supports_native_inference_routing: bool,
     pub supports_remote_host: bool,
+    #[serde(default)]
+    pub supports_persistent_sessions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -353,6 +355,62 @@ pub struct ShellHandle {
     pub tty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Starting,
+    Attached,
+    Detached,
+    Exited,
+    Killed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CreateSessionParams {
+    pub handle: String,
+    pub name: String,
+    pub command: String,
+    pub detached: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AttachSessionParams {
+    pub handle: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct KillSessionParams {
+    pub handle: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ListSessionsParams {
+    pub handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SessionHandle {
+    pub session_id: String,
+    pub name: String,
+    pub status: SessionStatus,
+    pub created_at: String,
+    pub updated_at: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ListSessionsResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SessionHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
