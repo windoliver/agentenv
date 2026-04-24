@@ -913,7 +913,8 @@ pub async fn resume_env(
 
     let paths =
         crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
-    let sessions = crate::sessions::read_sessions(&paths, name)?;
+    let sessions =
+        reconcile_sessions_with_driver(&paths, name, set.sandbox.as_ref(), &handle).await?;
     let (selected, requested_id) = match session_id {
         Some(id) => (find_session_or_invalid(&sessions, id)?, id),
         None => {
@@ -975,39 +976,9 @@ pub async fn list_sessions_env(
             options.root.clone(),
             crate::env::validate_env_name(&env_name)?,
         );
-        let mut sessions = crate::sessions::read_sessions(&paths, &env_name)?;
-        let live_sessions = set
-            .sandbox
-            .list_sessions(agentenv_proto::ListSessionsParams {
-                handle: handle.clone(),
-            })
-            .await?;
-        let reported_live_ids = live_sessions
-            .sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<BTreeSet<_>>();
-        for session in live_sessions.sessions {
-            crate::sessions::upsert_session(
-                &mut sessions,
-                persisted_from_driver_session(session),
-                false,
-            );
-        }
-        let now = now_utc_string();
-        for session in sessions
-            .sessions
-            .iter_mut()
-            .filter(|session| crate::sessions::is_live_status(&session.status))
-        {
-            if !reported_live_ids.contains(&session.driver_session_id)
-                && !reported_live_ids.contains(&session.id)
-            {
-                session.status = agentenv_proto::SessionStatus::Unknown;
-                session.updated_at = now.clone();
-            }
-        }
-        crate::sessions::write_sessions(&paths, &sessions)?;
+        let sessions =
+            reconcile_sessions_with_driver(&paths, &env_name, set.sandbox.as_ref(), &handle)
+                .await?;
 
         rows.extend(sessions.sessions.into_iter().map(|session| SessionListRow {
             env: env_name.clone(),
@@ -1267,6 +1238,56 @@ fn supports_persistent_sessions(capabilities: &Capabilities) -> bool {
             ..
         })
     )
+}
+
+async fn reconcile_sessions_with_driver(
+    paths: &crate::env::EnvPaths,
+    env: &str,
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+) -> RuntimeResult<crate::sessions::SessionStateFile> {
+    let mut sessions = crate::sessions::read_sessions(paths, env)?;
+    let live_sessions = sandbox
+        .list_sessions(agentenv_proto::ListSessionsParams {
+            handle: handle.to_owned(),
+        })
+        .await?;
+    reconcile_session_state(&mut sessions, live_sessions);
+    crate::sessions::write_sessions(paths, &sessions)?;
+    Ok(sessions)
+}
+
+fn reconcile_session_state(
+    sessions: &mut crate::sessions::SessionStateFile,
+    live_sessions: agentenv_proto::ListSessionsResult,
+) {
+    let reported_live_ids = live_sessions
+        .sessions
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    for session in live_sessions.sessions {
+        if crate::sessions::find_session(sessions, &session.session_id)
+            .is_ok_and(|persisted| !crate::sessions::is_live_status(&persisted.status))
+        {
+            continue;
+        }
+        crate::sessions::upsert_session(sessions, persisted_from_driver_session(session), false);
+    }
+
+    let now = now_utc_string();
+    for session in sessions
+        .sessions
+        .iter_mut()
+        .filter(|session| crate::sessions::is_live_status(&session.status))
+    {
+        if !reported_live_ids.contains(&session.driver_session_id)
+            && !reported_live_ids.contains(&session.id)
+        {
+            session.status = agentenv_proto::SessionStatus::Unknown;
+            session.updated_at = now.clone();
+        }
+    }
 }
 
 fn next_session_name(env: &str, sessions: &crate::sessions::SessionStateFile) -> String {
@@ -4576,6 +4597,17 @@ policy:
     }
 
     async fn session_test_runtime(label: &str) -> (RuntimeOptions, SessionFactory) {
+        create_session_test_runtime(label, SessionFactory).await
+    }
+
+    async fn stale_session_test_runtime(label: &str) -> (RuntimeOptions, StaleSessionFactory) {
+        create_session_test_runtime(label, StaleSessionFactory).await
+    }
+
+    async fn create_session_test_runtime<F>(label: &str, factory: F) -> (RuntimeOptions, F)
+    where
+        F: DriverFactory,
+    {
         let root = unique_root(&format!("agentenv-session-{label}"));
         let options = RuntimeOptions {
             root: root.clone(),
@@ -4597,11 +4629,11 @@ policy:
   presets: []
 "#;
         let mut credentials = super::tests_support::EmptyCredentialProvider;
-        super::create_env(&options, &SessionFactory, &mut credentials, "demo", yaml)
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
             .await
             .unwrap();
 
-        (options, SessionFactory)
+        (options, factory)
     }
 
     struct SessionFactory;
@@ -4609,7 +4641,9 @@ policy:
     impl DriverFactory for SessionFactory {
         fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
             Ok(DriverSet {
-                sandbox: Box::new(SessionSandboxDriver),
+                sandbox: Box::new(SessionSandboxDriver {
+                    report_sessions: true,
+                }),
                 agent: Box::new(super::tests_support::TinyAgentDriver),
                 context: Box::new(TinyContextDriver),
                 inference: None,
@@ -4617,7 +4651,24 @@ policy:
         }
     }
 
-    struct SessionSandboxDriver;
+    struct StaleSessionFactory;
+
+    impl DriverFactory for StaleSessionFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(SessionSandboxDriver {
+                    report_sessions: false,
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct SessionSandboxDriver {
+        report_sessions: bool,
+    }
 
     #[async_trait]
     impl SandboxDriver for SessionSandboxDriver {
@@ -4681,8 +4732,22 @@ policy:
             &self,
             _params: agentenv_proto::ListSessionsParams,
         ) -> DriverResult<agentenv_proto::ListSessionsResult> {
+            if !self.report_sessions {
+                return Ok(agentenv_proto::ListSessionsResult {
+                    sessions: Vec::new(),
+                });
+            }
+
             Ok(agentenv_proto::ListSessionsResult {
-                sessions: Vec::new(),
+                sessions: vec![agentenv_proto::SessionHandle {
+                    session_id: "sh-1".to_owned(),
+                    name: "demo".to_owned(),
+                    status: agentenv_proto::SessionStatus::Detached,
+                    created_at: "2026-04-24T17:00:00Z".to_owned(),
+                    updated_at: "2026-04-24T17:00:00Z".to_owned(),
+                    command: super::AGENT_ENTRYPOINT_PATH.to_owned(),
+                    working_dir: Some("/sandbox".to_owned()),
+                }],
             })
         }
 
@@ -4887,7 +4952,7 @@ policy:
 
     #[tokio::test]
     async fn list_sessions_marks_missing_live_persisted_sessions_unknown() {
-        let (options, factory) = session_test_runtime("list-stale-session").await;
+        let (options, factory) = stale_session_test_runtime("list-stale-session").await;
         super::enter_env(&options, &factory, "demo", true, false)
             .await
             .unwrap();
@@ -4931,6 +4996,32 @@ policy:
             RuntimeError::Driver(crate::driver::DriverError::InvalidHandle { handle, message })
                 if handle == "sh-1" && message.contains("not live")
         ));
+    }
+
+    #[tokio::test]
+    async fn resume_env_rejects_stale_live_default_session() {
+        let (options, factory) = stale_session_test_runtime("resume-stale-live").await;
+        super::enter_env(&options, &factory, "demo", true, false)
+            .await
+            .unwrap();
+
+        let err = super::resume_env(&options, &factory, "demo", None)
+            .await
+            .expect_err("stale live default session should not attach");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Driver(crate::driver::DriverError::InvalidHandle { handle, message })
+                if handle == "sh-1" && message.contains("not live")
+        ));
+
+        let env_name = crate::env::validate_env_name("demo").unwrap();
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        assert_eq!(
+            sessions.sessions[0].status,
+            agentenv_proto::SessionStatus::Unknown
+        );
     }
 
     #[tokio::test]
