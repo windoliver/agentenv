@@ -190,21 +190,27 @@ policy:
         .current_dir(&temp_dir)
         .output()
         .unwrap();
-    let present_stderr = String::from_utf8_lossy(&present.stderr);
-    assert!(
-        !present_stderr.contains("missing credential `OPENAI_API_KEY`"),
-        "reproduce used the lockfile key instead of the credential reference: {present_stderr}"
+    let present_summary = output_summary(&present);
+    let present_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&present.stdout),
+        String::from_utf8_lossy(&present.stderr)
     );
     assert!(
-        present_stderr.contains("OpenShell")
-            || present_stderr.contains("openshell")
-            || present_stderr.contains("preflight")
-            || present_stderr.contains("capability")
-            || present_stderr.contains("sandbox")
-            || present_stderr.contains("invalid driver config")
-            || present_stderr.contains("mount")
-            || present_stderr.contains("created"),
-        "expected reproduce to pass credential resolution and reach create/preflight: {present_stderr}"
+        !present_output.contains("missing credential `OPENAI_API_KEY`"),
+        "reproduce used the lockfile key instead of the credential reference: {present_summary}"
+    );
+    assert!(
+        present.status.success()
+            || present_output.contains("OpenShell")
+            || present_output.contains("openshell")
+            || present_output.contains("preflight")
+            || present_output.contains("capability")
+            || present_output.contains("sandbox")
+            || present_output.contains("invalid driver config")
+            || present_output.contains("mount")
+            || present_output.contains("created"),
+        "expected reproduce to pass credential resolution and reach create/preflight: {present_summary}"
     );
 }
 
