@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use agentenv_proto::SessionStatus;
@@ -85,25 +88,58 @@ pub fn write_sessions(
             path: path.clone(),
             source,
         })?;
-    let temp_path = path.with_file_name(format!(".sessions.json.{}.tmp", std::process::id()));
-    std::fs::write(&temp_path, rendered).map_err(|source| crate::env::EnvError::Io {
-        path: temp_path.clone(),
-        source,
-    })?;
-    std::fs::rename(&temp_path, &path).map_err(|source| {
-        let _ = std::fs::remove_file(&temp_path);
+    let rendered = rendered.as_bytes();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| crate::env::EnvError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(source),
+        })?;
+    let temp_path = path.with_file_name(format!(
+        ".sessions.json.{}.{}.tmp",
+        std::process::id(),
+        timestamp.as_nanos()
+    ));
+
+    let mut options = OpenOptions::new();
+    restrict_file_permissions(&mut options);
+    let mut tmp_file = options
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|source| crate::env::EnvError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+    tmp_file
+        .write_all(rendered)
+        .map_err(|source| crate::env::EnvError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+    tmp_file
+        .sync_all()
+        .map_err(|source| crate::env::EnvError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+    drop(tmp_file);
+
+    fs::rename(&temp_path, &path).map_err(|source| {
+        let _ = fs::remove_file(&temp_path);
         crate::env::EnvError::Io { path, source }
     })
 }
 
 pub fn upsert_session(file: &mut SessionStateFile, session: PersistedSession, make_default: bool) {
+    let session_id = session.id.clone();
     if let Some(existing) = file.sessions.iter_mut().find(|item| item.id == session.id) {
         *existing = session;
     } else {
         file.sessions.push(session);
     }
     if make_default || file.default_session_id.is_none() {
-        file.default_session_id = file.sessions.last().map(|item| item.id.clone());
+        file.default_session_id = Some(session_id);
     }
 }
 
@@ -125,6 +161,15 @@ pub fn is_live_status(status: &SessionStatus) -> bool {
         SessionStatus::Starting | SessionStatus::Attached | SessionStatus::Detached
     )
 }
+
+#[cfg(unix)]
+fn restrict_file_permissions(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_options: &mut OpenOptions) {}
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +216,18 @@ mod tests {
         upsert_session(&mut file, replacement.clone(), true);
 
         assert_eq!(file.sessions, vec![replacement]);
+        assert_eq!(file.default_session_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn upsert_make_default_uses_replaced_session_not_last_session() {
+        let mut file = empty_session_file("demo");
+        upsert_session(&mut file, session("s1", "tmux-s1"), true);
+        upsert_session(&mut file, session("s2", "tmux-s2"), true);
+
+        let replacement = session("s1", "tmux-s1b");
+        upsert_session(&mut file, replacement, true);
+
         assert_eq!(file.default_session_id.as_deref(), Some("s1"));
     }
 
