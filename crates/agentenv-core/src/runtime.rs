@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -914,8 +914,8 @@ pub async fn resume_env(
     let paths =
         crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
     let sessions = crate::sessions::read_sessions(&paths, name)?;
-    let selected = match session_id {
-        Some(id) => find_session_or_invalid(&sessions, id)?,
+    let (selected, requested_id) = match session_id {
+        Some(id) => (find_session_or_invalid(&sessions, id)?, id),
         None => {
             let default_id = sessions.default_session_id.as_deref().ok_or_else(|| {
                 RuntimeError::Driver(DriverError::InvalidHandle {
@@ -923,9 +923,15 @@ pub async fn resume_env(
                     message: "no default session exists".to_owned(),
                 })
             })?;
-            find_session_or_invalid(&sessions, default_id)?
+            (find_session_or_invalid(&sessions, default_id)?, default_id)
         }
     };
+    if !crate::sessions::is_live_status(&selected.status) {
+        return Err(RuntimeError::Driver(DriverError::InvalidHandle {
+            handle: requested_id.to_owned(),
+            message: format!("session `{requested_id}` is not live"),
+        }));
+    }
 
     set.sandbox
         .attach_session(agentenv_proto::AttachSessionParams {
@@ -976,12 +982,30 @@ pub async fn list_sessions_env(
                 handle: handle.clone(),
             })
             .await?;
+        let reported_live_ids = live_sessions
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<BTreeSet<_>>();
         for session in live_sessions.sessions {
             crate::sessions::upsert_session(
                 &mut sessions,
                 persisted_from_driver_session(session),
                 false,
             );
+        }
+        let now = now_utc_string();
+        for session in sessions
+            .sessions
+            .iter_mut()
+            .filter(|session| crate::sessions::is_live_status(&session.status))
+        {
+            if !reported_live_ids.contains(&session.driver_session_id)
+                && !reported_live_ids.contains(&session.id)
+            {
+                session.status = agentenv_proto::SessionStatus::Unknown;
+                session.updated_at = now.clone();
+            }
         }
         crate::sessions::write_sessions(&paths, &sessions)?;
 
@@ -1163,21 +1187,23 @@ pub async fn destroy_env(
     }
 
     if let Some(handle) = state.handles.sandbox.clone() {
-        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
-        let session_file = crate::sessions::read_sessions(&paths, name)
-            .unwrap_or_else(|_| crate::sessions::empty_session_file(name));
-        for session in session_file
-            .sessions
-            .iter()
-            .filter(|session| crate::sessions::is_live_status(&session.status))
-        {
-            let _ = set
-                .sandbox
-                .kill_session(agentenv_proto::KillSessionParams {
-                    handle: handle.clone(),
-                    session_id: session.driver_session_id.clone(),
-                })
-                .await;
+        let init = initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+        if supports_persistent_sessions(&init.capabilities) {
+            let session_file = crate::sessions::read_sessions(&paths, name)
+                .unwrap_or_else(|_| crate::sessions::empty_session_file(name));
+            for session in session_file
+                .sessions
+                .iter()
+                .filter(|session| crate::sessions::is_live_status(&session.status))
+            {
+                let _ = set
+                    .sandbox
+                    .kill_session(agentenv_proto::KillSessionParams {
+                        handle: handle.clone(),
+                        session_id: session.driver_session_id.clone(),
+                    })
+                    .await;
+            }
         }
         set.sandbox
             .destroy(agentenv_proto::DestroyParams { handle })
@@ -2489,6 +2515,27 @@ mod tests {
         destroyed: Arc<AtomicBool>,
     }
 
+    struct KillTrackingUnsupportedSessionFactory {
+        kill_called: Arc<AtomicBool>,
+    }
+
+    impl DriverFactory for KillTrackingUnsupportedSessionFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(KillTrackingUnsupportedSessionSandboxDriver {
+                    kill_called: Arc::clone(&self.kill_called),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct KillTrackingUnsupportedSessionSandboxDriver {
+        kill_called: Arc<AtomicBool>,
+    }
+
     #[async_trait]
     impl SandboxDriver for TinySandboxDriver {
         async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
@@ -2780,6 +2827,105 @@ mod tests {
             params: agentenv_proto::DestroyParams,
         ) -> DriverResult<EmptyResult> {
             self.destroyed.store(true, Ordering::SeqCst);
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinySandboxDriver;
+            inner.shutdown(params).await
+        }
+    }
+
+    #[async_trait]
+    impl SandboxDriver for KillTrackingUnsupportedSessionSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = TinySandboxDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn kill_session(
+            &self,
+            _params: agentenv_proto::KillSessionParams,
+        ) -> DriverResult<EmptyResult> {
+            self.kill_called.store(true, Ordering::SeqCst);
+            Err(crate::driver::persistent_sessions_missing())
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
             TinySandboxDriver.destroy(params).await
         }
 
@@ -4740,6 +4886,54 @@ policy:
     }
 
     #[tokio::test]
+    async fn list_sessions_marks_missing_live_persisted_sessions_unknown() {
+        let (options, factory) = session_test_runtime("list-stale-session").await;
+        super::enter_env(&options, &factory, "demo", true, false)
+            .await
+            .unwrap();
+
+        let rows = super::list_sessions_env(&options, &factory, Some("demo"))
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "sh-1");
+        assert_eq!(rows[0].status, agentenv_proto::SessionStatus::Unknown);
+
+        let env_name = crate::env::validate_env_name("demo").unwrap();
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        assert_eq!(
+            sessions.sessions[0].status,
+            agentenv_proto::SessionStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_env_rejects_non_live_default_session() {
+        let (options, factory) = session_test_runtime("resume-non-live").await;
+        super::enter_env(&options, &factory, "demo", true, false)
+            .await
+            .unwrap();
+
+        let env_name = crate::env::validate_env_name("demo").unwrap();
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let mut sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        sessions.sessions[0].status = agentenv_proto::SessionStatus::Killed;
+        crate::sessions::write_sessions(&paths, &sessions).unwrap();
+
+        let err = super::resume_env(&options, &factory, "demo", None)
+            .await
+            .expect_err("non-live default session should not attach");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Driver(crate::driver::DriverError::InvalidHandle { handle, message })
+                if handle == "sh-1" && message.contains("not live")
+        ));
+    }
+
+    #[tokio::test]
     async fn enter_detach_without_session_support_returns_capability_missing() {
         let (options, factory) = command_test_runtime("enter-detach-unsupported").await;
         let err = super::enter_env(&options, &factory, "demo", true, false)
@@ -4751,6 +4945,41 @@ policy:
             RuntimeError::Driver(crate::driver::DriverError::CapabilityMissing { capability })
                 if capability == "supports_persistent_sessions"
         ));
+    }
+
+    #[tokio::test]
+    async fn destroy_env_skips_session_cleanup_without_session_support() {
+        let (options, _) = command_test_runtime("destroy-session-unsupported").await;
+        let env_name = crate::env::validate_env_name("demo").unwrap();
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let mut sessions = crate::sessions::empty_session_file("demo");
+        crate::sessions::upsert_session(
+            &mut sessions,
+            crate::sessions::PersistedSession {
+                id: "sh-1".to_owned(),
+                driver_session_id: "sh-1".to_owned(),
+                name: "demo".to_owned(),
+                status: agentenv_proto::SessionStatus::Detached,
+                command: super::AGENT_ENTRYPOINT_PATH.to_owned(),
+                created_at: "2026-04-24T17:00:00Z".to_owned(),
+                updated_at: "2026-04-24T17:00:00Z".to_owned(),
+                working_dir: Some("/sandbox".to_owned()),
+                metadata: BTreeMap::new(),
+            },
+            true,
+        );
+        crate::sessions::write_sessions(&paths, &sessions).unwrap();
+
+        let kill_called = Arc::new(AtomicBool::new(false));
+        let factory = KillTrackingUnsupportedSessionFactory {
+            kill_called: Arc::clone(&kill_called),
+        };
+
+        super::destroy_env(&options, &factory, "demo")
+            .await
+            .unwrap();
+
+        assert!(!kill_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
