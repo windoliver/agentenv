@@ -1095,8 +1095,11 @@ pub async fn reproduce_env(
     let credential_bindings = credential_bindings_from_portable_lockfile(&lockfile);
     let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
     let artifact_registry = registry_from_driver_artifacts(&driver_artifacts);
-    let resolved_blueprint =
+    let mut resolved_blueprint =
         crate::lifecycle::verify_blueprint_yaml_with_registry(&blueprint_yaml, &artifact_registry)?;
+    // Portable composition component versions are driver pins. AgentSpec.version controls
+    // agent package installation, so do not replay the driver version as a package version.
+    resolved_blueprint.blueprint.agent.version = None;
     let driver_pins =
         DriverPinSet::from_portable_lockfile_and_artifacts(&lockfile, &driver_artifacts)?;
     lockfile.name = name.to_owned();
@@ -2412,6 +2415,7 @@ mod tests {
     struct AgentSetupTracker {
         copied_paths: Mutex<Vec<String>>,
         exec_cmds: Mutex<Vec<String>>,
+        agent_spec_versions: Mutex<Vec<Option<String>>>,
         create_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
         applied_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
         preinstall_probe_succeeds: AtomicBool,
@@ -2427,7 +2431,9 @@ mod tests {
                 sandbox: Box::new(AgentSetupSandboxDriver {
                     tracker: Arc::clone(&self.tracker),
                 }),
-                agent: Box::new(AgentSetupAgentDriver),
+                agent: Box::new(AgentSetupAgentDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
                 context: Box::new(TinyContextDriver),
                 inference: None,
             })
@@ -2445,7 +2451,9 @@ mod tests {
                 sandbox: Box::new(AgentSetupSandboxDriver {
                     tracker: Arc::clone(&self.tracker),
                 }),
-                agent: Box::new(AgentSetupAgentDriver),
+                agent: Box::new(AgentSetupAgentDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
                 context: Box::new(RequiredRuleContextDriver {
                     required_rule: self.required_rule.clone(),
                 }),
@@ -2574,7 +2582,9 @@ mod tests {
         }
     }
 
-    struct AgentSetupAgentDriver;
+    struct AgentSetupAgentDriver {
+        tracker: Arc<AgentSetupTracker>,
+    }
 
     #[async_trait]
     impl crate::driver::AgentDriver for AgentSetupAgentDriver {
@@ -2591,8 +2601,13 @@ mod tests {
 
         async fn install_steps(
             &self,
-            _spec: agentenv_proto::AgentSpec,
+            spec: agentenv_proto::AgentSpec,
         ) -> DriverResult<agentenv_proto::InstallStepsResult> {
+            self.tracker
+                .agent_spec_versions
+                .lock()
+                .expect("agent spec versions")
+                .push(spec.version);
             Ok(agentenv_proto::InstallStepsResult {
                 steps: vec![agentenv_proto::DockerfileFragment {
                     name: Some("install-agent".to_owned()),
@@ -4625,6 +4640,69 @@ policy:
         roles.sort();
         roles.dedup();
         assert_eq!(roles, vec!["agent", "context", "sandbox"]);
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_does_not_forward_driver_pin_as_agent_package_version() {
+        let root = unique_root("agentenv-reproduce-agent-spec-version");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        assert_eq!(
+            lockfile.composition.agent.version,
+            env!("CARGO_PKG_VERSION")
+        );
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+            .await
+            .expect("reproduce env");
+
+        assert_eq!(
+            tracker
+                .agent_spec_versions
+                .lock()
+                .expect("agent spec versions")
+                .as_slice(),
+            &[None],
+            "portable driver pins must not be forwarded as agent package versions"
+        );
     }
 
     #[tokio::test]
