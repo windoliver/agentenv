@@ -1107,6 +1107,8 @@ mod tests {
             vec![
                 "create".to_string(),
                 "enter".to_string(),
+                "resume".to_string(),
+                "sessions".to_string(),
                 "list".to_string(),
                 "destroy".to_string(),
                 "describe".to_string(),
