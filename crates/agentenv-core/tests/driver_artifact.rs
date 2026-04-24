@@ -42,11 +42,26 @@ fn driver_root_digest_hashes_symlink_metadata_without_following() {
     let root = tempfile_dir("driver-root-symlink");
     write_file(&root, "manifest.json", "{}\n");
     write_file(&root, "bin/driver", "#!/bin/sh\nexit 0\n");
-    std::os::unix::fs::symlink("../outside", root.join("bin/link")).unwrap();
+    std::os::unix::fs::symlink("driver", root.join("bin/link")).unwrap();
 
     let digest = digest_driver_root(&root).unwrap();
 
     assert!(digest.starts_with("sha256:"));
+}
+
+#[test]
+#[cfg(unix)]
+fn driver_root_digest_rejects_symlink_that_escapes_root() {
+    let root = tempfile_dir("driver-root-symlink-escape");
+    let outside = tempfile_dir("driver-root-symlink-outside");
+    write_file(&root, "manifest.json", "{}\n");
+    write_file(&root, "bin/driver", "#!/bin/sh\nexit 0\n");
+    write_file(&outside, "shared.sh", "echo outside\n");
+    std::os::unix::fs::symlink(outside.join("shared.sh"), root.join("bin/shared.sh")).unwrap();
+
+    let error = digest_driver_root(&root).unwrap_err();
+
+    assert!(matches!(error, DriverArtifactError::PathEscapesRoot { .. }));
 }
 
 #[test]
@@ -56,8 +71,10 @@ fn driver_root_digest_changes_when_symlink_target_text_changes() {
     let right = tempfile_dir("driver-root-link-right");
     write_file(&left, "manifest.json", "{}\n");
     write_file(&right, "manifest.json", "{}\n");
-    std::os::unix::fs::symlink("../outside-a", left.join("link")).unwrap();
-    std::os::unix::fs::symlink("../outside-b", right.join("link")).unwrap();
+    write_file(&left, "target-a", "same bytes\n");
+    write_file(&right, "target-b", "same bytes\n");
+    std::os::unix::fs::symlink("target-a", left.join("link")).unwrap();
+    std::os::unix::fs::symlink("target-b", right.join("link")).unwrap();
 
     let left_digest = digest_driver_root(&left).unwrap();
     let right_digest = digest_driver_root(&right).unwrap();

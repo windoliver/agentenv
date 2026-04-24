@@ -44,6 +44,7 @@ pub struct DriverPinIdentity {
     pub version: String,
     pub source: crate::lockfile::DriverSourcePin,
     pub digest: String,
+    pub verified_entry: Option<crate::driver_catalog::DiscoveredDriver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -73,10 +74,52 @@ impl DriverPinSet {
                     version: pin.version.clone(),
                     source: pin.source.clone(),
                     digest: pin.digest.clone(),
+                    verified_entry: None,
                 },
             );
         }
         Ok(Self { pins })
+    }
+
+    pub fn from_portable_lockfile_and_artifacts(
+        lockfile: &crate::lockfile::PortableLockfile,
+        artifacts: &[crate::driver_artifact::DriverArtifact],
+    ) -> RuntimeResult<Self> {
+        let mut pin_set = Self::from_portable_lockfile(lockfile)?;
+        for (role, pin) in &mut pin_set.pins {
+            if pin.source == crate::lockfile::DriverSourcePin::BuiltIn {
+                continue;
+            }
+            let Some(source) = source_pin_to_driver_source(&pin.source) else {
+                return Err(RuntimeError::PortableLockfileVerification {
+                    details: format!("pinned {role} driver has unsupported source"),
+                });
+            };
+            let Some(artifact) = artifacts.iter().find(|artifact| {
+                artifact.kind == driver_kind_to_catalog_kind(&pin.kind)
+                    && artifact.name == pin.name
+                    && artifact.version.to_string() == pin.version
+                    && artifact.source == source
+                    && artifact.digest == pin.digest
+            }) else {
+                return Err(RuntimeError::PortableLockfileVerification {
+                    details: format!(
+                        "pinned {role} driver `{}` version `{}` was not verified against a local artifact",
+                        pin.name, pin.version
+                    ),
+                });
+            };
+            let Some(entry) = artifact.entry.clone() else {
+                return Err(RuntimeError::PortableLockfileVerification {
+                    details: format!(
+                        "pinned {role} driver `{}` version `{}` has no verified materialization entry",
+                        pin.name, pin.version
+                    ),
+                });
+            };
+            pin.verified_entry = Some(entry);
+        }
+        Ok(pin_set)
     }
 
     pub fn get(&self, role: &str) -> Option<&DriverPinIdentity> {
@@ -89,6 +132,29 @@ impl DriverPinSet {
 
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
+    }
+}
+
+fn driver_kind_to_catalog_kind(kind: &DriverKind) -> crate::registry::DriverKind {
+    match kind {
+        DriverKind::Sandbox => crate::registry::DriverKind::Sandbox,
+        DriverKind::Agent => crate::registry::DriverKind::Agent,
+        DriverKind::Context => crate::registry::DriverKind::Context,
+        DriverKind::Inference => crate::registry::DriverKind::Inference,
+    }
+}
+
+fn source_pin_to_driver_source(
+    source: &crate::lockfile::DriverSourcePin,
+) -> Option<crate::driver_catalog::DriverSource> {
+    match source {
+        crate::lockfile::DriverSourcePin::BuiltIn => None,
+        crate::lockfile::DriverSourcePin::Installed => {
+            Some(crate::driver_catalog::DriverSource::InstalledSubprocess)
+        }
+        crate::lockfile::DriverSourcePin::Override => {
+            Some(crate::driver_catalog::DriverSource::DevelopmentOverride)
+        }
     }
 }
 
@@ -1031,7 +1097,8 @@ pub async fn reproduce_env(
     let artifact_registry = registry_from_driver_artifacts(&driver_artifacts);
     let resolved_blueprint =
         crate::lifecycle::verify_blueprint_yaml_with_registry(&blueprint_yaml, &artifact_registry)?;
-    let driver_pins = DriverPinSet::from_portable_lockfile(&lockfile)?;
+    let driver_pins =
+        DriverPinSet::from_portable_lockfile_and_artifacts(&lockfile, &driver_artifacts)?;
     lockfile.name = name.to_owned();
     let persisted_lock_yaml = lockfile.to_yaml_deterministic()?;
     let mut aliased_credentials = ReproducedCredentialProvider {

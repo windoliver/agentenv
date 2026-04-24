@@ -105,11 +105,10 @@ impl DriverFactory for BuiltInDriverFactory {
         selection: &DriverSelection,
         pins: &DriverPinSet,
     ) -> RuntimeResult<DriverSet> {
-        let mut catalog = None;
         Ok(DriverSet {
             sandbox: build_pinned_sandbox(selection, pins.get("sandbox"))?,
-            agent: build_pinned_agent(selection, pins.get("agent"), &mut catalog)?,
-            context: build_pinned_context(selection, pins.get("context"), &mut catalog)?,
+            agent: build_pinned_agent(selection, pins.get("agent"))?,
+            context: build_pinned_context(selection, pins.get("context"))?,
             inference: build_pinned_inference(selection, pins.get("inference"))?,
         })
     }
@@ -139,34 +138,16 @@ fn build_pinned_sandbox(
 fn build_pinned_agent(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
-    catalog: &mut Option<DriverCatalog>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::AgentDriver>> {
     match pin {
         Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
-            let Some(source) = subprocess_source_from_pin(&pin.source) else {
-                return Err(RuntimeError::UnsupportedDriver {
-                    kind: "agent",
-                    name: pin.name.clone(),
-                });
-            };
-            match exact_subprocess_entry(
-                catalog,
-                CatalogKind::Agent,
-                &pin.name,
-                &pin.version,
-                source,
-            )? {
-                Some(entry) => Ok(Box::new(
-                    agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
-                        entry,
-                        SUBPROCESS_DRIVER_TIMEOUT,
-                    )?,
-                )),
-                None => Err(RuntimeError::UnsupportedDriver {
-                    kind: "agent",
-                    name: pin.name.clone(),
-                }),
-            }
+            let entry = verified_subprocess_entry(pin, CatalogKind::Agent, "agent")?;
+            Ok(Box::new(
+                agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
+                    entry,
+                    SUBPROCESS_DRIVER_TIMEOUT,
+                )?,
+            ))
         }
         _ => match selection.agent.as_str() {
             "claude" | "agent-claude" => {
@@ -207,34 +188,16 @@ fn build_pinned_agent(
 fn build_pinned_context(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
-    catalog: &mut Option<DriverCatalog>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::ContextDriver>> {
     match pin {
         Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
-            let Some(source) = subprocess_source_from_pin(&pin.source) else {
-                return Err(RuntimeError::UnsupportedDriver {
-                    kind: "context",
-                    name: pin.name.clone(),
-                });
-            };
-            match exact_subprocess_entry(
-                catalog,
-                CatalogKind::Context,
-                &pin.name,
-                &pin.version,
-                source,
-            )? {
-                Some(entry) => Ok(Box::new(
-                    agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
-                        entry,
-                        SUBPROCESS_DRIVER_TIMEOUT,
-                    )?,
-                )),
-                None => Err(RuntimeError::UnsupportedDriver {
-                    kind: "context",
-                    name: pin.name.clone(),
-                }),
-            }
+            let entry = verified_subprocess_entry(pin, CatalogKind::Context, "context")?;
+            Ok(Box::new(
+                agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
+                    entry,
+                    SUBPROCESS_DRIVER_TIMEOUT,
+                )?,
+            ))
         }
         _ => match selection.context.as_str() {
             "filesystem" | "context-filesystem" => {
@@ -364,6 +327,36 @@ fn validate_builtin_pin(
     Ok(())
 }
 
+fn verified_subprocess_entry(
+    pin: &DriverPinIdentity,
+    expected_kind: CatalogKind,
+    role: &'static str,
+) -> RuntimeResult<DiscoveredDriver> {
+    let Some(source) = subprocess_source_from_pin(&pin.source) else {
+        return Err(RuntimeError::UnsupportedDriver {
+            kind: role,
+            name: pin.name.clone(),
+        });
+    };
+    let Some(entry) = pin.verified_entry.clone() else {
+        return Err(RuntimeError::UnsupportedDriver {
+            kind: role,
+            name: pin.name.clone(),
+        });
+    };
+    if entry.kind != expected_kind
+        || entry.name != pin.name
+        || entry.version.to_string() != pin.version
+        || entry.source != source
+    {
+        return Err(RuntimeError::UnsupportedDriver {
+            kind: role,
+            name: pin.name.clone(),
+        });
+    }
+    Ok(entry)
+}
+
 fn discover_catalog() -> RuntimeResult<DriverCatalog> {
     DriverCatalog::discover_from_environment().map_err(|err| {
         RuntimeError::Driver(DriverError::Subprocess {
@@ -392,6 +385,7 @@ fn subprocess_entry(
         .cloned())
 }
 
+#[cfg(test)]
 fn exact_subprocess_entry(
     catalog: &mut Option<DriverCatalog>,
     kind: CatalogKind,
@@ -435,7 +429,8 @@ mod tests {
     use std::{collections::BTreeMap, sync::Mutex};
 
     use agentenv_core::{
-        driver_catalog::DriverSource,
+        driver_artifact::discover_driver_artifacts,
+        driver_catalog::{DriverDiscoveryConfig, DriverSource},
         lockfile::{
             DriverSourcePin, PortableComponent, PortableComposition, PortableDriverPin,
             PortableLockfile, PortablePolicy,
@@ -587,6 +582,60 @@ mod tests {
     }
 
     #[test]
+    fn pinned_subprocess_build_uses_verified_artifact_manifest_without_rediscovery() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let installed_parent = temp.path().join("verified-drivers");
+        let installed = installed_parent.join("agent-hermes");
+        let built_in_binary = temp.path().join("agentenv-test-binary");
+        std::fs::write(&built_in_binary, "fake agentenv binary\n").expect("built-in binary");
+        write_manifest(&installed, "agent", "hermes", "agentenv-driver-hermes");
+        let artifacts = discover_driver_artifacts(
+            DriverDiscoveryConfig::new(installed_parent, Vec::new()),
+            Some(built_in_binary),
+        )
+        .expect("discover artifacts");
+        let hermes = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == CatalogKind::Agent
+                    && artifact.name == "hermes"
+                    && artifact.source == DriverSource::InstalledSubprocess
+            })
+            .expect("hermes artifact");
+        let lockfile = lockfile_with_pin(
+            "agent",
+            ProtoDriverKind::Agent,
+            "hermes",
+            "0.1.0",
+            DriverSourcePin::Installed,
+            &hermes.digest,
+        );
+        let pins = DriverPinSet::from_portable_lockfile_and_artifacts(&lockfile, &artifacts)
+            .expect("pin set");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            (
+                "AGENTENV_DRIVER_PATH",
+                temp.path().join("missing-driver-path").into_os_string(),
+            ),
+        ]);
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "hermes".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: None,
+        };
+
+        let set = BuiltInDriverFactory
+            .build_pinned(&selection, &pins)
+            .expect("verified artifact should materialize without rediscovery");
+        drop(set);
+    }
+
+    #[test]
     fn pinned_build_rejects_non_builtin_sandbox_pin() {
         let selection = DriverSelection {
             sandbox: "openshell".to_owned(),
@@ -639,6 +688,25 @@ mod tests {
         version: &str,
         source: DriverSourcePin,
     ) -> DriverPinSet {
+        let lockfile = lockfile_with_pin(
+            role,
+            kind,
+            name,
+            version,
+            source,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        DriverPinSet::from_portable_lockfile(&lockfile).expect("pin set")
+    }
+
+    fn lockfile_with_pin(
+        role: &str,
+        kind: ProtoDriverKind,
+        name: &str,
+        version: &str,
+        source: DriverSourcePin,
+        digest: &str,
+    ) -> PortableLockfile {
         let mut drivers = BTreeMap::new();
         drivers.insert(
             role.to_owned(),
@@ -647,11 +715,10 @@ mod tests {
                 name: name.to_owned(),
                 version: version.to_owned(),
                 source,
-                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_owned(),
+                digest: digest.to_owned(),
             },
         );
-        let lockfile = PortableLockfile {
+        PortableLockfile {
             version: agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION.to_owned(),
             driver_protocol_version: SCHEMA_VERSION.to_owned(),
             name: "demo".to_owned(),
@@ -684,8 +751,7 @@ mod tests {
             drivers,
             artifacts: BTreeMap::new(),
             credentials: BTreeMap::new(),
-        };
-        DriverPinSet::from_portable_lockfile(&lockfile).expect("pin set")
+        }
     }
 
     fn proto_kind_label(kind: ProtoDriverKind) -> &'static str {

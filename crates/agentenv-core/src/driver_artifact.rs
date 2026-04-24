@@ -24,6 +24,7 @@ pub struct DriverArtifact {
     pub source: DriverSource,
     pub digest: String,
     pub install_hint: Option<String>,
+    pub entry: Option<DiscoveredDriver>,
 }
 
 #[derive(Debug, Error)]
@@ -94,6 +95,7 @@ pub fn discover_driver_artifacts(
             source: entry.source,
             digest,
             install_hint,
+            entry: Some(entry.clone()),
         });
     }
 
@@ -109,8 +111,12 @@ pub fn discover_driver_artifacts(
 }
 
 pub fn digest_driver_root(root: &Path) -> Result<String, DriverArtifactError> {
+    let canonical_root = fs::canonicalize(root).map_err(|source| DriverArtifactError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
     let mut entries = Vec::new();
-    collect_entries(root, root, &mut entries)?;
+    collect_entries(root, &canonical_root, root, &mut entries)?;
     entries.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
 
     let mut hasher = Sha256::new();
@@ -187,6 +193,7 @@ impl ArtifactEntryKind {
 
 fn collect_entries(
     root: &Path,
+    canonical_root: &Path,
     current: &Path,
     entries: &mut Vec<ArtifactEntry>,
 ) -> Result<(), DriverArtifactError> {
@@ -206,6 +213,7 @@ fn collect_entries(
         let file_type = metadata.file_type();
 
         let kind = if file_type.is_symlink() {
+            validate_symlink_target(root, canonical_root, &path)?;
             ArtifactEntryKind::Symlink
         } else if metadata.is_dir() {
             ArtifactEntryKind::Directory
@@ -223,10 +231,28 @@ fn collect_entries(
         });
 
         if kind == ArtifactEntryKind::Directory {
-            collect_entries(root, &path, entries)?;
+            collect_entries(root, canonical_root, &path, entries)?;
         }
     }
 
+    Ok(())
+}
+
+fn validate_symlink_target(
+    root: &Path,
+    canonical_root: &Path,
+    path: &Path,
+) -> Result<(), DriverArtifactError> {
+    let canonical_target = fs::canonicalize(path).map_err(|source| DriverArtifactError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !canonical_target.starts_with(canonical_root) {
+        return Err(DriverArtifactError::PathEscapesRoot {
+            root: root.to_path_buf(),
+            path: path.to_path_buf(),
+        });
+    }
     Ok(())
 }
 

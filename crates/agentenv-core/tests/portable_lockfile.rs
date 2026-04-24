@@ -183,6 +183,7 @@ fn portable_lockfile_builder_rejects_ambiguous_driver_artifacts() {
         digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
             .to_owned(),
         install_hint: Some("/tmp/demo-driver".to_owned()),
+        entry: None,
     });
 
     let error = build_portable_lockfile(PortableLockfileInput {
@@ -273,6 +274,7 @@ fn portable_lockfile_verify_rejects_driver_pin_that_disagrees_with_composition()
         digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
             .to_owned(),
         install_hint: None,
+        entry: None,
     });
 
     let pin = lockfile.drivers.get_mut("agent").expect("agent pin exists");
@@ -783,6 +785,7 @@ fn artifacts_with_external_context() -> Vec<DriverArtifact> {
         digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
             .to_owned(),
         install_hint: Some("/tmp/demo-context".to_owned()),
+        entry: None,
     });
     artifacts
 }
@@ -804,6 +807,7 @@ fn built_in_artifacts() -> Vec<DriverArtifact> {
         digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             .to_owned(),
         install_hint: None,
+        entry: None,
     })
     .collect()
 }
