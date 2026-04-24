@@ -38,6 +38,27 @@ fn driver_root_digest_delimits_file_payloads_from_later_entries() {
 
 #[test]
 #[cfg(unix)]
+fn driver_root_digest_changes_when_executable_mode_changes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let plain = tempfile_dir("driver-root-mode-plain");
+    let executable = tempfile_dir("driver-root-mode-executable");
+    write_file(&plain, "bin/driver", "#!/bin/sh\nexit 0\n");
+    write_file(&executable, "bin/driver", "#!/bin/sh\nexit 0\n");
+    let mut permissions = fs::metadata(executable.join("bin/driver"))
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(executable.join("bin/driver"), permissions).unwrap();
+
+    let plain_digest = digest_driver_root(&plain).unwrap();
+    let executable_digest = digest_driver_root(&executable).unwrap();
+
+    assert_ne!(plain_digest, executable_digest);
+}
+
+#[test]
+#[cfg(unix)]
 fn driver_root_digest_hashes_symlink_metadata_without_following() {
     let root = tempfile_dir("driver-root-symlink");
     write_file(&root, "manifest.json", "{}\n");

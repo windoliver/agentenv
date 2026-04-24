@@ -133,6 +133,7 @@ pub fn digest_driver_root(root: &Path) -> Result<String, DriverArtifactError> {
                         path: entry.path.clone(),
                         source,
                     })?;
+                update_field(&mut hasher, file_mode_class(&metadata));
                 update_payload_len(&mut hasher, metadata.len());
                 hash_file_bytes(&entry.path, &mut hasher)?;
             }
@@ -236,6 +237,22 @@ fn collect_entries(
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode_class(metadata: &fs::Metadata) -> &'static [u8] {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 == 0 {
+        b"file"
+    } else {
+        b"executable-file"
+    }
+}
+
+#[cfg(not(unix))]
+fn file_mode_class(_metadata: &fs::Metadata) -> &'static [u8] {
+    b"file"
 }
 
 fn validate_symlink_target(
