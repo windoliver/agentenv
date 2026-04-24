@@ -1267,12 +1267,13 @@ fn reconcile_session_state(
         .map(|session| session.session_id.clone())
         .collect::<BTreeSet<_>>();
     for session in live_sessions.sessions {
-        if crate::sessions::find_session(sessions, &session.session_id)
-            .is_ok_and(|persisted| !crate::sessions::is_live_status(&persisted.status))
-        {
-            continue;
+        let stable_name = crate::sessions::find_session(sessions, &session.session_id)
+            .map(|persisted| persisted.name.clone());
+        let mut persisted = persisted_from_driver_session(session);
+        if let Ok(name) = stable_name {
+            persisted.name = name;
         }
-        crate::sessions::upsert_session(sessions, persisted_from_driver_session(session), false);
+        crate::sessions::upsert_session(sessions, persisted, false);
     }
 
     let now = now_utc_string();
@@ -4976,7 +4977,7 @@ policy:
 
     #[tokio::test]
     async fn resume_env_rejects_non_live_default_session() {
-        let (options, factory) = session_test_runtime("resume-non-live").await;
+        let (options, factory) = stale_session_test_runtime("resume-non-live").await;
         super::enter_env(&options, &factory, "demo", true, false)
             .await
             .unwrap();
@@ -4996,6 +4997,38 @@ policy:
             RuntimeError::Driver(crate::driver::DriverError::InvalidHandle { handle, message })
                 if handle == "sh-1" && message.contains("not live")
         ));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_revives_unknown_session_reported_live_by_driver() {
+        let (options, factory) = session_test_runtime("list-revived-session").await;
+        super::enter_env(&options, &factory, "demo", true, false)
+            .await
+            .unwrap();
+
+        let env_name = crate::env::validate_env_name("demo").unwrap();
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let mut sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        sessions.sessions[0].name = "custom session name".to_owned();
+        sessions.sessions[0].status = agentenv_proto::SessionStatus::Unknown;
+        crate::sessions::write_sessions(&paths, &sessions).unwrap();
+
+        let rows = super::list_sessions_env(&options, &factory, Some("demo"))
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "sh-1");
+        assert_eq!(rows[0].name, "custom session name");
+        assert_eq!(rows[0].status, agentenv_proto::SessionStatus::Detached);
+
+        let sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        assert_eq!(sessions.default_session_id.as_deref(), Some("sh-1"));
+        assert_eq!(sessions.sessions[0].name, "custom session name");
+        assert_eq!(
+            sessions.sessions[0].status,
+            agentenv_proto::SessionStatus::Detached
+        );
     }
 
     #[tokio::test]
