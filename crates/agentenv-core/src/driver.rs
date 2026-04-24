@@ -280,6 +280,7 @@ mod tests {
                 supports_syscall_filter: true,
                 supports_native_inference_routing: true,
                 supports_remote_host: false,
+                supports_persistent_sessions: false,
             }),
         };
 
@@ -302,6 +303,7 @@ mod tests {
                 supports_syscall_filter: true,
                 supports_native_inference_routing: true,
                 supports_remote_host: false,
+                supports_persistent_sessions: false,
             }),
         };
 

@@ -439,6 +439,7 @@ impl SandboxDriver for OpenShellDriver {
                 supports_syscall_filter: true,
                 supports_native_inference_routing: true,
                 supports_remote_host: true,
+                supports_persistent_sessions: false,
             }),
         })
     }
