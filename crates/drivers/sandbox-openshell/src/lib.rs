@@ -671,20 +671,7 @@ impl SandboxDriver for OpenShellDriver {
         } = params;
         let session_id = tmux_session_id(&name)?;
 
-        let check_request =
-            sandbox_shell_request(&handle, "command -v tmux >/dev/null 2>&1".to_owned());
-        let check_command = command_string(&self.binary, &check_request.args);
-        let check_output = self.run_command_request(check_request).map_err(|source| {
-            DriverError::CommandSpawn {
-                command: check_command,
-                source,
-            }
-        })?;
-        if check_output.status.is_none_or(|status| status != 0) {
-            return Err(DriverError::CapabilityMissing {
-                capability: "supports_persistent_sessions".to_owned(),
-            });
-        }
+        self.ensure_tmux_available(&handle)?;
 
         let tmux_command = format!(
             "tmux new-session -d -s {session_id} -c {SANDBOX_WORKING_DIR} {}",
@@ -706,6 +693,7 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn attach_session(&self, params: AttachSessionParams) -> DriverResult<ExecResult> {
         let session_id = tmux_session_id(&params.session_id)?;
+        self.ensure_tmux_available(&params.handle)?;
         let request = sandbox_shell_request(
             &params.handle,
             format!("tmux attach-session -t {session_id}"),
@@ -726,6 +714,7 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn list_sessions(&self, params: ListSessionsParams) -> DriverResult<ListSessionsResult> {
+        self.ensure_tmux_available(&params.handle)?;
         let request = sandbox_shell_request(
             &params.handle,
             "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'"
@@ -760,6 +749,7 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn kill_session(&self, params: KillSessionParams) -> DriverResult<EmptyResult> {
         let session_id = tmux_session_id(&params.session_id)?;
+        self.ensure_tmux_available(&params.handle)?;
         let _output = self.run_checked_command(sandbox_shell_request(
             &params.handle,
             format!("tmux kill-session -t {session_id}"),
@@ -920,6 +910,19 @@ impl SandboxDriver for OpenShellDriver {
 impl OpenShellDriver {
     fn run_command_request(&self, request: CommandRequest) -> io::Result<CommandOutput> {
         self.run_host_command(&self.binary, request)
+    }
+
+    fn ensure_tmux_available(&self, handle: &str) -> DriverResult<()> {
+        let request = sandbox_shell_request(handle, "command -v tmux >/dev/null 2>&1".to_owned());
+        let command = command_string(&self.binary, &request.args);
+        let output = self
+            .run_command_request(request)
+            .map_err(|source| DriverError::CommandSpawn { command, source })?;
+        if output.status.is_some_and(|status| status == 0) {
+            return Ok(());
+        }
+
+        Err(agentenv_core::driver::persistent_sessions_missing())
     }
 
     fn run_interactive_request(&self, request: CommandRequest) -> io::Result<Option<i32>> {
@@ -2345,6 +2348,52 @@ mod driver_tests {
         );
     }
 
+    fn tmux_available_script(handle: &str) -> CommandScript {
+        CommandScript::success(
+            "openshell",
+            &[
+                "sandbox",
+                "exec",
+                "--name",
+                handle,
+                "--",
+                "sh",
+                "-lc",
+                "command -v tmux >/dev/null 2>&1",
+            ],
+            "",
+            "",
+        )
+    }
+
+    fn tmux_missing_script(handle: &str) -> CommandScript {
+        CommandScript::output(
+            "openshell",
+            &[
+                "sandbox",
+                "exec",
+                "--name",
+                handle,
+                "--",
+                "sh",
+                "-lc",
+                "command -v tmux >/dev/null 2>&1",
+            ],
+            Some(127),
+            "",
+            "",
+        )
+    }
+
+    fn assert_persistent_sessions_missing(err: agentenv_core::driver::DriverError) {
+        match err {
+            agentenv_core::driver::DriverError::CapabilityMissing { capability } => {
+                assert_eq!(capability, "supports_persistent_sessions");
+            }
+            other => panic!("expected CapabilityMissing, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn openshell_driver_initializes_with_required_capabilities() {
         let mut driver = OpenShellDriver::default();
@@ -3274,21 +3323,24 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_attach_session_attaches_tmux_interactively() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::success(
-            "openshell",
-            &[
-                "sandbox",
-                "exec",
-                "--name",
-                "sb-1",
-                "--",
-                "sh",
-                "-lc",
-                "tmux attach-session -t sh-1",
-            ],
-            "",
-            "",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script("sb-1"),
+            CommandScript::success(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "tmux attach-session -t sh-1",
+                ],
+                "",
+                "",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner);
         let result = driver
             .attach_session(AttachSessionParams {
@@ -3303,21 +3355,8 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_create_session_reports_missing_tmux_capability() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
-            "openshell",
-            &[
-                "sandbox",
-                "exec",
-                "--name",
-                "sb-1",
-                "--",
-                "sh",
-                "-lc",
-                "command -v tmux >/dev/null 2>&1",
-            ],
-            Some(127),
-            "",
-            "",
+        let runner = Arc::new(RecordingCommandRunner::new(vec![tmux_missing_script(
+            "sb-1",
         )]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
@@ -3332,12 +3371,64 @@ mod driver_tests {
             .await
             .expect_err("create_session should report missing tmux capability");
 
-        match err {
-            agentenv_core::driver::DriverError::CapabilityMissing { capability } => {
-                assert_eq!(capability, "supports_persistent_sessions");
-            }
-            other => panic!("expected CapabilityMissing, got {other:?}"),
-        }
+        assert_persistent_sessions_missing(err);
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn openshell_attach_session_reports_missing_tmux_capability() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![tmux_missing_script(
+            "sb-1",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .attach_session(AttachSessionParams {
+                handle: "sb-1".to_owned(),
+                session_id: "sh-1".to_owned(),
+            })
+            .await
+            .expect_err("attach_session should report missing tmux capability");
+
+        assert_persistent_sessions_missing(err);
+        assert_eq!(runner.calls().len(), 1);
+        assert!(runner.status_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn openshell_list_sessions_reports_missing_tmux_capability() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![tmux_missing_script(
+            "sb-1",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .list_sessions(ListSessionsParams {
+                handle: "sb-1".to_owned(),
+            })
+            .await
+            .expect_err("list_sessions should report missing tmux capability");
+
+        assert_persistent_sessions_missing(err);
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn openshell_kill_session_reports_missing_tmux_capability() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![tmux_missing_script(
+            "sb-1",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .kill_session(KillSessionParams {
+                handle: "sb-1".to_owned(),
+                session_id: "sh-1".to_owned(),
+            })
+            .await
+            .expect_err("kill_session should report missing tmux capability");
+
+        assert_persistent_sessions_missing(err);
         assert_eq!(runner.calls().len(), 1);
     }
 
@@ -3371,22 +3462,25 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_list_sessions_parses_tmux_rows_and_skips_malformed_rows() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
-            "openshell",
-            &[
-                "sandbox",
-                "exec",
-                "--name",
-                "sb-1",
-                "--",
-                "sh",
-                "-lc",
-                "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'",
-            ],
-            Some(0),
-            "sh-1\t0\t1714000000\nsh_2\t2\t1714000010\nmalformed\nbad-count\tmany\t1714000020\nbad/name\t0\t1714000030\nbad-ts\t0\tnot-a-ts\n",
-            "",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script("sb-1"),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'",
+                ],
+                Some(0),
+                "sh-1\t0\t1714000000\nsh_2\t2\t1714000010\nmalformed\nbad-count\tmany\t1714000020\nbad/name\t0\t1714000030\nbad-ts\t0\tnot-a-ts\n",
+                "",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
         let result = driver
@@ -3408,22 +3502,25 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_list_sessions_treats_missing_tmux_server_as_empty() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
-            "openshell",
-            &[
-                "sandbox",
-                "exec",
-                "--name",
-                "sb-1",
-                "--",
-                "sh",
-                "-lc",
-                "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'",
-            ],
-            Some(1),
-            "",
-            "no server running on /tmp/tmux-1000/default",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script("sb-1"),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'",
+                ],
+                Some(1),
+                "",
+                "no server running on /tmp/tmux-1000/default",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
         let result = driver
@@ -3438,22 +3535,25 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_list_sessions_preserves_unrelated_command_errors() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
-            "openshell",
-            &[
-                "sandbox",
-                "exec",
-                "--name",
-                "sb-1",
-                "--",
-                "sh",
-                "-lc",
-                "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'",
-            ],
-            Some(127),
-            "",
-            "sh: 1: tmux: not found",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script("sb-1"),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "tmux list-sessions -F '#{session_name}\\t#{session_attached}\\t#{session_created}'",
+                ],
+                Some(2),
+                "",
+                "tmux failed to format sessions",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
         let err = driver
@@ -3466,7 +3566,7 @@ mod driver_tests {
         assert!(matches!(
             err,
             agentenv_core::driver::DriverError::CommandFailed {
-                status: Some(127),
+                status: Some(2),
                 ..
             }
         ));
@@ -3474,21 +3574,24 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_kill_session_uses_tmux_kill_session() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::success(
-            "openshell",
-            &[
-                "sandbox",
-                "exec",
-                "--name",
-                "sb-1",
-                "--",
-                "sh",
-                "-lc",
-                "tmux kill-session -t sh-1",
-            ],
-            "",
-            "",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script("sb-1"),
+            CommandScript::success(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "tmux kill-session -t sh-1",
+                ],
+                "",
+                "",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
         driver
@@ -3499,7 +3602,7 @@ mod driver_tests {
             .await
             .expect("kill_session");
 
-        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[tokio::test]
