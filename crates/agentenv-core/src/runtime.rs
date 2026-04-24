@@ -829,16 +829,7 @@ pub async fn enter_env(
             ));
         }
 
-        let result = set
-            .sandbox
-            .exec(agentenv_proto::ExecParams {
-                handle,
-                cmd: AGENT_ENTRYPOINT_PATH.to_owned(),
-                tty: true,
-                env: BTreeMap::new(),
-            })
-            .await?;
-        return Ok(EnterResult::Attached(result));
+        return enter_env_via_foreground_exec(set.sandbox.as_ref(), handle).await;
     }
 
     let env_name = crate::env::validate_env_name(name)?;
@@ -855,7 +846,7 @@ pub async fn enter_env(
         if let Some(session) = (!new_session).then_some(existing_default).flatten() {
             session.driver_session_id
         } else {
-            let created = set
+            let created = match set
                 .sandbox
                 .create_session(agentenv_proto::CreateSessionParams {
                     handle: handle.clone(),
@@ -864,7 +855,16 @@ pub async fn enter_env(
                     detached: detach,
                     metadata: BTreeMap::new(),
                 })
-                .await?;
+                .await
+            {
+                Ok(created) => created,
+                Err(DriverError::CapabilityMissing { capability })
+                    if capability == "supports_persistent_sessions" && !detach && !new_session =>
+                {
+                    return enter_env_via_foreground_exec(set.sandbox.as_ref(), handle).await;
+                }
+                Err(err) => return Err(RuntimeError::Driver(err)),
+            };
             let driver_session_id = created.session_id.clone();
             let make_default = !new_session || sessions.default_session_id.is_none();
             crate::sessions::upsert_session(
@@ -889,6 +889,21 @@ pub async fn enter_env(
         .attach_session(agentenv_proto::AttachSessionParams {
             handle,
             session_id: driver_session_id,
+        })
+        .await?;
+    Ok(EnterResult::Attached(result))
+}
+
+async fn enter_env_via_foreground_exec(
+    sandbox: &dyn SandboxDriver,
+    handle: String,
+) -> RuntimeResult<EnterResult> {
+    let result = sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle,
+            cmd: AGENT_ENTRYPOINT_PATH.to_owned(),
+            tty: true,
+            env: BTreeMap::new(),
         })
         .await?;
     Ok(EnterResult::Attached(result))
@@ -4668,6 +4683,27 @@ policy:
         }
     }
 
+    struct MissingSessionBackendFactory {
+        tracker: Arc<AgentSetupTracker>,
+    }
+
+    impl DriverFactory for MissingSessionBackendFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(MissingSessionBackendSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct MissingSessionBackendSandboxDriver {
+        tracker: Arc<AgentSetupTracker>,
+    }
+
     struct SessionSandboxDriver {
         report_sessions: bool,
     }
@@ -4826,6 +4862,139 @@ policy:
         }
     }
 
+    #[async_trait]
+    impl SandboxDriver for MissingSessionBackendSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut result = TinySandboxDriver.initialize(params).await?;
+            if let Capabilities::Sandbox(capabilities) = &mut result.capabilities {
+                capabilities.supports_persistent_sessions = true;
+            }
+            Ok(result)
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn create_session(
+            &self,
+            _params: agentenv_proto::CreateSessionParams,
+        ) -> DriverResult<agentenv_proto::SessionHandle> {
+            Err(crate::driver::persistent_sessions_missing())
+        }
+
+        async fn attach_session(
+            &self,
+            _params: agentenv_proto::AttachSessionParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            Ok(agentenv_proto::ExecResult {
+                status: 0,
+                stdout: "attached\n".to_owned(),
+                stderr: String::new(),
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _params: agentenv_proto::ListSessionsParams,
+        ) -> DriverResult<agentenv_proto::ListSessionsResult> {
+            Ok(agentenv_proto::ListSessionsResult {
+                sessions: Vec::new(),
+            })
+        }
+
+        async fn kill_session(
+            &self,
+            _params: agentenv_proto::KillSessionParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            self.tracker
+                .exec_cmds
+                .lock()
+                .expect("exec tracker")
+                .push(params.cmd.clone());
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinySandboxDriver;
+            inner.shutdown(params).await
+        }
+    }
+
     #[tokio::test]
     async fn exec_env_returns_sandbox_exec_result() {
         let (options, factory) = command_test_runtime("exec").await;
@@ -4920,6 +5089,49 @@ policy:
             tracker.exec_cmds.lock().expect("exec tracker").as_slice(),
             &[super::AGENT_ENTRYPOINT_PATH.to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn enter_env_falls_back_to_exec_when_session_backend_is_missing() {
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = MissingSessionBackendFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let (options, factory) =
+            create_session_test_runtime("enter-missing-session-backend", factory).await;
+        tracker.exec_cmds.lock().expect("exec tracker").clear();
+
+        let result = super::enter_env(&options, &factory, "demo", false, false)
+            .await
+            .unwrap();
+
+        let super::EnterResult::Attached(result) = result else {
+            panic!("foreground enter fallback should return an exec result");
+        };
+        assert_eq!(result.status, 0);
+        assert_eq!(
+            tracker.exec_cmds.lock().expect("exec tracker").as_slice(),
+            &[super::AGENT_ENTRYPOINT_PATH.to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_env_preserves_missing_session_backend_error_for_detach_and_new() {
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = MissingSessionBackendFactory { tracker };
+        let (options, factory) =
+            create_session_test_runtime("enter-missing-session-backend-required", factory).await;
+
+        for (detach, new_session) in [(true, false), (false, true)] {
+            let err = super::enter_env(&options, &factory, "demo", detach, new_session)
+                .await
+                .expect_err("required session operation should not fall back");
+            assert!(matches!(
+                err,
+                RuntimeError::Driver(crate::driver::DriverError::CapabilityMissing { capability })
+                    if capability == "supports_persistent_sessions"
+            ));
+        }
     }
 
     #[tokio::test]
