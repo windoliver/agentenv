@@ -1267,10 +1267,11 @@ fn reconcile_session_state(
         .map(|session| session.session_id.clone())
         .collect::<BTreeSet<_>>();
     for session in live_sessions.sessions {
-        let stable_name = crate::sessions::find_session(sessions, &session.session_id)
-            .map(|persisted| persisted.name.clone());
+        let stable_identity = crate::sessions::find_session(sessions, &session.session_id)
+            .map(|persisted| (persisted.id.clone(), persisted.name.clone()));
         let mut persisted = persisted_from_driver_session(session);
-        if let Ok(name) = stable_name {
+        if let Ok((id, name)) = stable_identity {
+            persisted.id = id;
             persisted.name = name;
         }
         crate::sessions::upsert_session(sessions, persisted, false);
@@ -5025,6 +5026,79 @@ policy:
         let sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
         assert_eq!(sessions.default_session_id.as_deref(), Some("sh-1"));
         assert_eq!(sessions.sessions[0].name, "custom session name");
+        assert_eq!(
+            sessions.sessions[0].status,
+            agentenv_proto::SessionStatus::Detached
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_preserves_core_session_id_when_driver_id_matches() {
+        let (options, factory) = session_test_runtime("reconcile-core-id").await;
+        let env_name = crate::env::validate_env_name("demo").unwrap();
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+
+        let mut sessions = crate::sessions::empty_session_file("demo");
+        crate::sessions::upsert_session(
+            &mut sessions,
+            crate::sessions::PersistedSession {
+                id: "core-default".to_owned(),
+                driver_session_id: "sh-1".to_owned(),
+                name: "custom session name".to_owned(),
+                status: agentenv_proto::SessionStatus::Unknown,
+                command: super::AGENT_ENTRYPOINT_PATH.to_owned(),
+                created_at: "2026-04-24T17:00:00Z".to_owned(),
+                updated_at: "2026-04-24T17:00:00Z".to_owned(),
+                working_dir: Some("/sandbox".to_owned()),
+                metadata: BTreeMap::new(),
+            },
+            true,
+        );
+        crate::sessions::write_sessions(&paths, &sessions).unwrap();
+
+        let rows = super::list_sessions_env(&options, &factory, Some("demo"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "core-default");
+        assert_eq!(rows[0].name, "custom session name");
+        assert_eq!(rows[0].status, agentenv_proto::SessionStatus::Detached);
+
+        let sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        assert_eq!(sessions.default_session_id.as_deref(), Some("core-default"));
+        assert_eq!(sessions.sessions.len(), 1);
+        assert_eq!(sessions.sessions[0].id, "core-default");
+        assert_eq!(sessions.sessions[0].driver_session_id, "sh-1");
+        assert_eq!(sessions.sessions[0].name, "custom session name");
+
+        let mut sessions = crate::sessions::empty_session_file("demo");
+        crate::sessions::upsert_session(
+            &mut sessions,
+            crate::sessions::PersistedSession {
+                id: "core-default".to_owned(),
+                driver_session_id: "sh-1".to_owned(),
+                name: "custom session name".to_owned(),
+                status: agentenv_proto::SessionStatus::Unknown,
+                command: super::AGENT_ENTRYPOINT_PATH.to_owned(),
+                created_at: "2026-04-24T17:00:00Z".to_owned(),
+                updated_at: "2026-04-24T17:00:00Z".to_owned(),
+                working_dir: Some("/sandbox".to_owned()),
+                metadata: BTreeMap::new(),
+            },
+            true,
+        );
+        crate::sessions::write_sessions(&paths, &sessions).unwrap();
+
+        let result = super::resume_env(&options, &factory, "demo", None)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 0);
+
+        let sessions = crate::sessions::read_sessions(&paths, "demo").unwrap();
+        assert_eq!(sessions.default_session_id.as_deref(), Some("core-default"));
+        assert_eq!(sessions.sessions.len(), 1);
+        assert_eq!(sessions.sessions[0].id, "core-default");
+        assert_eq!(sessions.sessions[0].driver_session_id, "sh-1");
         assert_eq!(
             sessions.sessions[0].status,
             agentenv_proto::SessionStatus::Detached
