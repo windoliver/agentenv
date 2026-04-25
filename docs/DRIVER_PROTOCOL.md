@@ -1,4 +1,4 @@
-# agentenv Driver Protocol (v1.0 draft)
+# agentenv Driver Protocol (v1.1 draft)
 
 > JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
 
@@ -63,7 +63,7 @@ Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it a
   "id": 1,
   "method": "initialize",
   "params": {
-    "schema_version": "1.0",
+    "schema_version": "1.1",
     "core_version": "0.1.0",
     "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
     "log_level": "info"
@@ -82,14 +82,15 @@ Response:
       "name": "openshell",
       "kind": "sandbox",
       "version": "0.1.0",
-      "protocol_version": "1.0"
+      "protocol_version": "1.1"
     },
     "capabilities": {
       "supports_hot_reload_policy": true,
       "supports_filesystem_lockdown": true,
       "supports_syscall_filter": true,
       "supports_native_inference_routing": true,
-      "supports_remote_host": true
+      "supports_remote_host": true,
+      "supports_persistent_sessions": true
     }
   }
 }
@@ -121,6 +122,10 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 |---|---|---|
 | `create` | `SandboxSpec` | `SandboxHandle` |
 | `connect` | `{handle}` | `ShellHandle` (session info) |
+| `create_session` | `CreateSessionParams` | `SessionHandle` |
+| `attach_session` | `AttachSessionParams` | `ExecResult` |
+| `list_sessions` | `ListSessionsParams` | `ListSessionsResult` |
+| `kill_session` | `KillSessionParams` | `{}` |
 | `exec` | `{handle, cmd, tty, env}` | `ExecResult` |
 | `copy_in` | `{handle, src_host_path, dst_sandbox_path}` | `{}` |
 | `copy_out` | `{handle, src_sandbox_path, dst_host_path}` | `{}` |
@@ -130,6 +135,11 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `logs_stream` | `{handle, since}` | streamed via notifications |
 | `stop` | `{handle}` | `{}` |
 | `destroy` | `{handle}` | `{}` |
+
+Persistent sessions are optional. Core checks `supports_persistent_sessions`
+before calling session methods. Drivers that cannot provide durable attach,
+detach, resume, and single-session kill semantics return `CapabilityMissing`
+for these methods.
 
 #### `AgentDriver`
 
