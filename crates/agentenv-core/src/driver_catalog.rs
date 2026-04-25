@@ -115,6 +115,31 @@ pub struct DiscoveredDriver {
     pub capabilities_preview: Value,
 }
 
+pub(crate) fn built_in_driver_entries() -> Vec<DiscoveredDriver> {
+    let version =
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be valid semver");
+    let mut entries = Vec::new();
+
+    for spec in built_in_driver_specs() {
+        for name in spec.names {
+            entries.push(DiscoveredDriver {
+                kind: spec.kind,
+                name: (*name).to_string(),
+                version: version.clone(),
+                source: DriverSource::BuiltIn,
+                description: None,
+                binary: None,
+                manifest_path: None,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                capabilities_preview: Value::Null,
+            });
+        }
+    }
+
+    entries
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverCatalog {
     pub entries: Vec<DiscoveredDriver>,
@@ -156,6 +181,10 @@ impl DriverCatalog {
             registry.register_version(entry.kind, entry.name.clone(), entry.version.clone());
         }
     }
+
+    pub fn registry_entries(&self) -> impl Iterator<Item = &DiscoveredDriver> {
+        self.registry_entries.iter()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,27 +220,8 @@ struct CatalogBuilder {
 
 impl CatalogBuilder {
     fn add_built_ins(&mut self) {
-        let version =
-            Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be valid semver");
-
-        for spec in built_in_driver_specs() {
-            for name in spec.names {
-                self.entries.insert(
-                    (spec.kind, (*name).to_string()),
-                    DiscoveredDriver {
-                        kind: spec.kind,
-                        name: (*name).to_string(),
-                        version: version.clone(),
-                        source: DriverSource::BuiltIn,
-                        description: None,
-                        binary: None,
-                        manifest_path: None,
-                        args: Vec::new(),
-                        env: BTreeMap::new(),
-                        capabilities_preview: Value::Null,
-                    },
-                );
-            }
+        for entry in built_in_driver_entries() {
+            self.entries.insert((entry.kind, entry.name.clone()), entry);
         }
     }
 
@@ -523,6 +533,24 @@ fn resolve_manifest_binary(
         });
     }
 
+    let canonical_root =
+        fs::canonicalize(root).map_err(|source| DriverDiscoveryError::ReadManifest {
+            path: manifest_path.to_path_buf(),
+            source,
+        })?;
+    let canonical_binary =
+        fs::canonicalize(&resolved).map_err(|_| DriverDiscoveryError::MissingBinary {
+            path: manifest_path.to_path_buf(),
+            binary: resolved.clone(),
+        })?;
+    if !canonical_binary.starts_with(&canonical_root) {
+        return Err(DriverDiscoveryError::BinaryEscapesRoot {
+            path: manifest_path.to_path_buf(),
+            root: root.to_path_buf(),
+            binary: binary.to_path_buf(),
+        });
+    }
+
     Ok(resolved)
 }
 
@@ -678,6 +706,56 @@ mod tests {
           "kind": "context",
           "version": "0.2.0",
           "binary": "../outside-driver"
+        }"#,
+        );
+
+        let err = DriverManifest::from_path(&root.join("manifest.json")).unwrap_err();
+
+        assert!(err.to_string().contains("escapes driver root"));
+        assert!(err.to_string().contains("manifest.json"));
+    }
+
+    #[test]
+    fn rejects_absolute_binary_outside_manifest_root() {
+        let root = make_temp_dir("manifest-absolute-escape");
+        let outside = make_temp_dir("manifest-absolute-outside").join("driver");
+        touch_file(&outside);
+        let outside_json = serde_json::to_string(&outside).unwrap();
+        write_manifest(
+            &root,
+            &format!(
+                r#"{{
+          "schema_version": "1.0",
+          "name": "nexus",
+          "kind": "context",
+          "version": "0.2.0",
+          "binary": {outside_json}
+        }}"#,
+            ),
+        );
+
+        let err = DriverManifest::from_path(&root.join("manifest.json")).unwrap_err();
+
+        assert!(err.to_string().contains("escapes driver root"));
+        assert!(err.to_string().contains("manifest.json"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_binary_symlink_that_escapes_manifest_root() {
+        let root = make_temp_dir("manifest-symlink-escape");
+        let outside = make_temp_dir("manifest-symlink-outside").join("driver");
+        touch_file(&outside);
+        fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("bin/driver")).unwrap();
+        write_manifest(
+            &root,
+            r#"{
+          "schema_version": "1.0",
+          "name": "nexus",
+          "kind": "context",
+          "version": "0.2.0",
+          "binary": "./bin/driver"
         }"#,
         );
 

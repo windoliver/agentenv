@@ -12,21 +12,205 @@ fn agentenv_bin() -> &'static str {
 }
 
 #[test]
-fn freeze_fails_without_blueprint_or_default_file() {
-    let temp_dir = make_temp_dir("freeze-missing-blueprint");
+fn freeze_persisted_env_writes_default_lockfile() {
+    let temp_dir = make_temp_dir("freeze-persisted-default");
+    write_minimal_env_state(&temp_dir, "demo");
 
     let output = Command::new(agentenv_bin())
         .arg("freeze")
         .arg("demo")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Lockfile written"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let rendered = fs::read_to_string(temp_dir.join("agentenv.lock")).unwrap();
+    assert!(rendered.contains("version: 0.2.0"));
+    assert!(rendered.contains("name: demo"));
+}
+
+#[test]
+fn reproduce_portable_lockfile_reports_missing_required_credential() {
+    let temp_dir = make_temp_dir("reproduce-portable-missing-credential");
+    let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let lockfile = temp_dir.join("agentenv.lock");
+    let freeze = Command::new(agentenv_bin())
+        .arg("freeze")
+        .arg("demo")
+        .arg("--output")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        output_summary(&freeze)
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("reproduce")
+        .arg(&lockfile)
+        .arg("--name")
+        .arg("demo-copy")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
         .current_dir(&temp_dir)
         .output()
         .unwrap();
 
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPENAI_API_KEY"), "stderr was: {stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no blueprint provided"),
-        "stderr was: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("missing credential") || stderr.contains("missing_credential"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown field `driver_protocol_version`"),
+        "portable lockfile was parsed as legacy: {stderr}"
+    );
+}
+
+#[test]
+fn reproduce_portable_lockfile_honors_required_credential_reference() {
+    let temp_dir = make_temp_dir("reproduce-portable-credential-reference");
+    let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      value: CUSTOM_OPENAI_KEY
+      required: true
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let lockfile = temp_dir.join("agentenv.lock");
+    let freeze = Command::new(agentenv_bin())
+        .arg("freeze")
+        .arg("demo")
+        .arg("--output")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        output_summary(&freeze)
+    );
+    let rendered = fs::read_to_string(&lockfile).unwrap();
+    assert!(rendered.contains("OPENAI_API_KEY"));
+    assert!(rendered.contains("reference: CUSTOM_OPENAI_KEY"));
+
+    let missing = Command::new(agentenv_bin())
+        .arg("reproduce")
+        .arg(&lockfile)
+        .arg("--name")
+        .arg("demo-missing-reference")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CUSTOM_OPENAI_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("CUSTOM_OPENAI_KEY"),
+        "stderr was: {missing_stderr}"
+    );
+
+    let present = Command::new(agentenv_bin())
+        .arg("reproduce")
+        .arg(&lockfile)
+        .arg("--name")
+        .arg("demo-reference-present")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .env("CUSTOM_OPENAI_KEY", "sk-reference-present")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    let present_summary = output_summary(&present);
+    let present_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&present.stdout),
+        String::from_utf8_lossy(&present.stderr)
+    );
+    assert!(
+        !present_output.contains("missing credential `OPENAI_API_KEY`"),
+        "reproduce used the lockfile key instead of the credential reference: {present_summary}"
+    );
+    assert!(
+        present.status.success()
+            || present_output.contains("OpenShell")
+            || present_output.contains("openshell")
+            || present_output.contains("preflight")
+            || present_output.contains("capability")
+            || present_output.contains("sandbox")
+            || present_output.contains("invalid driver config")
+            || present_output.contains("mount")
+            || present_output.contains("created"),
+        "expected reproduce to pass credential resolution and reach create/preflight: {present_summary}"
     );
 }
 
@@ -600,45 +784,43 @@ fn drivers_list_reports_malformed_manifest_path() {
 }
 
 #[test]
-fn freeze_with_blueprint_and_out_writes_lockfile() {
-    let temp_dir = make_temp_dir("freeze-out");
-    let lockfile = temp_dir.join("demo.lock.yaml");
+fn freeze_persisted_env_output_dash_prints_lockfile_without_dash_file() {
+    let temp_dir = make_temp_dir("freeze-persisted-stdout");
+    write_minimal_env_state(&temp_dir, "demo");
 
     let output = Command::new(agentenv_bin())
         .arg("freeze")
         .arg("demo")
-        .arg("--blueprint")
-        .arg(fixture_blueprint())
-        .arg("--out")
-        .arg(&lockfile)
+        .arg("--output")
+        .arg("-")
+        .env("HOME", &temp_dir)
         .current_dir(&temp_dir)
         .output()
         .unwrap();
 
-    assert!(output.status.success());
     assert!(
-        lockfile.is_file(),
-        "missing lockfile: {}",
-        lockfile.display()
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-
-    let rendered = fs::read_to_string(&lockfile).unwrap();
-    assert!(rendered.contains("version: 0.1.0"));
-    assert!(rendered.contains("blueprint_hash:"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("version: 0.2.0"), "stdout was: {stdout}");
+    assert!(stdout.contains("name: demo"), "stdout was: {stdout}");
+    assert!(
+        !temp_dir.join("-").exists(),
+        "`--output -` unexpectedly created a file named `-`"
+    );
 }
 
 #[test]
-fn reproduce_succeeds_from_generated_lockfile() {
-    let temp_dir = make_temp_dir("reproduce-lockfile");
-    let lockfile = temp_dir.join("demo.lock.yaml");
+fn verify_accepts_generated_portable_lockfile() {
+    let temp_dir = make_temp_dir("verify-portable-lockfile");
+    write_minimal_env_state(&temp_dir, "demo");
 
     let freeze = Command::new(agentenv_bin())
         .arg("freeze")
         .arg("demo")
-        .arg("--blueprint")
-        .arg(fixture_blueprint())
-        .arg("--out")
-        .arg(&lockfile)
+        .env("HOME", &temp_dir)
         .current_dir(&temp_dir)
         .output()
         .unwrap();
@@ -648,19 +830,101 @@ fn reproduce_succeeds_from_generated_lockfile() {
         String::from_utf8_lossy(&freeze.stderr)
     );
 
-    let reproduce = Command::new(agentenv_bin())
-        .arg("reproduce")
-        .arg(&lockfile)
+    let verify = Command::new(agentenv_bin())
+        .arg("verify")
+        .arg("agentenv.lock")
+        .env("HOME", &temp_dir)
         .current_dir(&temp_dir)
         .output()
         .unwrap();
 
-    assert!(reproduce.status.success());
     assert!(
-        String::from_utf8_lossy(&reproduce.stdout)
-            .contains("Lockfile reproduced successfully for environment `demo`"),
+        verify.status.success(),
+        "verify stderr: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&verify.stdout).contains("Lockfile verified"),
         "stdout was: {}",
-        String::from_utf8_lossy(&reproduce.stdout)
+        String::from_utf8_lossy(&verify.stdout)
+    );
+}
+
+#[test]
+fn freeze_and_verify_do_not_print_known_secret() {
+    let temp_dir = make_temp_dir("freeze-verify-secret-redaction");
+    let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+      note: sk-known-secret
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let lockfile = temp_dir.join("secret-free.agentenv.lock");
+    let freeze = Command::new(agentenv_bin())
+        .arg("freeze")
+        .arg("demo")
+        .arg("--output")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        freeze.status.success(),
+        "freeze failed: {}",
+        output_summary(&freeze)
+    );
+    let freeze_output = output_summary(&freeze);
+    assert!(
+        !freeze_output.contains("sk-known-secret"),
+        "freeze output leaked secret metadata:\n{freeze_output}"
+    );
+
+    let rendered = fs::read_to_string(&lockfile).unwrap();
+    assert!(
+        !rendered.contains("sk-known-secret"),
+        "lockfile leaked secret metadata:\n{rendered}"
+    );
+
+    let verify = Command::new(agentenv_bin())
+        .arg("verify")
+        .arg(&lockfile)
+        .env("HOME", &temp_dir)
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "verify failed: {}",
+        output_summary(&verify)
+    );
+    let verify_output = output_summary(&verify);
+    assert!(
+        !verify_output.contains("sk-known-secret"),
+        "verify output leaked secret metadata:\n{verify_output}"
     );
 }
 
@@ -1024,6 +1288,7 @@ fn write_minimal_env_state_with_credentials(
 ) -> PathBuf {
     let env_dir = home.join(".agentenv").join("envs").join(name);
     fs::create_dir_all(&env_dir).unwrap();
+    let driver_version = env!("CARGO_PKG_VERSION");
     fs::write(
         env_dir.join("state.json"),
         serde_json::json!({
@@ -1033,9 +1298,10 @@ fn write_minimal_env_state_with_credentials(
             "created_at": "2026-04-21T00:00:00Z",
             "updated_at": "2026-04-21T00:00:00Z",
             "drivers": {
-                "sandbox": {"name": "openshell", "version": "0.0.1-alpha0"},
-                "agent": {"name": "codex", "version": "0.0.1-alpha0"},
-                "context": {"name": "filesystem", "version": "0.0.1-alpha0"}
+                "sandbox": {"name": "openshell", "version": driver_version},
+                "agent": {"name": "codex", "version": driver_version},
+                "context": {"name": "filesystem", "version": driver_version},
+                "inference": {"name": "passthrough", "version": driver_version}
             },
             "handles": {},
             "endpoints": {},
@@ -1045,7 +1311,44 @@ fn write_minimal_env_state_with_credentials(
         .to_string(),
     )
     .unwrap();
-    fs::write(env_dir.join("blueprint.yaml"), "version: 0.1.0\n").unwrap();
-    fs::write(env_dir.join("lock.yaml"), "version: 0.1.0\n").unwrap();
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+    fs::write(
+        env_dir.join("lock.yaml"),
+        r#"
+version: 0.1.0
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  sandbox:
+    name: openshell
+    version: 0.0.1-alpha0
+  agent:
+    name: codex
+    version: 0.0.1-alpha0
+  context:
+    name: filesystem
+    version: 0.0.1-alpha0
+"#,
+    )
+    .unwrap();
     env_dir
 }
