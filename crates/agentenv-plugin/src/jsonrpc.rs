@@ -671,10 +671,10 @@ mod tests {
 #[cfg(test)]
 mod async_client_tests {
     use std::fs;
-    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -682,6 +682,8 @@ mod async_client_tests {
     use serde_json::json;
 
     use super::{JsonRpcClient, JsonRpcClientConfig};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[tokio::test]
     async fn jsonrpc_client_returns_method_result() {
@@ -884,15 +886,7 @@ mod async_client_tests {
     }
 
     fn write_fixture_script() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "agentenv-jsonrpc-fixture-{}-{}.py",
-            std::process::id(),
-            unique
-        ));
+        let path = temp_fixture_artifact_path("fixture", "py");
         let script = r#"#!/usr/bin/env python3
 import json
 import os
@@ -972,27 +966,12 @@ while True:
         while True:
             time.sleep(1.0)
 "#;
-        let mut file = fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            let mut perms = file.metadata().unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&path, perms).unwrap();
-        }
+        write_executable_fixture(&path, script);
         path
     }
 
     fn temp_fixture_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "agentenv-jsonrpc-{}-{}-{}.pid",
-            label,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+        temp_fixture_artifact_path(label, "pid")
     }
 
     fn read_fixture_pid(path: &Path) -> u32 {
@@ -1036,15 +1015,7 @@ while True:
     }
 
     fn write_racy_driver_script() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "agentenv-jsonrpc-racy-{}-{}.py",
-            std::process::id(),
-            unique
-        ));
+        let path = temp_fixture_artifact_path("racy", "py");
         let script = r#"#!/usr/bin/env python3
 import json
 import select
@@ -1112,14 +1083,33 @@ while True:
     if next_request["method"] == "shutdown":
         break
 "#;
-        let mut file = fs::File::create(&path).unwrap();
-        file.write_all(script.as_bytes()).unwrap();
+        write_executable_fixture(&path, script);
+        path
+    }
+
+    fn temp_fixture_artifact_path(label: &str, extension: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agentenv-jsonrpc-{}-{}-{}-{}.{}",
+            label,
+            std::process::id(),
+            sequence,
+            unique,
+            extension
+        ))
+    }
+
+    fn write_executable_fixture(path: &Path, script: &str) {
+        fs::write(path, script).unwrap();
         #[cfg(unix)]
         {
-            let mut perms = file.metadata().unwrap().permissions();
+            let mut perms = fs::metadata(path).unwrap().permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&path, perms).unwrap();
+            fs::set_permissions(path, perms).unwrap();
         }
-        path
     }
 }
