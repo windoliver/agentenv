@@ -56,6 +56,11 @@ const MINIMUM_SUPPORTED_OPEN_SHELL_VERSION: Version = Version::new(0, 0, 30);
 const CONTAINER_RUNTIME_WAIT_ATTEMPTS: usize = 30;
 const SANDBOX_WORKING_DIR: &str = "/sandbox";
 const UNKNOWN_SESSION_COMMAND: &str = "agentenv-agent";
+const TMUX_AGENTENV_HANDLE_OPTION: &str = "@agentenv_handle";
+const TMUX_AGENTENV_COMMAND_OPTION: &str = "@agentenv_command";
+const TMUX_AGENTENV_SESSION_NAME_OPTION: &str = "@agentenv_session_name";
+const TMUX_SESSION_FORMAT: &str =
+    "#{session_name}\t#{session_attached}\t#{session_created}\t#{@agentenv_handle}\t#{@agentenv_session_name}\t#{@agentenv_command}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDisposition {
@@ -669,15 +674,17 @@ impl SandboxDriver for OpenShellDriver {
             detached: _,
             metadata: _,
         } = params;
-        let session_id = tmux_session_id(&name)?;
+        validate_session_display_name(&name)?;
+        let session_id = generate_tmux_session_id(&handle);
 
         self.ensure_host_tmux_available()?;
 
         let tmux_command = self.openshell_session_command(&handle, &command);
         let new_session = command_request(&["new-session", "-d", "-s", &session_id, &tmux_command]);
         self.run_checked_host_command("tmux", new_session)?;
-        self.set_tmux_session_option(&session_id, "@agentenv_handle", &handle)?;
-        self.set_tmux_session_option(&session_id, "@agentenv_command", &command)?;
+        self.set_tmux_session_option(&session_id, TMUX_AGENTENV_HANDLE_OPTION, &handle)?;
+        self.set_tmux_session_option(&session_id, TMUX_AGENTENV_SESSION_NAME_OPTION, &name)?;
+        self.set_tmux_session_option(&session_id, TMUX_AGENTENV_COMMAND_OPTION, &command)?;
         let now = now_timestamp_string();
 
         Ok(SessionHandle {
@@ -692,9 +699,11 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn attach_session(&self, params: AttachSessionParams) -> DriverResult<ExecResult> {
-        let session_id = tmux_session_id(&params.session_id)?;
+        let session_id = validate_tmux_session_id(&params.session_id)?;
         self.ensure_host_tmux_available()?;
-        let request = command_request(&["attach-session", "-t", &session_id]);
+        self.ensure_tmux_session_owned_by_handle(&params.handle, &session_id)?;
+        let target = tmux_exact_target(&session_id);
+        let request = command_request(&["attach-session", "-t", &target]);
         let command = command_string("tmux", &request.args);
         let status = self
             .run_interactive_host_request("tmux", request)
@@ -712,11 +721,7 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn list_sessions(&self, params: ListSessionsParams) -> DriverResult<ListSessionsResult> {
         self.ensure_host_tmux_available()?;
-        let request = command_request(&[
-            "list-sessions",
-            "-F",
-            "#{session_name}\t#{session_attached}\t#{session_created}\t#{@agentenv_handle}\t#{@agentenv_command}",
-        ]);
+        let request = command_request(&["list-sessions", "-F", TMUX_SESSION_FORMAT]);
         let command = command_string("tmux", &request.args);
         let output =
             self.run_host_command("tmux", request)
@@ -745,12 +750,11 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn kill_session(&self, params: KillSessionParams) -> DriverResult<EmptyResult> {
-        let session_id = tmux_session_id(&params.session_id)?;
+        let session_id = validate_tmux_session_id(&params.session_id)?;
         self.ensure_host_tmux_available()?;
-        self.run_checked_host_command(
-            "tmux",
-            command_request(&["kill-session", "-t", &session_id]),
-        )?;
+        self.ensure_tmux_session_owned_by_handle(&params.handle, &session_id)?;
+        let target = tmux_exact_target(&session_id);
+        self.run_checked_host_command("tmux", command_request(&["kill-session", "-t", &target]))?;
 
         Ok(EmptyResult::default())
     }
@@ -942,10 +946,46 @@ impl OpenShellDriver {
         option: &str,
         value: &str,
     ) -> DriverResult<()> {
+        let target = tmux_exact_target(session_id);
         self.run_checked_host_command(
             "tmux",
-            command_request(&["set-option", "-t", session_id, option, value]),
+            command_request(&["set-option", "-t", &target, option, value]),
         )?;
+        Ok(())
+    }
+
+    fn ensure_tmux_session_owned_by_handle(
+        &self,
+        handle: &str,
+        session_id: &str,
+    ) -> DriverResult<()> {
+        let target = tmux_exact_target(session_id);
+        let request = command_request(&[
+            "display-message",
+            "-p",
+            "-t",
+            &target,
+            "#{@agentenv_handle}",
+        ]);
+        let command = command_string("tmux", &request.args);
+        let output =
+            self.run_host_command("tmux", request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command.clone(),
+                    source,
+                })?;
+        if output.status.is_none_or(|status| status != 0) {
+            return Err(DriverError::InvalidHandle {
+                handle: session_id.to_owned(),
+                message: "session not found".to_owned(),
+            });
+        }
+        if output.stdout.trim() != handle {
+            return Err(DriverError::InvalidHandle {
+                handle: session_id.to_owned(),
+                message: "session is not owned by this sandbox".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -1527,7 +1567,7 @@ fn command_string(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-fn tmux_session_id(name: &str) -> DriverResult<String> {
+fn validate_session_display_name(name: &str) -> DriverResult<()> {
     if name.is_empty() {
         return Err(DriverError::InvalidInput {
             message: "session name must not be empty".to_owned(),
@@ -1544,7 +1584,40 @@ fn tmux_session_id(name: &str) -> DriverResult<String> {
         });
     }
 
-    Ok(name.to_owned())
+    Ok(())
+}
+
+fn validate_tmux_session_id(session_id: &str) -> DriverResult<String> {
+    validate_session_display_name(session_id)?;
+    Ok(session_id.to_owned())
+}
+
+fn generate_tmux_session_id(handle: &str) -> String {
+    format!(
+        "agentenv-{}-{}",
+        tmux_scope_label(handle),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn tmux_scope_label(handle: &str) -> String {
+    let mut label = String::new();
+    for byte in handle.bytes().take(32) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            label.push(char::from(byte));
+        } else {
+            label.push('-');
+        }
+    }
+    if label.is_empty() {
+        "sandbox".to_owned()
+    } else {
+        label
+    }
+}
+
+fn tmux_exact_target(session_id: &str) -> String {
+    format!("={session_id}:")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1594,17 +1667,22 @@ fn parse_tmux_sessions(handle: &str, stdout: &str) -> Vec<SessionHandle> {
 }
 
 fn parse_tmux_session(handle: &str, line: &str) -> Option<SessionHandle> {
-    let mut fields = line.splitn(5, '\t');
-    let name = fields.next()?.trim();
+    let mut fields = line.splitn(6, '\t');
+    let tmux_name = fields.next()?.trim();
     let attached = fields.next()?.trim();
     let created_at = fields.next()?.trim();
     let owner_handle = fields.next()?.trim();
-    let command = fields.next().unwrap_or_default().trim();
+    let display_name_or_command = fields.next().unwrap_or_default().trim();
+    let command = fields.next().map(str::trim);
+    let (display_name, command) = match command {
+        Some(command) => (display_name_or_command, command),
+        None => ("", display_name_or_command),
+    };
     if owner_handle != handle || created_at.is_empty() {
         return None;
     }
 
-    let session_id = tmux_session_id(name).ok()?;
+    let session_id = validate_tmux_session_id(tmux_name).ok()?;
     let attached_count = attached.parse::<u64>().ok()?;
     let timestamp = tmux_epoch_seconds_to_rfc3339(created_at)?;
     let status = if attached_count > 0 {
@@ -1615,7 +1693,11 @@ fn parse_tmux_session(handle: &str, line: &str) -> Option<SessionHandle> {
 
     Some(SessionHandle {
         session_id: session_id.clone(),
-        name: session_id,
+        name: if display_name.is_empty() {
+            session_id.clone()
+        } else {
+            display_name.to_owned()
+        },
         status,
         created_at: timestamp.clone(),
         updated_at: timestamp,
@@ -1999,6 +2081,8 @@ mod driver_tests {
         command_request, command_request_with_env, extract_semver_token, shell_quote, CommandCall,
         CommandOutput, CommandRunner, CommandScript, CommandScriptResult, OpenShellDriver,
         RecordingCommandRunner, OPEN_SHELL_INSTALL_URL, SANDBOX_WORKING_DIR,
+        TMUX_AGENTENV_COMMAND_OPTION, TMUX_AGENTENV_HANDLE_OPTION,
+        TMUX_AGENTENV_SESSION_NAME_OPTION, TMUX_SESSION_FORMAT,
     };
 
     #[derive(Debug, Default)]
@@ -2402,43 +2486,130 @@ mod driver_tests {
         CommandScript::success("tmux", &["-V"], "tmux 3.5a\n", "")
     }
 
+    fn tmux_available_expectation() -> FlexibleCommandExpectation {
+        FlexibleCommandExpectation::success(
+            "tmux",
+            |call| {
+                assert_eq!(call.request.args, vec!["-V".to_owned()]);
+            },
+            "tmux 3.5a\n",
+            "",
+        )
+    }
+
     fn tmux_missing_script() -> CommandScript {
         CommandScript::output("tmux", &["-V"], Some(127), "", "tmux: not found")
     }
 
-    fn tmux_new_session_script(session_id: &str, handle: &str, command: &str) -> CommandScript {
-        let tmux_command = format!(
-            "{} sandbox exec --name {} --workdir {} --tty -- sh -lc {}",
-            shell_quote("openshell"),
-            shell_quote(handle),
-            shell_quote(SANDBOX_WORKING_DIR),
-            shell_quote(command)
-        );
-        CommandScript::success(
+    fn tmux_new_generated_session_expectation(
+        captured_session_id: Arc<Mutex<Option<String>>>,
+        handle: &str,
+        command: &str,
+    ) -> FlexibleCommandExpectation {
+        let handle = handle.to_owned();
+        let command = command.to_owned();
+        FlexibleCommandExpectation::success(
             "tmux",
-            &["new-session", "-d", "-s", session_id, &tmux_command],
+            move |call| {
+                assert_eq!(call.request.args.len(), 5);
+                assert_eq!(call.request.args[0], "new-session");
+                assert_eq!(call.request.args[1], "-d");
+                assert_eq!(call.request.args[2], "-s");
+
+                let session_id = call.request.args[3].clone();
+                let prefix = format!("agentenv-{}-", super::tmux_scope_label(&handle));
+                assert!(
+                    session_id.starts_with(&prefix),
+                    "generated session id {session_id:?} should start with {prefix:?}"
+                );
+                assert_eq!(session_id.len(), prefix.len() + 32);
+                assert!(
+                    session_id[prefix.len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit()),
+                    "generated session id {session_id:?} should end with a uuid"
+                );
+
+                let tmux_command = format!(
+                    "{} sandbox exec --name {} --workdir {} --tty -- sh -lc {}",
+                    shell_quote("openshell"),
+                    shell_quote(&handle),
+                    shell_quote(SANDBOX_WORKING_DIR),
+                    shell_quote(&command)
+                );
+                assert_eq!(call.request.args[4], tmux_command);
+                *captured_session_id
+                    .lock()
+                    .expect("captured session id mutex") = Some(session_id);
+            },
             "",
             "",
         )
     }
 
-    fn tmux_set_option_script(session_id: &str, option: &str, value: &str) -> CommandScript {
-        CommandScript::success(
+    fn tmux_set_generated_option_expectation(
+        captured_session_id: Arc<Mutex<Option<String>>>,
+        option: &str,
+        value: &str,
+    ) -> FlexibleCommandExpectation {
+        let option = option.to_owned();
+        let value = value.to_owned();
+        FlexibleCommandExpectation::success(
             "tmux",
-            &["set-option", "-t", session_id, option, value],
+            move |call| {
+                let session_id = captured_session_id
+                    .lock()
+                    .expect("captured session id mutex")
+                    .clone()
+                    .expect("generated tmux session id should be captured first");
+                let target = super::tmux_exact_target(&session_id);
+                assert_eq!(
+                    call.request.args,
+                    vec![
+                        "set-option".to_owned(),
+                        "-t".to_owned(),
+                        target,
+                        option.clone(),
+                        value.clone(),
+                    ]
+                );
+            },
             "",
             "",
         )
+    }
+
+    fn tmux_owner_script(session_id: &str, handle: &str) -> CommandScript {
+        let target = super::tmux_exact_target(session_id);
+        let stdout = format!("{handle}\n");
+        CommandScript::success(
+            "tmux",
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "#{@agentenv_handle}",
+            ],
+            &stdout,
+            "",
+        )
+    }
+
+    fn tmux_attach_script(session_id: &str) -> CommandScript {
+        let target = super::tmux_exact_target(session_id);
+        CommandScript::success("tmux", &["attach-session", "-t", &target], "", "")
+    }
+
+    fn tmux_kill_script(session_id: &str) -> CommandScript {
+        let target = super::tmux_exact_target(session_id);
+        CommandScript::success("tmux", &["kill-session", "-t", &target], "", "")
     }
 
     fn tmux_list_sessions_script(stdout: &str, status: Option<i32>, stderr: &str) -> CommandScript {
         CommandScript::output(
             "tmux",
-            &[
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{session_attached}\t#{session_created}\t#{@agentenv_handle}\t#{@agentenv_command}",
-            ],
+            &["list-sessions", "-F", TMUX_SESSION_FORMAT],
             status,
             stdout,
             stderr,
@@ -3281,11 +3452,29 @@ mod driver_tests {
 
     #[tokio::test]
     async fn openshell_create_session_uses_host_tmux_when_available() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![
-            tmux_available_script(),
-            tmux_new_session_script("sh-1", "sb-1", "agentenv-agent"),
-            tmux_set_option_script("sh-1", "@agentenv_handle", "sb-1"),
-            tmux_set_option_script("sh-1", "@agentenv_command", "agentenv-agent"),
+        let captured_session_id = Arc::new(Mutex::new(None::<String>));
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            tmux_available_expectation(),
+            tmux_new_generated_session_expectation(
+                captured_session_id.clone(),
+                "sb-1",
+                "agentenv-agent",
+            ),
+            tmux_set_generated_option_expectation(
+                captured_session_id.clone(),
+                TMUX_AGENTENV_HANDLE_OPTION,
+                "sb-1",
+            ),
+            tmux_set_generated_option_expectation(
+                captured_session_id.clone(),
+                TMUX_AGENTENV_SESSION_NAME_OPTION,
+                "sh-1",
+            ),
+            tmux_set_generated_option_expectation(
+                captured_session_id.clone(),
+                TMUX_AGENTENV_COMMAND_OPTION,
+                "agentenv-agent",
+            ),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
@@ -3300,17 +3489,43 @@ mod driver_tests {
             .await
             .unwrap();
 
-        assert_eq!(session.session_id, "sh-1");
+        assert_eq!(
+            captured_session_id
+                .lock()
+                .expect("captured session id mutex")
+                .as_ref(),
+            Some(&session.session_id)
+        );
+        assert!(session.session_id.starts_with("agentenv-sb-1-"));
+        assert_eq!(session.name, "sh-1");
         assert_eq!(session.status, agentenv_proto::SessionStatus::Detached);
     }
 
     #[tokio::test]
     async fn openshell_create_session_allows_dot_names_and_reports_detached() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![
-            tmux_available_script(),
-            tmux_new_session_script("demo.env", "sb-1", "agentenv-agent"),
-            tmux_set_option_script("demo.env", "@agentenv_handle", "sb-1"),
-            tmux_set_option_script("demo.env", "@agentenv_command", "agentenv-agent"),
+        let captured_session_id = Arc::new(Mutex::new(None::<String>));
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            tmux_available_expectation(),
+            tmux_new_generated_session_expectation(
+                captured_session_id.clone(),
+                "sb-1",
+                "agentenv-agent",
+            ),
+            tmux_set_generated_option_expectation(
+                captured_session_id.clone(),
+                TMUX_AGENTENV_HANDLE_OPTION,
+                "sb-1",
+            ),
+            tmux_set_generated_option_expectation(
+                captured_session_id.clone(),
+                TMUX_AGENTENV_SESSION_NAME_OPTION,
+                "demo.env",
+            ),
+            tmux_set_generated_option_expectation(
+                captured_session_id.clone(),
+                TMUX_AGENTENV_COMMAND_OPTION,
+                "agentenv-agent",
+            ),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
@@ -3325,7 +3540,15 @@ mod driver_tests {
             .await
             .unwrap();
 
-        assert_eq!(session.session_id, "demo.env");
+        assert_eq!(
+            captured_session_id
+                .lock()
+                .expect("captured session id mutex")
+                .as_ref(),
+            Some(&session.session_id)
+        );
+        assert!(session.session_id.starts_with("agentenv-sb-1-"));
+        assert_eq!(session.name, "demo.env");
         assert_eq!(session.status, SessionStatus::Detached);
     }
 
@@ -3333,13 +3556,14 @@ mod driver_tests {
     async fn openshell_attach_session_attaches_tmux_interactively() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             tmux_available_script(),
-            CommandScript::success("tmux", &["attach-session", "-t", "sh-1"], "", ""),
+            tmux_owner_script("agentenv-sb-1-session", "sb-1"),
+            tmux_attach_script("agentenv-sb-1-session"),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner);
         let result = driver
             .attach_session(AttachSessionParams {
                 handle: "sb-1".to_owned(),
-                session_id: "sh-1".to_owned(),
+                session_id: "agentenv-sb-1-session".to_owned(),
             })
             .await
             .unwrap();
@@ -3451,7 +3675,7 @@ mod driver_tests {
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             tmux_available_script(),
             tmux_list_sessions_script(
-                "sh-1\t0\t1714000000\tsb-1\tagentenv-agent\nsh_2\t2\t1714000010\tsb-1\tagentenv-agent\nother\t0\t1714000015\tsb-2\tagentenv-agent\nmalformed\nbad-count\tmany\t1714000020\tsb-1\tagentenv-agent\nbad/name\t0\t1714000030\tsb-1\tagentenv-agent\nbad-ts\t0\tnot-a-ts\tsb-1\tagentenv-agent\n",
+                "agentenv-sb-1-aaa\t0\t1714000000\tsb-1\tsh-1\tagentenv-agent\nagentenv-sb-1-bbb\t2\t1714000010\tsb-1\tsh_2\tagentenv-agent\nother\t0\t1714000015\tsb-2\tother\tagentenv-agent\nmalformed\nagentenv-sb-1-bad-count\tmany\t1714000020\tsb-1\tbad-count\tagentenv-agent\nbad/name\t0\t1714000030\tsb-1\tbad-name\tagentenv-agent\nagentenv-sb-1-bad-ts\t0\tnot-a-ts\tsb-1\tbad-ts\tagentenv-agent\nagentenv-sb-1-legacy\t0\t1714000040\tsb-1\t\tagentenv-agent\n",
                 Some(0),
                 "",
             ),
@@ -3465,15 +3689,19 @@ mod driver_tests {
             .await
             .expect("list_sessions");
 
-        assert_eq!(result.sessions.len(), 2);
-        assert_eq!(result.sessions[0].session_id, "sh-1");
+        assert_eq!(result.sessions.len(), 3);
+        assert_eq!(result.sessions[0].session_id, "agentenv-sb-1-aaa");
+        assert_eq!(result.sessions[0].name, "sh-1");
         assert_eq!(result.sessions[0].status, SessionStatus::Detached);
         assert_eq!(result.sessions[0].command, "agentenv-agent");
         assert_eq!(result.sessions[0].created_at, "2024-04-24T23:06:40Z");
         assert_eq!(result.sessions[0].updated_at, "2024-04-24T23:06:40Z");
-        assert_eq!(result.sessions[1].session_id, "sh_2");
+        assert_eq!(result.sessions[1].session_id, "agentenv-sb-1-bbb");
+        assert_eq!(result.sessions[1].name, "sh_2");
         assert_eq!(result.sessions[1].status, SessionStatus::Attached);
         assert_eq!(result.sessions[1].created_at, "2024-04-24T23:06:50Z");
+        assert_eq!(result.sessions[2].session_id, "agentenv-sb-1-legacy");
+        assert_eq!(result.sessions[2].name, "agentenv-sb-1-legacy");
     }
 
     #[tokio::test]
@@ -3522,18 +3750,72 @@ mod driver_tests {
     async fn openshell_kill_session_uses_tmux_kill_session() {
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             tmux_available_script(),
-            CommandScript::success("tmux", &["kill-session", "-t", "sh-1"], "", ""),
+            tmux_owner_script("agentenv-sb-1-session", "sb-1"),
+            tmux_kill_script("agentenv-sb-1-session"),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
         driver
             .kill_session(KillSessionParams {
                 handle: "sb-1".to_owned(),
-                session_id: "sh-1".to_owned(),
+                session_id: "agentenv-sb-1-session".to_owned(),
             })
             .await
             .expect("kill_session");
 
+        assert_eq!(runner.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn openshell_attach_session_rejects_unowned_tmux_session() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script(),
+            tmux_owner_script("agentenv-sb-1-session", "sb-2"),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .attach_session(AttachSessionParams {
+                handle: "sb-1".to_owned(),
+                session_id: "agentenv-sb-1-session".to_owned(),
+            })
+            .await
+            .expect_err("attach_session should reject unowned tmux sessions");
+
+        match err {
+            agentenv_core::driver::DriverError::InvalidHandle { handle, message } => {
+                assert_eq!(handle, "agentenv-sb-1-session");
+                assert!(message.contains("not owned"));
+            }
+            other => panic!("expected InvalidHandle, got {other:?}"),
+        }
+        assert_eq!(runner.calls().len(), 2);
+        assert!(runner.status_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn openshell_kill_session_rejects_unowned_tmux_session() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            tmux_available_script(),
+            tmux_owner_script("agentenv-sb-1-session", "sb-2"),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .kill_session(KillSessionParams {
+                handle: "sb-1".to_owned(),
+                session_id: "agentenv-sb-1-session".to_owned(),
+            })
+            .await
+            .expect_err("kill_session should reject unowned tmux sessions");
+
+        match err {
+            agentenv_core::driver::DriverError::InvalidHandle { handle, message } => {
+                assert_eq!(handle, "agentenv-sb-1-session");
+                assert!(message.contains("not owned"));
+            }
+            other => panic!("expected InvalidHandle, got {other:?}"),
+        }
         assert_eq!(runner.calls().len(), 2);
     }
 
