@@ -825,8 +825,8 @@ mod async_client_tests {
 
         let client = Arc::new(
             JsonRpcClient::spawn(JsonRpcClientConfig {
-                binary: driver,
-                args: Vec::new(),
+                binary: python_fixture_binary(),
+                args: python_fixture_args(&driver),
                 env: Default::default(),
                 timeout: Duration::from_secs(5),
             })
@@ -876,8 +876,8 @@ mod async_client_tests {
         }
 
         JsonRpcClient::spawn(JsonRpcClientConfig {
-            binary: driver,
-            args: Vec::new(),
+            binary: python_fixture_binary(),
+            args: python_fixture_args(&driver),
             env,
             timeout,
         })
@@ -977,6 +977,14 @@ while True:
     fn read_fixture_pid(path: &Path) -> u32 {
         let pid = fs::read_to_string(path).unwrap();
         pid.trim().parse::<u32>().unwrap()
+    }
+
+    fn python_fixture_binary() -> PathBuf {
+        PathBuf::from("python3")
+    }
+
+    fn python_fixture_args(script: &Path) -> Vec<String> {
+        vec![script.to_string_lossy().into_owned()]
     }
 
     async fn wait_for_file(path: &Path) {
