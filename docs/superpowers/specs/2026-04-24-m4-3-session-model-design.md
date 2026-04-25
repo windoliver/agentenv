@@ -120,7 +120,7 @@ Core reconciles persisted metadata with `SandboxDriver::list_sessions` when list
 
 ## OpenShell Driver
 
-OpenShell is the first built-in sandbox driver to declare `supports_persistent_sessions: true` only if its implementation can create durable in-sandbox sessions. The driver should prefer an in-sandbox multiplexer such as `tmux`, then `screen`, then `dtach`, but the core must not know which backend is used.
+OpenShell is the first built-in sandbox driver to declare `supports_persistent_sessions: true` when the driver can create durable sessions. The implementation uses host-side `tmux` to wrap `openshell sandbox exec --tty`, because the default OpenShell sandbox image does not ship an in-sandbox multiplexer. The core still does not know which backend is used.
 
 The driver-level contract is:
 
@@ -129,7 +129,7 @@ The driver-level contract is:
 - `list_sessions` reports backend-observed status.
 - `kill_session` terminates only that session.
 
-If OpenShell cannot find a usable backend inside the sandbox, it returns `CapabilityMissing { capability: "supports_persistent_sessions" }` with remediation such as installing `tmux` in the sandbox image. Foreground `enter` remains available through `exec`.
+If OpenShell cannot find a usable host-side `tmux`, it returns `CapabilityMissing { capability: "supports_persistent_sessions" }`. Foreground `enter` remains available through `exec`.
 
 ## Error Handling
 
@@ -164,4 +164,4 @@ OpenShell driver tests will use the existing command-runner test harness to asse
 
 ## Trade-Offs
 
-This design is larger than wrapping `tmux` in the CLI, but it preserves the driver boundary and keeps remote sandboxes viable. It also creates a protocol bump, but only an additive minor bump. The fallback path for unsupported drivers keeps current foreground `enter` behavior working while making detached and resumable behavior explicit.
+This design is larger than putting session state in the core, but it preserves the driver boundary while still working with OpenShell's default sandbox image. It also creates a protocol bump, but only an additive minor bump. The fallback path for unsupported drivers keeps current foreground `enter` behavior working while making detached and resumable behavior explicit.
