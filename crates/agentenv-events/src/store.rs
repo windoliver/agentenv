@@ -29,6 +29,8 @@ pub enum StoreError {
     NegativeLatency(i64),
     #[error("activity event count is outside u64 range: {0}")]
     CountOutOfRange(i64),
+    #[error("unsafe activity database path: {path}")]
+    UnsafeDatabasePath { path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +45,8 @@ pub struct EventQuery {
     pub kind: Option<ActivityKind>,
     pub result: Option<ActivityResult>,
     pub after_id: Option<i64>,
+    pub from_ts: Option<String>,
+    pub to_ts: Option<String>,
     pub limit: usize,
 }
 
@@ -199,8 +203,16 @@ impl SqliteEventStore {
             sql.push_str(" AND id > ?");
             query_params.push(SqlValue::Integer(after_id));
         }
+        if let Some(from_ts) = query.from_ts {
+            sql.push_str(" AND ts >= ?");
+            query_params.push(SqlValue::Text(from_ts));
+        }
+        if let Some(to_ts) = query.to_ts {
+            sql.push_str(" AND ts <= ?");
+            query_params.push(SqlValue::Text(to_ts));
+        }
 
-        sql.push_str(" ORDER BY id ASC LIMIT ?");
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
         query_params.push(SqlValue::Integer(query.limit.clamp(1, 10_000) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -302,9 +314,30 @@ fn create_private_database_file(path: &Path) -> StoreResult<()> {
         .open(path)
     {
         Ok(_) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            harden_existing_database_file(path)
+        }
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(unix)]
+fn harden_existing_database_file(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(StoreError::UnsafeDatabasePath {
+            path: path.to_owned(),
+        });
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -436,6 +469,13 @@ mod tests {
         ActivityEvent::new(ts, kind, result, "trace-store").with_env(env)
     }
 
+    fn query_all(limit: usize) -> EventQuery {
+        EventQuery {
+            limit,
+            ..EventQuery::default()
+        }
+    }
+
     #[test]
     fn sqlite_store_appends_and_filters_by_env_kind_result() {
         let temp = tempfile::tempdir().unwrap();
@@ -471,12 +511,160 @@ mod tests {
                 result: Some(ActivityResult::Denied),
                 after_id: None,
                 limit: 100,
+                ..EventQuery::default()
             })
             .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event.env.as_deref(), Some("demo"));
         assert_eq!(rows[0].event.kind, ActivityKind::EgressDenied);
+    }
+
+    #[test]
+    fn sqlite_store_queries_newest_rows_first_with_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressAllowed,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
+
+        let rows = store.query(query_all(2)).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event.ts, "2026-04-26T12:00:02Z");
+        assert_eq!(rows[1].event.ts, "2026-04-26T12:00:01Z");
+    }
+
+    #[test]
+    fn sqlite_store_filters_by_timestamp_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressAllowed,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
+
+        let rows = store
+            .query(EventQuery {
+                from_ts: Some("2026-04-26T12:00:01Z".to_owned()),
+                to_ts: Some("2026-04-26T12:00:01Z".to_owned()),
+                limit: 100,
+                ..EventQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.ts, "2026-04-26T12:00:01Z");
+    }
+
+    #[test]
+    fn sqlite_store_clamps_zero_limit_to_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
+
+        let rows = store.query(query_all(0)).unwrap();
+
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_store_counts_by_kind_env_and_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::SandboxCreate,
+                    "other",
+                    ActivityResult::Ok,
+                ),
+            ])
+            .unwrap();
+
+        let counts = store.counts_by_kind_result().unwrap();
+
+        assert!(counts
+            .iter()
+            .any(|count| count.kind == ActivityKind::EgressDenied
+                && count.env.as_deref() == Some("demo")
+                && count.result == ActivityResult::Denied
+                && count.count == 2));
+        assert!(counts
+            .iter()
+            .any(|count| count.kind == ActivityKind::SandboxCreate
+                && count.env.as_deref() == Some("other")
+                && count.result == ActivityResult::Ok
+                && count.count == 1));
     }
 
     #[test]
@@ -509,6 +697,20 @@ mod tests {
 
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_rejects_symlink_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.db");
+        let link = temp.path().join("events.db");
+        std::fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(SqliteEventStore::open(&link).is_err());
     }
 
     #[test]
