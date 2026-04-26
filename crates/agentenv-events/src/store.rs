@@ -265,7 +265,19 @@ impl SqliteEventStore {
 
 #[cfg(unix)]
 fn database_open_path(path: &Path) -> StoreResult<PathBuf> {
-    Ok(std::fs::canonicalize(path)?)
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| StoreError::UnsafeDatabasePath {
+            path: path.to_owned(),
+        })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
 }
 
 #[cfg(not(unix))]
@@ -780,6 +792,28 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         assert!(SqliteEventStore::open(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_open_path_resolves_parent_symlinks_but_preserves_final_component() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_parent = temp.path().join("real");
+        let link_parent = temp.path().join("link");
+        std::fs::create_dir(&real_parent).unwrap();
+        symlink(&real_parent, &link_parent).unwrap();
+
+        let target = real_parent.join("target.db");
+        let final_component = real_parent.join("events.db");
+        std::fs::write(&target, "").unwrap();
+        symlink(&target, &final_component).unwrap();
+
+        let open_path = database_open_path(&link_parent.join("events.db")).unwrap();
+        let expected_parent = std::fs::canonicalize(&real_parent).unwrap();
+
+        assert_eq!(open_path, expected_parent.join("events.db"));
     }
 
     #[cfg(unix)]
