@@ -20,6 +20,18 @@ impl EventDispatcher {
         Self::with_sinks(capacity, sinks)
     }
 
+    #[cfg(test)]
+    fn for_test_with_hooks(
+        capacity: usize,
+        sinks: Vec<Box<dyn EventSink>>,
+        hooks: DispatchTestHooks,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        let counters = EventCounters::default();
+        spawn_dispatch_worker_with_hooks(receiver, sinks, capacity.max(1), counters.clone(), hooks);
+        Self { sender, counters }
+    }
+
     pub fn with_sinks(capacity: usize, sinks: Vec<Box<dyn EventSink>>) -> Self {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         let counters = EventCounters::default();
@@ -195,11 +207,35 @@ struct SinkWorker {
     counters: SinkCounters,
 }
 
+#[derive(Clone, Default)]
+struct DispatchTestHooks {
+    #[cfg(test)]
+    sink_event_enqueued: Option<mpsc::UnboundedSender<String>>,
+    #[cfg(test)]
+    sink_event_dropped: Option<mpsc::UnboundedSender<String>>,
+}
+
 fn spawn_dispatch_worker(
+    receiver: mpsc::Receiver<DispatcherMessage>,
+    sinks: Vec<Box<dyn EventSink>>,
+    sink_capacity: usize,
+    counters: EventCounters,
+) {
+    spawn_dispatch_worker_with_hooks(
+        receiver,
+        sinks,
+        sink_capacity,
+        counters,
+        DispatchTestHooks::default(),
+    );
+}
+
+fn spawn_dispatch_worker_with_hooks(
     mut receiver: mpsc::Receiver<DispatcherMessage>,
     sinks: Vec<Box<dyn EventSink>>,
     sink_capacity: usize,
     counters: EventCounters,
+    hooks: DispatchTestHooks,
 ) {
     let sink_workers = sinks
         .into_iter()
@@ -215,9 +251,10 @@ fn spawn_dispatch_worker(
                 DispatcherMessage::Event(event) => {
                     for worker in &sink_workers {
                         match worker.sender.try_send(SinkMessage::Event(event.clone())) {
-                            Ok(()) => {}
+                            Ok(()) => notify_sink_event_enqueued(&hooks, &event),
                             Err(mpsc::error::TrySendError::Full(_))
                             | Err(mpsc::error::TrySendError::Closed(_)) => {
+                                notify_sink_event_dropped(&hooks, &event);
                                 worker.counters.increment_dropped_events();
                                 counters.increment_dropped_events();
                             }
@@ -232,6 +269,26 @@ fn spawn_dispatch_worker(
         }
     });
 }
+
+#[cfg(test)]
+fn notify_sink_event_enqueued(hooks: &DispatchTestHooks, event: &ActivityEvent) {
+    if let Some(enqueued) = &hooks.sink_event_enqueued {
+        let _ = enqueued.send(event.trace_id.clone());
+    }
+}
+
+#[cfg(test)]
+fn notify_sink_event_dropped(hooks: &DispatchTestHooks, event: &ActivityEvent) {
+    if let Some(dropped) = &hooks.sink_event_dropped {
+        let _ = dropped.send(event.trace_id.clone());
+    }
+}
+
+#[cfg(not(test))]
+fn notify_sink_event_enqueued(_hooks: &DispatchTestHooks, _event: &ActivityEvent) {}
+
+#[cfg(not(test))]
+fn notify_sink_event_dropped(_hooks: &DispatchTestHooks, _event: &ActivityEvent) {}
 
 fn spawn_sink_worker(
     sink: Box<dyn EventSink>,
@@ -301,7 +358,7 @@ mod tests {
     use super::*;
     use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
     use crate::sink::{EventSink, SinkError};
-    use tokio::sync::{oneshot, Mutex as AsyncMutex};
+    use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
     #[derive(Clone, Default)]
     struct RecordingSink {
@@ -366,6 +423,19 @@ mod tests {
         )
     }
 
+    async fn wait_for_trace(receiver: &mut mpsc::UnboundedReceiver<String>, trace_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while let Some(received) = receiver.recv().await {
+                if received == trace_id {
+                    return;
+                }
+            }
+            panic!("event notification channel closed before {trace_id}");
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn dispatcher_delivers_events_to_sink() {
         let sink = RecordingSink::default();
@@ -382,18 +452,27 @@ mod tests {
     async fn dispatcher_counts_drops_when_queue_is_full() {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
+        let (enqueued_tx, mut enqueued_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
         let sink = GatedSink {
             started: Mutex::new(Some(started_tx)),
             release: AsyncMutex::new(Some(release_rx)),
         };
-        let dispatcher = EventDispatcher::for_test(1, vec![Box::new(sink)]);
+        let dispatcher = EventDispatcher::for_test_with_hooks(
+            1,
+            vec![Box::new(sink)],
+            DispatchTestHooks {
+                sink_event_enqueued: Some(enqueued_tx),
+                sink_event_dropped: Some(dropped_tx),
+            },
+        );
 
         dispatcher.emitter().emit(event("trace-1"));
         started_rx.await.unwrap();
         dispatcher.emitter().emit(event("trace-2"));
-        tokio::task::yield_now().await;
+        wait_for_trace(&mut enqueued_rx, "trace-2").await;
         dispatcher.emitter().emit(event("trace-3"));
-        tokio::task::yield_now().await;
+        wait_for_trace(&mut dropped_rx, "trace-3").await;
 
         assert_eq!(dispatcher.counters().dropped_events(), 1);
         let snapshots = dispatcher.counters().sink_snapshots();
