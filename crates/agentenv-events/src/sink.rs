@@ -52,7 +52,7 @@ impl SinkConfig {
                 source,
             })?;
             match url.scheme() {
-                "http" | "https" => return Ok(Self::Webhook { url }),
+                "https" => return Ok(Self::Webhook { url }),
                 _ => {
                     return Err(SinkError::InvalidSinkUri {
                         uri: uri.to_owned(),
@@ -260,6 +260,15 @@ mod tests {
     fn rejects_unknown_sink_uri() {
         let err = SinkConfig::parse("syslog:/dev/log").unwrap_err();
         assert!(err.to_string().contains("unsupported events sink"));
+    }
+
+    #[test]
+    fn rejects_insecure_webhook_sink_uri() {
+        let err = SinkConfig::parse("webhook:http://example.test/events").unwrap_err();
+        assert!(err.to_string().contains("invalid events sink URI"));
+        assert!(err
+            .to_string()
+            .contains("webhook:http://example.test/events"));
     }
 
     #[tokio::test]
