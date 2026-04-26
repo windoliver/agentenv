@@ -86,6 +86,8 @@ pub enum SinkError {
     Store(#[from] StoreError),
     #[error("events sink worker failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("unsafe events JSONL sink path: {path}")]
+    UnsafeJsonlPath { path: PathBuf },
     #[error("events dispatcher worker is closed")]
     DispatcherClosed,
 }
@@ -158,6 +160,7 @@ impl EventSink for JsonlSink {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        prepare_jsonl_file(&self.path)?;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -181,6 +184,48 @@ fn parse_sink_path(uri: &str, path: &str) -> Result<PathBuf, SinkError> {
         });
     }
     Ok(PathBuf::from(path))
+}
+
+#[cfg(unix)]
+fn prepare_jsonl_file(path: &Path) -> Result<(), SinkError> {
+    use std::fs::OpenOptions;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => harden_existing_jsonl_file(path),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn harden_existing_jsonl_file(path: &Path) -> Result<(), SinkError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(SinkError::UnsafeJsonlPath {
+            path: path.to_owned(),
+        });
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_jsonl_file(_path: &Path) -> Result<(), SinkError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -237,5 +282,26 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let rendered: crate::ActivityEvent = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(rendered, event);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jsonl_sink_creates_file_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let sink = JsonlSink::new(&path);
+        let event = crate::ActivityEvent::new(
+            "2026-04-26T12:00:00Z",
+            crate::ActivityKind::SandboxCreate,
+            crate::ActivityResult::Ok,
+            "trace-jsonl",
+        );
+
+        sink.write_batch(vec![event]).await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

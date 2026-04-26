@@ -23,7 +23,7 @@ impl EventDispatcher {
     pub fn with_sinks(capacity: usize, sinks: Vec<Box<dyn EventSink>>) -> Self {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         let counters = EventCounters::default();
-        spawn_sink_worker(receiver, sinks, counters.clone());
+        spawn_dispatch_worker(receiver, sinks, capacity.max(1), counters.clone());
         Self { sender, counters }
     }
 
@@ -62,6 +62,20 @@ impl EventCounters {
         self.inner.sink_errors.load(Ordering::Relaxed)
     }
 
+    pub fn sink_snapshots(&self) -> Vec<SinkCounterSnapshot> {
+        match self.inner.sink_counters.lock() {
+            Ok(sinks) => sinks
+                .iter()
+                .map(|sink| SinkCounterSnapshot {
+                    name: sink.name,
+                    dropped_events: sink.dropped_events.load(Ordering::Relaxed),
+                    errors: sink.errors.load(Ordering::Relaxed),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn increment_dropped_events(&self) {
         self.inner.dropped_events.fetch_add(1, Ordering::Relaxed);
     }
@@ -69,12 +83,49 @@ impl EventCounters {
     fn increment_sink_errors(&self) {
         self.inner.sink_errors.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn add_sink_counters(&self, name: &'static str) -> SinkCounters {
+        let counters = SinkCounters {
+            name,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+            errors: Arc::new(AtomicU64::new(0)),
+        };
+        if let Ok(mut sinks) = self.inner.sink_counters.lock() {
+            sinks.push(counters.clone());
+        }
+        counters
+    }
 }
 
 #[derive(Default)]
 struct EventCountersInner {
     dropped_events: AtomicU64,
     sink_errors: AtomicU64,
+    sink_counters: Mutex<Vec<SinkCounters>>,
+}
+
+#[derive(Clone)]
+struct SinkCounters {
+    name: &'static str,
+    dropped_events: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+}
+
+impl SinkCounters {
+    fn increment_dropped_events(&self) {
+        self.dropped_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_errors(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkCounterSnapshot {
+    pub name: &'static str,
+    pub dropped_events: u64,
+    pub errors: u64,
 }
 
 #[derive(Clone)]
@@ -134,27 +185,113 @@ enum DispatcherMessage {
     Flush(oneshot::Sender<()>),
 }
 
-fn spawn_sink_worker(
+enum SinkMessage {
+    Event(ActivityEvent),
+    Flush(oneshot::Sender<()>),
+}
+
+struct SinkWorker {
+    sender: mpsc::Sender<SinkMessage>,
+    counters: SinkCounters,
+}
+
+fn spawn_dispatch_worker(
     mut receiver: mpsc::Receiver<DispatcherMessage>,
     sinks: Vec<Box<dyn EventSink>>,
+    sink_capacity: usize,
     counters: EventCounters,
 ) {
+    let sink_workers = sinks
+        .into_iter()
+        .map(|sink| {
+            let sink_counters = counters.add_sink_counters(sink.name());
+            spawn_sink_worker(sink, sink_capacity, counters.clone(), sink_counters)
+        })
+        .collect::<Vec<_>>();
+
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
             match message {
                 DispatcherMessage::Event(event) => {
-                    for sink in &sinks {
-                        if sink.write_batch(vec![event.clone()]).await.is_err() {
-                            counters.increment_sink_errors();
+                    for worker in &sink_workers {
+                        match worker.sender.try_send(SinkMessage::Event(event.clone())) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_))
+                            | Err(mpsc::error::TrySendError::Closed(_)) => {
+                                worker.counters.increment_dropped_events();
+                                counters.increment_dropped_events();
+                            }
                         }
                     }
                 }
                 DispatcherMessage::Flush(ack) => {
+                    flush_sink_workers(&sink_workers, &counters).await;
                     let _ = ack.send(());
                 }
             }
         }
     });
+}
+
+fn spawn_sink_worker(
+    sink: Box<dyn EventSink>,
+    capacity: usize,
+    counters: EventCounters,
+    sink_counters: SinkCounters,
+) -> SinkWorker {
+    let (sender, mut receiver) = mpsc::channel(capacity);
+    let worker_counters = sink_counters.clone();
+    tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            match message {
+                SinkMessage::Event(event) => {
+                    if sink.write_batch(vec![event]).await.is_err() {
+                        worker_counters.increment_errors();
+                        counters.increment_sink_errors();
+                    }
+                }
+                SinkMessage::Flush(ack) => {
+                    let _ = ack.send(());
+                }
+            }
+        }
+    });
+    SinkWorker {
+        sender,
+        counters: sink_counters,
+    }
+}
+
+async fn flush_sink_workers(sink_workers: &[SinkWorker], counters: &EventCounters) {
+    let mut flushes = Vec::with_capacity(sink_workers.len());
+    for worker in sink_workers {
+        let sender = worker.sender.clone();
+        let sink_counters = worker.counters.clone();
+        flushes.push(tokio::spawn(flush_one_sink_worker(sender, sink_counters)));
+    }
+
+    for flushed in flushes {
+        match flushed.await {
+            Ok(Ok(())) => {}
+            Ok(Err(sink_counters)) => {
+                sink_counters.increment_errors();
+                counters.increment_sink_errors();
+            }
+            Err(_) => counters.increment_sink_errors(),
+        }
+    }
+}
+
+async fn flush_one_sink_worker(
+    sender: mpsc::Sender<SinkMessage>,
+    counters: SinkCounters,
+) -> Result<(), SinkCounters> {
+    let (ack, flushed) = oneshot::channel();
+    sender
+        .send(SinkMessage::Flush(ack))
+        .await
+        .map_err(|_| counters.clone())?;
+    flushed.await.map_err(|_| counters)
 }
 
 #[cfg(test)]
@@ -164,11 +301,19 @@ mod tests {
     use super::*;
     use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
     use crate::sink::{EventSink, SinkError};
+    use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
     #[derive(Clone, Default)]
     struct RecordingSink {
         events: Arc<Mutex<Vec<ActivityEvent>>>,
     }
+
+    struct GatedSink {
+        started: Mutex<Option<oneshot::Sender<()>>>,
+        release: AsyncMutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    struct FailingSink;
 
     #[async_trait::async_trait]
     impl EventSink for RecordingSink {
@@ -179,6 +324,36 @@ mod tests {
         async fn write_batch(&self, events: Vec<ActivityEvent>) -> Result<(), SinkError> {
             self.events.lock().unwrap().extend(events);
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for GatedSink {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+
+        async fn write_batch(&self, _events: Vec<ActivityEvent>) -> Result<(), SinkError> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                let _ = release.await;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for FailingSink {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+
+        async fn write_batch(&self, _events: Vec<ActivityEvent>) -> Result<(), SinkError> {
+            Err(SinkError::InvalidSinkUri {
+                uri: "test-failure".to_owned(),
+            })
         }
     }
 
@@ -205,11 +380,69 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_counts_drops_when_queue_is_full() {
-        let dispatcher = EventDispatcher::for_test(1, Vec::new());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let sink = GatedSink {
+            started: Mutex::new(Some(started_tx)),
+            release: AsyncMutex::new(Some(release_rx)),
+        };
+        let dispatcher = EventDispatcher::for_test(1, vec![Box::new(sink)]);
 
         dispatcher.emitter().emit(event("trace-1"));
+        started_rx.await.unwrap();
         dispatcher.emitter().emit(event("trace-2"));
+        tokio::task::yield_now().await;
+        dispatcher.emitter().emit(event("trace-3"));
+        tokio::task::yield_now().await;
 
         assert_eq!(dispatcher.counters().dropped_events(), 1);
+        let snapshots = dispatcher.counters().sink_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].dropped_events, 1);
+        release_tx.send(()).unwrap();
+        dispatcher.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_sink_does_not_block_fast_sink() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let slow = GatedSink {
+            started: Mutex::new(Some(started_tx)),
+            release: AsyncMutex::new(Some(release_rx)),
+        };
+        let fast = RecordingSink::default();
+        let seen = fast.events.clone();
+        let dispatcher = EventDispatcher::for_test(16, vec![Box::new(slow), Box::new(fast)]);
+
+        dispatcher.emitter().emit(event("trace-independent"));
+        started_rx.await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if !seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        release_tx.send(()).unwrap();
+        dispatcher.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sink_errors_are_counted() {
+        let dispatcher = EventDispatcher::for_test(16, vec![Box::new(FailingSink)]);
+
+        dispatcher.emitter().emit(event("trace-failing"));
+        dispatcher.flush().await.unwrap();
+
+        assert_eq!(dispatcher.counters().sink_errors(), 1);
+        let snapshots = dispatcher.counters().sink_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].errors, 1);
     }
 }
