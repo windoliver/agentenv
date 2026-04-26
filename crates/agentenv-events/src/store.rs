@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -258,7 +258,34 @@ impl SqliteEventStore {
 
     fn connection(&self) -> StoreResult<Connection> {
         create_private_database_file(&self.path)?;
-        Ok(Connection::open(&self.path)?)
+        let path = database_open_path(&self.path)?;
+        Ok(Connection::open_with_flags(path, database_open_flags())?)
+    }
+}
+
+#[cfg(unix)]
+fn database_open_path(path: &Path) -> StoreResult<PathBuf> {
+    Ok(std::fs::canonicalize(path)?)
+}
+
+#[cfg(not(unix))]
+fn database_open_path(path: &Path) -> StoreResult<PathBuf> {
+    Ok(path.to_owned())
+}
+
+fn database_open_flags() -> OpenFlags {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+    #[cfg(unix)]
+    {
+        flags | OpenFlags::SQLITE_OPEN_NOFOLLOW
+    }
+
+    #[cfg(not(unix))]
+    {
+        flags
     }
 }
 
@@ -465,6 +492,26 @@ mod tests {
     use super::*;
     use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
 
+    static CURRENT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
+
     fn event(ts: &str, kind: ActivityKind, env: &str, result: ActivityResult) -> ActivityEvent {
         ActivityEvent::new(ts, kind, result, "trace-store").with_env(env)
     }
@@ -668,6 +715,28 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_store_treats_file_colon_path_as_literal_path_not_uri() {
+        let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = CurrentDirGuard::enter(temp.path());
+        let path = PathBuf::from("file:events.db?mode=memory");
+        let store = SqliteEventStore::open(&path).unwrap();
+
+        store
+            .append_many(&[event(
+                "2026-04-26T12:00:00Z",
+                ActivityKind::SandboxCreate,
+                "demo",
+                ActivityResult::Ok,
+            )])
+            .unwrap();
+        let rows = store.query(query_all(10)).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert!(path.exists());
+    }
+
+    #[test]
     fn legacy_jsonl_reader_accepts_old_event_shape() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("events.jsonl");
@@ -711,6 +780,32 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         assert!(SqliteEventStore::open(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_normalizes_existing_regular_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _store = SqliteEventStore::open(&path).unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_rejects_existing_non_regular_database_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(SqliteEventStore::open(&path).is_err());
     }
 
     #[test]
