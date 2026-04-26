@@ -123,21 +123,9 @@ impl ActivityEvent {
     }
 
     pub fn redacted(mut self) -> Self {
-        self.extras = self
-            .extras
-            .into_iter()
-            .map(|(key, value)| {
-                let object = std::iter::once((key.clone(), value)).collect();
-                (key, redact_json_value(Value::Object(object)))
-            })
-            .map(|(key, value)| {
-                let redacted = match value {
-                    Value::Object(mut object) => object.remove(&key).unwrap_or(Value::Null),
-                    other => other,
-                };
-                (key, redacted)
-            })
-            .collect();
+        self.actor = redact_event_map(self.actor);
+        self.subject = redact_event_map(self.subject);
+        self.extras = redact_event_map(self.extras);
         self
     }
 
@@ -165,6 +153,14 @@ impl ActivityEvent {
             event = event.with_subject_value("handle", Value::String(handle));
         }
         event
+    }
+}
+
+fn redact_event_map(map: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let object = map.into_iter().collect();
+    match redact_json_value(Value::Object(object)) {
+        Value::Object(object) => object.into_iter().collect(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -197,7 +193,7 @@ mod tests {
             "trace-1",
         )
         .with_env("demo")
-        .with_subject_value("credential", serde_json::json!("OPENAI_API_KEY"))
+        .with_subject_value("name", serde_json::json!("OPENAI_API_KEY"))
         .with_extra("token", serde_json::json!("sk-secret-value"))
         .redacted();
 
@@ -205,6 +201,41 @@ mod tests {
         assert!(rendered.contains("OPENAI_API_KEY"));
         assert!(!rendered.contains("sk-secret-value"));
         assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn activity_event_redacts_secret_like_actor_subject_and_extras() {
+        let event = ActivityEvent::new(
+            "2026-04-26T12:00:00Z",
+            ActivityKind::CredentialInjected,
+            ActivityResult::Ok,
+            "trace-1",
+        )
+        .with_actor_value("authorization", serde_json::json!("Bearer actor-secret"))
+        .with_subject_value(
+            "url",
+            serde_json::json!("https://user:pass@example.test/path?token=secret#frag"),
+        )
+        .with_subject_value("credential", serde_json::json!("subject-secret"))
+        .with_extra("token", serde_json::json!("extra-secret"))
+        .redacted();
+
+        let rendered = serde_json::to_string(&event).unwrap();
+        assert!(!rendered.contains("actor-secret"));
+        assert!(!rendered.contains("subject-secret"));
+        assert!(!rendered.contains("extra-secret"));
+        assert!(!rendered.contains("user:pass"));
+        assert!(!rendered.contains("token=secret"));
+        assert_eq!(
+            event.actor["authorization"],
+            serde_json::json!("[redacted]")
+        );
+        assert_eq!(event.subject["credential"], serde_json::json!("[redacted]"));
+        assert_eq!(event.extras["token"], serde_json::json!("[redacted]"));
+        assert_eq!(
+            event.subject["url"],
+            serde_json::json!("https://example.test/path")
+        );
     }
 
     #[test]

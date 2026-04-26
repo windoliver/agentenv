@@ -137,7 +137,6 @@ dependencies = [
  "agentenv-proto",
  "serde",
  "serde_json",
- "thiserror",
  "url",
 ]
 

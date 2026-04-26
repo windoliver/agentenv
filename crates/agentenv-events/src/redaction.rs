@@ -15,7 +15,11 @@ pub fn redact_string(raw: &str) -> String {
         }
     }
 
-    redact_url_like_text(raw)
+    if is_url_like_text(raw) {
+        redact_url_like_text(raw)
+    } else {
+        raw.to_owned()
+    }
 }
 
 pub fn redact_json_value(value: Value) -> Value {
@@ -46,6 +50,10 @@ fn is_secret_key(key: &str) -> bool {
     SECRET_KEY_MARKERS
         .iter()
         .any(|marker| lowercase.contains(marker))
+}
+
+fn is_url_like_text(raw: &str) -> bool {
+    raw.contains("://") || raw.starts_with("//")
 }
 
 fn redact_url(mut url: Url) -> Url {
@@ -104,6 +112,12 @@ mod tests {
     fn redacts_url_credentials_query_and_fragment() {
         let redacted = redact_string("https://user:pass@example.test/path?token=secret#frag");
         assert_eq!(redacted, "https://example.test/path");
+    }
+
+    #[test]
+    fn leaves_non_url_prose_with_query_and_fragment_markers_unchanged() {
+        let redacted = redact_string("why? see #123");
+        assert_eq!(redacted, "why? see #123");
     }
 
     #[test]
