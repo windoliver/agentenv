@@ -93,6 +93,7 @@ version = "0.0.1-alpha0"
 name = "agentenv-core"
 version = "0.0.1-alpha0"
 dependencies = [
+ "agentenv-events",
  "agentenv-policy",
  "agentenv-proto",
  "async-trait",
@@ -133,8 +134,11 @@ dependencies = [
 name = "agentenv-events"
 version = "0.0.1-alpha0"
 dependencies = [
- "agentenv-core",
  "agentenv-proto",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
 ]
 
 [[package]]

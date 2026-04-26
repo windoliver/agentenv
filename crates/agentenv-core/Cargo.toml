@@ -11,6 +11,7 @@ readme = "README.md"
 description = "Core abstractions and orchestration scaffolding for agentenv"
 
 [dependencies]
+agentenv-events = { path = "../agentenv-events" }
 agentenv-proto = { path = "../agentenv-proto" }
 agentenv-policy = { path = "../agentenv-policy" }
 async-trait.workspace = true
