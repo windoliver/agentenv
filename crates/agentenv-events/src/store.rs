@@ -245,6 +245,7 @@ impl SqliteEventStore {
     }
 
     fn connection(&self) -> StoreResult<Connection> {
+        create_private_database_file(&self.path)?;
         Ok(Connection::open(&self.path)?)
     }
 }
@@ -265,11 +266,9 @@ pub fn read_legacy_jsonl(
             continue;
         }
 
-        let value: Value = serde_json::from_str(line)?;
-        let event = if value.get("kind").is_some() && value.get("result").is_some() {
-            serde_json::from_value(value)?
-        } else {
-            legacy_json_value_to_activity(value)?
+        let event = match parse_jsonl_activity_event(line) {
+            Ok(event) => event,
+            Err(_) => continue,
         };
 
         if let Some(kind) = kind_filter {
@@ -287,6 +286,30 @@ pub fn read_legacy_jsonl(
     }
 
     Ok(events)
+}
+
+#[cfg(unix)]
+fn create_private_database_file(path: &Path) -> StoreResult<()> {
+    use std::fs::OpenOptions;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_database_file(_path: &Path) -> StoreResult<()> {
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -395,6 +418,15 @@ fn legacy_json_value_to_activity(value: Value) -> StoreResult<ActivityEvent> {
     Ok(event)
 }
 
+fn parse_jsonl_activity_event(line: &str) -> StoreResult<ActivityEvent> {
+    let value: Value = serde_json::from_str(line)?;
+    if value.get("kind").is_some() && value.get("result").is_some() {
+        Ok(serde_json::from_value(value)?)
+    } else {
+        legacy_json_value_to_activity(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +495,40 @@ mod tests {
         assert_eq!(rows[0].kind, ActivityKind::Log);
         assert_eq!(rows[0].actor["driver"], serde_json::json!("context"));
         assert_eq!(rows[0].extras["msg"], serde_json::json!("context ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_creates_database_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+
+        let _store = SqliteEventStore::open(&path).unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn legacy_jsonl_reader_skips_malformed_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"ts\":\"2026-04-21T00:00:00Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context ready\"}\n",
+                "{malformed json}\n",
+                "{\"ts\":\"2026-04-21T00:00:01Z\",\"driver\":\"sandbox\",\"level\":\"warn\",\"msg\":\"sandbox ready\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let rows = read_legacy_jsonl(&path, None, None).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].actor["driver"], serde_json::json!("context"));
+        assert_eq!(rows[1].actor["driver"], serde_json::json!("sandbox"));
     }
 }
