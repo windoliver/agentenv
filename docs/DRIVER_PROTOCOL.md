@@ -1,4 +1,4 @@
-# agentenv Driver Protocol (v1.0 draft)
+# agentenv Driver Protocol (v1.1 draft)
 
 > JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
 
@@ -34,7 +34,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "name": "nexus",
   "kind": "context",
   "version": "0.1.0",
@@ -63,7 +63,7 @@ Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it a
   "id": 1,
   "method": "initialize",
   "params": {
-    "schema_version": "1.0",
+    "schema_version": "1.1",
     "core_version": "0.1.0",
     "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
     "log_level": "info"
@@ -82,7 +82,7 @@ Response:
       "name": "openshell",
       "kind": "sandbox",
       "version": "0.1.0",
-      "protocol_version": "1.0"
+      "protocol_version": "1.1"
     },
     "capabilities": {
       "supports_hot_reload_policy": true,
@@ -208,7 +208,9 @@ Push-only messages (no `id`). Drivers use these for events, logs, and approval r
 
 ### `event/activity`
 
-Structured activity events for the audit log and TUI.
+Structured activity events for the audit log and TUI. Schema `1.1` accepts both
+the legacy flat params shape and the rich params shape. The legacy
+`ActivityEventParams` shape remains valid for compatibility:
 
 ```json
 {
@@ -219,6 +221,27 @@ Structured activity events for the audit log and TUI.
     "reason": "not in policy",
     "ts": "2026-04-16T14:22:00Z",
     "handle": "sb-01HXY"
+  }
+}
+```
+
+Rich `DriverActivityEventParams` include typed kind/result fields plus structured
+actor, subject, and extras maps:
+
+```json
+{
+  "method": "event/activity",
+  "params": {
+    "ts": "2026-04-16T14:22:00Z",
+    "kind": "sandbox_create",
+    "env": "myapp",
+    "actor": {"driver": "openshell"},
+    "subject": {"handle": "sb-01HXY"},
+    "result": "ok",
+    "latency_ms": 42,
+    "trace_id": "trace-01HXY",
+    "reason_code": "created",
+    "extras": {"phase": "create"}
   }
 }
 ```

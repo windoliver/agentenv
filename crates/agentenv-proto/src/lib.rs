@@ -10,7 +10,7 @@ pub use types::*;
 mod tests {
     use super::{
         assert_compatible_schema_version, is_compatible_schema_version, AgentHealthCheckProbe,
-        SchemaVersionError, SCHEMA_VERSION,
+        DriverActivityEventParams, SchemaVersionError, SCHEMA_VERSION,
     };
 
     #[test]
@@ -43,8 +43,49 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_1_0() {
-        assert_eq!(SCHEMA_VERSION, "1.0");
+    fn schema_version_is_1_1() {
+        assert_eq!(SCHEMA_VERSION, "1.1");
+    }
+
+    #[test]
+    fn driver_activity_event_accepts_legacy_shape() {
+        let event: DriverActivityEventParams = serde_json::from_value(serde_json::json!({
+            "kind": "egress_denied",
+            "subject": "api.example.test:443",
+            "reason": "not_in_policy",
+            "ts": "2026-04-26T12:00:00Z",
+            "handle": "sb-1"
+        }))
+        .expect("legacy driver activity event should deserialize");
+
+        assert!(matches!(event, DriverActivityEventParams::Legacy(_)));
+    }
+
+    #[test]
+    fn driver_activity_event_accepts_rich_shape() {
+        let event: DriverActivityEventParams = serde_json::from_value(serde_json::json!({
+            "ts": "2026-04-26T12:00:00Z",
+            "kind": "sandbox_create",
+            "env": "demo",
+            "actor": {"driver": "openshell"},
+            "subject": {"handle": "sb-1"},
+            "result": "ok",
+            "latency_ms": 42,
+            "trace_id": "trace-1",
+            "reason_code": "created",
+            "extras": {"phase": "create"}
+        }))
+        .expect("rich driver activity event should deserialize");
+
+        assert!(matches!(event, DriverActivityEventParams::Rich(_)));
+    }
+
+    #[test]
+    fn driver_activity_schema_is_exported() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(manifest_dir
+            .join("schema/driver-activity-event-params.json")
+            .exists());
     }
 
     #[test]

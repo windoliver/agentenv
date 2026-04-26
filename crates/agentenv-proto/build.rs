@@ -69,6 +69,7 @@ fn main() {
     write_schema::<types::EndpointInSandboxResult>(&schema_dir, "endpoint-in-sandbox-result");
     write_schema::<types::EventLogParams>(&schema_dir, "event-log-params");
     write_schema::<types::ActivityEventParams>(&schema_dir, "activity-event-params");
+    write_schema::<types::DriverActivityEventParams>(&schema_dir, "driver-activity-event-params");
     write_schema::<types::ApprovalRequestedParams>(&schema_dir, "approval-requested-params");
     write_schema::<types::ApprovalDecisionParams>(&schema_dir, "approval-decision-params");
 }
