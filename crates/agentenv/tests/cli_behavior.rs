@@ -1011,6 +1011,55 @@ fn logs_env_json_reads_global_activity_store_when_env_store_absent() {
 }
 
 #[test]
+fn logs_env_kind_follow_polls_empty_sqlite_activity_store() {
+    let temp_dir = make_temp_dir("logs-follow-empty-sqlite");
+    write_minimal_env_state(&temp_dir, "demo");
+    let db_path = env_activity_db_path(&temp_dir, "demo");
+    SqliteEventStore::open(&db_path).unwrap();
+
+    let mut child = Command::new(agentenv_bin())
+        .arg("logs")
+        .arg("--env")
+        .arg("demo")
+        .arg("--kind")
+        .arg("egress_denied")
+        .arg("--json")
+        .arg("--follow")
+        .env("HOME", &temp_dir)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "logs --follow exited before SQLite events were appended"
+    );
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    store
+        .append_many(&[activity_event(
+            "2026-04-21T00:00:00Z",
+            ActivityKind::EgressDenied,
+            ActivityResult::Denied,
+            "trace-follow-sqlite",
+        )
+        .with_subject_value("target", serde_json::json!("api.example.test:443"))])
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(600));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("trace-follow-sqlite"),
+        "stdout was: {stdout}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn destroy_prompts_when_yes_is_absent() {
     let temp_dir = make_temp_dir("destroy-prompt");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
@@ -1632,13 +1681,16 @@ fn activity_event(
 }
 
 fn seed_activity_db(home: &Path, env: &str, events: &[ActivityEvent]) {
-    let db_path = home
-        .join(".agentenv")
-        .join("envs")
-        .join(env)
-        .join("events.db");
+    let db_path = env_activity_db_path(home, env);
     let store = SqliteEventStore::open(db_path).unwrap();
     store.append_many(events).unwrap();
+}
+
+fn env_activity_db_path(home: &Path, env: &str) -> PathBuf {
+    home.join(".agentenv")
+        .join("envs")
+        .join(env)
+        .join("events.db")
 }
 
 fn seed_global_activity_db(home: &Path, events: &[ActivityEvent]) {

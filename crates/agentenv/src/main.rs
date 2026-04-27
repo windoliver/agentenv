@@ -890,26 +890,46 @@ async fn print_activity_logs(
     let kind = parse_activity_kind_opt(kind_filter)?;
     let db_path = env_events_db_path(options, name)?;
     if db_path.is_file() {
-        let rows = query_sqlite_activity_logs(&db_path, name, kind, None)?;
-        if !rows.is_empty() {
-            let after_id = print_activity_rows(rows, json, None)?;
-            if follow {
-                return follow_sqlite_activity_logs(&db_path, name, kind, json, after_id).await;
+        match print_sqlite_activity_logs(&db_path, name, kind, json, None) {
+            Ok(after_id) => {
+                if follow {
+                    return follow_sqlite_activity_logs(&db_path, name, kind, json, after_id).await;
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(error) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    %error,
+                    "failed to read per-env activity database; trying fallback"
+                );
+            }
         }
     }
 
     let global_db_path = global_events_db_path(options);
     if global_db_path.is_file() {
-        let rows = query_sqlite_activity_logs(&global_db_path, name, kind, None)?;
-        if !rows.is_empty() {
-            let after_id = print_activity_rows(rows, json, None)?;
-            if follow {
-                return follow_sqlite_activity_logs(&global_db_path, name, kind, json, after_id)
+        match print_sqlite_activity_logs(&global_db_path, name, kind, json, None) {
+            Ok(after_id) => {
+                if follow {
+                    return follow_sqlite_activity_logs(
+                        &global_db_path,
+                        name,
+                        kind,
+                        json,
+                        after_id,
+                    )
                     .await;
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(error) => {
+                tracing::warn!(
+                    path = %global_db_path.display(),
+                    %error,
+                    "failed to read global activity database; trying fallback"
+                );
+            }
         }
     }
 
