@@ -33,9 +33,12 @@ fn portable_lockfile_builder_is_byte_identical_for_repeated_calls() {
 
     assert_eq!(first, second);
     assert!(first.contains("version: 0.2.0"));
-    let single_quoted_protocol = format!("driver_protocol_version: '{SCHEMA_VERSION}'");
-    let double_quoted_protocol = format!("driver_protocol_version: \"{SCHEMA_VERSION}\"");
-    assert!(first.contains(&single_quoted_protocol) || first.contains(&double_quoted_protocol));
+    let expected_single_quoted = format!("driver_protocol_version: '{SCHEMA_VERSION}'");
+    let expected_double_quoted = format!("driver_protocol_version: \"{SCHEMA_VERSION}\"");
+    assert!(
+        first.contains(&expected_single_quoted) || first.contains(&expected_double_quoted),
+        "lockfile should include current driver protocol version {SCHEMA_VERSION}: {first}"
+    );
     assert!(!first.contains("sk-known-secret"));
 }
 

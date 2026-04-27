@@ -143,6 +143,10 @@
         "supports_native_inference_routing": {
           "type": "boolean"
         },
+        "supports_persistent_sessions": {
+          "default": false,
+          "type": "boolean"
+        },
         "supports_remote_host": {
           "type": "boolean"
         },

@@ -21,6 +21,7 @@ async-trait.workspace = true
 semver = "1"
 serde_json.workspace = true
 thiserror.workspace = true
+time = { workspace = true, features = ["formatting"] }
 uuid.workspace = true
 
 [dev-dependencies]

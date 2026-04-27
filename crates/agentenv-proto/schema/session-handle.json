@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SessionHandle",
+  "type": "object",
+  "required": [
+    "command",
+    "created_at",
+    "name",
+    "session_id",
+    "status",
+    "updated_at"
+  ],
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/definitions/SessionStatus"
+    },
+    "updated_at": {
+      "type": "string"
+    },
+    "working_dir": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "SessionStatus": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "attached",
+        "detached",
+        "exited",
+        "killed",
+        "unknown"
+      ]
+    }
+  }
+}

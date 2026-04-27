@@ -28,6 +28,12 @@ fn main() {
     write_schema::<types::SandboxHandle>(&schema_dir, "sandbox-handle");
     write_schema::<types::ConnectParams>(&schema_dir, "connect-params");
     write_schema::<types::ShellHandle>(&schema_dir, "shell-handle");
+    write_schema::<types::CreateSessionParams>(&schema_dir, "create-session-params");
+    write_schema::<types::AttachSessionParams>(&schema_dir, "attach-session-params");
+    write_schema::<types::KillSessionParams>(&schema_dir, "kill-session-params");
+    write_schema::<types::ListSessionsParams>(&schema_dir, "list-sessions-params");
+    write_schema::<types::SessionHandle>(&schema_dir, "session-handle");
+    write_schema::<types::ListSessionsResult>(&schema_dir, "list-sessions-result");
     write_schema::<types::ExecParams>(&schema_dir, "exec-params");
     write_schema::<types::ExecResult>(&schema_dir, "exec-result");
     write_schema::<types::CopyInParams>(&schema_dir, "copy-in-params");

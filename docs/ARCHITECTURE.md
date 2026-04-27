@@ -286,8 +286,10 @@ A **sandbox** is the long-lived resource (container / VM / E2B box). A **session
 agentenv create myapp          # creates a sandbox
 agentenv enter myapp           # creates a foreground session
 agentenv enter myapp --detach  # creates a detached session
-agentenv resume myapp          # reattaches an existing session
-agentenv sessions list         # shows all live sessions
+agentenv enter myapp --new     # creates an additional session
+agentenv resume myapp          # reattaches the default detached session
+agentenv sessions list myapp   # shows session status
+agentenv sessions kill 01HXY   # kills one session only
 ```
 
 This matters for agents running long tasks: closing your laptop doesn't kill the agent.
