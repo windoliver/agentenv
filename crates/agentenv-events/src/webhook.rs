@@ -77,7 +77,10 @@ impl WebhookSink {
     pub fn new(config: WebhookConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("static webhook client configuration is valid"),
         }
     }
 
@@ -195,5 +198,18 @@ mod tests {
         );
 
         sink.write_batch(vec![event]).await.unwrap();
+    }
+
+    #[test]
+    fn webhook_sink_client_disables_redirects() {
+        let config =
+            WebhookConfig::parse("https://example.test/events").expect("valid webhook config");
+        let sink = WebhookSink::new(config);
+        let client_debug = format!("{:?}", sink.client);
+
+        assert!(
+            client_debug.contains("redirect_policy: Policy(None)"),
+            "webhook client must disable redirects: {client_debug}"
+        );
     }
 }

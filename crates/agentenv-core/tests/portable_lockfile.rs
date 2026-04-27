@@ -8,7 +8,7 @@ use agentenv_core::{
     },
     registry::DriverKind,
 };
-use agentenv_proto::NetworkTarget;
+use agentenv_proto::{NetworkTarget, SCHEMA_VERSION};
 use semver::Version;
 use sha2::{Digest, Sha256};
 
@@ -33,10 +33,9 @@ fn portable_lockfile_builder_is_byte_identical_for_repeated_calls() {
 
     assert_eq!(first, second);
     assert!(first.contains("version: 0.2.0"));
-    assert!(
-        first.contains("driver_protocol_version: '1.0'")
-            || first.contains("driver_protocol_version: \"1.0\"")
-    );
+    let single_quoted_protocol = format!("driver_protocol_version: '{SCHEMA_VERSION}'");
+    let double_quoted_protocol = format!("driver_protocol_version: \"{SCHEMA_VERSION}\"");
+    assert!(first.contains(&single_quoted_protocol) || first.contains(&double_quoted_protocol));
     assert!(!first.contains("sk-known-secret"));
 }
 
