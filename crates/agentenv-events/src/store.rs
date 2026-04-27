@@ -410,21 +410,32 @@ impl SqliteEventStore {
         let conn = self.connection()?;
         let approval_requested = enum_to_db_string(ActivityKind::ApprovalRequested, "kind")?;
         let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
-        let (requested, decided) = conn.query_row(
+        let pending = conn.query_row(
             r#"
-            SELECT
-                SUM(CASE WHEN kind = ?1 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN kind = ?2 THEN 1 ELSE 0 END)
-            FROM activity_events
-            WHERE kind IN (?1, ?2)
+            SELECT COUNT(DISTINCT requested.request_id)
+            FROM (
+                SELECT
+                    CASE
+                        WHEN json_type(subject_json, '$.request_id') = 'text'
+                        THEN json_extract(subject_json, '$.request_id')
+                    END AS request_id
+                FROM activity_events
+                WHERE kind = ?1
+            ) AS requested
+            WHERE requested.request_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM activity_events AS decided
+                WHERE decided.kind = ?2
+                  AND json_type(decided.subject_json, '$.request_id') = 'text'
+                  AND json_extract(decided.subject_json, '$.request_id') = requested.request_id
+              )
             "#,
             params![approval_requested, approval_decided],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            |row| row.get::<_, i64>(0),
         )?;
 
-        let requested = count_to_u64(requested.unwrap_or(0))?;
-        let decided = count_to_u64(decided.unwrap_or(0))?;
-        Ok(requested.saturating_sub(decided))
+        count_to_u64(pending)
     }
 
     fn connection(&self) -> StoreResult<Connection> {

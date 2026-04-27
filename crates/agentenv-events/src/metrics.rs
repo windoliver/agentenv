@@ -62,19 +62,28 @@ pub struct LatencyBucketMetric {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatencySummaryMetric {
+    pub op: String,
+    pub driver: Option<String>,
+    pub sum_seconds: f64,
+    pub count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkCounterMetric {
     pub sink: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricsSnapshot {
     pub envs_by_status: Vec<EnvMetricRow>,
     pub events_total: Vec<EventCountMetric>,
     pub policy_blocks_total: Vec<PolicyBlockMetric>,
     pub mcp_tool_calls_total: Vec<McpToolMetric>,
     pub sandbox_latency: Vec<LatencyBucketMetric>,
+    pub sandbox_latency_summary: Vec<LatencySummaryMetric>,
     pub approvals_pending_total: u64,
     pub event_drops_total: Vec<SinkCounterMetric>,
     pub event_sink_errors_total: Vec<SinkCounterMetric>,
@@ -114,7 +123,8 @@ impl MetricsSnapshot {
                 count: row.count,
             })
             .collect();
-        let sandbox_latency = latency_buckets(store.sandbox_latency_rows()?);
+        let (sandbox_latency, sandbox_latency_summary) =
+            latency_metrics(store.sandbox_latency_rows()?);
         let approvals_pending_total = store.approvals_pending_count()?;
 
         Ok(Self {
@@ -123,6 +133,7 @@ impl MetricsSnapshot {
             policy_blocks_total,
             mcp_tool_calls_total,
             sandbox_latency,
+            sandbox_latency_summary,
             approvals_pending_total,
             event_drops_total: Vec::new(),
             event_sink_errors_total: Vec::new(),
@@ -169,9 +180,9 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
 
     render_help_type(
         &mut output,
-        "agentenv_sandbox_latency_seconds_bucket",
-        "Cumulative sandbox operation latency buckets in seconds.",
-        "counter",
+        "agentenv_sandbox_latency_seconds",
+        "Sandbox operation latency in seconds.",
+        "histogram",
     );
     for row in &snapshot.sandbox_latency {
         render_sample(
@@ -181,6 +192,26 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
                 ("op", Some(row.op.as_str())),
                 ("driver", row.driver.as_deref()),
                 ("le", Some(row.le.as_str())),
+            ],
+            row.count,
+        );
+    }
+    for row in &snapshot.sandbox_latency_summary {
+        render_sample_float(
+            &mut output,
+            "agentenv_sandbox_latency_seconds_sum",
+            &[
+                ("op", Some(row.op.as_str())),
+                ("driver", row.driver.as_deref()),
+            ],
+            row.sum_seconds,
+        );
+        render_sample(
+            &mut output,
+            "agentenv_sandbox_latency_seconds_count",
+            &[
+                ("op", Some(row.op.as_str())),
+                ("driver", row.driver.as_deref()),
             ],
             row.count,
         );
@@ -268,7 +299,9 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
     output
 }
 
-fn latency_buckets(rows: Vec<crate::store::SandboxLatencyRow>) -> Vec<LatencyBucketMetric> {
+fn latency_metrics(
+    rows: Vec<crate::store::SandboxLatencyRow>,
+) -> (Vec<LatencyBucketMetric>, Vec<LatencySummaryMetric>) {
     let mut grouped: BTreeMap<(String, Option<String>), Vec<u64>> = BTreeMap::new();
     for row in rows {
         grouped
@@ -278,7 +311,17 @@ fn latency_buckets(rows: Vec<crate::store::SandboxLatencyRow>) -> Vec<LatencyBuc
     }
 
     let mut buckets = Vec::new();
+    let mut summaries = Vec::new();
     for ((op, driver), latencies) in grouped {
+        let count = latencies.len() as u64;
+        let sum_seconds = latencies.iter().sum::<u64>() as f64 / 1000.0;
+        summaries.push(LatencySummaryMetric {
+            op: op.clone(),
+            driver: driver.clone(),
+            sum_seconds,
+            count,
+        });
+
         for (label, limit_ms) in LATENCY_BUCKET_LABELS.iter().zip(LATENCY_BUCKET_MILLIS) {
             let count = latencies
                 .iter()
@@ -295,7 +338,7 @@ fn latency_buckets(rows: Vec<crate::store::SandboxLatencyRow>) -> Vec<LatencyBuc
             });
         }
     }
-    buckets
+    (buckets, summaries)
 }
 
 fn render_help_type(output: &mut String, name: &str, help: &str, metric_type: &str) {
@@ -319,6 +362,24 @@ fn render_scalar(output: &mut String, name: &str, value: u64) {
 }
 
 fn render_sample(output: &mut String, name: &str, labels: &[(&str, Option<&str>)], value: u64) {
+    render_sample_value(output, name, labels, &value.to_string());
+}
+
+fn render_sample_float(
+    output: &mut String,
+    name: &str,
+    labels: &[(&str, Option<&str>)],
+    value: f64,
+) {
+    render_sample_value(output, name, labels, &value.to_string());
+}
+
+fn render_sample_value(
+    output: &mut String,
+    name: &str,
+    labels: &[(&str, Option<&str>)],
+    value: &str,
+) {
     output.push_str(name);
     output.push('{');
     for (index, (key, value)) in labels.iter().enumerate() {
@@ -331,7 +392,7 @@ fn render_sample(output: &mut String, name: &str, labels: &[(&str, Option<&str>)
         output.push('"');
     }
     output.push_str("} ");
-    output.push_str(&value.to_string());
+    output.push_str(value);
     output.push('\n');
 }
 
@@ -413,7 +474,7 @@ mod tests {
         for series in [
             "agentenv_envs_total",
             "agentenv_events_total",
-            "agentenv_sandbox_latency_seconds_bucket",
+            "agentenv_sandbox_latency_seconds",
             "agentenv_mcp_tool_calls_total",
             "agentenv_policy_blocks_total",
             "agentenv_approvals_pending_total",
@@ -431,6 +492,12 @@ mod tests {
             "agentenv_policy_blocks_total{kind=\"egress_denied\",driver=\"openshell\"} 1"
         ));
         assert!(rendered.contains("agentenv_sandbox_latency_seconds_bucket"));
+        assert!(rendered.contains(
+            "agentenv_sandbox_latency_seconds_count{op=\"create\",driver=\"openshell\"} 1"
+        ));
+        assert!(rendered.contains(
+            "agentenv_sandbox_latency_seconds_sum{op=\"create\",driver=\"openshell\"} 0.005"
+        ));
     }
 
     #[test]
@@ -444,6 +511,7 @@ mod tests {
             policy_blocks_total: Vec::new(),
             mcp_tool_calls_total: Vec::new(),
             sandbox_latency: Vec::new(),
+            sandbox_latency_summary: Vec::new(),
             approvals_pending_total: 0,
             event_drops_total: Vec::new(),
             event_sink_errors_total: Vec::new(),
@@ -525,6 +593,55 @@ mod tests {
     }
 
     #[test]
+    fn approvals_pending_correlates_requests_and_decisions_by_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::ApprovalRequested,
+                    ActivityResult::PendingApproval,
+                )
+                .with_subject_value("request_id", serde_json::json!("req-1")),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::ApprovalRequested,
+                    ActivityResult::PendingApproval,
+                )
+                .with_subject_value("request_id", serde_json::json!("req-2")),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::ApprovalDecided,
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("req-1")),
+                event(
+                    "2026-04-26T12:00:03Z",
+                    ActivityKind::ApprovalDecided,
+                    ActivityResult::Denied,
+                )
+                .with_subject_value("request_id", serde_json::json!("req-1")),
+                event(
+                    "2026-04-26T12:00:04Z",
+                    ActivityKind::ApprovalDecided,
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("unrelated")),
+                event(
+                    "2026-04-26T12:00:05Z",
+                    ActivityKind::ApprovalRequested,
+                    ActivityResult::PendingApproval,
+                ),
+            ])
+            .unwrap();
+
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+
+        assert_eq!(snapshot.approvals_pending_total, 1);
+    }
+
+    #[test]
     fn latency_buckets_are_cumulative_and_include_positive_infinity() {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
@@ -575,5 +692,44 @@ mod tests {
         assert_eq!(counts[5], 2);
         assert_eq!(counts[10], 2);
         assert_eq!(counts[11], 3);
+    }
+
+    #[test]
+    fn latency_histogram_renders_sum_and_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    ActivityResult::Ok,
+                )
+                .with_actor_value("driver", serde_json::json!("openshell"))
+                .with_latency_ms(5),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::SandboxCreate,
+                    ActivityResult::Ok,
+                )
+                .with_actor_value("driver", serde_json::json!("openshell"))
+                .with_latency_ms(250),
+            ])
+            .unwrap();
+
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+        let rendered = render_prometheus(&snapshot);
+
+        assert!(rendered.contains("# HELP agentenv_sandbox_latency_seconds "));
+        assert!(rendered.contains("# TYPE agentenv_sandbox_latency_seconds histogram"));
+        assert!(rendered.contains(
+            "agentenv_sandbox_latency_seconds_bucket{op=\"create\",driver=\"openshell\",le=\"+Inf\"} 2"
+        ));
+        assert!(rendered.contains(
+            "agentenv_sandbox_latency_seconds_sum{op=\"create\",driver=\"openshell\"} 0.255"
+        ));
+        assert!(rendered.contains(
+            "agentenv_sandbox_latency_seconds_count{op=\"create\",driver=\"openshell\"} 2"
+        ));
     }
 }
