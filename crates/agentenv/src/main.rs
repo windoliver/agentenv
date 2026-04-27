@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -9,8 +10,19 @@ use std::{
 use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
 use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
+use agentenv_events::{
+    audit::AuditStore,
+    metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric},
+    sink::{JsonlSink, SqliteSink},
+    store::{EventQuery, SqliteEventStore},
+    ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
+    SinkConfig,
+};
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use hyper::{Method, StatusCode};
+use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
@@ -25,6 +37,8 @@ const SELF_ENV_SENTINEL: &str = "__self__";
     version = concat!("v", env!("CARGO_PKG_VERSION"))
 )]
 struct Cli {
+    #[arg(long = "events-sink", global = true)]
+    events_sink: Vec<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -38,6 +52,9 @@ enum Commands {
     Describe(DescribeArgs),
     Status(StatusArgs),
     Logs(LogsArgs),
+    Stats(StatsArgs),
+    Audit(AuditArgs),
+    Metrics(MetricsArgs),
     Exec(ExecArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
@@ -134,11 +151,77 @@ struct StatusArgs {
 
 #[derive(Debug, Args)]
 struct LogsArgs {
-    name: String,
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    #[arg(long)]
+    env: Option<String>,
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long)]
+    json: bool,
     #[arg(long)]
     follow: bool,
     #[arg(long)]
     driver: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct StatsArgs {
+    #[arg(long)]
+    env: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AuditArgs {
+    #[command(subcommand)]
+    command: AuditCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    Export {
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value_t = AuditFormat::Jsonl)]
+        format: AuditFormat,
+        #[arg(long)]
+        env: Option<String>,
+    },
+    Verify {
+        #[arg(long)]
+        env: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum AuditFormat {
+    Jsonl,
+    Csv,
+}
+
+impl std::fmt::Display for AuditFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jsonl => formatter.write_str("jsonl"),
+            Self::Csv => formatter.write_str("csv"),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct MetricsArgs {
+    #[command(subcommand)]
+    command: MetricsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum MetricsCommand {
+    Serve {
+        #[arg(long, default_value_t = 9180)]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -219,15 +302,18 @@ fn init_tracing() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::Create(args)) => run_create(args).await,
+        Some(Commands::Create(args)) => run_create(args, &cli.events_sink).await,
         Some(Commands::Enter(args)) => run_enter(args).await,
         Some(Commands::List(args)) => run_list(args),
-        Some(Commands::Destroy(args)) => run_destroy(args).await,
+        Some(Commands::Destroy(args)) => run_destroy(args, &cli.events_sink).await,
         Some(Commands::Describe(args)) => run_describe(args),
         Some(Commands::Status(args)) => run_status(args).await,
         Some(Commands::Logs(args)) => run_logs(args).await,
-        Some(Commands::Exec(args)) => run_exec(args).await,
-        Some(Commands::Credentials(command)) => run_credentials(command),
+        Some(Commands::Stats(args)) => run_stats(args),
+        Some(Commands::Audit(args)) => run_audit(args),
+        Some(Commands::Metrics(args)) => run_metrics(args).await,
+        Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
+        Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
@@ -242,7 +328,7 @@ async fn run() -> Result<()> {
     }
 }
 
-async fn run_create(args: CreateArgs) -> Result<()> {
+async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> {
     let options = runtime_options(args.non_interactive)?;
     let cwd = std::env::current_dir().context("failed to determine current working directory")?;
     let blueprint_path = match resolve_create_blueprint_path(
@@ -304,37 +390,46 @@ async fn run_create(args: CreateArgs) -> Result<()> {
             Err(error) => Err(error.into()),
         }
     } else {
+        let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
+        let emitter = dispatcher.emitter();
         let store = CredentialStore::from_default_paths().context("initialize credential store")?;
         let mut provider = CliCredentialProvider {
             store,
             non_interactive: args.non_interactive,
             prompter: Box::new(TerminalCredentialPrompter),
         };
-        match agentenv_core::runtime::create_env(
+        match agentenv_core::runtime::create_env_observed(
             &options,
             &factory,
             &mut provider,
             &args.name,
             &blueprint_yaml,
+            &emitter,
         )
         .await
         {
             Ok(result) if args.json => {
+                flush_dispatcher_best_effort(&dispatcher).await;
                 render::print_json(&result.admission)?;
                 exit_if_rejected(&result.admission);
                 Ok(())
             }
             Ok(result) => {
+                flush_dispatcher_best_effort(&dispatcher).await;
                 render::print_admission_text(&result.admission);
                 exit_if_rejected(&result.admission);
                 println!("Next: agentenv enter {}", args.name);
                 Ok(())
             }
             Err(error) if args.json => {
+                flush_dispatcher_best_effort(&dispatcher).await;
                 render::print_error_json(&error);
                 exit_process(render::exit_for_error(&error).code());
             }
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                flush_dispatcher_best_effort(&dispatcher).await;
+                Err(error.into())
+            }
         }
     }
 }
@@ -379,7 +474,7 @@ fn run_list(args: ListArgs) -> Result<()> {
     }
 }
 
-async fn run_destroy(args: DestroyArgs) -> Result<()> {
+async fn run_destroy(args: DestroyArgs, event_sink_args: &[String]) -> Result<()> {
     let options = runtime_options(true)?;
     if !args.yes {
         confirm_destroy(&args.name, args.non_interactive)?;
@@ -391,12 +486,25 @@ async fn run_destroy(args: DestroyArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let report = agentenv_core::runtime::destroy_env(
+    let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
+    let emitter = dispatcher.emitter();
+    let report = match agentenv_core::runtime::destroy_env_observed(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
+        &emitter,
     )
-    .await?;
+    .await
+    {
+        Ok(report) => {
+            flush_dispatcher_best_effort(&dispatcher).await;
+            report
+        }
+        Err(error) => {
+            flush_dispatcher_best_effort(&dispatcher).await;
+            return Err(error.into());
+        }
+    };
     if args.purge_credentials {
         purge_state_credentials(&purge_credentials)?;
     }
@@ -444,15 +552,25 @@ async fn run_status(args: StatusArgs) -> Result<()> {
 
 async fn run_logs(args: LogsArgs) -> Result<()> {
     let options = runtime_options(true)?;
+    let use_activity_logs = args.env.is_some() || args.kind.is_some() || args.json;
+    let name = args
+        .env
+        .as_deref()
+        .or(args.name.as_deref())
+        .context("logs requires an environment name or --env <name>")?;
     if let Some(driver) = args.driver.as_deref().filter(|driver| *driver != "sandbox") {
-        print_event_logs(&options, &args.name, Some(driver), args.follow)?;
+        print_event_logs(&options, name, Some(driver), args.follow)?;
+        return Ok(());
+    }
+    if use_activity_logs {
+        print_activity_logs(&options, name, args.kind.as_deref(), args.json, args.follow).await?;
         return Ok(());
     }
     if args.follow {
         let _guard = agentenv_core::runtime::start_logs_stream_env(
             &options,
             &builtin_factory::BuiltInDriverFactory,
-            &args.name,
+            name,
         )
         .await?;
         tokio::signal::ctrl_c()
@@ -463,7 +581,7 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
     let logs = agentenv_core::runtime::logs_env(
         &options,
         &builtin_factory::BuiltInDriverFactory,
-        &args.name,
+        name,
         args.follow,
     )
     .await?;
@@ -473,15 +591,225 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_exec(args: ExecArgs) -> Result<()> {
+fn run_stats(args: StatsArgs) -> Result<()> {
     let options = runtime_options(true)?;
-    let result = agentenv_core::runtime::exec_env(
+    let env = args.env.context("stats requires --env <name>")?;
+    agentenv_core::runtime::describe_env(&options, &env)?;
+    let db_path = env_events_db_path(&options, &env)?;
+    let store = SqliteEventStore::open(&db_path)
+        .with_context(|| format!("open activity database `{}`", db_path.display()))?;
+
+    println!("activity summary for {env}");
+    println!("kind/result counts:");
+    for row in store.counts_by_kind_result()? {
+        if row.env.as_deref() == Some(env.as_str()) {
+            println!(
+                "  {} {} {}",
+                activity_kind_label(row.kind),
+                activity_result_label(row.result),
+                row.count
+            );
+        }
+    }
+
+    println!("policy blocks:");
+    for row in store.policy_blocks_by_kind_driver()? {
+        println!(
+            "  {} {} {}",
+            row.kind,
+            row.driver.as_deref().unwrap_or("-"),
+            row.count
+        );
+    }
+
+    println!("pending approvals: {}", store.approvals_pending_count()?);
+    let latency_rows = store.sandbox_latency_rows()?;
+    if latency_rows.is_empty() {
+        println!("latency: none");
+    } else {
+        let count = latency_rows.len() as u64;
+        let sum = latency_rows.iter().map(|row| row.latency_ms).sum::<u64>();
+        let max = latency_rows
+            .iter()
+            .map(|row| row.latency_ms)
+            .max()
+            .unwrap_or(0);
+        println!("latency: count={count} avg_ms={} max_ms={max}", sum / count);
+    }
+    println!("sink drops/errors: unavailable");
+    Ok(())
+}
+
+fn run_audit(args: AuditArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    match args.command {
+        AuditCommand::Export {
+            from: _,
+            to: _,
+            format,
+            env,
+        } => {
+            let env = env.context("audit export requires --env <name>")?;
+            agentenv_core::runtime::describe_env(&options, &env)?;
+            let store = AuditStore::open(env_events_db_path(&options, &env)?)
+                .with_context(|| format!("open audit database for environment `{env}`"))?;
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            match format {
+                AuditFormat::Jsonl => store.export_jsonl(&mut handle)?,
+                AuditFormat::Csv => store.export_csv(&mut handle)?,
+            }
+            Ok(())
+        }
+        AuditCommand::Verify { env } => {
+            let env = env.context("audit verify requires --env <name>")?;
+            agentenv_core::runtime::describe_env(&options, &env)?;
+            let store = AuditStore::open(env_events_db_path(&options, &env)?)
+                .with_context(|| format!("open audit database for environment `{env}`"))?;
+            let report = store.verify()?;
+            if report.valid {
+                println!("valid: {} entries checked", report.checked_entries);
+                Ok(())
+            } else {
+                println!(
+                    "invalid: {} entries checked, first invalid sequence {}",
+                    report.checked_entries,
+                    report
+                        .first_invalid_sequence
+                        .map(|sequence| sequence.to_string())
+                        .unwrap_or_else(|| "-".to_owned())
+                );
+                exit_process(1);
+            }
+        }
+    }
+}
+
+async fn run_metrics(args: MetricsArgs) -> Result<()> {
+    match args.command {
+        MetricsCommand::Serve { port } => serve_metrics(port).await,
+    }
+}
+
+async fn serve_metrics(port: u16) -> Result<()> {
+    let options = runtime_options(true)?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("bind metrics listener on 127.0.0.1:{port}"))?;
+    loop {
+        let (stream, _) = listener.accept().await.context("accept metrics request")?;
+        let options = options.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_metrics_connection(stream, options).await {
+                tracing::warn!(%error, "metrics request failed");
+            }
+        });
+    }
+}
+
+async fn handle_metrics_connection(
+    mut stream: tokio::net::TcpStream,
+    options: agentenv_core::runtime::RuntimeOptions,
+) -> Result<()> {
+    let mut buffer = [0u8; 4096];
+    let read = stream
+        .read(&mut buffer)
+        .await
+        .context("read metrics request")?;
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts
+        .next()
+        .and_then(|value| Method::from_bytes(value.as_bytes()).ok());
+    let path = parts.next().unwrap_or_default();
+
+    let (status, content_type, body) = if method == Some(Method::GET) && path == "/metrics" {
+        (
+            StatusCode::OK,
+            "text/plain; version=0.0.4",
+            render_metrics_body(&options)?,
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "not found\n".to_owned(),
+        )
+    };
+    write_http_response(&mut stream, status, content_type, &body).await
+}
+
+fn render_metrics_body(options: &agentenv_core::runtime::RuntimeOptions) -> Result<String> {
+    let store = SqliteEventStore::open(global_events_db_path(options))
+        .context("open global activity database")?;
+    let env_rows = env_status_metrics(options)?;
+    let mut snapshot =
+        MetricsSnapshot::from_store(&store, &env_rows).context("build metrics snapshot")?;
+    snapshot.event_drops_total = Vec::<SinkCounterMetric>::new();
+    snapshot.event_sink_errors_total = Vec::<SinkCounterMetric>::new();
+    Ok(render_prometheus(&snapshot))
+}
+
+fn env_status_metrics(
+    options: &agentenv_core::runtime::RuntimeOptions,
+) -> Result<Vec<EnvMetricRow>> {
+    let mut counts = BTreeMap::<String, u64>::new();
+    for row in agentenv_core::runtime::list_envs(options)? {
+        *counts.entry(row.status).or_default() += 1;
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(status, count)| EnvMetricRow { status, count })
+        .collect())
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: StatusCode,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let reason = status.canonical_reason().unwrap_or("");
+    let response = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        status.as_u16(),
+        reason,
+        content_type,
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write metrics response")
+}
+
+async fn run_exec(args: ExecArgs, event_sink_args: &[String]) -> Result<()> {
+    let options = runtime_options(true)?;
+    let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
+    let emitter = dispatcher.emitter();
+    let result = match agentenv_core::runtime::exec_env_observed(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
         args.cmd,
+        &emitter,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => {
+            flush_dispatcher_best_effort(&dispatcher).await;
+            result
+        }
+        Err(error) => {
+            flush_dispatcher_best_effort(&dispatcher).await;
+            return Err(error.into());
+        }
+    };
     print!("{}", result.stdout);
     eprint!("{}", result.stderr);
     io::stdout().flush().context("flush forwarded stdout")?;
@@ -539,6 +867,166 @@ fn purge_state_credentials(credential_names: &[String]) -> Result<()> {
             Err(CredentialStoreError::MissingCredential { .. }) => {}
             Err(error) => return Err(error).with_context(|| format!("purge credential `{name}`")),
         }
+    }
+    Ok(())
+}
+
+async fn print_activity_logs(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    name: &str,
+    kind_filter: Option<&str>,
+    json: bool,
+    follow: bool,
+) -> Result<()> {
+    agentenv_core::runtime::describe_env(options, name)?;
+    let kind = parse_activity_kind_opt(kind_filter)?;
+    let db_path = env_events_db_path(options, name)?;
+    if !db_path.is_file() {
+        print_legacy_activity_logs(options, name, kind, json, follow)?;
+        return Ok(());
+    }
+
+    if follow {
+        follow_sqlite_activity_logs(&db_path, name, kind, json).await
+    } else {
+        print_sqlite_activity_logs(&db_path, name, kind, json, None).map(|_| ())
+    }
+}
+
+async fn follow_sqlite_activity_logs(
+    db_path: &Path,
+    env: &str,
+    kind: Option<ActivityKind>,
+    json: bool,
+) -> Result<()> {
+    let mut after_id = None;
+    loop {
+        after_id = print_sqlite_activity_logs(db_path, env, kind, json, after_id)?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn print_sqlite_activity_logs(
+    db_path: &Path,
+    env: &str,
+    kind: Option<ActivityKind>,
+    json: bool,
+    after_id: Option<i64>,
+) -> Result<Option<i64>> {
+    let store = SqliteEventStore::open(db_path.to_path_buf())
+        .with_context(|| format!("open activity database `{}`", db_path.display()))?;
+    let mut rows = store
+        .query(EventQuery {
+            env: Some(env.to_owned()),
+            kind,
+            after_id,
+            limit: 1000,
+            ..EventQuery::default()
+        })
+        .with_context(|| format!("query activity database `{}`", db_path.display()))?;
+    rows.sort_by_key(|row| row.id);
+    let last_id = rows.last().map(|row| row.id).or(after_id);
+    for row in rows {
+        print_activity_event(&row.event, json)?;
+    }
+    io::stdout().flush().context("flush activity logs")?;
+    Ok(last_id)
+}
+
+fn print_legacy_activity_logs(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    name: &str,
+    kind: Option<ActivityKind>,
+    json: bool,
+    follow: bool,
+) -> Result<()> {
+    if follow {
+        let env_name = agentenv_core::env::validate_env_name(name)?;
+        let paths = agentenv_core::env::EnvPaths::new(options.root.clone(), env_name);
+        follow_legacy_activity_logs(&paths.events_path(), kind, json)
+    } else {
+        let env_name = agentenv_core::env::validate_env_name(name)?;
+        let paths = agentenv_core::env::EnvPaths::new(options.root.clone(), env_name);
+        print_legacy_activity_log_chunk(&paths.events_path(), kind, json, 0).map(|_| ())
+    }
+}
+
+fn follow_legacy_activity_logs(
+    events_path: &Path,
+    kind: Option<ActivityKind>,
+    json: bool,
+) -> Result<()> {
+    let mut position = 0;
+    loop {
+        position = print_legacy_activity_log_chunk(events_path, kind, json, position)?;
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn print_legacy_activity_log_chunk(
+    events_path: &Path,
+    kind: Option<ActivityKind>,
+    json: bool,
+    position: u64,
+) -> Result<u64> {
+    let mut file = match fs::File::open(events_path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(position),
+        Err(source) => {
+            return Err(agentenv_core::env::EnvError::Io {
+                path: events_path.to_path_buf(),
+                source,
+            }
+            .into());
+        }
+    };
+    let len = file
+        .metadata()
+        .with_context(|| format!("read events metadata `{}`", events_path.display()))?
+        .len();
+    let start = if position <= len { position } else { 0 };
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("seek events log `{}`", events_path.display()))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("read events log `{}`", events_path.display()))?;
+
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<ActivityEvent>(line) else {
+            continue;
+        };
+        if kind.is_some_and(|kind| event.kind != kind) {
+            continue;
+        }
+        print_activity_event(&event, json)?;
+    }
+    io::stdout().flush().context("flush activity logs")?;
+
+    Ok(start + content.len() as u64)
+}
+
+fn print_activity_event(event: &ActivityEvent, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(event)?);
+    } else {
+        println!(
+            "{} {} {} {}",
+            event.ts,
+            activity_kind_label(event.kind),
+            activity_result_label(event.result),
+            event
+                .reason_code
+                .as_deref()
+                .or_else(|| event
+                    .subject
+                    .get("message")
+                    .and_then(serde_json::Value::as_str))
+                .or_else(|| event
+                    .subject
+                    .get("target")
+                    .and_then(serde_json::Value::as_str))
+                .unwrap_or("")
+        );
     }
     Ok(())
 }
@@ -654,6 +1142,113 @@ fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::Runt
     })
 }
 
+fn build_event_dispatcher(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: Option<&str>,
+    sink_args: &[String],
+) -> Result<EventDispatcher> {
+    let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
+    if sink_args.is_empty() {
+        add_default_sqlite_sinks(&mut sinks, options, env)?;
+    } else {
+        for raw in sink_args {
+            match SinkConfig::parse(raw)? {
+                SinkConfig::DefaultSqlite => add_default_sqlite_sinks(&mut sinks, options, env)?,
+                SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
+                SinkConfig::Jsonl { path } => sinks.push(Box::new(JsonlSink::new(path))),
+                SinkConfig::OtelGrpc { .. } | SinkConfig::Webhook { .. } => {}
+            }
+        }
+    }
+    Ok(EventDispatcher::with_sinks(1024, sinks))
+}
+
+fn add_default_sqlite_sinks(
+    sinks: &mut Vec<Box<dyn EventSink>>,
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: Option<&str>,
+) -> Result<()> {
+    sinks.push(Box::new(SqliteSink::new(global_events_db_path(options))));
+    if let Some(env) = env {
+        sinks.push(Box::new(SqliteSink::new(env_events_db_path(options, env)?)));
+    }
+    Ok(())
+}
+
+async fn flush_dispatcher_best_effort(dispatcher: &EventDispatcher) {
+    if let Err(error) = dispatcher.flush().await {
+        eprintln!("warning: failed to flush event sinks: {error}");
+    }
+}
+
+fn emit_credential_event(
+    emitter: &dyn EventEmitter,
+    kind: ActivityKind,
+    result: ActivityResult,
+    name: &str,
+) {
+    emitter.emit(
+        ActivityEvent::new(now_event_ts(), kind, result, new_cli_trace_id())
+            .with_actor_value("kind", serde_json::json!("cli"))
+            .with_subject_value("name", serde_json::json!(name))
+            .redacted(),
+    );
+}
+
+fn global_events_db_path(options: &agentenv_core::runtime::RuntimeOptions) -> PathBuf {
+    options.root.join("events.db")
+}
+
+fn env_events_db_path(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    name: &str,
+) -> Result<PathBuf> {
+    let env_name = agentenv_core::env::validate_env_name(name)?;
+    let paths = agentenv_core::env::EnvPaths::new(options.root.clone(), env_name);
+    Ok(paths.env_dir().join("events.db"))
+}
+
+fn parse_activity_kind_opt(value: Option<&str>) -> Result<Option<ActivityKind>> {
+    value.map(parse_activity_kind).transpose()
+}
+
+fn parse_activity_kind(value: &str) -> Result<ActivityKind> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .with_context(|| format!("invalid activity kind `{value}`"))
+}
+
+fn activity_kind_label(kind: ActivityKind) -> String {
+    enum_label(kind)
+}
+
+fn activity_result_label(result: ActivityResult) -> String {
+    enum_label(result)
+}
+
+fn enum_label<T>(value: T) -> String
+where
+    T: Serialize,
+{
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(label)) => label,
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn now_event_ts() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("unix:{}", duration.as_secs()),
+        Err(_) => "unix:0".to_owned(),
+    }
+}
+
+fn new_cli_trace_id() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("cli-{}-{}", process::id(), duration.as_nanos()),
+        Err(_) => format!("cli-{}-0", process::id()),
+    }
+}
+
 struct CliCredentialProvider {
     store: CredentialStore,
     non_interactive: bool,
@@ -746,7 +1341,10 @@ fn credential_store_runtime_error(
     })
 }
 
-fn run_credentials(args: CredentialsArgs) -> Result<()> {
+async fn run_credentials(args: CredentialsArgs, event_sink_args: &[String]) -> Result<()> {
+    let options = runtime_options(true)?;
+    let dispatcher = build_event_dispatcher(&options, None, event_sink_args)?;
+    let emitter = dispatcher.emitter();
     let mut store = CredentialStore::from_default_paths().context("initialize credential store")?;
     for warning in store.startup_warnings() {
         eprintln!("warning: {warning}");
@@ -763,6 +1361,13 @@ fn run_credentials(args: CredentialsArgs) -> Result<()> {
             store
                 .remove(&name)
                 .with_context(|| format!("reset credential `{name}`"))?;
+            emit_credential_event(
+                &emitter,
+                ActivityKind::CredentialReset,
+                ActivityResult::Ok,
+                &name,
+            );
+            flush_dispatcher_best_effort(&dispatcher).await;
             println!("{name}");
             Ok(())
         }
@@ -784,6 +1389,13 @@ fn run_credentials(args: CredentialsArgs) -> Result<()> {
                     .store(&name, &SecretString::new(value))
                     .with_context(|| format!("store credential `{name}`"))?;
             }
+            emit_credential_event(
+                &emitter,
+                ActivityKind::CredentialSet,
+                ActivityResult::Ok,
+                &name,
+            );
+            flush_dispatcher_best_effort(&dispatcher).await;
             println!("{name}");
             Ok(())
         }
@@ -1080,6 +1692,9 @@ mod tests {
                 "describe".to_string(),
                 "status".to_string(),
                 "logs".to_string(),
+                "stats".to_string(),
+                "audit".to_string(),
+                "metrics".to_string(),
                 "exec".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
