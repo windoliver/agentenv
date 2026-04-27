@@ -503,11 +503,11 @@ async fn run_destroy(args: DestroyArgs, event_sink_args: &[String]) -> Result<()
     } else {
         Vec::new()
     };
-    let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
+    let dispatcher = build_destroy_event_dispatcher(&options, event_sink_args)?;
     let emitter = Arc::new(AuditingEventEmitter::new(
         dispatcher.emitter(),
         audit_signing_key_path(&options),
-        audit_write_db_paths(&options, Some(&args.name))?,
+        audit_destroy_write_db_paths(&options)?,
     ));
     let report = match agentenv_core::runtime::destroy_env_observed(
         &options,
@@ -1284,6 +1284,13 @@ fn build_event_dispatcher(
     Ok(EventDispatcher::with_sinks(1024, sinks))
 }
 
+fn build_destroy_event_dispatcher(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    sink_args: &[String],
+) -> Result<EventDispatcher> {
+    build_event_dispatcher(options, None, sink_args)
+}
+
 fn validate_webhook_sink_url(config: &WebhookConfig) -> Result<()> {
     agentenv_core::security::ssrf::validate_outbound(
         &config.url,
@@ -1501,6 +1508,12 @@ fn audit_write_db_paths(
         }
     }
     Ok(paths)
+}
+
+fn audit_destroy_write_db_paths(
+    options: &agentenv_core::runtime::RuntimeOptions,
+) -> Result<Vec<PathBuf>> {
+    audit_write_db_paths(options, None)
 }
 
 fn env_events_db_path(
@@ -2199,6 +2212,44 @@ drivers:
         assert!(
             !env_dir.exists(),
             "create-time observability must not create `{}` before runtime commit",
+            env_dir.display()
+        );
+        assert!(global_events_db_path(&options).is_file());
+    }
+
+    #[tokio::test]
+    async fn destroy_time_events_do_not_recreate_removed_env_dir() {
+        let root = make_temp_dir("destroy-time-events-global-only");
+        let options = agentenv_core::runtime::RuntimeOptions {
+            root: root.clone(),
+            log_level: agentenv_proto::LogLevel::Info,
+            non_interactive: true,
+        };
+        let env_dir = root.join("envs").join("demo");
+        fs::create_dir_all(&env_dir).unwrap();
+        let dispatcher = build_destroy_event_dispatcher(&options, &[]).unwrap();
+        let emitter = AuditingEventEmitter::new(
+            dispatcher.emitter(),
+            audit_signing_key_path(&options),
+            audit_destroy_write_db_paths(&options).unwrap(),
+        );
+
+        emitter.emit(
+            ActivityEvent::new(
+                "2026-04-26T12:00:00Z",
+                ActivityKind::SandboxDestroy,
+                ActivityResult::Ok,
+                "trace-destroy-event",
+            )
+            .with_env("demo"),
+        );
+        emitter.check_audit().unwrap();
+        fs::remove_dir_all(&env_dir).unwrap();
+        dispatcher.flush().await.unwrap();
+
+        assert!(
+            !env_dir.exists(),
+            "destroy-time observability must not recreate `{}` after runtime removal",
             env_dir.display()
         );
         assert!(global_events_db_path(&options).is_file());
