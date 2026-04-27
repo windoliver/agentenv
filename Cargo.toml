@@ -73,8 +73,8 @@ hyper = { version = "1", features = ["http1", "server"] }
 reqwest = { version = "=0.11.27", default-features = false, features = ["rustls-tls"] }
 ipnet = "2"
 url = "2"
-opentelemetry = "0.31.0"
-opentelemetry_sdk = "0.31.0"
+opentelemetry = { version = "0.31.0", default-features = false }
+opentelemetry_sdk = { version = "0.31.0", default-features = false }
 opentelemetry-otlp = { version = "0.31.1", default-features = false }
 
 # Keyring / credential store

@@ -1257,7 +1257,9 @@ fn build_event_dispatcher(
             SinkConfig::DefaultSqlite => {}
             SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
             SinkConfig::Jsonl { path } => sinks.push(Box::new(JsonlSink::new(path))),
-            SinkConfig::OtelGrpc { .. } => {}
+            SinkConfig::OtelGrpc { endpoint } => {
+                sinks.push(agentenv_events::sink::otel_grpc_sink(endpoint)?);
+            }
             SinkConfig::Webhook { config } => {
                 validate_webhook_sink_url(&config)?;
                 sinks.push(Box::new(WebhookSink::new(config)));
@@ -2142,6 +2144,41 @@ drivers:
             rendered.contains("outbound URL"),
             "unexpected error: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn events_sink_otel_registers_dispatcher_sink_when_supported() {
+        let root = make_temp_dir("events-sink-otel");
+        let options = agentenv_core::runtime::RuntimeOptions {
+            root,
+            log_level: agentenv_proto::LogLevel::Info,
+            non_interactive: true,
+        };
+        let sinks = vec!["otel:grpc://collector:4317".to_owned()];
+
+        let dispatcher = match build_event_dispatcher(&options, None, &sinks) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("events sink requires feature `otel`"),
+                    "unexpected error: {rendered}"
+                );
+                return;
+            }
+        };
+
+        let sink_names = dispatcher
+            .counters()
+            .sink_snapshots()
+            .into_iter()
+            .map(|snapshot| snapshot.name)
+            .collect::<Vec<_>>();
+        assert!(
+            sink_names.contains(&"otel"),
+            "dispatcher sinks did not include otel: {sink_names:?}"
+        );
+        dispatcher.flush().await.unwrap();
     }
 
     #[test]

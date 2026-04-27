@@ -196,6 +196,19 @@ fn parse_otel_grpc_sink(uri: &str, endpoint: &str) -> Result<SinkConfig, SinkErr
     }
 }
 
+pub fn otel_grpc_sink(endpoint: String) -> Result<Box<dyn EventSink>, SinkError> {
+    #[cfg(feature = "otel")]
+    {
+        Ok(Box::new(crate::otel::OtelSink::new(endpoint)?))
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = endpoint;
+        Err(SinkError::UnsupportedFeature { feature: "otel" })
+    }
+}
+
 #[cfg(unix)]
 fn prepare_jsonl_file(path: &Path) -> Result<(), SinkError> {
     use std::fs::OpenOptions;
