@@ -393,11 +393,11 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
         }
     } else {
         let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
-        let emitter = AuditingEventEmitter::new(
+        let emitter = Arc::new(AuditingEventEmitter::new(
             dispatcher.emitter(),
             audit_signing_key_path(&options),
             audit_write_db_paths(&options, Some(&args.name))?,
-        );
+        ));
         let store = CredentialStore::from_default_paths().context("initialize credential store")?;
         let mut provider = CliCredentialProvider {
             store,
@@ -410,7 +410,7 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
             &mut provider,
             &args.name,
             &blueprint_yaml,
-            &emitter,
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
         )
         .await
         {
@@ -504,16 +504,16 @@ async fn run_destroy(args: DestroyArgs, event_sink_args: &[String]) -> Result<()
         Vec::new()
     };
     let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
-    let emitter = AuditingEventEmitter::new(
+    let emitter = Arc::new(AuditingEventEmitter::new(
         dispatcher.emitter(),
         audit_signing_key_path(&options),
         audit_write_db_paths(&options, Some(&args.name))?,
-    );
+    ));
     let report = match agentenv_core::runtime::destroy_env_observed(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
-        &emitter,
+        Arc::clone(&emitter) as Arc<dyn EventEmitter>,
     )
     .await
     {
@@ -822,17 +822,17 @@ async fn write_http_response(
 async fn run_exec(args: ExecArgs, event_sink_args: &[String]) -> Result<()> {
     let options = runtime_options(true)?;
     let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
-    let emitter = AuditingEventEmitter::new(
+    let emitter = Arc::new(AuditingEventEmitter::new(
         dispatcher.emitter(),
         audit_signing_key_path(&options),
         audit_write_db_paths(&options, Some(&args.name))?,
-    );
+    ));
     let result = match agentenv_core::runtime::exec_env_observed(
         &options,
         &builtin_factory::BuiltInDriverFactory,
         &args.name,
         args.cmd,
-        &emitter,
+        Arc::clone(&emitter) as Arc<dyn EventEmitter>,
     )
     .await
     {

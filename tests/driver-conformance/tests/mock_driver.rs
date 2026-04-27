@@ -1,6 +1,7 @@
 use std::io::BufReader;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use driver_conformance::{
     read_framed_json, run_schema_mismatch_suite, run_standard_suite, write_framed_json,
@@ -97,4 +98,49 @@ fn mock_driver_emits_log_and_activity_notifications_before_preflight_response() 
     assert!(shutdown["result"].is_object());
     let status = child.wait().expect("wait for mock driver");
     assert!(status.success());
+}
+
+#[tokio::test]
+async fn mock_driver_notifications_emit_through_agentenv_plugin_client() {
+    let emitter = agentenv_events::RecordingEventEmitter::default();
+    let mut client = agentenv_plugin::JsonRpcClient::spawn(agentenv_plugin::JsonRpcClientConfig {
+        binary: Path::new(env!("CARGO_BIN_EXE_mock-driver")).to_path_buf(),
+        args: Vec::new(),
+        env: Default::default(),
+        timeout: Duration::from_secs(5),
+    })
+    .await
+    .expect("spawn plugin client");
+    client.set_event_emitter(emitter.clone());
+
+    let _: agentenv_proto::InitializeResult = client
+        .call(
+            "initialize",
+            &agentenv_proto::InitializeParams {
+                schema_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
+                core_version: "0.0.1".to_owned(),
+                workdir: "/tmp/agentenv".to_owned(),
+                log_level: agentenv_proto::LogLevel::Info,
+            },
+        )
+        .await
+        .expect("initialize mock driver");
+
+    let preflight: agentenv_proto::PreflightResult = client
+        .call("preflight", &agentenv_proto::PreflightParams::default())
+        .await
+        .expect("preflight mock driver");
+
+    assert!(preflight.ok);
+    let recorded = emitter.recorded();
+    assert!(recorded.iter().any(|event| {
+        event.kind == agentenv_events::ActivityKind::Log
+            && event.actor["driver"] == json!("mock-driver")
+    }));
+    assert!(recorded.iter().any(|event| {
+        event.kind == agentenv_events::ActivityKind::SandboxCreate
+            && event.trace_id == "trace-mock-driver"
+    }));
+
+    client.shutdown().await.expect("shutdown mock driver");
 }

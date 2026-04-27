@@ -164,6 +164,12 @@ impl EventEmitter for NoopEventEmitter {
     fn emit(&self, _event: ActivityEvent) {}
 }
 
+impl EventEmitter for Arc<dyn EventEmitter> {
+    fn emit(&self, event: ActivityEvent) {
+        self.as_ref().emit(event);
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RecordingEventEmitter {
     events: Arc<Mutex<Vec<ActivityEvent>>>,

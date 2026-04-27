@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use agentenv_events::{
     ActivityEvent, ActivityKind as EventActivityKind, ActivityResult as EventActivityResult,
@@ -415,9 +415,9 @@ fn rich_activity_result_to_event_result(
 }
 
 fn now_event_ts() -> String {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => format!("unix:{}", duration.as_secs()),
-        Err(_) => "unix:0".to_owned(),
+    match time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) {
+        Ok(value) => value,
+        Err(_) => "1970-01-01T00:00:00Z".to_owned(),
     }
 }
 
@@ -570,11 +570,20 @@ impl JsonRpcClient {
         self.event_emitter = Arc::new(event_emitter);
     }
 
+    pub fn set_event_emitter_arc(&mut self, event_emitter: Arc<dyn EventEmitter>) {
+        self.event_emitter = event_emitter;
+    }
+
     pub fn with_event_emitter<E>(mut self, event_emitter: E) -> Self
     where
         E: EventEmitter + 'static,
     {
         self.set_event_emitter(event_emitter);
+        self
+    }
+
+    pub fn with_event_emitter_arc(mut self, event_emitter: Arc<dyn EventEmitter>) -> Self {
+        self.set_event_emitter_arc(event_emitter);
         self
     }
 
@@ -1093,6 +1102,28 @@ mod tests {
             json!("https://api.example.test/v1")
         );
         assert_eq!(event.extras["default_ttl"], json!("session"));
+    }
+
+    #[test]
+    fn generated_notification_timestamp_is_rfc3339_utc() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/approval_requested",
+            "params": {
+                "request_id": "req-1",
+                "kind": "egress_host",
+                "subject": "api.example.test:443",
+                "reason": "agent requested network",
+                "context": {}
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert!(!event.ts.starts_with("unix:"));
+        assert!(event.ts.contains('T'));
+        assert!(event.ts.ends_with('Z'));
     }
 
     #[test]

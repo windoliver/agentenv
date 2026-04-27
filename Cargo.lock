@@ -171,12 +171,14 @@ name = "agentenv-plugin"
 version = "0.0.1-alpha0"
 dependencies = [
  "agentenv-core",
+ "agentenv-events",
  "agentenv-proto",
  "async-trait",
  "semver",
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "tokio",
 ]
 
@@ -857,6 +859,8 @@ name = "driver-conformance"
 version = "0.0.1-alpha0"
 dependencies = [
  "agentenv-core",
+ "agentenv-events",
+ "agentenv-plugin",
  "agentenv-proto",
  "anyhow",
  "async-trait",

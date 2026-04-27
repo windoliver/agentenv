@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -171,12 +174,29 @@ pub struct DriverSet {
 pub trait DriverFactory {
     fn build(&self, selection: &DriverSelection) -> RuntimeResult<DriverSet>;
 
+    fn build_observed(
+        &self,
+        selection: &DriverSelection,
+        _events: Arc<dyn EventEmitter>,
+    ) -> RuntimeResult<DriverSet> {
+        self.build(selection)
+    }
+
     fn build_pinned(
         &self,
         selection: &DriverSelection,
         _pins: &DriverPinSet,
     ) -> RuntimeResult<DriverSet> {
         self.build(selection)
+    }
+
+    fn build_pinned_observed(
+        &self,
+        selection: &DriverSelection,
+        pins: &DriverPinSet,
+        _events: Arc<dyn EventEmitter>,
+    ) -> RuntimeResult<DriverSet> {
+        self.build_pinned(selection, pins)
     }
 }
 
@@ -484,7 +504,15 @@ pub async fn run_preflight_only(
     env: &str,
     selection: &DriverSelection,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
-    run_preflight_with_pins(options, factory, env, selection, None).await
+    run_preflight_with_pins(
+        options,
+        factory,
+        env,
+        selection,
+        None,
+        Arc::new(NoopEventEmitter),
+    )
+    .await
 }
 
 async fn run_preflight_with_pins(
@@ -493,8 +521,9 @@ async fn run_preflight_with_pins(
     env: &str,
     selection: &DriverSelection,
     pins: Option<&DriverPinSet>,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
-    let mut set = build_driver_set(factory, selection, pins)?;
+    let mut set = build_driver_set(factory, selection, pins, events)?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
     initialize_agent_driver(options, set.agent.as_mut()).await?;
     initialize_context_driver(options, set.context.as_mut()).await?;
@@ -550,10 +579,11 @@ fn build_driver_set(
     factory: &dyn DriverFactory,
     selection: &DriverSelection,
     pins: Option<&DriverPinSet>,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<DriverSet> {
     match pins {
-        Some(pins) if !pins.is_empty() => factory.build_pinned(selection, pins),
-        _ => factory.build(selection),
+        Some(pins) if !pins.is_empty() => factory.build_pinned_observed(selection, pins, events),
+        _ => factory.build_observed(selection, events),
     }
 }
 
@@ -570,7 +600,7 @@ pub async fn create_env(
         credentials,
         name,
         blueprint_yaml,
-        &NoopEventEmitter,
+        Arc::new(NoopEventEmitter),
     )
     .await
 }
@@ -581,7 +611,7 @@ pub async fn create_env_observed(
     credentials: &mut dyn CredentialProvider,
     name: &str,
     blueprint_yaml: &str,
-    events: &dyn EventEmitter,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<CreateResult> {
     create_env_with_input(
         options,
@@ -605,14 +635,14 @@ async fn create_env_with_input(
     factory: &dyn DriverFactory,
     credentials: &mut dyn CredentialProvider,
     input: CreateEnvInput<'_>,
-    events: &dyn EventEmitter,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<CreateResult> {
     let name = input.name;
     let blueprint_yaml = input.blueprint_yaml;
     let env_name = crate::env::validate_env_name(name)?;
     let trace_id = new_trace_id();
     emit_runtime_event(
-        events,
+        events.as_ref(),
         core_activity_event(
             ActivityKind::SpawnRequested,
             ActivityResult::Ok,
@@ -624,7 +654,7 @@ async fn create_env_with_input(
     let env_dir = paths.env_dir();
     if env_dir.exists() {
         emit_runtime_event(
-            events,
+            events.as_ref(),
             core_activity_event(
                 ActivityKind::SpawnRejected,
                 ActivityResult::Denied,
@@ -645,7 +675,7 @@ async fn create_env_with_input(
             Ok(resolved) => resolved,
             Err(err) => {
                 emit_runtime_event(
-                    events,
+                    events.as_ref(),
                     core_activity_event(
                         ActivityKind::SpawnRejected,
                         ActivityResult::Denied,
@@ -677,13 +707,14 @@ async fn create_env_with_input(
         name,
         &selection,
         input.driver_pins.as_ref(),
+        Arc::clone(&events),
     )
     .await
     {
         Ok(admission) => admission,
         Err(err) => {
             emit_runtime_event(
-                events,
+                events.as_ref(),
                 core_activity_event(
                     ActivityKind::SpawnRejected,
                     ActivityResult::Denied,
@@ -697,7 +728,7 @@ async fn create_env_with_input(
     };
     if admission.status == crate::admission::AdmissionStatus::Rejected {
         emit_runtime_event(
-            events,
+            events.as_ref(),
             core_activity_event(
                 ActivityKind::SpawnRejected,
                 ActivityResult::Denied,
@@ -713,7 +744,7 @@ async fn create_env_with_input(
         });
     }
     emit_runtime_event(
-        events,
+        events.as_ref(),
         core_activity_event(
             ActivityKind::SpawnAdmitted,
             ActivityResult::Ok,
@@ -723,13 +754,18 @@ async fn create_env_with_input(
         .with_reason_code(admission.reason_code.as_str()),
     );
 
-    let mut set = build_driver_set(factory, &selection, input.driver_pins.as_ref())?;
+    let mut set = build_driver_set(
+        factory,
+        &selection,
+        input.driver_pins.as_ref(),
+        Arc::clone(&events),
+    )?;
     let temp_workspace = create_temp_workspace(&options.root, env_name.as_str());
     let temp_paths = crate::env::EnvPaths::new(temp_workspace.clone(), env_name.clone());
     let mut rollback = CreateEnvRollback::new(temp_workspace.clone());
 
     emit_runtime_event(
-        events,
+        events.as_ref(),
         core_activity_event(
             ActivityKind::SpawnStarted,
             ActivityResult::Ok,
@@ -776,7 +812,7 @@ async fn create_env_with_input(
             credential_names.push(requirement.name.clone());
             if let Some(value) = credentials.resolve(&requirement)? {
                 emit_runtime_event(
-                    events,
+                    events.as_ref(),
                     core_activity_event(
                         ActivityKind::CredentialInjected,
                         ActivityResult::Ok,
@@ -892,7 +928,7 @@ async fn create_env_with_input(
         {
             Ok(handle) => {
                 emit_runtime_event(
-                    events,
+                    events.as_ref(),
                     core_activity_event(
                         ActivityKind::SandboxCreate,
                         ActivityResult::Ok,
@@ -906,7 +942,7 @@ async fn create_env_with_input(
             }
             Err(err) => {
                 emit_runtime_event(
-                    events,
+                    events.as_ref(),
                     core_activity_event(
                         ActivityKind::SandboxCreate,
                         ActivityResult::Error,
@@ -1008,7 +1044,7 @@ async fn create_env_with_input(
         let _ = fs::remove_dir_all(&temp_workspace);
 
         emit_runtime_event(
-            events,
+            events.as_ref(),
             core_activity_event(
                 ActivityKind::SpawnReady,
                 ActivityResult::Ok,
@@ -1028,7 +1064,7 @@ async fn create_env_with_input(
 
     if let Err(err) = &result {
         emit_runtime_event(
-            events,
+            events.as_ref(),
             core_activity_event(
                 ActivityKind::SpawnRejected,
                 ActivityResult::Error,
@@ -1287,7 +1323,7 @@ pub async fn reproduce_env(
             resolved_policy: Some(lockfile.policy.resolved.clone()),
             driver_pins: Some(driver_pins),
         },
-        &NoopEventEmitter,
+        Arc::new(NoopEventEmitter),
     )
     .await
 }
@@ -1540,7 +1576,7 @@ pub async fn exec_env(
     name: &str,
     command: Vec<String>,
 ) -> RuntimeResult<agentenv_proto::ExecResult> {
-    exec_env_observed(options, factory, name, command, &NoopEventEmitter).await
+    exec_env_observed(options, factory, name, command, Arc::new(NoopEventEmitter)).await
 }
 
 pub async fn exec_env_observed(
@@ -1548,16 +1584,16 @@ pub async fn exec_env_observed(
     factory: &dyn DriverFactory,
     name: &str,
     command: Vec<String>,
-    events: &dyn EventEmitter,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<agentenv_proto::ExecResult> {
     let trace_id = new_trace_id();
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
-    let mut set = factory.build(&selection)?;
+    let mut set = factory.build_observed(&selection, Arc::clone(&events))?;
     if let Err(err) = initialize_sandbox_driver(options, set.sandbox.as_mut()).await {
         emit_runtime_event(
-            events,
+            events.as_ref(),
             with_command_metadata(
                 core_activity_event(
                     ActivityKind::Exec,
@@ -1600,12 +1636,12 @@ pub async fn exec_env_observed(
             if result.status != 0 {
                 event = event.with_reason_code("command_status");
             }
-            emit_runtime_event(events, event);
+            emit_runtime_event(events.as_ref(), event);
             Ok(result)
         }
         Err(err) => {
             emit_runtime_event(
-                events,
+                events.as_ref(),
                 with_command_metadata(
                     core_activity_event(
                         ActivityKind::Exec,
@@ -1661,18 +1697,18 @@ pub async fn status_env(
     factory: &dyn DriverFactory,
     name: &str,
 ) -> RuntimeResult<EnvStatusSummary> {
-    status_env_observed(options, factory, name, &NoopEventEmitter).await
+    status_env_observed(options, factory, name, Arc::new(NoopEventEmitter)).await
 }
 
 pub async fn status_env_observed(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
     name: &str,
-    _events: &dyn EventEmitter,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<EnvStatusSummary> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let mut set = factory.build(&selection)?;
+    let mut set = factory.build_observed(&selection, events)?;
 
     let sandbox = match state.handles.sandbox.clone() {
         Some(handle) => {
@@ -1720,7 +1756,7 @@ pub async fn logs_env(
     name: &str,
     follow: bool,
 ) -> RuntimeResult<agentenv_proto::LogsResult> {
-    logs_env_observed(options, factory, name, follow, &NoopEventEmitter).await
+    logs_env_observed(options, factory, name, follow, Arc::new(NoopEventEmitter)).await
 }
 
 pub async fn logs_env_observed(
@@ -1728,7 +1764,7 @@ pub async fn logs_env_observed(
     factory: &dyn DriverFactory,
     name: &str,
     follow: bool,
-    _events: &dyn EventEmitter,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<agentenv_proto::LogsResult> {
     if follow {
         let _guard = start_logs_stream_env(options, factory, name).await?;
@@ -1740,7 +1776,7 @@ pub async fn logs_env_observed(
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
-    let mut set = factory.build(&selection)?;
+    let mut set = factory.build_observed(&selection, events)?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
     set.sandbox
@@ -1777,14 +1813,14 @@ pub async fn destroy_env(
     factory: &dyn DriverFactory,
     name: &str,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
-    destroy_env_observed(options, factory, name, &NoopEventEmitter).await
+    destroy_env_observed(options, factory, name, Arc::new(NoopEventEmitter)).await
 }
 
 pub async fn destroy_env_observed(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
     name: &str,
-    events: &dyn EventEmitter,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
     let trace_id = new_trace_id();
     let mut state = describe_env(options, name)?.state;
@@ -1795,7 +1831,7 @@ pub async fn destroy_env_observed(
         .or_else(|| state.handles.context.clone())
         .or_else(|| state.handles.inference.clone());
     let selection = selection_from_state(&state);
-    let mut set = factory.build(&selection)?;
+    let mut set = factory.build_observed(&selection, Arc::clone(&events))?;
     let paths =
         crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
     let mut destroy_error_emitted = false;
@@ -1817,7 +1853,7 @@ pub async fn destroy_env_observed(
             {
                 Ok(_) => {
                     emit_runtime_event(
-                        events,
+                        events.as_ref(),
                         core_activity_event(
                             ActivityKind::SandboxDestroy,
                             ActivityResult::Ok,
@@ -1831,7 +1867,7 @@ pub async fn destroy_env_observed(
                 Err(err) => {
                     destroy_error_emitted = true;
                     emit_runtime_event(
-                        events,
+                        events.as_ref(),
                         core_activity_event(
                             ActivityKind::SandboxDestroy,
                             ActivityResult::Error,
@@ -1898,7 +1934,7 @@ pub async fn destroy_env_observed(
             if let Some(handle) = destroy_event_handle {
                 event = event.with_subject_value("handle", serde_json::json!(handle));
             }
-            emit_runtime_event(events, event);
+            emit_runtime_event(events.as_ref(), event);
         }
     }
 
@@ -2718,7 +2754,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use agentenv_events::{ActivityKind, ActivityResult, RecordingEventEmitter};
+    use agentenv_events::{
+        ActivityEvent, ActivityKind, ActivityResult, EventEmitter, RecordingEventEmitter,
+    };
     use agentenv_proto::{
         Capabilities, ContextCapabilities, DriverInfo, DriverKind, EmptyResult,
         InferenceCapabilities, InitializeParams, InitializeResult, LogLevel, NetworkTarget,
@@ -2780,6 +2818,36 @@ mod tests {
                 context: Box::new(TinyContextDriver),
                 inference: None,
             })
+        }
+    }
+
+    struct ObservedFactory;
+
+    impl DriverFactory for ObservedFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(TinySandboxDriver),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+
+        fn build_observed(
+            &self,
+            selection: &super::DriverSelection,
+            events: Arc<dyn EventEmitter>,
+        ) -> super::RuntimeResult<DriverSet> {
+            events.emit(
+                ActivityEvent::new(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::Log,
+                    ActivityResult::Ok,
+                    "factory-trace",
+                )
+                .with_actor_value("driver", serde_json::json!("observed-factory")),
+            );
+            self.build(selection)
         }
     }
 
@@ -4646,7 +4714,7 @@ policy:
             &mut credentials,
             "demo",
             yaml,
-            &events,
+            Arc::new(events.clone()),
         )
         .await
         .unwrap();
@@ -4691,6 +4759,49 @@ policy:
     }
 
     #[tokio::test]
+    async fn create_env_observed_passes_event_emitter_to_driver_factory() {
+        let root = unique_root("agentenv-create-observed-factory-events");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let events = RecordingEventEmitter::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env_observed(
+            &options,
+            &ObservedFactory,
+            &mut credentials,
+            "demo",
+            yaml,
+            Arc::new(events.clone()),
+        )
+        .await
+        .unwrap();
+
+        let recorded = events.recorded();
+        assert!(recorded.iter().any(|event| {
+            event.trace_id == "factory-trace"
+                && event.actor["driver"] == serde_json::json!("observed-factory")
+        }));
+    }
+
+    #[tokio::test]
     async fn create_env_observed_emits_terminal_event_after_post_start_failure() {
         let root = unique_root("agentenv-create-observed-failure");
         let options = RuntimeOptions {
@@ -4721,7 +4832,7 @@ policy:
             &mut credentials,
             "demo",
             yaml,
-            &events,
+            Arc::new(events.clone()),
         )
         .await
         .unwrap_err();
@@ -6083,7 +6194,7 @@ policy:
             &factory,
             "demo",
             vec!["echo".to_owned(), fake_secret.to_owned()],
-            &events,
+            Arc::new(events.clone()),
         )
         .await
         .unwrap();
@@ -6328,7 +6439,7 @@ policy:
         };
         let events = RecordingEventEmitter::default();
 
-        let err = super::destroy_env_observed(&options, &factory, "demo", &events)
+        let err = super::destroy_env_observed(&options, &factory, "demo", Arc::new(events.clone()))
             .await
             .unwrap_err();
 
