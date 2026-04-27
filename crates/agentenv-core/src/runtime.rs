@@ -3,9 +3,12 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use agentenv_events::{
+    ActivityEvent, ActivityKind, ActivityResult, EventEmitter, NoopEventEmitter,
+};
 use agentenv_policy::{compose_policy, PresetRegistry, PresetSelection, Tier};
 use agentenv_proto::{
     AgentSpec, Capabilities, ContextSpec, DriverKind, InferenceSpec, InitializeParams,
@@ -561,6 +564,25 @@ pub async fn create_env(
     name: &str,
     blueprint_yaml: &str,
 ) -> RuntimeResult<CreateResult> {
+    create_env_observed(
+        options,
+        factory,
+        credentials,
+        name,
+        blueprint_yaml,
+        &NoopEventEmitter,
+    )
+    .await
+}
+
+pub async fn create_env_observed(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    credentials: &mut dyn CredentialProvider,
+    name: &str,
+    blueprint_yaml: &str,
+    events: &dyn EventEmitter,
+) -> RuntimeResult<CreateResult> {
     create_env_with_input(
         options,
         factory,
@@ -573,6 +595,7 @@ pub async fn create_env(
             resolved_policy: None,
             driver_pins: None,
         },
+        events,
     )
     .await
 }
@@ -582,13 +605,34 @@ async fn create_env_with_input(
     factory: &dyn DriverFactory,
     credentials: &mut dyn CredentialProvider,
     input: CreateEnvInput<'_>,
+    events: &dyn EventEmitter,
 ) -> RuntimeResult<CreateResult> {
     let name = input.name;
     let blueprint_yaml = input.blueprint_yaml;
     let env_name = crate::env::validate_env_name(name)?;
+    let trace_id = new_trace_id();
+    emit_runtime_event(
+        events,
+        core_activity_event(
+            ActivityKind::SpawnRequested,
+            ActivityResult::Ok,
+            &trace_id,
+            Some(name),
+        ),
+    );
     let paths = crate::env::EnvPaths::new(options.root.clone(), env_name.clone());
     let env_dir = paths.env_dir();
     if env_dir.exists() {
+        emit_runtime_event(
+            events,
+            core_activity_event(
+                ActivityKind::SpawnRejected,
+                ActivityResult::Denied,
+                &trace_id,
+                Some(name),
+            )
+            .with_reason_code(crate::admission::ReasonCode::EnvExists.as_str()),
+        );
         return Err(crate::env::EnvError::AlreadyExists {
             name: name.to_owned(),
         }
@@ -597,7 +641,22 @@ async fn create_env_with_input(
 
     let resolved = match input.resolved_blueprint {
         Some(resolved) => resolved,
-        None => crate::lifecycle::verify_blueprint_yaml(blueprint_yaml)?,
+        None => match crate::lifecycle::verify_blueprint_yaml(blueprint_yaml) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                emit_runtime_event(
+                    events,
+                    core_activity_event(
+                        ActivityKind::SpawnRejected,
+                        ActivityResult::Denied,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_reason_code(crate::admission::ReasonCode::InvalidBlueprint.as_str()),
+                );
+                return Err(err.into());
+            }
+        },
     };
     let lock_yaml = match input.lock_yaml {
         Some(lock_yaml) => lock_yaml,
@@ -612,26 +671,72 @@ async fn create_env_with_input(
             .as_ref()
             .map(|driver| driver.driver.clone()),
     };
-    let admission = run_preflight_with_pins(
+    let admission = match run_preflight_with_pins(
         options,
         factory,
         name,
         &selection,
         input.driver_pins.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(admission) => admission,
+        Err(err) => {
+            emit_runtime_event(
+                events,
+                core_activity_event(
+                    ActivityKind::SpawnRejected,
+                    ActivityResult::Denied,
+                    &trace_id,
+                    Some(name),
+                )
+                .with_reason_code(runtime_error_reason_code(&err)),
+            );
+            return Err(err);
+        }
+    };
     if admission.status == crate::admission::AdmissionStatus::Rejected {
+        emit_runtime_event(
+            events,
+            core_activity_event(
+                ActivityKind::SpawnRejected,
+                ActivityResult::Denied,
+                &trace_id,
+                Some(name),
+            )
+            .with_reason_code(admission.reason_code.as_str()),
+        );
         return Ok(CreateResult {
             admission,
             state: empty_state(name, selection),
             state_path: paths.state_path(),
         });
     }
+    emit_runtime_event(
+        events,
+        core_activity_event(
+            ActivityKind::SpawnAdmitted,
+            ActivityResult::Ok,
+            &trace_id,
+            Some(name),
+        )
+        .with_reason_code(admission.reason_code.as_str()),
+    );
 
     let mut set = build_driver_set(factory, &selection, input.driver_pins.as_ref())?;
     let temp_workspace = create_temp_workspace(&options.root, env_name.as_str());
     let temp_paths = crate::env::EnvPaths::new(temp_workspace.clone(), env_name.clone());
     let mut rollback = CreateEnvRollback::new(temp_workspace.clone());
+
+    emit_runtime_event(
+        events,
+        core_activity_event(
+            ActivityKind::SpawnStarted,
+            ActivityResult::Ok,
+            &trace_id,
+            Some(name),
+        ),
+    );
 
     let result = async {
         initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
@@ -670,6 +775,16 @@ async fn create_env_with_input(
         for requirement in requirements {
             credential_names.push(requirement.name.clone());
             if let Some(value) = credentials.resolve(&requirement)? {
+                emit_runtime_event(
+                    events,
+                    core_activity_event(
+                        ActivityKind::CredentialInjected,
+                        ActivityResult::Ok,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_subject_value("name", serde_json::json!(requirement.name.clone())),
+                );
                 env.insert(requirement.name, value.expose_secret().to_owned());
             } else if requirement.required {
                 return Err(RuntimeError::MissingCredential {
@@ -764,7 +879,8 @@ async fn create_env_with_input(
         let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
         let restore_policy_after_install = create_policy != policy;
 
-        let sandbox_handle = set
+        let sandbox_create_start = Instant::now();
+        let sandbox_handle = match set
             .sandbox
             .create(agentenv_proto::SandboxSpec {
                 image: None,
@@ -772,7 +888,37 @@ async fn create_env_with_input(
                 policy: Some(create_policy),
                 metadata: BTreeMap::new(),
             })
-            .await?;
+            .await
+        {
+            Ok(handle) => {
+                emit_runtime_event(
+                    events,
+                    core_activity_event(
+                        ActivityKind::SandboxCreate,
+                        ActivityResult::Ok,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_subject_value("handle", serde_json::json!(handle.handle.clone()))
+                    .with_latency_ms(elapsed_ms(sandbox_create_start)),
+                );
+                handle
+            }
+            Err(err) => {
+                emit_runtime_event(
+                    events,
+                    core_activity_event(
+                        ActivityKind::SandboxCreate,
+                        ActivityResult::Error,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_reason_code(crate::admission::ReasonCode::DriverCommandFailed.as_str())
+                    .with_latency_ms(elapsed_ms(sandbox_create_start)),
+                );
+                return Err(err.into());
+            }
+        };
         let sandbox_handle_value = sandbox_handle.handle.clone();
         rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle_value.clone());
         install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
@@ -860,6 +1006,17 @@ async fn create_env_with_input(
             }
         })?;
         let _ = fs::remove_dir_all(&temp_workspace);
+
+        emit_runtime_event(
+            events,
+            core_activity_event(
+                ActivityKind::SpawnReady,
+                ActivityResult::Ok,
+                &trace_id,
+                Some(name),
+            )
+            .with_subject_value("handle", serde_json::json!(sandbox_handle_value)),
+        );
 
         Ok(CreateResult {
             admission: crate::admission::AdmissionReport::accepted(name),
@@ -1120,6 +1277,7 @@ pub async fn reproduce_env(
             resolved_policy: Some(lockfile.policy.resolved.clone()),
             driver_pins: Some(driver_pins),
         },
+        &NoopEventEmitter,
     )
     .await
 }
@@ -1372,21 +1530,88 @@ pub async fn exec_env(
     name: &str,
     command: Vec<String>,
 ) -> RuntimeResult<agentenv_proto::ExecResult> {
+    exec_env_observed(options, factory, name, command, &NoopEventEmitter).await
+}
+
+pub async fn exec_env_observed(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    command: Vec<String>,
+    events: &dyn EventEmitter,
+) -> RuntimeResult<agentenv_proto::ExecResult> {
+    let trace_id = new_trace_id();
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
     let mut set = factory.build(&selection)?;
-    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+    if let Err(err) = initialize_sandbox_driver(options, set.sandbox.as_mut()).await {
+        emit_runtime_event(
+            events,
+            with_optional_command_subject(
+                core_activity_event(
+                    ActivityKind::Exec,
+                    ActivityResult::Error,
+                    &trace_id,
+                    Some(name),
+                )
+                .with_subject_value("handle", serde_json::json!(handle.clone()))
+                .with_reason_code(runtime_error_reason_code(&err)),
+                command_preview(&command),
+            ),
+        );
+        return Err(err);
+    }
 
-    set.sandbox
+    let cmd = command.join(" ");
+    let exec_start = Instant::now();
+    match set
+        .sandbox
         .exec(agentenv_proto::ExecParams {
-            handle,
-            cmd: command.join(" "),
+            handle: handle.clone(),
+            cmd,
             tty: false,
             env: BTreeMap::new(),
         })
         .await
-        .map_err(Into::into)
+    {
+        Ok(result) => {
+            let event_result = if result.status == 0 {
+                ActivityResult::Ok
+            } else {
+                ActivityResult::Error
+            };
+            let mut event = with_optional_command_subject(
+                core_activity_event(ActivityKind::Exec, event_result, &trace_id, Some(name))
+                    .with_subject_value("handle", serde_json::json!(handle))
+                    .with_latency_ms(elapsed_ms(exec_start)),
+                command_preview(&command),
+            );
+            if result.status != 0 {
+                event = event.with_reason_code("command_status");
+            }
+            emit_runtime_event(events, event);
+            Ok(result)
+        }
+        Err(err) => {
+            emit_runtime_event(
+                events,
+                with_optional_command_subject(
+                    core_activity_event(
+                        ActivityKind::Exec,
+                        ActivityResult::Error,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_subject_value("handle", serde_json::json!(handle))
+                    .with_reason_code(crate::admission::ReasonCode::DriverCommandFailed.as_str())
+                    .with_latency_ms(elapsed_ms(exec_start)),
+                    command_preview(&command),
+                ),
+            );
+            Err(err.into())
+        }
+    }
 }
 
 pub async fn enter_env(
@@ -1425,6 +1650,15 @@ pub async fn status_env(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
     name: &str,
+) -> RuntimeResult<EnvStatusSummary> {
+    status_env_observed(options, factory, name, &NoopEventEmitter).await
+}
+
+pub async fn status_env_observed(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    _events: &dyn EventEmitter,
 ) -> RuntimeResult<EnvStatusSummary> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
@@ -1476,6 +1710,16 @@ pub async fn logs_env(
     name: &str,
     follow: bool,
 ) -> RuntimeResult<agentenv_proto::LogsResult> {
+    logs_env_observed(options, factory, name, follow, &NoopEventEmitter).await
+}
+
+pub async fn logs_env_observed(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    follow: bool,
+    _events: &dyn EventEmitter,
+) -> RuntimeResult<agentenv_proto::LogsResult> {
     if follow {
         let _guard = start_logs_stream_env(options, factory, name).await?;
         return Ok(agentenv_proto::LogsResult {
@@ -1523,6 +1767,16 @@ pub async fn destroy_env(
     factory: &dyn DriverFactory,
     name: &str,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
+    destroy_env_observed(options, factory, name, &NoopEventEmitter).await
+}
+
+pub async fn destroy_env_observed(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    events: &dyn EventEmitter,
+) -> RuntimeResult<crate::admission::AdmissionReport> {
+    let trace_id = new_trace_id();
     let mut state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let mut set = factory.build(&selection)?;
@@ -1535,9 +1789,43 @@ pub async fn destroy_env(
 
     if let Some(handle) = state.handles.sandbox.clone() {
         initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
-        set.sandbox
-            .destroy(agentenv_proto::DestroyParams { handle })
-            .await?;
+        let destroy_start = Instant::now();
+        match set
+            .sandbox
+            .destroy(agentenv_proto::DestroyParams {
+                handle: handle.clone(),
+            })
+            .await
+        {
+            Ok(_) => {
+                emit_runtime_event(
+                    events,
+                    core_activity_event(
+                        ActivityKind::SandboxDestroy,
+                        ActivityResult::Ok,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_subject_value("handle", serde_json::json!(handle.clone()))
+                    .with_latency_ms(elapsed_ms(destroy_start)),
+                );
+            }
+            Err(err) => {
+                emit_runtime_event(
+                    events,
+                    core_activity_event(
+                        ActivityKind::SandboxDestroy,
+                        ActivityResult::Error,
+                        &trace_id,
+                        Some(name),
+                    )
+                    .with_subject_value("handle", serde_json::json!(handle))
+                    .with_reason_code(crate::admission::ReasonCode::DriverCommandFailed.as_str())
+                    .with_latency_ms(elapsed_ms(destroy_start)),
+                );
+                return Err(err.into());
+            }
+        }
         state.handles.sandbox = None;
         crate::env::write_state(&paths, &state)?;
     }
@@ -2049,6 +2337,120 @@ fn now_utc_string() -> String {
     }
 }
 
+fn new_trace_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    let millis = start.elapsed().as_millis();
+    if millis > u128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        millis as u64
+    }
+}
+
+fn core_activity_event(
+    kind: ActivityKind,
+    result: ActivityResult,
+    trace_id: &str,
+    env: Option<&str>,
+) -> ActivityEvent {
+    let mut event = ActivityEvent::new(now_utc_string(), kind, result, trace_id)
+        .with_actor_value("kind", serde_json::json!("core"));
+    if let Some(env) = env {
+        event = event.with_env(env);
+    }
+    event
+}
+
+fn emit_runtime_event(events: &dyn EventEmitter, event: ActivityEvent) {
+    events.emit(event.redacted());
+}
+
+fn with_optional_command_subject(event: ActivityEvent, command: Option<String>) -> ActivityEvent {
+    match command {
+        Some(command) => event.with_subject_value("command", serde_json::json!(command)),
+        None => event,
+    }
+}
+
+fn command_preview(command: &[String]) -> Option<String> {
+    if command.is_empty() {
+        return None;
+    }
+
+    let mut preview = command
+        .iter()
+        .take(2)
+        .map(|arg| {
+            if looks_sensitive_arg(arg) {
+                "[redacted]".to_owned()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if command.len() > 2 {
+        preview.push("...".to_owned());
+    }
+    Some(preview.join(" "))
+}
+
+fn looks_sensitive_arg(arg: &str) -> bool {
+    let lowercase = arg.to_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+}
+
+fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::Env(EnvError::AlreadyExists { .. }) => {
+            crate::admission::ReasonCode::EnvExists.as_str()
+        }
+        RuntimeError::Env(EnvError::NotFound { .. }) => {
+            crate::admission::ReasonCode::EnvNotFound.as_str()
+        }
+        RuntimeError::Env(EnvError::InvalidName { .. })
+        | RuntimeError::InvalidPolicyTier { .. }
+        | RuntimeError::Lifecycle(_)
+        | RuntimeError::Lockfile(_)
+        | RuntimeError::PortableLockfile(_)
+        | RuntimeError::LegacyLockfileReproduce
+        | RuntimeError::PortableLockfileVerification { .. }
+        | RuntimeError::ComponentConfigConversion { .. }
+        | RuntimeError::FrozenLockfileDriverMismatch { .. } => {
+            crate::admission::ReasonCode::InvalidBlueprint.as_str()
+        }
+        RuntimeError::MissingCredential { .. } => {
+            crate::admission::ReasonCode::MissingCredential.as_str()
+        }
+        RuntimeError::MissingSelectedDriver { .. }
+        | RuntimeError::UnsupportedDriver { .. }
+        | RuntimeError::InvalidDriverHandshake { .. }
+        | RuntimeError::MissingSandboxHandle { .. }
+        | RuntimeError::StateNameMismatch { .. } => {
+            crate::admission::ReasonCode::CapabilityMissing.as_str()
+        }
+        RuntimeError::Env(EnvError::Io { .. })
+        | RuntimeError::Env(EnvError::Json { .. })
+        | RuntimeError::Driver(_)
+        | RuntimeError::DriverArtifact(_)
+        | RuntimeError::CommandStatus { .. } => {
+            crate::admission::ReasonCode::DriverCommandFailed.as_str()
+        }
+    }
+}
+
 fn parse_tier(value: &str) -> RuntimeResult<Tier> {
     match value {
         "restricted" => Ok(Tier::Restricted),
@@ -2313,6 +2715,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use agentenv_events::{ActivityKind, ActivityResult, RecordingEventEmitter};
     use agentenv_proto::{
         Capabilities, ContextCapabilities, DriverInfo, DriverKind, EmptyResult,
         InferenceCapabilities, InitializeParams, InitializeResult, LogLevel, NetworkTarget,
@@ -4131,6 +4534,81 @@ policy:
     }
 
     #[tokio::test]
+    async fn create_env_observed_emits_spawn_lifecycle_events() {
+        let root = unique_root("agentenv-create-observed-events");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let events = RecordingEventEmitter::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env_observed(
+            &options,
+            &TinyFactory,
+            &mut credentials,
+            "demo",
+            yaml,
+            &events,
+        )
+        .await
+        .unwrap();
+
+        let recorded = events.recorded();
+        let kinds = recorded.iter().map(|event| event.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                ActivityKind::SpawnRequested,
+                ActivityKind::SpawnAdmitted,
+                ActivityKind::SpawnStarted,
+                ActivityKind::SandboxCreate,
+                ActivityKind::SpawnReady,
+            ]
+        );
+        assert!(!kinds.contains(&ActivityKind::SpawnQueued));
+        assert!(recorded
+            .iter()
+            .all(|event| event.env.as_deref() == Some("demo")));
+        assert!(recorded
+            .iter()
+            .all(|event| event.actor["kind"] == serde_json::json!("core")));
+        assert!(recorded.iter().all(|event| !event.trace_id.is_empty()));
+        assert!(recorded
+            .iter()
+            .all(|event| event.trace_id == recorded[0].trace_id));
+
+        let sandbox_create = recorded
+            .iter()
+            .find(|event| event.kind == ActivityKind::SandboxCreate)
+            .expect("sandbox create event");
+        assert_eq!(sandbox_create.result, ActivityResult::Ok);
+        assert_eq!(sandbox_create.subject["handle"], serde_json::json!("sb-1"));
+
+        let ready = recorded
+            .iter()
+            .find(|event| event.kind == ActivityKind::SpawnReady)
+            .expect("spawn ready event");
+        assert_eq!(ready.result, ActivityResult::Ok);
+        assert_eq!(ready.subject["handle"], serde_json::json!("sb-1"));
+    }
+
+    #[tokio::test]
     async fn list_and_describe_read_persisted_state() {
         let root = unique_root("agentenv-list-describe");
         let options = RuntimeOptions {
@@ -5454,6 +5932,34 @@ policy:
 
         assert_eq!(result.status, 0);
         assert_eq!(result.stdout, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn exec_env_observed_emits_exec_event() {
+        let (options, factory) = command_test_runtime("exec-observed").await;
+        let events = RecordingEventEmitter::default();
+        let result = super::exec_env_observed(
+            &options,
+            &factory,
+            "demo",
+            vec!["echo".to_owned(), "ok".to_owned()],
+            &events,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, 0);
+
+        let recorded = events.recorded();
+        assert_eq!(recorded.len(), 1);
+        let event = &recorded[0];
+        assert_eq!(event.kind, ActivityKind::Exec);
+        assert_eq!(event.result, ActivityResult::Ok);
+        assert_eq!(event.env.as_deref(), Some("demo"));
+        assert_eq!(event.actor["kind"], serde_json::json!("core"));
+        assert_eq!(event.subject["handle"], serde_json::json!("sb-1"));
+        assert_eq!(event.subject["command"], serde_json::json!("echo ok"));
+        assert!(!event.trace_id.is_empty());
     }
 
     #[tokio::test]
