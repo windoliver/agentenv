@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use reqwest::header::CONTENT_TYPE;
 use serde::Serialize;
 use url::Url;
@@ -8,6 +10,8 @@ use crate::{
 };
 
 const ACTIVITY_SCHEMA: &str = "agentenv.activity.v1";
+
+pub type WebhookUrlValidator = Arc<dyn Fn(&Url) -> Result<(), SinkError> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookConfig {
@@ -71,16 +75,18 @@ pub enum WebhookError {
 pub struct WebhookSink {
     config: WebhookConfig,
     client: reqwest::Client,
+    validate_url: WebhookUrlValidator,
 }
 
 impl WebhookSink {
-    pub fn new(config: WebhookConfig) -> Self {
+    pub fn new(config: WebhookConfig, validate_url: WebhookUrlValidator) -> Self {
         Self {
             config,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("static webhook client configuration is valid"),
+            validate_url,
         }
     }
 
@@ -108,6 +114,7 @@ impl EventSink for WebhookSink {
             return Ok(());
         }
 
+        (self.validate_url)(&self.config.url)?;
         let body = serde_json::to_vec(&WebhookPayload {
             schema: ACTIVITY_SCHEMA,
             events: &events,
@@ -163,6 +170,8 @@ fn remove_kinds_query_params(url: &mut Url) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{ActivityEvent, ActivityKind, ActivityResult};
 
     use super::*;
@@ -189,7 +198,7 @@ mod tests {
     async fn webhook_sink_noops_when_kind_filter_excludes_all_events() {
         let config = WebhookConfig::parse("https://127.0.0.1:1/events?kinds=egress_denied")
             .expect("valid webhook config");
-        let sink = WebhookSink::new(config);
+        let sink = WebhookSink::new(config, Arc::new(|_| Ok(())));
         let event = ActivityEvent::new(
             "2026-04-26T12:00:00Z",
             ActivityKind::Log,
@@ -204,12 +213,35 @@ mod tests {
     fn webhook_sink_client_disables_redirects() {
         let config =
             WebhookConfig::parse("https://example.test/events").expect("valid webhook config");
-        let sink = WebhookSink::new(config);
+        let sink = WebhookSink::new(config, Arc::new(|_| Ok(())));
         let client_debug = format!("{:?}", sink.client);
 
         assert!(
             client_debug.contains("redirect_policy: Policy(None)"),
             "webhook client must disable redirects: {client_debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sink_revalidates_url_before_each_send() {
+        let config =
+            WebhookConfig::parse("https://example.test/events").expect("valid webhook config");
+        let sink = WebhookSink::new(
+            config,
+            Arc::new(|url| Err(SinkError::webhook_validation_failed(url, "blocked"))),
+        );
+        let event = ActivityEvent::new(
+            "2026-04-26T12:00:00Z",
+            ActivityKind::EgressDenied,
+            ActivityResult::Denied,
+            "trace-webhook-validation",
+        );
+
+        let error = sink.write_batch(vec![event]).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("blocked"),
+            "unexpected error: {error}"
         );
     }
 }

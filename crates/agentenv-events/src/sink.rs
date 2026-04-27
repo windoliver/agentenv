@@ -4,6 +4,7 @@ use crate::activity::ActivityEvent;
 use crate::store::{SqliteEventStore, StoreError};
 use crate::webhook::{WebhookConfig, WebhookError};
 use tokio::io::AsyncWriteExt;
+use url::Url;
 
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
@@ -76,9 +77,20 @@ pub enum SinkError {
     DispatcherClosed,
     #[error("events webhook sink request failed: {0}")]
     WebhookRequest(#[from] reqwest::Error),
+    #[error("events webhook sink URL validation failed for `{url}`: {message}")]
+    WebhookValidation { url: String, message: String },
     #[cfg(feature = "otel")]
     #[error("events OTEL sink configuration failed: {0}")]
     OtelExporter(#[from] opentelemetry_otlp::ExporterBuildError),
+}
+
+impl SinkError {
+    pub fn webhook_validation_failed(url: &Url, message: impl Into<String>) -> Self {
+        Self::WebhookValidation {
+            url: url.to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 pub struct SqliteSink {

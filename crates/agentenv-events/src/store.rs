@@ -234,7 +234,11 @@ impl SqliteEventStore {
             query_params.push(SqlValue::Text(to_ts));
         }
 
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        if query.after_id.is_some() {
+            sql.push_str(" ORDER BY id ASC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY id DESC LIMIT ?");
+        }
         query_params.push(SqlValue::Integer(query.limit.clamp(1, 10_000) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
@@ -807,6 +811,53 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].event.ts, "2026-04-26T12:00:02Z");
         assert_eq!(rows[1].event.ts, "2026-04-26T12:00:01Z");
+    }
+
+    #[test]
+    fn sqlite_store_queries_oldest_rows_first_after_cursor_with_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:03Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+            ])
+            .unwrap();
+
+        let rows = store
+            .query(EventQuery {
+                after_id: Some(1),
+                limit: 2,
+                ..EventQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 2);
+        assert_eq!(rows[1].id, 3);
     }
 
     #[test]

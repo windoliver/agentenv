@@ -1262,7 +1262,22 @@ fn build_event_dispatcher(
             }
             SinkConfig::Webhook { config } => {
                 validate_webhook_sink_url(&config)?;
-                sinks.push(Box::new(WebhookSink::new(config)));
+                sinks.push(Box::new(WebhookSink::new(
+                    config,
+                    Arc::new(|url| {
+                        agentenv_core::security::ssrf::validate_outbound(
+                            url,
+                            agentenv_core::security::ssrf::SsrfOptions::default(),
+                        )
+                        .map(|_| ())
+                        .map_err(|source| {
+                            agentenv_events::SinkError::webhook_validation_failed(
+                                url,
+                                source.to_string(),
+                            )
+                        })
+                    }),
+                )));
             }
         }
     }
@@ -1292,7 +1307,9 @@ fn add_default_event_sinks(
     sinks.push(Box::new(SqliteSink::new(global_db_path)));
     if let Some(env) = env {
         let env_db_path = env_events_db_path(options, env)?;
-        sinks.push(Box::new(SqliteSink::new(env_db_path)));
+        if env_db_path.parent().is_some_and(|env_dir| env_dir.is_dir()) {
+            sinks.push(Box::new(SqliteSink::new(env_db_path)));
+        }
     }
     Ok(())
 }
@@ -1478,7 +1495,10 @@ fn audit_write_db_paths(
 ) -> Result<Vec<PathBuf>> {
     let mut paths = vec![global_events_db_path(options)];
     if let Some(env) = env {
-        paths.push(env_events_db_path(options, env)?);
+        let env_db_path = env_events_db_path(options, env)?;
+        if env_db_path.parent().is_some_and(|env_dir| env_dir.is_dir()) {
+            paths.push(env_db_path);
+        }
     }
     Ok(paths)
 }
@@ -1520,9 +1540,10 @@ where
 }
 
 fn now_event_ts() -> String {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => format!("unix:{}", duration.as_secs()),
-        Err(_) => "unix:0".to_owned(),
+    match ::time::OffsetDateTime::now_utc().format(&::time::format_description::well_known::Rfc3339)
+    {
+        Ok(value) => value,
+        Err(_) => "1970-01-01T00:00:00Z".to_owned(),
     }
 }
 
@@ -2143,6 +2164,53 @@ drivers:
         assert!(
             rendered.contains("outbound URL"),
             "unexpected error: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_time_events_do_not_materialize_final_env_dir() {
+        let root = make_temp_dir("create-time-events-global-only");
+        let options = agentenv_core::runtime::RuntimeOptions {
+            root: root.clone(),
+            log_level: agentenv_proto::LogLevel::Info,
+            non_interactive: true,
+        };
+        let env_dir = root.join("envs").join("demo");
+        let dispatcher = build_event_dispatcher(&options, Some("demo"), &[]).unwrap();
+        let emitter = AuditingEventEmitter::new(
+            dispatcher.emitter(),
+            audit_signing_key_path(&options),
+            audit_write_db_paths(&options, Some("demo")).unwrap(),
+        );
+
+        emitter.emit(
+            ActivityEvent::new(
+                "2026-04-26T12:00:00Z",
+                ActivityKind::CredentialInjected,
+                ActivityResult::Ok,
+                "trace-create-event",
+            )
+            .with_env("demo")
+            .with_subject_value("name", serde_json::json!("OPENAI_API_KEY")),
+        );
+        emitter.check_audit().unwrap();
+        dispatcher.flush().await.unwrap();
+
+        assert!(
+            !env_dir.exists(),
+            "create-time observability must not create `{}` before runtime commit",
+            env_dir.display()
+        );
+        assert!(global_events_db_path(&options).is_file());
+    }
+
+    #[test]
+    fn cli_event_timestamps_are_rfc3339() {
+        let ts = now_event_ts();
+
+        assert!(
+            ts.contains('T') && ts.ends_with('Z') && !ts.starts_with("unix:"),
+            "timestamp must be RFC3339 UTC, got `{ts}`"
         );
     }
 
