@@ -145,6 +145,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "rand_core",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

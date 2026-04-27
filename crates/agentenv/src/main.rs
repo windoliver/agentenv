@@ -18,7 +18,7 @@ use agentenv_events::{
     sink::{JsonlSink, SqliteSink},
     store::{EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
-    SinkConfig,
+    SinkConfig, WebhookConfig, WebhookSink,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -1257,10 +1257,28 @@ fn build_event_dispatcher(
             SinkConfig::DefaultSqlite => {}
             SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
             SinkConfig::Jsonl { path } => sinks.push(Box::new(JsonlSink::new(path))),
-            SinkConfig::OtelGrpc { .. } | SinkConfig::Webhook { .. } => {}
+            SinkConfig::OtelGrpc { .. } => {}
+            SinkConfig::Webhook { config } => {
+                validate_webhook_sink_url(&config)?;
+                sinks.push(Box::new(WebhookSink::new(config)));
+            }
         }
     }
     Ok(EventDispatcher::with_sinks(1024, sinks))
+}
+
+fn validate_webhook_sink_url(config: &WebhookConfig) -> Result<()> {
+    agentenv_core::security::ssrf::validate_outbound(
+        &config.url,
+        agentenv_core::security::ssrf::SsrfOptions::default(),
+    )
+    .with_context(|| {
+        format!(
+            "webhook events sink failed SSRF validation for `{}`",
+            config.url
+        )
+    })?;
+    Ok(())
 }
 
 fn add_default_event_sinks(
@@ -2101,6 +2119,28 @@ drivers:
         assert!(
             error.to_string().contains("failed validation"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_sink_webhook_rejects_loopback_with_ssrf_validation() {
+        let root = make_temp_dir("events-sink-webhook-ssrf");
+        let options = agentenv_core::runtime::RuntimeOptions {
+            root,
+            log_level: agentenv_proto::LogLevel::Info,
+            non_interactive: true,
+        };
+        let sinks = vec!["webhook:https://127.0.0.1/events".to_owned()];
+
+        let error = match build_event_dispatcher(&options, None, &sinks) {
+            Ok(_) => panic!("webhook sink loopback URL must be rejected"),
+            Err(error) => error,
+        };
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("outbound URL"),
+            "unexpected error: {rendered}"
         );
     }
 

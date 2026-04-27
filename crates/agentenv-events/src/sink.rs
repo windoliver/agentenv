@@ -1,10 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use tokio::io::AsyncWriteExt;
-use url::Url;
-
 use crate::activity::ActivityEvent;
 use crate::store::{SqliteEventStore, StoreError};
+use crate::webhook::{WebhookConfig, WebhookError};
+use tokio::io::AsyncWriteExt;
 
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
@@ -18,7 +17,7 @@ pub enum SinkConfig {
     Sqlite { path: PathBuf },
     Jsonl { path: PathBuf },
     OtelGrpc { endpoint: String },
-    Webhook { url: Url },
+    Webhook { config: WebhookConfig },
 }
 
 impl SinkConfig {
@@ -47,18 +46,11 @@ impl SinkConfig {
         }
 
         if let Some(raw_url) = uri.strip_prefix("webhook:") {
-            let url = Url::parse(raw_url).map_err(|source| SinkError::InvalidWebhookUrl {
+            let config = WebhookConfig::parse(raw_url).map_err(|source| SinkError::Webhook {
                 uri: uri.to_owned(),
                 source,
             })?;
-            match url.scheme() {
-                "https" => return Ok(Self::Webhook { url }),
-                _ => {
-                    return Err(SinkError::InvalidSinkUri {
-                        uri: uri.to_owned(),
-                    })
-                }
-            }
+            return Ok(Self::Webhook { config });
         }
 
         Err(SinkError::UnsupportedSink {
@@ -73,11 +65,8 @@ pub enum SinkError {
     UnsupportedSink { uri: String },
     #[error("invalid events sink URI: {uri}")]
     InvalidSinkUri { uri: String },
-    #[error("invalid events webhook sink URL in {uri}: {source}")]
-    InvalidWebhookUrl {
-        uri: String,
-        source: url::ParseError,
-    },
+    #[error("invalid events sink URI: {uri}: {source}")]
+    Webhook { uri: String, source: WebhookError },
     #[error("events sink IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("events sink JSON error: {0}")]
@@ -90,6 +79,8 @@ pub enum SinkError {
     UnsafeJsonlPath { path: PathBuf },
     #[error("events dispatcher worker is closed")]
     DispatcherClosed,
+    #[error("events webhook sink request failed: {0}")]
+    WebhookRequest(#[from] reqwest::Error),
 }
 
 pub struct SqliteSink {
