@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod audit;
 pub mod dispatcher;
+pub mod metrics;
 pub mod redaction;
 pub mod sink;
 pub mod store;

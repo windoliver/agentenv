@@ -58,6 +58,28 @@ pub struct EventCount {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyBlockCount {
+    pub kind: String,
+    pub driver: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCount {
+    pub tool: String,
+    pub env: Option<String>,
+    pub result: ActivityResult,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLatencyRow {
+    pub op: String,
+    pub driver: Option<String>,
+    pub latency_ms: u64,
+}
+
 pub struct SqliteEventStore {
     path: PathBuf,
 }
@@ -254,6 +276,155 @@ impl SqliteEventStore {
             });
         }
         Ok(rows)
+    }
+
+    pub fn policy_blocks_by_kind_driver(&self) -> StoreResult<Vec<PolicyBlockCount>> {
+        let conn = self.connection()?;
+        let egress_denied = enum_to_db_string(ActivityKind::EgressDenied, "kind")?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                kind,
+                CASE
+                    WHEN json_type(actor_json, '$.driver') = 'text'
+                    THEN json_extract(actor_json, '$.driver')
+                END AS driver,
+                COUNT(*)
+            FROM activity_events
+            WHERE kind = ?
+            GROUP BY kind, driver
+            ORDER BY kind ASC, driver ASC
+            "#,
+        )?;
+        let raw_rows = stmt.query_map(params![egress_denied], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (kind, driver, count) = raw?;
+            rows.push(PolicyBlockCount {
+                kind,
+                driver,
+                count: count_to_u64(count)?,
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn mcp_tool_calls_by_tool_env_result(&self) -> StoreResult<Vec<McpToolCount>> {
+        let conn = self.connection()?;
+        let mcp_tool_call = enum_to_db_string(ActivityKind::McpToolCall, "kind")?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                COALESCE(
+                    CASE
+                        WHEN json_type(subject_json, '$.tool') = 'text'
+                        THEN json_extract(subject_json, '$.tool')
+                    END,
+                    'unknown'
+                ) AS tool,
+                env,
+                result,
+                COUNT(*)
+            FROM activity_events
+            WHERE kind = ?
+            GROUP BY tool, env, result
+            ORDER BY tool ASC, env ASC, result ASC
+            "#,
+        )?;
+        let raw_rows = stmt.query_map(params![mcp_tool_call], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (tool, env, result, count) = raw?;
+            rows.push(McpToolCount {
+                tool,
+                env,
+                result: enum_from_db_string(result)?,
+                count: count_to_u64(count)?,
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn sandbox_latency_rows(&self) -> StoreResult<Vec<SandboxLatencyRow>> {
+        let conn = self.connection()?;
+        let sandbox_create = enum_to_db_string(ActivityKind::SandboxCreate, "kind")?;
+        let sandbox_destroy = enum_to_db_string(ActivityKind::SandboxDestroy, "kind")?;
+        let exec = enum_to_db_string(ActivityKind::Exec, "kind")?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                kind,
+                CASE
+                    WHEN json_type(actor_json, '$.driver') = 'text'
+                    THEN json_extract(actor_json, '$.driver')
+                END AS driver,
+                latency_ms
+            FROM activity_events
+            WHERE latency_ms IS NOT NULL
+              AND kind IN (?, ?, ?)
+            ORDER BY kind ASC, driver ASC, latency_ms ASC
+            "#,
+        )?;
+        let raw_rows = stmt.query_map(params![sandbox_create, sandbox_destroy, exec], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (kind, driver, latency_ms) = raw?;
+            if let Some(op) = sandbox_op_from_kind(enum_from_db_string(kind)?) {
+                if latency_ms < 0 {
+                    return Err(StoreError::NegativeLatency(latency_ms));
+                }
+                rows.push(SandboxLatencyRow {
+                    op: op.to_owned(),
+                    driver,
+                    latency_ms: u64::try_from(latency_ms)
+                        .map_err(|_| StoreError::NegativeLatency(latency_ms))?,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn approvals_pending_count(&self) -> StoreResult<u64> {
+        let conn = self.connection()?;
+        let approval_requested = enum_to_db_string(ActivityKind::ApprovalRequested, "kind")?;
+        let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
+        let (requested, decided) = conn.query_row(
+            r#"
+            SELECT
+                SUM(CASE WHEN kind = ?1 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN kind = ?2 THEN 1 ELSE 0 END)
+            FROM activity_events
+            WHERE kind IN (?1, ?2)
+            "#,
+            params![approval_requested, approval_decided],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+
+        let requested = count_to_u64(requested.unwrap_or(0))?;
+        let decided = count_to_u64(decided.unwrap_or(0))?;
+        Ok(requested.saturating_sub(decided))
     }
 
     fn connection(&self) -> StoreResult<Connection> {
@@ -458,6 +629,19 @@ where
     T: DeserializeOwned,
 {
     Ok(serde_json::from_value(Value::String(value))?)
+}
+
+fn count_to_u64(count: i64) -> StoreResult<u64> {
+    u64::try_from(count).map_err(|_| StoreError::CountOutOfRange(count))
+}
+
+fn sandbox_op_from_kind(kind: ActivityKind) -> Option<&'static str> {
+    match kind {
+        ActivityKind::SandboxCreate => Some("create"),
+        ActivityKind::SandboxDestroy => Some("destroy"),
+        ActivityKind::Exec => Some("exec"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
