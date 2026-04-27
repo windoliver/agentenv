@@ -3,8 +3,13 @@ use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentenv_events::{
+    ActivityEvent, ActivityKind as EventActivityKind, ActivityResult as EventActivityResult,
+    EventEmitter, NoopEventEmitter,
+};
 use agentenv_proto::ShutdownParams;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -60,6 +65,7 @@ pub struct JsonRpcClient {
     state: Mutex<ClientState>,
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
+    event_emitter: Arc<dyn EventEmitter>,
     next_id: AtomicU64,
     timeout: Duration,
 }
@@ -145,6 +151,274 @@ pub struct RpcNotificationEnvelope {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+pub fn notification_to_activity_event(
+    notification: RpcNotificationEnvelope,
+    fallback_trace_id: &str,
+) -> Result<ActivityEvent, JsonRpcError> {
+    let RpcNotificationEnvelope {
+        jsonrpc,
+        method,
+        params,
+    } = notification;
+    if jsonrpc != "2.0" {
+        return Err(JsonRpcError::Protocol(format!(
+            "unsupported notification JSON-RPC version `{jsonrpc}`"
+        )));
+    }
+
+    match method.as_str() {
+        "event/log" => convert_known_notification::<agentenv_proto::EventLogParams>(
+            &method,
+            params,
+            fallback_trace_id,
+            |params| event_log_params_to_activity_event(params, fallback_trace_id),
+        ),
+        "event/activity" => {
+            convert_known_notification::<agentenv_proto::DriverActivityEventParams>(
+                &method,
+                params,
+                fallback_trace_id,
+                |params| driver_activity_params_to_activity_event(params, fallback_trace_id),
+            )
+        }
+        "event/approval_requested" => convert_known_notification::<
+            agentenv_proto::ApprovalRequestedParams,
+        >(&method, params, fallback_trace_id, |params| {
+            approval_requested_params_to_activity_event(params, fallback_trace_id)
+        }),
+        method => Err(JsonRpcError::Protocol(format!(
+            "unsupported notification method `{method}`"
+        ))),
+    }
+}
+
+fn convert_known_notification<T>(
+    method: &str,
+    params: Value,
+    fallback_trace_id: &str,
+    convert: impl FnOnce(T) -> ActivityEvent,
+) -> Result<ActivityEvent, JsonRpcError>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value::<T>(params.clone()) {
+        Ok(params) => Ok(convert(params)),
+        Err(err) => Ok(invalid_notification_event(
+            method,
+            params,
+            fallback_trace_id,
+            &err,
+        )),
+    }
+}
+
+fn event_log_params_to_activity_event(
+    params: agentenv_proto::EventLogParams,
+    fallback_trace_id: &str,
+) -> ActivityEvent {
+    let agentenv_proto::EventLogParams { level, ts, msg, kv } = params;
+    let mut event = ActivityEvent::new(
+        ts,
+        EventActivityKind::Log,
+        EventActivityResult::Ok,
+        fallback_trace_id,
+    )
+    .with_subject_value("msg", Value::String(msg.clone()))
+    .with_extra("msg", Value::String(msg))
+    .with_extra("level", Value::String(log_level_name(&level).to_owned()));
+
+    for (key, value) in kv {
+        if key == "driver" {
+            if let Some(driver) = value.as_str() {
+                event = event.with_actor_value("driver", Value::String(driver.to_owned()));
+            }
+            event = event.with_extra(key, value);
+        } else if key == "env" {
+            if let Some(env) = value.as_str() {
+                event = event.with_env(env.to_owned());
+            }
+            event = event.with_extra(key, value);
+        } else if is_log_subject_key(&key) {
+            event = event
+                .with_subject_value(key.clone(), value.clone())
+                .with_extra(key, value);
+        } else {
+            event = event.with_extra(key, value);
+        }
+    }
+
+    event
+}
+
+fn driver_activity_params_to_activity_event(
+    params: agentenv_proto::DriverActivityEventParams,
+    fallback_trace_id: &str,
+) -> ActivityEvent {
+    match params {
+        agentenv_proto::DriverActivityEventParams::Legacy(params) => {
+            ActivityEvent::from_legacy_proto(params, fallback_trace_id)
+        }
+        agentenv_proto::DriverActivityEventParams::Rich(params) => {
+            rich_activity_params_to_activity_event(params)
+        }
+    }
+}
+
+fn rich_activity_params_to_activity_event(
+    params: agentenv_proto::RichActivityEventParams,
+) -> ActivityEvent {
+    let agentenv_proto::RichActivityEventParams {
+        ts,
+        kind,
+        env,
+        actor,
+        subject,
+        result,
+        latency_ms,
+        trace_id,
+        reason_code,
+        extras,
+    } = params;
+    let mut event = ActivityEvent::new(
+        ts,
+        rich_activity_kind_to_event_kind(kind),
+        rich_activity_result_to_event_result(result),
+        trace_id,
+    );
+    event.env = env;
+    event.actor = actor;
+    event.subject = subject;
+    event.latency_ms = latency_ms;
+    event.reason_code = reason_code;
+    event.extras = extras;
+    event
+}
+
+fn approval_requested_params_to_activity_event(
+    params: agentenv_proto::ApprovalRequestedParams,
+    fallback_trace_id: &str,
+) -> ActivityEvent {
+    let mut event = ActivityEvent::new(
+        now_event_ts(),
+        EventActivityKind::ApprovalRequested,
+        EventActivityResult::PendingApproval,
+        fallback_trace_id,
+    )
+    .with_subject_value("request_id", Value::String(params.request_id))
+    .with_subject_value(
+        "kind",
+        Value::String(approval_kind_name(&params.kind).to_owned()),
+    )
+    .with_subject_value("subject", Value::String(params.subject))
+    .with_subject_value("reason", Value::String(params.reason))
+    .with_extra(
+        "context",
+        Value::Object(params.context.into_iter().collect()),
+    );
+
+    if let Some(default_ttl) = params.default_ttl {
+        event = event.with_extra("default_ttl", Value::String(default_ttl));
+    }
+
+    event
+}
+
+fn invalid_notification_event(
+    method: &str,
+    params: Value,
+    fallback_trace_id: &str,
+    error: &dyn std::fmt::Display,
+) -> ActivityEvent {
+    ActivityEvent::new(
+        notification_error_timestamp(&params),
+        EventActivityKind::Log,
+        EventActivityResult::Error,
+        fallback_trace_id,
+    )
+    .with_reason_code("invalid_driver_notification")
+    .with_subject_value("method", Value::String(method.to_owned()))
+    .with_extra("error", Value::String(error.to_string()))
+    .with_extra("params", params)
+}
+
+fn notification_error_timestamp(params: &Value) -> String {
+    params
+        .get("ts")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(now_event_ts)
+}
+
+fn log_level_name(level: &agentenv_proto::LogLevel) -> &'static str {
+    match level {
+        agentenv_proto::LogLevel::Trace => "trace",
+        agentenv_proto::LogLevel::Debug => "debug",
+        agentenv_proto::LogLevel::Info => "info",
+        agentenv_proto::LogLevel::Warn => "warn",
+        agentenv_proto::LogLevel::Error => "error",
+    }
+}
+
+fn approval_kind_name(kind: &agentenv_proto::ApprovalKind) -> &'static str {
+    match kind {
+        agentenv_proto::ApprovalKind::EgressHost => "egress_host",
+        agentenv_proto::ApprovalKind::McpTool => "mcp_tool",
+        agentenv_proto::ApprovalKind::ZoneAccess => "zone_access",
+    }
+}
+
+fn is_log_subject_key(key: &str) -> bool {
+    matches!(
+        key,
+        "handle" | "target" | "subject" | "request_id" | "tool" | "resource"
+    )
+}
+
+fn rich_activity_kind_to_event_kind(kind: agentenv_proto::RichActivityKind) -> EventActivityKind {
+    match kind {
+        agentenv_proto::RichActivityKind::SandboxCreate => EventActivityKind::SandboxCreate,
+        agentenv_proto::RichActivityKind::SandboxDestroy => EventActivityKind::SandboxDestroy,
+        agentenv_proto::RichActivityKind::Exec => EventActivityKind::Exec,
+        agentenv_proto::RichActivityKind::EgressAllowed => EventActivityKind::EgressAllowed,
+        agentenv_proto::RichActivityKind::EgressDenied => EventActivityKind::EgressDenied,
+        agentenv_proto::RichActivityKind::McpToolCall => EventActivityKind::McpToolCall,
+        agentenv_proto::RichActivityKind::PolicyApplied => EventActivityKind::PolicyApplied,
+        agentenv_proto::RichActivityKind::CredentialInjected => {
+            EventActivityKind::CredentialInjected
+        }
+        agentenv_proto::RichActivityKind::CredentialSet => EventActivityKind::CredentialSet,
+        agentenv_proto::RichActivityKind::CredentialReset => EventActivityKind::CredentialReset,
+        agentenv_proto::RichActivityKind::Auth => EventActivityKind::Auth,
+        agentenv_proto::RichActivityKind::ApprovalRequested => EventActivityKind::ApprovalRequested,
+        agentenv_proto::RichActivityKind::ApprovalDecided => EventActivityKind::ApprovalDecided,
+        agentenv_proto::RichActivityKind::SpawnRequested => EventActivityKind::SpawnRequested,
+        agentenv_proto::RichActivityKind::SpawnQueued => EventActivityKind::SpawnQueued,
+        agentenv_proto::RichActivityKind::SpawnAdmitted => EventActivityKind::SpawnAdmitted,
+        agentenv_proto::RichActivityKind::SpawnRejected => EventActivityKind::SpawnRejected,
+        agentenv_proto::RichActivityKind::SpawnStarted => EventActivityKind::SpawnStarted,
+        agentenv_proto::RichActivityKind::SpawnReady => EventActivityKind::SpawnReady,
+        agentenv_proto::RichActivityKind::Log => EventActivityKind::Log,
+    }
+}
+
+fn rich_activity_result_to_event_result(
+    result: agentenv_proto::RichActivityResult,
+) -> EventActivityResult {
+    match result {
+        agentenv_proto::RichActivityResult::Ok => EventActivityResult::Ok,
+        agentenv_proto::RichActivityResult::Error => EventActivityResult::Error,
+        agentenv_proto::RichActivityResult::Denied => EventActivityResult::Denied,
+        agentenv_proto::RichActivityResult::PendingApproval => EventActivityResult::PendingApproval,
+    }
+}
+
+fn now_event_ts() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix:{}", duration.as_secs()),
+        Err(_) => "unix:0".to_owned(),
+    }
 }
 
 pub fn write_framed_json_blocking<W, T>(writer: &mut W, message: &T) -> Result<(), JsonRpcError>
@@ -283,9 +557,25 @@ impl JsonRpcClient {
             state: Mutex::new(ClientState::Open),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
+            event_emitter: Arc::new(NoopEventEmitter),
             next_id: AtomicU64::new(1),
             timeout: config.timeout,
         })
+    }
+
+    pub fn set_event_emitter<E>(&mut self, event_emitter: E)
+    where
+        E: EventEmitter + 'static,
+    {
+        self.event_emitter = Arc::new(event_emitter);
+    }
+
+    pub fn with_event_emitter<E>(mut self, event_emitter: E) -> Self
+    where
+        E: EventEmitter + 'static,
+    {
+        self.set_event_emitter(event_emitter);
+        self
     }
 
     pub async fn call<P, R>(&self, method: &str, params: &P) -> Result<R, JsonRpcError>
@@ -354,6 +644,7 @@ impl JsonRpcClient {
         R: DeserializeOwned,
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let fallback_trace_id = format!("jsonrpc-{id}");
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -372,6 +663,9 @@ impl JsonRpcClient {
                 read_framed_json_async(&mut *stdout).await?
             };
             if raw.get("method").is_some() && raw.get("id").is_none() {
+                let notification: RpcNotificationEnvelope = serde_json::from_value(raw)?;
+                let event = notification_to_activity_event(notification, &fallback_trace_id)?;
+                self.event_emitter.emit(event.redacted());
                 continue;
             }
             let response: RpcResponseEnvelope = serde_json::from_value(raw)?;
@@ -554,8 +848,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        read_framed_json_blocking, write_framed_json_blocking, JsonRpcError, RpcResponseEnvelope,
-        DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_LINES,
+        notification_to_activity_event, read_framed_json_blocking, write_framed_json_blocking,
+        JsonRpcError, RpcNotificationEnvelope, RpcResponseEnvelope, DEFAULT_MAX_FRAME_BYTES,
+        DEFAULT_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_LINES,
     };
 
     #[test]
@@ -665,6 +960,155 @@ mod tests {
         let err = read_framed_json_blocking(&mut Cursor::new(framed.as_bytes())).unwrap_err();
 
         assert!(matches!(err, JsonRpcError::DuplicateContentLength));
+    }
+
+    #[test]
+    fn event_activity_notification_converts_to_activity_event() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/activity",
+            "params": {
+                "ts": "2026-04-26T12:00:00Z",
+                "kind": "mcp_tool_call",
+                "env": "demo",
+                "actor": {"driver": "nexus"},
+                "subject": {"tool": "search"},
+                "result": "ok",
+                "trace_id": "trace-plugin",
+                "extras": {}
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::McpToolCall);
+        assert_eq!(event.subject["tool"], json!("search"));
+    }
+
+    #[test]
+    fn malformed_notification_becomes_error_log_event() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/activity",
+            "params": {"kind": 7}
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::Log);
+        assert_eq!(event.result, agentenv_events::ActivityResult::Error);
+        assert_eq!(
+            event.reason_code.as_deref(),
+            Some("invalid_driver_notification")
+        );
+    }
+
+    #[test]
+    fn event_log_notification_preserves_log_fields_and_driver_actor() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/log",
+            "params": {
+                "level": "warn",
+                "ts": "2026-04-26T12:00:01Z",
+                "msg": "policy applied",
+                "kv": {
+                    "driver": "openshell",
+                    "handle": "sb-1",
+                    "rule_count": 42
+                }
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::Log);
+        assert_eq!(event.result, agentenv_events::ActivityResult::Ok);
+        assert_eq!(event.trace_id, "fallback-trace");
+        assert_eq!(event.actor["driver"], json!("openshell"));
+        assert_eq!(event.subject["msg"], json!("policy applied"));
+        assert_eq!(event.subject["handle"], json!("sb-1"));
+        assert_eq!(event.extras["level"], json!("warn"));
+        assert_eq!(event.extras["rule_count"], json!(42));
+    }
+
+    #[test]
+    fn legacy_event_activity_notification_uses_fallback_trace() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/activity",
+            "params": {
+                "kind": "egress_denied",
+                "subject": "api.example.test:443",
+                "reason": "not_in_policy",
+                "ts": "2026-04-26T12:00:02Z",
+                "handle": "sb-1"
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::EgressDenied);
+        assert_eq!(event.result, agentenv_events::ActivityResult::Denied);
+        assert_eq!(event.trace_id, "fallback-trace");
+        assert_eq!(event.reason_code.as_deref(), Some("not_in_policy"));
+        assert_eq!(event.subject["target"], json!("api.example.test:443"));
+        assert_eq!(event.subject["handle"], json!("sb-1"));
+    }
+
+    #[test]
+    fn approval_requested_notification_preserves_structured_fields() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/approval_requested",
+            "params": {
+                "request_id": "req-1",
+                "kind": "egress_host",
+                "subject": "api.example.test:443",
+                "reason": "agent requested network",
+                "context": {"url": "https://api.example.test/v1"},
+                "default_ttl": "session"
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::ApprovalRequested);
+        assert_eq!(
+            event.result,
+            agentenv_events::ActivityResult::PendingApproval
+        );
+        assert_eq!(event.trace_id, "fallback-trace");
+        assert_eq!(event.subject["request_id"], json!("req-1"));
+        assert_eq!(event.subject["kind"], json!("egress_host"));
+        assert_eq!(event.subject["subject"], json!("api.example.test:443"));
+        assert_eq!(event.subject["reason"], json!("agent requested network"));
+        assert_eq!(
+            event.extras["context"]["url"],
+            json!("https://api.example.test/v1")
+        );
+        assert_eq!(event.extras["default_ttl"], json!("session"));
+    }
+
+    #[test]
+    fn unknown_notification_method_returns_protocol_error() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/unknown",
+            "params": {}
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let err = notification_to_activity_event(notification, "fallback-trace").unwrap_err();
+
+        assert!(
+            matches!(err, JsonRpcError::Protocol(message) if message.contains("event/unknown"))
+        );
     }
 }
 
@@ -861,6 +1305,28 @@ mod async_client_tests {
         client.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn jsonrpc_client_emits_notification_seen_before_response() {
+        let mut client =
+            spawn_fixture_client("notification_before_preflight", Duration::from_secs(5), &[])
+                .await;
+        let emitter = agentenv_events::RecordingEventEmitter::default();
+        client.set_event_emitter(emitter.clone());
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        let recorded = emitter.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].kind, agentenv_events::ActivityKind::McpToolCall);
+        assert_eq!(recorded[0].trace_id, "trace-fixture");
+        assert_eq!(recorded[0].subject["tool"], json!("search"));
+        client.shutdown().await.unwrap();
+    }
+
     async fn spawn_fixture_client(
         mode: &str,
         timeout: Duration,
@@ -932,6 +1398,21 @@ def response(request):
     if request["method"] == "preflight":
         if MODE == "slow_preflight":
             time.sleep(1.0)
+        if MODE == "notification_before_preflight":
+            write_message({
+                "jsonrpc": "2.0",
+                "method": "event/activity",
+                "params": {
+                    "ts": "2026-04-26T12:00:03Z",
+                    "kind": "mcp_tool_call",
+                    "env": "demo",
+                    "actor": {"driver": "fixture"},
+                    "subject": {"tool": "search"},
+                    "result": "ok",
+                    "trace_id": "trace-fixture",
+                    "extras": {},
+                },
+            })
         return {
             "jsonrpc": "2.0",
             "id": request["id"],

@@ -12,6 +12,7 @@ description = "Plugin host scaffolding for agentenv"
 
 [dependencies]
 agentenv-core = { path = "../agentenv-core" }
+agentenv-events = { path = "../agentenv-events" }
 agentenv-proto = { path = "../agentenv-proto" }
 async-trait.workspace = true
 serde.workspace = true
