@@ -1026,7 +1026,17 @@ async fn create_env_with_input(
     }
     .await;
 
-    if result.is_err() {
+    if let Err(err) = &result {
+        emit_runtime_event(
+            events,
+            core_activity_event(
+                ActivityKind::SpawnRejected,
+                ActivityResult::Error,
+                &trace_id,
+                Some(name),
+            )
+            .with_reason_code(runtime_error_reason_code(err)),
+        );
         rollback.rollback().await;
     }
 
@@ -1548,7 +1558,7 @@ pub async fn exec_env_observed(
     if let Err(err) = initialize_sandbox_driver(options, set.sandbox.as_mut()).await {
         emit_runtime_event(
             events,
-            with_optional_command_subject(
+            with_command_metadata(
                 core_activity_event(
                     ActivityKind::Exec,
                     ActivityResult::Error,
@@ -1557,7 +1567,7 @@ pub async fn exec_env_observed(
                 )
                 .with_subject_value("handle", serde_json::json!(handle.clone()))
                 .with_reason_code(runtime_error_reason_code(&err)),
-                command_preview(&command),
+                &command,
             ),
         );
         return Err(err);
@@ -1581,11 +1591,11 @@ pub async fn exec_env_observed(
             } else {
                 ActivityResult::Error
             };
-            let mut event = with_optional_command_subject(
+            let mut event = with_command_metadata(
                 core_activity_event(ActivityKind::Exec, event_result, &trace_id, Some(name))
                     .with_subject_value("handle", serde_json::json!(handle))
                     .with_latency_ms(elapsed_ms(exec_start)),
-                command_preview(&command),
+                &command,
             );
             if result.status != 0 {
                 event = event.with_reason_code("command_status");
@@ -1596,7 +1606,7 @@ pub async fn exec_env_observed(
         Err(err) => {
             emit_runtime_event(
                 events,
-                with_optional_command_subject(
+                with_command_metadata(
                     core_activity_event(
                         ActivityKind::Exec,
                         ActivityResult::Error,
@@ -1606,7 +1616,7 @@ pub async fn exec_env_observed(
                     .with_subject_value("handle", serde_json::json!(handle))
                     .with_reason_code(crate::admission::ReasonCode::DriverCommandFailed.as_str())
                     .with_latency_ms(elapsed_ms(exec_start)),
-                    command_preview(&command),
+                    &command,
                 ),
             );
             Err(err.into())
@@ -1778,90 +1788,121 @@ pub async fn destroy_env_observed(
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
     let trace_id = new_trace_id();
     let mut state = describe_env(options, name)?.state;
+    let destroy_event_handle = state
+        .handles
+        .sandbox
+        .clone()
+        .or_else(|| state.handles.context.clone())
+        .or_else(|| state.handles.inference.clone());
     let selection = selection_from_state(&state);
     let mut set = factory.build(&selection)?;
     let paths =
         crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
+    let mut destroy_error_emitted = false;
 
-    if state.handles.inference.is_some() && set.inference.is_none() {
-        return Err(missing_inference_driver(&state));
-    }
-
-    if let Some(handle) = state.handles.sandbox.clone() {
-        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
-        let destroy_start = Instant::now();
-        match set
-            .sandbox
-            .destroy(agentenv_proto::DestroyParams {
-                handle: handle.clone(),
-            })
-            .await
-        {
-            Ok(_) => {
-                emit_runtime_event(
-                    events,
-                    core_activity_event(
-                        ActivityKind::SandboxDestroy,
-                        ActivityResult::Ok,
-                        &trace_id,
-                        Some(name),
-                    )
-                    .with_subject_value("handle", serde_json::json!(handle.clone()))
-                    .with_latency_ms(elapsed_ms(destroy_start)),
-                );
-            }
-            Err(err) => {
-                emit_runtime_event(
-                    events,
-                    core_activity_event(
-                        ActivityKind::SandboxDestroy,
-                        ActivityResult::Error,
-                        &trace_id,
-                        Some(name),
-                    )
-                    .with_subject_value("handle", serde_json::json!(handle))
-                    .with_reason_code(crate::admission::ReasonCode::DriverCommandFailed.as_str())
-                    .with_latency_ms(elapsed_ms(destroy_start)),
-                );
-                return Err(err.into());
-            }
-        }
-        state.handles.sandbox = None;
-        crate::env::write_state(&paths, &state)?;
-    }
-
-    if let Some(handle) = state.handles.inference.clone() {
-        let Some(inference) = set.inference.as_mut() else {
+    let result = async {
+        if state.handles.inference.is_some() && set.inference.is_none() {
             return Err(missing_inference_driver(&state));
-        };
-        initialize_inference_driver(options, inference.as_mut()).await?;
-        inference
-            .teardown(agentenv_proto::InferenceHandleRequest { handle })
-            .await?;
-        state.handles.inference = None;
-        crate::env::write_state(&paths, &state)?;
+        }
+
+        if let Some(handle) = state.handles.sandbox.clone() {
+            initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+            let destroy_start = Instant::now();
+            match set
+                .sandbox
+                .destroy(agentenv_proto::DestroyParams {
+                    handle: handle.clone(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    emit_runtime_event(
+                        events,
+                        core_activity_event(
+                            ActivityKind::SandboxDestroy,
+                            ActivityResult::Ok,
+                            &trace_id,
+                            Some(name),
+                        )
+                        .with_subject_value("handle", serde_json::json!(handle.clone()))
+                        .with_latency_ms(elapsed_ms(destroy_start)),
+                    );
+                }
+                Err(err) => {
+                    destroy_error_emitted = true;
+                    emit_runtime_event(
+                        events,
+                        core_activity_event(
+                            ActivityKind::SandboxDestroy,
+                            ActivityResult::Error,
+                            &trace_id,
+                            Some(name),
+                        )
+                        .with_subject_value("handle", serde_json::json!(handle))
+                        .with_reason_code(
+                            crate::admission::ReasonCode::DriverCommandFailed.as_str(),
+                        )
+                        .with_latency_ms(elapsed_ms(destroy_start)),
+                    );
+                    return Err(err.into());
+                }
+            }
+            state.handles.sandbox = None;
+            crate::env::write_state(&paths, &state)?;
+        }
+
+        if let Some(handle) = state.handles.inference.clone() {
+            let Some(inference) = set.inference.as_mut() else {
+                return Err(missing_inference_driver(&state));
+            };
+            initialize_inference_driver(options, inference.as_mut()).await?;
+            inference
+                .teardown(agentenv_proto::InferenceHandleRequest { handle })
+                .await?;
+            state.handles.inference = None;
+            crate::env::write_state(&paths, &state)?;
+        }
+
+        if let Some(handle) = state.handles.context.clone() {
+            initialize_context_driver(options, set.context.as_mut()).await?;
+            set.context
+                .teardown(agentenv_proto::ContextHandleRequest { handle })
+                .await?;
+            state.handles.context = None;
+            crate::env::write_state(&paths, &state)?;
+        }
+
+        fs::remove_dir_all(paths.env_dir()).map_err(|source| crate::env::EnvError::Io {
+            path: paths.env_dir(),
+            source,
+        })?;
+
+        Ok(crate::admission::AdmissionReport {
+            status: crate::admission::AdmissionStatus::Accepted,
+            reason_code: crate::admission::ReasonCode::Destroyed,
+            env: name.to_owned(),
+            checks: Vec::new(),
+        })
+    }
+    .await;
+
+    if let Err(err) = &result {
+        if !destroy_error_emitted {
+            let mut event = core_activity_event(
+                ActivityKind::SandboxDestroy,
+                ActivityResult::Error,
+                &trace_id,
+                Some(name),
+            )
+            .with_reason_code(runtime_error_reason_code(err));
+            if let Some(handle) = destroy_event_handle {
+                event = event.with_subject_value("handle", serde_json::json!(handle));
+            }
+            emit_runtime_event(events, event);
+        }
     }
 
-    if let Some(handle) = state.handles.context.clone() {
-        initialize_context_driver(options, set.context.as_mut()).await?;
-        set.context
-            .teardown(agentenv_proto::ContextHandleRequest { handle })
-            .await?;
-        state.handles.context = None;
-        crate::env::write_state(&paths, &state)?;
-    }
-
-    fs::remove_dir_all(paths.env_dir()).map_err(|source| crate::env::EnvError::Io {
-        path: paths.env_dir(),
-        source,
-    })?;
-
-    Ok(crate::admission::AdmissionReport {
-        status: crate::admission::AdmissionStatus::Accepted,
-        reason_code: crate::admission::ReasonCode::Destroyed,
-        env: name.to_owned(),
-        checks: Vec::new(),
-    })
+    result
 }
 
 fn selection_from_state(state: &crate::env::EnvStateFile) -> DriverSelection {
@@ -2368,48 +2409,10 @@ fn emit_runtime_event(events: &dyn EventEmitter, event: ActivityEvent) {
     events.emit(event.redacted());
 }
 
-fn with_optional_command_subject(event: ActivityEvent, command: Option<String>) -> ActivityEvent {
-    match command {
-        Some(command) => event.with_subject_value("command", serde_json::json!(command)),
-        None => event,
-    }
-}
-
-fn command_preview(command: &[String]) -> Option<String> {
-    if command.is_empty() {
-        return None;
-    }
-
-    let mut preview = command
-        .iter()
-        .take(2)
-        .map(|arg| {
-            if looks_sensitive_arg(arg) {
-                "[redacted]".to_owned()
-            } else {
-                arg.clone()
-            }
-        })
-        .collect::<Vec<_>>();
-    if command.len() > 2 {
-        preview.push("...".to_owned());
-    }
-    Some(preview.join(" "))
-}
-
-fn looks_sensitive_arg(arg: &str) -> bool {
-    let lowercase = arg.to_lowercase();
-    [
-        "token",
-        "secret",
-        "password",
-        "api_key",
-        "apikey",
-        "authorization",
-        "credential",
-    ]
-    .iter()
-    .any(|marker| lowercase.contains(marker))
+fn with_command_metadata(event: ActivityEvent, command: &[String]) -> ActivityEvent {
+    event
+        .with_subject_value("command_present", serde_json::json!(!command.is_empty()))
+        .with_subject_value("command_argc", serde_json::json!(command.len()))
 }
 
 fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
@@ -2809,6 +2812,19 @@ mod tests {
                 }),
                 agent: Box::new(super::tests_support::TinyAgentDriver),
                 context: Box::new(FailingTeardownContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct FailingContextProvisionFactory;
+
+    impl DriverFactory for FailingContextProvisionFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(TinySandboxDriver),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(FailingProvisionContextDriver),
                 inference: None,
             })
         }
@@ -3959,6 +3975,72 @@ mod tests {
         }
     }
 
+    struct FailingProvisionContextDriver;
+
+    #[async_trait]
+    impl ContextDriver for FailingProvisionContextDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            let mut inner = TinyContextDriver;
+            inner.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinyContextDriver.preflight(params).await
+        }
+
+        async fn provision(
+            &self,
+            _spec: agentenv_proto::ContextSpec,
+        ) -> DriverResult<agentenv_proto::ContextHandle> {
+            Err(crate::driver::DriverError::CleanupFailed {
+                message: "context provision failed".to_owned(),
+            })
+        }
+
+        async fn mcp_endpoint(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::McpEndpoint> {
+            TinyContextDriver.mcp_endpoint(params).await
+        }
+
+        async fn required_network_rules(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::RequiredNetworkRulesResult> {
+            TinyContextDriver.required_network_rules(params).await
+        }
+
+        async fn credential_requirements(
+            &self,
+            params: agentenv_proto::CredentialRequirementsParams,
+        ) -> DriverResult<agentenv_proto::CredentialRequirementsResult> {
+            TinyContextDriver.credential_requirements(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<agentenv_proto::ContextStatus> {
+            TinyContextDriver.status(params).await
+        }
+
+        async fn teardown(
+            &self,
+            params: agentenv_proto::ContextHandleRequest,
+        ) -> DriverResult<EmptyResult> {
+            TinyContextDriver.teardown(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            let mut inner = TinyContextDriver;
+            inner.shutdown(params).await
+        }
+    }
+
     struct TinyInferenceDriver;
 
     #[async_trait]
@@ -4606,6 +4688,63 @@ policy:
             .expect("spawn ready event");
         assert_eq!(ready.result, ActivityResult::Ok);
         assert_eq!(ready.subject["handle"], serde_json::json!("sb-1"));
+    }
+
+    #[tokio::test]
+    async fn create_env_observed_emits_terminal_event_after_post_start_failure() {
+        let root = unique_root("agentenv-create-observed-failure");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let events = RecordingEventEmitter::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env_observed(
+            &options,
+            &FailingContextProvisionFactory,
+            &mut credentials,
+            "demo",
+            yaml,
+            &events,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("context provision failed"));
+        let recorded = events.recorded();
+        let started_index = recorded
+            .iter()
+            .position(|event| event.kind == ActivityKind::SpawnStarted)
+            .expect("spawn started event");
+        let failure = recorded
+            .iter()
+            .enumerate()
+            .skip(started_index + 1)
+            .find(|(_, event)| {
+                event.kind == ActivityKind::SpawnRejected && event.result == ActivityResult::Error
+            })
+            .map(|(_, event)| event)
+            .expect("terminal create failure event");
+        assert_eq!(
+            failure.reason_code.as_deref(),
+            Some(crate::admission::ReasonCode::DriverCommandFailed.as_str())
+        );
     }
 
     #[tokio::test]
@@ -5938,11 +6077,12 @@ policy:
     async fn exec_env_observed_emits_exec_event() {
         let (options, factory) = command_test_runtime("exec-observed").await;
         let events = RecordingEventEmitter::default();
+        let fake_secret = "sk-test-value-that-must-not-persist";
         let result = super::exec_env_observed(
             &options,
             &factory,
             "demo",
-            vec!["echo".to_owned(), "ok".to_owned()],
+            vec!["echo".to_owned(), fake_secret.to_owned()],
             &events,
         )
         .await
@@ -5958,8 +6098,13 @@ policy:
         assert_eq!(event.env.as_deref(), Some("demo"));
         assert_eq!(event.actor["kind"], serde_json::json!("core"));
         assert_eq!(event.subject["handle"], serde_json::json!("sb-1"));
-        assert_eq!(event.subject["command"], serde_json::json!("echo ok"));
+        assert_eq!(event.subject["command_argc"], serde_json::json!(2));
+        assert!(!event.subject.contains_key("command"));
         assert!(!event.trace_id.is_empty());
+
+        let rendered = serde_json::to_string(&recorded).unwrap();
+        assert!(!rendered.contains(fake_secret));
+        assert!(!rendered.contains("echo"));
     }
 
     #[tokio::test]
@@ -6172,6 +6317,38 @@ policy:
         let state = crate::env::read_state(&paths).unwrap();
         assert!(state.handles.sandbox.is_none());
         assert_eq!(state.handles.context.as_deref(), Some("ctx-1"));
+    }
+
+    #[tokio::test]
+    async fn destroy_env_observed_emits_sandbox_destroy_error_for_sidecar_failure() {
+        let (options, _) = command_test_runtime("destroy-observed-sidecar-failure").await;
+        let sandbox_destroyed = Arc::new(AtomicBool::new(false));
+        let factory = FailingContextTeardownFactory {
+            sandbox_destroyed: Arc::clone(&sandbox_destroyed),
+        };
+        let events = RecordingEventEmitter::default();
+
+        let err = super::destroy_env_observed(&options, &factory, "demo", &events)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("context teardown failed"));
+        assert!(sandbox_destroyed.load(Ordering::SeqCst));
+
+        let recorded = events.recorded();
+        assert!(recorded.iter().any(|event| {
+            event.kind == ActivityKind::SandboxDestroy && event.result == ActivityResult::Ok
+        }));
+        let failure = recorded
+            .iter()
+            .find(|event| {
+                event.kind == ActivityKind::SandboxDestroy && event.result == ActivityResult::Error
+            })
+            .expect("sandbox destroy terminal failure event");
+        assert_eq!(
+            failure.reason_code.as_deref(),
+            Some(crate::admission::ReasonCode::DriverCommandFailed.as_str())
+        );
     }
 
     #[tokio::test]
