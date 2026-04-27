@@ -16,7 +16,7 @@ use agentenv_events::{
     audit::{AuditPolicy, AuditSigningKey, AuditStore},
     metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric},
     sink::{JsonlSink, SqliteSink},
-    store::{EventQuery, SqliteEventStore},
+    store::{EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
     SinkConfig, SinkError,
 };
@@ -595,16 +595,22 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
 
 fn run_stats(args: StatsArgs) -> Result<()> {
     let options = runtime_options(true)?;
-    let env = args.env.context("stats requires --env <name>")?;
-    agentenv_core::runtime::describe_env(&options, &env)?;
-    let db_path = env_events_db_path(&options, &env)?;
+    if let Some(env) = args.env.as_deref() {
+        agentenv_core::runtime::describe_env(&options, env)?;
+    }
+    let db_path = activity_reader_db_path(&options, args.env.as_deref())?;
     let store = SqliteEventStore::open(&db_path)
         .with_context(|| format!("open activity database `{}`", db_path.display()))?;
 
-    println!("activity summary for {env}");
+    let scope = args.env.as_deref().unwrap_or("global");
+    println!("activity summary for {scope}");
     println!("kind/result counts:");
     for row in store.counts_by_kind_result()? {
-        if row.env.as_deref() == Some(env.as_str()) {
+        if args
+            .env
+            .as_deref()
+            .is_none_or(|env| row.env.as_deref() == Some(env))
+        {
             println!(
                 "  {} {} {}",
                 activity_kind_label(row.kind),
@@ -651,10 +657,8 @@ fn run_audit(args: AuditArgs) -> Result<()> {
             format,
             env,
         } => {
-            let env = env.context("audit export requires --env <name>")?;
-            agentenv_core::runtime::describe_env(&options, &env)?;
-            let store = AuditStore::open(env_events_db_path(&options, &env)?)
-                .with_context(|| format!("open audit database for environment `{env}`"))?;
+            let store = AuditStore::open(audit_reader_db_path(&options, env.as_deref())?)
+                .with_context(|| audit_store_context(env.as_deref()))?;
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             match format {
@@ -668,10 +672,8 @@ fn run_audit(args: AuditArgs) -> Result<()> {
             Ok(())
         }
         AuditCommand::Verify { env } => {
-            let env = env.context("audit verify requires --env <name>")?;
-            agentenv_core::runtime::describe_env(&options, &env)?;
-            let store = AuditStore::open(env_events_db_path(&options, &env)?)
-                .with_context(|| format!("open audit database for environment `{env}`"))?;
+            let store = AuditStore::open(audit_reader_db_path(&options, env.as_deref())?)
+                .with_context(|| audit_store_context(env.as_deref()))?;
             let report = store.verify()?;
             if report.valid {
                 println!("valid: {} entries checked", report.checked_entries);
@@ -887,16 +889,31 @@ async fn print_activity_logs(
     agentenv_core::runtime::describe_env(options, name)?;
     let kind = parse_activity_kind_opt(kind_filter)?;
     let db_path = env_events_db_path(options, name)?;
-    if !db_path.is_file() {
-        print_legacy_activity_logs(options, name, kind, json, follow)?;
-        return Ok(());
+    if db_path.is_file() {
+        let rows = query_sqlite_activity_logs(&db_path, name, kind, None)?;
+        if !rows.is_empty() {
+            let after_id = print_activity_rows(rows, json, None)?;
+            if follow {
+                return follow_sqlite_activity_logs(&db_path, name, kind, json, after_id).await;
+            }
+            return Ok(());
+        }
     }
 
-    if follow {
-        follow_sqlite_activity_logs(&db_path, name, kind, json).await
-    } else {
-        print_sqlite_activity_logs(&db_path, name, kind, json, None).map(|_| ())
+    let global_db_path = global_events_db_path(options);
+    if global_db_path.is_file() {
+        let rows = query_sqlite_activity_logs(&global_db_path, name, kind, None)?;
+        if !rows.is_empty() {
+            let after_id = print_activity_rows(rows, json, None)?;
+            if follow {
+                return follow_sqlite_activity_logs(&global_db_path, name, kind, json, after_id)
+                    .await;
+            }
+            return Ok(());
+        }
     }
+
+    print_legacy_activity_logs(options, name, kind, json, follow)
 }
 
 async fn follow_sqlite_activity_logs(
@@ -904,8 +921,8 @@ async fn follow_sqlite_activity_logs(
     env: &str,
     kind: Option<ActivityKind>,
     json: bool,
+    mut after_id: Option<i64>,
 ) -> Result<()> {
-    let mut after_id = None;
     loop {
         after_id = print_sqlite_activity_logs(db_path, env, kind, json, after_id)?;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -919,6 +936,16 @@ fn print_sqlite_activity_logs(
     json: bool,
     after_id: Option<i64>,
 ) -> Result<Option<i64>> {
+    let rows = query_sqlite_activity_logs(db_path, env, kind, after_id)?;
+    print_activity_rows(rows, json, after_id)
+}
+
+fn query_sqlite_activity_logs(
+    db_path: &Path,
+    env: &str,
+    kind: Option<ActivityKind>,
+    after_id: Option<i64>,
+) -> Result<Vec<StoredEvent>> {
     let store = SqliteEventStore::open(db_path.to_path_buf())
         .with_context(|| format!("open activity database `{}`", db_path.display()))?;
     let mut rows = store
@@ -931,6 +958,14 @@ fn print_sqlite_activity_logs(
         })
         .with_context(|| format!("query activity database `{}`", db_path.display()))?;
     rows.sort_by_key(|row| row.id);
+    Ok(rows)
+}
+
+fn print_activity_rows(
+    rows: Vec<StoredEvent>,
+    json: bool,
+    after_id: Option<i64>,
+) -> Result<Option<i64>> {
     let last_id = rows.last().map(|row| row.id).or(after_id);
     for row in rows {
         print_activity_event(&row.event, json)?;
@@ -1287,6 +1322,33 @@ fn emit_credential_event(
 
 fn global_events_db_path(options: &agentenv_core::runtime::RuntimeOptions) -> PathBuf {
     options.root.join("events.db")
+}
+
+fn activity_reader_db_path(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: Option<&str>,
+) -> Result<PathBuf> {
+    match env {
+        Some(env) => env_events_db_path(options, env),
+        None => Ok(global_events_db_path(options)),
+    }
+}
+
+fn audit_reader_db_path(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(env) = env {
+        agentenv_core::runtime::describe_env(options, env)?;
+    }
+    activity_reader_db_path(options, env)
+}
+
+fn audit_store_context(env: Option<&str>) -> String {
+    match env {
+        Some(env) => format!("open audit database for environment `{env}`"),
+        None => "open global audit database".to_owned(),
+    }
 }
 
 fn audit_signing_key_path(options: &agentenv_core::runtime::RuntimeOptions) -> PathBuf {
