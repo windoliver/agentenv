@@ -7,6 +7,8 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const MAX_LIST_RECENT_LIMIT: usize = 1_000;
+
 #[derive(Debug, Error)]
 pub enum EventStoreError {
     #[error("failed to create event store directory `{path}`: {source}")]
@@ -31,6 +33,8 @@ pub enum EventStoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to decode event kind `{value}`")]
+    KindDecode { value: String },
 }
 
 pub type EventStoreResult<T> = Result<T, EventStoreError>;
@@ -58,15 +62,21 @@ impl StoredEventKind {
         }
     }
 
-    fn from_str(value: &str) -> Self {
-        match value {
+    fn from_str(value: &str) -> EventStoreResult<Self> {
+        let kind = match value {
             "egress_denied" => Self::EgressDenied,
             "approval_requested" => Self::ApprovalRequested,
             "approval_allowed" => Self::ApprovalAllowed,
             "approval_denied" => Self::ApprovalDenied,
             "log" => Self::Log,
-            _ => Self::Runtime,
-        }
+            "runtime" => Self::Runtime,
+            _ => {
+                return Err(EventStoreError::KindDecode {
+                    value: value.to_owned(),
+                });
+            }
+        };
+        Ok(kind)
     }
 }
 
@@ -204,6 +214,7 @@ impl LocalEventStore {
              FROM events ORDER BY ts DESC, id DESC LIMIT ?1";
         let sql_env = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
              FROM events WHERE env = ?1 ORDER BY ts DESC, id DESC LIMIT ?2";
+        let limit = bounded_list_recent_limit(limit);
 
         if let Some(env) = env {
             let mut stmt =
@@ -213,12 +224,12 @@ impl LocalEventStore {
                         path: self.path.clone(),
                         source,
                     })?;
-            let rows = stmt.query(params![env, limit as i64]).map_err(|source| {
-                EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
+            let rows =
+                stmt.query(params![env, limit])
+                    .map_err(|source| EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             collect_events(rows, &self.path)
         } else {
             let mut stmt =
@@ -228,12 +239,12 @@ impl LocalEventStore {
                         path: self.path.clone(),
                         source,
                     })?;
-            let rows =
-                stmt.query(params![limit as i64])
-                    .map_err(|source| EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = stmt
+                .query(params![limit])
+                .map_err(|source| EventStoreError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
             collect_events(rows, &self.path)
         }
     }
@@ -265,6 +276,10 @@ fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult
     Ok(events)
 }
 
+fn bounded_list_recent_limit(limit: usize) -> i64 {
+    limit.min(MAX_LIST_RECENT_LIMIT) as i64
+}
+
 fn row_to_event(row: &rusqlite::Row<'_>, path: &Path) -> EventStoreResult<StoredEvent> {
     let metadata_json: String = row.get(8).map_err(|source| EventStoreError::Sqlite {
         path: path.to_path_buf(),
@@ -272,10 +287,11 @@ fn row_to_event(row: &rusqlite::Row<'_>, path: &Path) -> EventStoreResult<Stored
     })?;
     let metadata = serde_json::from_str(&metadata_json)
         .map_err(|source| EventStoreError::MetadataDecode { source })?;
-    let kind: String = row.get(3).map_err(|source| EventStoreError::Sqlite {
+    let kind_value: String = row.get(3).map_err(|source| EventStoreError::Sqlite {
         path: path.to_path_buf(),
         source,
     })?;
+    let kind = StoredEventKind::from_str(&kind_value)?;
     Ok(StoredEvent {
         id: row.get(0).map_err(|source| EventStoreError::Sqlite {
             path: path.to_path_buf(),
@@ -289,7 +305,7 @@ fn row_to_event(row: &rusqlite::Row<'_>, path: &Path) -> EventStoreResult<Stored
             path: path.to_path_buf(),
             source,
         })?,
-        kind: StoredEventKind::from_str(&kind),
+        kind,
         subject: row.get(4).map_err(|source| EventStoreError::Sqlite {
             path: path.to_path_buf(),
             source,
@@ -373,5 +389,54 @@ mod tests {
             result,
             Err(EventStoreError::MetadataDecode { .. })
         ));
+    }
+
+    #[test]
+    fn list_recent_huge_limit_is_bounded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        for index in 0..1_001 {
+            store
+                .append(&StoredEvent::new(
+                    "dev",
+                    format!("2026-04-27T12:{:02}:00Z", index % 60),
+                    StoredEventKind::Log,
+                    format!("event-{index}"),
+                ))
+                .expect("append event");
+        }
+
+        let events = store
+            .list_recent(None, usize::MAX)
+            .expect("list recent events");
+
+        assert_eq!(events.len(), 1_000);
+    }
+
+    #[test]
+    fn list_recent_errors_on_unknown_event_kind() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let id = store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00Z",
+                StoredEventKind::Log,
+                "event",
+            ))
+            .expect("append event");
+
+        store
+            .conn
+            .execute(
+                "UPDATE events SET kind = ?1 WHERE id = ?2",
+                rusqlite::params!["surprise", id],
+            )
+            .expect("corrupt kind");
+
+        let result = store.list_recent(None, 10);
+
+        assert!(matches!(result, Err(EventStoreError::KindDecode { .. })));
     }
 }
