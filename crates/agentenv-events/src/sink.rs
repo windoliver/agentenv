@@ -35,14 +35,7 @@ impl SinkConfig {
         }
 
         if let Some(endpoint) = uri.strip_prefix("otel:") {
-            if endpoint.starts_with("grpc://") && endpoint.len() > "grpc://".len() {
-                return Ok(Self::OtelGrpc {
-                    endpoint: endpoint.to_owned(),
-                });
-            }
-            return Err(SinkError::InvalidSinkUri {
-                uri: uri.to_owned(),
-            });
+            return parse_otel_grpc_sink(uri, endpoint);
         }
 
         if let Some(raw_url) = uri.strip_prefix("webhook:") {
@@ -63,6 +56,8 @@ impl SinkConfig {
 pub enum SinkError {
     #[error("unsupported events sink: {uri}")]
     UnsupportedSink { uri: String },
+    #[error("events sink requires feature `{feature}`")]
+    UnsupportedFeature { feature: &'static str },
     #[error("invalid events sink URI: {uri}")]
     InvalidSinkUri { uri: String },
     #[error("invalid events sink URI: {uri}: {source}")]
@@ -81,6 +76,9 @@ pub enum SinkError {
     DispatcherClosed,
     #[error("events webhook sink request failed: {0}")]
     WebhookRequest(#[from] reqwest::Error),
+    #[cfg(feature = "otel")]
+    #[error("events OTEL sink configuration failed: {0}")]
+    OtelExporter(#[from] opentelemetry_otlp::ExporterBuildError),
 }
 
 pub struct SqliteSink {
@@ -177,6 +175,27 @@ fn parse_sink_path(uri: &str, path: &str) -> Result<PathBuf, SinkError> {
     Ok(PathBuf::from(path))
 }
 
+fn parse_otel_grpc_sink(uri: &str, endpoint: &str) -> Result<SinkConfig, SinkError> {
+    if !endpoint.starts_with("grpc://") || endpoint.len() == "grpc://".len() {
+        return Err(SinkError::InvalidSinkUri {
+            uri: uri.to_owned(),
+        });
+    }
+
+    #[cfg(feature = "otel")]
+    {
+        Ok(SinkConfig::OtelGrpc {
+            endpoint: endpoint.to_owned(),
+        })
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = endpoint;
+        Err(SinkError::UnsupportedFeature { feature: "otel" })
+    }
+}
+
 #[cfg(unix)]
 fn prepare_jsonl_file(path: &Path) -> Result<(), SinkError> {
     use std::fs::OpenOptions;
@@ -237,9 +256,15 @@ mod tests {
             SinkConfig::parse("file:/tmp/events.jsonl").unwrap(),
             SinkConfig::Jsonl { .. }
         ));
+        #[cfg(feature = "otel")]
         assert!(matches!(
             SinkConfig::parse("otel:grpc://collector:4317").unwrap(),
             SinkConfig::OtelGrpc { .. }
+        ));
+        #[cfg(not(feature = "otel"))]
+        assert!(matches!(
+            SinkConfig::parse("otel:grpc://collector:4317").unwrap_err(),
+            SinkError::UnsupportedFeature { feature: "otel" }
         ));
         assert!(matches!(
             SinkConfig::parse("webhook:https://example.test/events?kinds=egress_denied").unwrap(),

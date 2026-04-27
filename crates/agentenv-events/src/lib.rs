@@ -4,6 +4,8 @@ pub mod activity;
 pub mod audit;
 pub mod dispatcher;
 pub mod metrics;
+#[cfg(feature = "otel")]
+pub mod otel;
 pub mod redaction;
 pub mod sink;
 pub mod store;
@@ -11,5 +13,7 @@ pub mod webhook;
 
 pub use activity::{ActivityEvent, ActivityKind, ActivityResult, ActorKind};
 pub use dispatcher::{EventDispatcher, EventEmitter, NoopEventEmitter, RecordingEventEmitter};
+#[cfg(feature = "otel")]
+pub use otel::OtelSink;
 pub use sink::{EventSink, SinkConfig, SinkError};
 pub use webhook::{WebhookConfig, WebhookSink};
