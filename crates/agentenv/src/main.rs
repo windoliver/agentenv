@@ -431,11 +431,20 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
             }
             Err(error) if args.json => {
                 flush_dispatcher_best_effort(&dispatcher).await;
+                if let Err(audit_error) = emitter.check_audit() {
+                    exit_json_error(
+                        ReasonCode::DriverCommandFailed,
+                        audit_error_after_original(audit_error, &error),
+                    );
+                }
                 render::print_error_json(&error);
                 exit_process(render::exit_for_error(&error).code());
             }
             Err(error) => {
                 flush_dispatcher_best_effort(&dispatcher).await;
+                if let Err(audit_error) = emitter.check_audit() {
+                    return Err(audit_error_after_original(audit_error, &error));
+                }
                 Err(error.into())
             }
         }
@@ -515,6 +524,9 @@ async fn run_destroy(args: DestroyArgs, event_sink_args: &[String]) -> Result<()
         }
         Err(error) => {
             flush_dispatcher_best_effort(&dispatcher).await;
+            if let Err(audit_error) = emitter.check_audit() {
+                return Err(audit_error_after_original(audit_error, &error));
+            }
             return Err(error.into());
         }
     };
@@ -831,6 +843,9 @@ async fn run_exec(args: ExecArgs, event_sink_args: &[String]) -> Result<()> {
         }
         Err(error) => {
             flush_dispatcher_best_effort(&dispatcher).await;
+            if let Err(audit_error) = emitter.check_audit() {
+                return Err(audit_error_after_original(audit_error, &error));
+            }
             return Err(error.into());
         }
     };
@@ -844,6 +859,17 @@ async fn run_exec(args: ExecArgs, event_sink_args: &[String]) -> Result<()> {
 fn exit_json_error(reason_code: ReasonCode, error: impl std::fmt::Display) -> ! {
     render::print_error_body_json(reason_code, error.to_string());
     exit_process(render::exit_for_reason(reason_code).code());
+}
+
+fn audit_error_after_original(
+    audit_error: anyhow::Error,
+    original_error: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "failed to write audit event after original command error `{}`: {:#}",
+        original_error,
+        audit_error
+    )
 }
 
 fn exit_if_rejected(report: &AdmissionReport) {

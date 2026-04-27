@@ -1013,6 +1013,39 @@ fn credential_reset_writes_global_audit_entry_before_success() {
 }
 
 #[test]
+fn create_json_existing_env_reports_audit_write_failure() {
+    let temp_dir = make_temp_dir("create-json-audit-failure");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    let key_path = temp_dir.join(".agentenv").join("audit-signing-key");
+    fs::write(&key_path, b"short").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .arg("--blueprint")
+        .arg(env_dir.join("blueprint.yaml"))
+        .arg("--json")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("audit"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("original command error"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("already exists"), "stderr was: {stderr}");
+}
+
+#[test]
 fn logs_env_json_reads_global_activity_store_when_env_store_absent() {
     let temp_dir = make_temp_dir("logs-global-fallback");
     write_minimal_env_state(&temp_dir, "demo");
