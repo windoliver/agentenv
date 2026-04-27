@@ -204,7 +204,6 @@ impl LocalEventStore {
              FROM events ORDER BY ts DESC, id DESC LIMIT ?1";
         let sql_env = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
              FROM events WHERE env = ?1 ORDER BY ts DESC, id DESC LIMIT ?2";
-        let mut events = Vec::new();
 
         if let Some(env) = env {
             let mut stmt =
@@ -214,18 +213,13 @@ impl LocalEventStore {
                         path: self.path.clone(),
                         source,
                     })?;
-            let rows = stmt
-                .query_map(params![env, limit as i64], row_to_event)
-                .map_err(|source| EventStoreError::Sqlite {
+            let rows = stmt.query(params![env, limit as i64]).map_err(|source| {
+                EventStoreError::Sqlite {
                     path: self.path.clone(),
                     source,
-                })?;
-            for row in rows {
-                events.push(row.map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?);
-            }
+                }
+            })?;
+            collect_events(rows, &self.path)
         } else {
             let mut stmt =
                 self.conn
@@ -234,28 +228,21 @@ impl LocalEventStore {
                         path: self.path.clone(),
                         source,
                     })?;
-            let rows = stmt
-                .query_map(params![limit as i64], row_to_event)
-                .map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            for row in rows {
-                events.push(row.map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?);
-            }
+            let rows =
+                stmt.query(params![limit as i64])
+                    .map_err(|source| EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            collect_events(rows, &self.path)
         }
-
-        Ok(events)
     }
 
     pub fn events_per_minute(&self) -> EventStoreResult<u64> {
         let count: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM events WHERE ts >= datetime('now', '-60 seconds')",
+                "SELECT COUNT(*) FROM events WHERE unixepoch(ts) >= unixepoch('now') - 60",
                 [],
                 |row| row.get(0),
             )
@@ -267,20 +254,124 @@ impl LocalEventStore {
     }
 }
 
-fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
-    let metadata_json: String = row.get(8)?;
+fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult<Vec<StoredEvent>> {
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().map_err(|source| EventStoreError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })? {
+        events.push(row_to_event(row, path)?);
+    }
+    Ok(events)
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>, path: &Path) -> EventStoreResult<StoredEvent> {
+    let metadata_json: String = row.get(8).map_err(|source| EventStoreError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let metadata = serde_json::from_str(&metadata_json)
-        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-    let kind: String = row.get(3)?;
+        .map_err(|source| EventStoreError::MetadataDecode { source })?;
+    let kind: String = row.get(3).map_err(|source| EventStoreError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(StoredEvent {
-        id: row.get(0)?,
-        env: row.get(1)?,
-        ts: row.get(2)?,
+        id: row.get(0).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        env: row.get(1).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        ts: row.get(2).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
         kind: StoredEventKind::from_str(&kind),
-        subject: row.get(4)?,
-        reason: row.get(5)?,
-        driver: row.get(6)?,
-        handle: row.get(7)?,
+        subject: row.get(4).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        reason: row.get(5).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        driver: row.get(6).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        handle: row.get(7).map_err(|source| EventStoreError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })?,
         metadata,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+
+    use super::{EventStoreError, LocalEventStore, StoredEvent, StoredEventKind};
+
+    #[test]
+    fn events_per_minute_excludes_old_rfc3339_same_day_event() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let now = OffsetDateTime::now_utc();
+        let old_ts = (now - Duration::minutes(2))
+            .format(&Rfc3339)
+            .expect("format old timestamp");
+        let current_ts = now.format(&Rfc3339).expect("format current timestamp");
+
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                old_ts,
+                StoredEventKind::Log,
+                "old event",
+            ))
+            .expect("append old event");
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                current_ts,
+                StoredEventKind::Log,
+                "current event",
+            ))
+            .expect("append current event");
+
+        assert_eq!(store.events_per_minute().expect("count events"), 1);
+    }
+
+    #[test]
+    fn list_recent_errors_on_corrupt_metadata_json() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let id = store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00Z",
+                StoredEventKind::Log,
+                "event",
+            ))
+            .expect("append event");
+
+        store
+            .conn
+            .execute(
+                "UPDATE events SET metadata_json = ?1 WHERE id = ?2",
+                rusqlite::params!["{", id],
+            )
+            .expect("corrupt metadata");
+
+        let result = store.list_recent(None, 10);
+
+        assert!(matches!(
+            result,
+            Err(EventStoreError::MetadataDecode { .. })
+        ));
+    }
 }
