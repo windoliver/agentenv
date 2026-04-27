@@ -776,6 +776,64 @@ fn stats_env_prints_activity_summary() {
 }
 
 #[test]
+fn env_scoped_stats_reads_global_activity_when_per_env_store_exists() {
+    let temp_dir = make_temp_dir("stats-env-global-plus-per-env");
+    write_minimal_env_state(&temp_dir, "demo");
+    seed_global_activity_db(
+        &temp_dir,
+        &[
+            activity_event(
+                "2026-04-21T00:00:00Z",
+                ActivityKind::SandboxCreate,
+                ActivityResult::Ok,
+                "trace-global-create",
+            )
+            .with_actor_value("driver", serde_json::json!("openshell"))
+            .with_latency_ms(10),
+            activity_event(
+                "2026-04-21T00:00:02Z",
+                ActivityKind::SandboxDestroy,
+                ActivityResult::Ok,
+                "trace-other-destroy",
+            )
+            .with_env("other")
+            .with_actor_value("driver", serde_json::json!("openshell"))
+            .with_latency_ms(30),
+        ],
+    );
+    seed_activity_db(
+        &temp_dir,
+        "demo",
+        &[activity_event(
+            "2026-04-21T00:00:01Z",
+            ActivityKind::Exec,
+            ActivityResult::Ok,
+            "trace-per-env-exec",
+        )
+        .with_actor_value("driver", serde_json::json!("openshell"))
+        .with_latency_ms(20)],
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("stats")
+        .arg("--env")
+        .arg("demo")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("sandbox_create"), "stdout was: {stdout}");
+    assert!(!stdout.contains("sandbox_destroy"), "stdout was: {stdout}");
+    assert!(stdout.contains("latency: count=1"), "stdout was: {stdout}");
+}
+
+#[test]
 fn stats_without_env_reads_global_activity_summary() {
     let temp_dir = make_temp_dir("stats-global-summary");
     seed_global_activity_db(
@@ -854,6 +912,42 @@ fn env_scoped_audit_export_reads_global_audit_entries() {
     );
     assert!(
         !stdout.contains("trace-other-credential"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn env_scoped_audit_verify_reports_zero_for_missing_env_entries() {
+    let temp_dir = make_temp_dir("audit-env-verify-zero");
+    seed_global_audit_db(
+        &temp_dir,
+        &[activity_event(
+            "2026-04-21T00:00:00Z",
+            ActivityKind::CredentialInjected,
+            ActivityResult::Ok,
+            "trace-other-credential",
+        )
+        .with_env("other")
+        .with_subject_value("name", serde_json::json!("OTHER_API_KEY"))],
+    );
+
+    let verify = Command::new(agentenv_bin())
+        .arg("audit")
+        .arg("verify")
+        .arg("--env")
+        .arg("demo")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        verify.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&verify.stdout);
+    assert!(
+        stdout.contains("valid: 0 entries checked"),
         "stdout was: {stdout}"
     );
 }

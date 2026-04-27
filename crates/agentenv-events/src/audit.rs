@@ -227,16 +227,23 @@ impl AuditStore {
 
     pub fn has_entries_for_env(&self, env: &str) -> AuditResult<bool> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT 1
-            FROM audit_entries
-            WHERE env = ?1
-            LIMIT 1
-            "#,
-        )?;
-        let mut rows = stmt.query(params![env])?;
-        Ok(rows.next()?.is_some())
+        for row in load_audit_rows(&conn)? {
+            if audit_row_event_env(&row)?.as_deref() == Some(env) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn count_entries_for_env(&self, env: &str) -> AuditResult<usize> {
+        let conn = self.connection()?;
+        let mut count = 0usize;
+        for row in load_audit_rows(&conn)? {
+            if audit_row_event_env(&row)?.as_deref() == Some(env) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn verify_rows_with_public_key_hex(
@@ -314,14 +321,15 @@ impl AuditStore {
     ) -> AuditResult<()> {
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
-            if !audit_row_matches(&row, from, to, env) {
+            let event: Value = serde_json::from_str(&row.event_json)?;
+            let event_env = event_env_from_value(&event);
+            if !audit_row_matches(&row, event_env, from, to, env) {
                 continue;
             }
-            let event: Value = serde_json::from_str(&row.event_json)?;
             let entry = JsonlAuditEntry {
                 sequence: row.sequence,
                 ts: row.ts,
-                env: row.env,
+                env: event_env.map(ToOwned::to_owned),
                 event,
                 prev_hash: row.prev_hash,
                 entry_hash: row.entry_hash,
@@ -360,16 +368,16 @@ impl AuditStore {
 
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
-            if !audit_row_matches(&row, from, to, env) {
+            let event: ActivityEvent = serde_json::from_str(&row.event_json)?;
+            if !audit_row_matches(&row, event.env.as_deref(), from, to, env) {
                 continue;
             }
-            let event: ActivityEvent = serde_json::from_str(&row.event_json)?;
             write_csv_row(
                 &mut writer,
                 &[
                     row.sequence.to_string(),
                     row.ts,
-                    row.env.unwrap_or_default(),
+                    event.env.unwrap_or_default(),
                     enum_as_string(event.kind)?,
                     enum_as_string(event.result)?,
                     event.trace_id,
@@ -425,27 +433,69 @@ impl AuditStore {
 
 fn audit_row_matches(
     row: &RawAuditRow,
+    event_env: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
     env: Option<&str>,
 ) -> bool {
-    if env.is_some_and(|env| row.env.as_deref() != Some(env)) {
+    if env.is_some_and(|env| event_env != Some(env)) {
         return false;
     }
-    if from.is_some_and(|from| row.ts.as_str() < from) {
-        return false;
+    if let Some(from) = from {
+        let from = normalized_audit_from_bound(from);
+        if row.ts.as_str() < from.as_str() {
+            return false;
+        }
     }
-    if to.is_some_and(|to| row.ts.as_str() > to) {
-        return false;
+    if let Some(to) = to {
+        let to = normalized_audit_to_bound(to);
+        if row.ts.as_str() > to.as_str() {
+            return false;
+        }
     }
     true
+}
+
+fn audit_row_event_env(row: &RawAuditRow) -> AuditResult<Option<String>> {
+    let event: ActivityEvent = serde_json::from_str(&row.event_json)?;
+    Ok(event.env)
+}
+
+fn event_env_from_value(value: &Value) -> Option<&str> {
+    value.get("env").and_then(Value::as_str)
+}
+
+fn normalized_audit_from_bound(bound: &str) -> String {
+    if is_date_only_bound(bound) {
+        format!("{bound}T00:00:00Z")
+    } else {
+        bound.to_owned()
+    }
+}
+
+fn normalized_audit_to_bound(bound: &str) -> String {
+    if is_date_only_bound(bound) {
+        format!("{bound}T23:59:59.999999999Z")
+    } else {
+        bound.to_owned()
+    }
+}
+
+fn is_date_only_bound(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
 }
 
 #[derive(Debug)]
 struct RawAuditRow {
     sequence: i64,
     ts: String,
-    env: Option<String>,
     event_json: String,
     prev_hash: String,
     entry_hash: String,
@@ -499,7 +549,7 @@ fn metadata_public_key_hex(conn: &Connection) -> AuditResult<Option<String>> {
 fn load_audit_rows(conn: &Connection) -> AuditResult<Vec<RawAuditRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT sequence, ts, env, event_json, prev_hash, entry_hash, signature, public_key
+        SELECT sequence, ts, event_json, prev_hash, entry_hash, signature, public_key
         FROM audit_entries
         ORDER BY sequence ASC
         "#,
@@ -508,12 +558,11 @@ fn load_audit_rows(conn: &Connection) -> AuditResult<Vec<RawAuditRow>> {
         Ok(RawAuditRow {
             sequence: row.get(0)?,
             ts: row.get(1)?,
-            env: row.get(2)?,
-            event_json: row.get(3)?,
-            prev_hash: row.get(4)?,
-            entry_hash: row.get(5)?,
-            signature: row.get(6)?,
-            public_key: row.get(7)?,
+            event_json: row.get(2)?,
+            prev_hash: row.get(3)?,
+            entry_hash: row.get(4)?,
+            signature: row.get(5)?,
+            public_key: row.get(6)?,
         })
     })?;
 
@@ -875,6 +924,47 @@ mod tests {
     }
 
     #[test]
+    fn audit_env_scope_uses_signed_event_env_not_row_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("events.db");
+        let store = AuditStore::open(&db_path).unwrap();
+        let key = AuditSigningKey::load_or_create(temp.path().join("audit.key")).unwrap();
+        store
+            .append(
+                &key,
+                &event(ActivityKind::CredentialInjected, ActivityResult::Ok),
+            )
+            .unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE audit_entries SET env = ?1 WHERE sequence = 1",
+            params!["other"],
+        )
+        .unwrap();
+
+        assert!(store.verify().unwrap().valid);
+        assert!(store.has_entries_for_env("demo").unwrap());
+
+        let mut demo_export = Vec::new();
+        store
+            .export_jsonl_range_for_env(&mut demo_export, None, None, Some("demo"))
+            .unwrap();
+        let demo_export = String::from_utf8(demo_export).unwrap();
+        assert!(demo_export.contains("trace-audit"), "{demo_export}");
+        assert!(demo_export.contains("\"env\":\"demo\""), "{demo_export}");
+
+        let mut other_export = Vec::new();
+        store
+            .export_jsonl_range_for_env(&mut other_export, None, None, Some("other"))
+            .unwrap();
+        assert!(
+            String::from_utf8(other_export).unwrap().is_empty(),
+            "tampered row env must not move a signed event to another env"
+        );
+    }
+
+    #[test]
     fn audit_verify_detects_signature_tampering() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("events.db");
@@ -1031,6 +1121,46 @@ mod tests {
             .starts_with("sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,signature,public_key,event_json\n"));
         assert!(csv.contains("egress_denied"));
         assert!(csv.contains("event_json"));
+    }
+
+    #[test]
+    fn audit_export_to_date_includes_that_full_day() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AuditStore::open(temp.path().join("events.db")).unwrap();
+        let key = AuditSigningKey::load_or_create(temp.path().join("audit.key")).unwrap();
+        store
+            .append(
+                &key,
+                &ActivityEvent::new(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::CredentialSet,
+                    ActivityResult::Ok,
+                    "trace-april-26",
+                )
+                .with_env("demo"),
+            )
+            .unwrap();
+        store
+            .append(
+                &key,
+                &ActivityEvent::new(
+                    "2026-04-27T00:00:00Z",
+                    ActivityKind::CredentialSet,
+                    ActivityResult::Ok,
+                    "trace-april-27",
+                )
+                .with_env("demo"),
+            )
+            .unwrap();
+
+        let mut exported = Vec::new();
+        store
+            .export_jsonl_range(&mut exported, None, Some("2026-04-26"))
+            .unwrap();
+        let exported = String::from_utf8(exported).unwrap();
+
+        assert!(exported.contains("trace-april-26"), "{exported}");
+        assert!(!exported.contains("trace-april-27"), "{exported}");
     }
 
     #[cfg(unix)]

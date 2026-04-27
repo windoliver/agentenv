@@ -250,6 +250,23 @@ impl SqliteEventStore {
         Ok(rows)
     }
 
+    pub fn has_entries_for_env(&self, env: &str) -> StoreResult<bool> {
+        let conn = self.connection()?;
+        let found = conn.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM activity_events
+                WHERE env = ?1
+                LIMIT 1
+            )
+            "#,
+            params![env],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(found != 0)
+    }
+
     pub fn counts_by_kind_result(&self) -> StoreResult<Vec<EventCount>> {
         let conn = self.connection()?;
         let mut stmt = conn.prepare(
@@ -283,9 +300,16 @@ impl SqliteEventStore {
     }
 
     pub fn policy_blocks_by_kind_driver(&self) -> StoreResult<Vec<PolicyBlockCount>> {
+        self.policy_blocks_by_kind_driver_for_env(None)
+    }
+
+    pub fn policy_blocks_by_kind_driver_for_env(
+        &self,
+        env: Option<&str>,
+    ) -> StoreResult<Vec<PolicyBlockCount>> {
         let conn = self.connection()?;
         let egress_denied = enum_to_db_string(ActivityKind::EgressDenied, "kind")?;
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             r#"
             SELECT
                 kind,
@@ -296,11 +320,21 @@ impl SqliteEventStore {
                 COUNT(*)
             FROM activity_events
             WHERE kind = ?
+            "#,
+        );
+        let mut query_params = vec![SqlValue::Text(egress_denied)];
+        if let Some(env) = env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
             GROUP BY kind, driver
             ORDER BY kind ASC, driver ASC
             "#,
-        )?;
-        let raw_rows = stmt.query_map(params![egress_denied], |row| {
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let raw_rows = stmt.query_map(params_from_iter(query_params), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -365,11 +399,18 @@ impl SqliteEventStore {
     }
 
     pub fn sandbox_latency_rows(&self) -> StoreResult<Vec<SandboxLatencyRow>> {
+        self.sandbox_latency_rows_for_env(None)
+    }
+
+    pub fn sandbox_latency_rows_for_env(
+        &self,
+        env: Option<&str>,
+    ) -> StoreResult<Vec<SandboxLatencyRow>> {
         let conn = self.connection()?;
         let sandbox_create = enum_to_db_string(ActivityKind::SandboxCreate, "kind")?;
         let sandbox_destroy = enum_to_db_string(ActivityKind::SandboxDestroy, "kind")?;
         let exec = enum_to_db_string(ActivityKind::Exec, "kind")?;
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             r#"
             SELECT
                 kind,
@@ -381,10 +422,24 @@ impl SqliteEventStore {
             FROM activity_events
             WHERE latency_ms IS NOT NULL
               AND kind IN (?, ?, ?)
+            "#,
+        );
+        let mut query_params = vec![
+            SqlValue::Text(sandbox_create),
+            SqlValue::Text(sandbox_destroy),
+            SqlValue::Text(exec),
+        ];
+        if let Some(env) = env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
             ORDER BY kind ASC, driver ASC, latency_ms ASC
             "#,
-        )?;
-        let raw_rows = stmt.query_map(params![sandbox_create, sandbox_destroy, exec], |row| {
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let raw_rows = stmt.query_map(params_from_iter(query_params), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -411,10 +466,14 @@ impl SqliteEventStore {
     }
 
     pub fn approvals_pending_count(&self) -> StoreResult<u64> {
+        self.approvals_pending_count_for_env(None)
+    }
+
+    pub fn approvals_pending_count_for_env(&self, env: Option<&str>) -> StoreResult<u64> {
         let conn = self.connection()?;
         let approval_requested = enum_to_db_string(ActivityKind::ApprovalRequested, "kind")?;
         let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
-        let pending = conn.query_row(
+        let mut sql = String::from(
             r#"
             SELECT COUNT(DISTINCT requested.request_id)
             FROM (
@@ -424,20 +483,39 @@ impl SqliteEventStore {
                         THEN json_extract(subject_json, '$.request_id')
                     END AS request_id
                 FROM activity_events
-                WHERE kind = ?1
+                WHERE kind = ?
+            "#,
+        );
+        let mut query_params = vec![SqlValue::Text(approval_requested)];
+        if let Some(env) = env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
             ) AS requested
             WHERE requested.request_id IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1
                 FROM activity_events AS decided
-                WHERE decided.kind = ?2
+                WHERE decided.kind = ?
                   AND json_type(decided.subject_json, '$.request_id') = 'text'
                   AND json_extract(decided.subject_json, '$.request_id') = requested.request_id
+            "#,
+        );
+        query_params.push(SqlValue::Text(approval_decided));
+        if let Some(env) = env {
+            sql.push_str(" AND decided.env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
               )
             "#,
-            params![approval_requested, approval_decided],
-            |row| row.get::<_, i64>(0),
-        )?;
+        );
+        let pending = conn.query_row(&sql, params_from_iter(query_params), |row| {
+            row.get::<_, i64>(0)
+        })?;
 
         count_to_u64(pending)
     }
@@ -970,6 +1048,94 @@ mod tests {
                 && count.env.as_deref() == Some("other")
                 && count.result == ActivityResult::Ok
                 && count.count == 1));
+    }
+
+    #[test]
+    fn sqlite_store_filters_stats_aggregates_by_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                )
+                .with_actor_value("driver", serde_json::json!("openshell")),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_actor_value("driver", serde_json::json!("openshell"))
+                .with_latency_ms(10),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::ApprovalRequested,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("request-demo")),
+                event(
+                    "2026-04-26T12:00:03Z",
+                    ActivityKind::EgressDenied,
+                    "other",
+                    ActivityResult::Denied,
+                )
+                .with_actor_value("driver", serde_json::json!("other-driver")),
+                event(
+                    "2026-04-26T12:00:04Z",
+                    ActivityKind::Exec,
+                    "other",
+                    ActivityResult::Ok,
+                )
+                .with_actor_value("driver", serde_json::json!("other-driver"))
+                .with_latency_ms(30),
+                event(
+                    "2026-04-26T12:00:05Z",
+                    ActivityKind::ApprovalRequested,
+                    "other",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("request-other")),
+                event(
+                    "2026-04-26T12:00:06Z",
+                    ActivityKind::ApprovalDecided,
+                    "other",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("request-other")),
+            ])
+            .unwrap();
+
+        assert!(store.has_entries_for_env("demo").unwrap());
+        assert!(!store.has_entries_for_env("missing").unwrap());
+
+        let blocks = store
+            .policy_blocks_by_kind_driver_for_env(Some("demo"))
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].driver.as_deref(), Some("openshell"));
+        assert_eq!(blocks[0].count, 1);
+
+        let latency = store.sandbox_latency_rows_for_env(Some("demo")).unwrap();
+        assert_eq!(latency.len(), 1);
+        assert_eq!(latency[0].op, "create");
+        assert_eq!(latency[0].latency_ms, 10);
+
+        assert_eq!(
+            store.approvals_pending_count_for_env(Some("demo")).unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .approvals_pending_count_for_env(Some("other"))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

@@ -618,22 +618,19 @@ async fn run_logs(args: LogsArgs) -> Result<()> {
 
 fn run_stats(args: StatsArgs) -> Result<()> {
     let options = runtime_options(true)?;
-    if let Some(env) = args.env.as_deref() {
-        agentenv_core::runtime::describe_env(&options, env)?;
+    let env_filter = args.env.as_deref();
+    if let Some(env) = env_filter {
+        agentenv_core::env::validate_env_name(env)?;
     }
-    let db_path = activity_reader_db_path(&options, args.env.as_deref())?;
+    let db_path = activity_stats_reader_db_path(&options, env_filter)?;
     let store = SqliteEventStore::open(&db_path)
         .with_context(|| format!("open activity database `{}`", db_path.display()))?;
 
-    let scope = args.env.as_deref().unwrap_or("global");
+    let scope = env_filter.unwrap_or("global");
     println!("activity summary for {scope}");
     println!("kind/result counts:");
     for row in store.counts_by_kind_result()? {
-        if args
-            .env
-            .as_deref()
-            .is_none_or(|env| row.env.as_deref() == Some(env))
-        {
+        if env_filter.is_none_or(|env| row.env.as_deref() == Some(env)) {
             println!(
                 "  {} {} {}",
                 activity_kind_label(row.kind),
@@ -644,7 +641,7 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
 
     println!("policy blocks:");
-    for row in store.policy_blocks_by_kind_driver()? {
+    for row in store.policy_blocks_by_kind_driver_for_env(env_filter)? {
         println!(
             "  {} {} {}",
             row.kind,
@@ -653,8 +650,11 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         );
     }
 
-    println!("pending approvals: {}", store.approvals_pending_count()?);
-    let latency_rows = store.sandbox_latency_rows()?;
+    println!(
+        "pending approvals: {}",
+        store.approvals_pending_count_for_env(env_filter)?
+    );
+    let latency_rows = store.sandbox_latency_rows_for_env(env_filter)?;
     if latency_rows.is_empty() {
         println!("latency: none");
     } else {
@@ -703,9 +703,20 @@ fn run_audit(args: AuditArgs) -> Result<()> {
         AuditCommand::Verify { env } => {
             let store = AuditStore::open(audit_reader_db_path(&options, env.as_deref())?)
                 .with_context(|| audit_store_context(env.as_deref()))?;
+            let scoped_count = env
+                .as_deref()
+                .map(|env| store.count_entries_for_env(env))
+                .transpose()?;
+            if scoped_count == Some(0) {
+                println!("valid: 0 entries checked");
+                return Ok(());
+            }
             let report = store.verify()?;
             if report.valid {
-                println!("valid: {} entries checked", report.checked_entries);
+                println!(
+                    "valid: {} entries checked",
+                    scoped_count.unwrap_or(report.checked_entries)
+                );
                 Ok(())
             } else {
                 println!(
@@ -1510,6 +1521,29 @@ fn activity_reader_db_path(
         Some(env) => env_events_db_path(options, env),
         None => Ok(global_events_db_path(options)),
     }
+}
+
+fn activity_stats_reader_db_path(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(env) = env {
+        agentenv_core::env::validate_env_name(env)?;
+        let global_path = global_events_db_path(options);
+        if global_path.is_file() {
+            let global_store = SqliteEventStore::open(&global_path)
+                .with_context(|| format!("open activity database `{}`", global_path.display()))?;
+            if global_store.has_entries_for_env(env)? {
+                return Ok(global_path);
+            }
+        }
+        let env_path = env_events_db_path(options, env)?;
+        if env_path.is_file() {
+            return Ok(env_path);
+        }
+        return Ok(global_path);
+    }
+    activity_reader_db_path(options, env)
 }
 
 fn audit_reader_db_path(
