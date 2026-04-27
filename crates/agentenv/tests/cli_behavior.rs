@@ -968,6 +968,51 @@ fn credential_set_explicit_file_sink_still_writes_default_sqlite_and_audit() {
 }
 
 #[test]
+fn credential_reset_writes_global_audit_entry_before_success() {
+    let temp_dir = make_temp_dir("credential-reset-audit");
+    let credential_name = format!("AGENTENV_RESET_AUDIT_TOKEN_{}", unique_suffix());
+    fs::create_dir_all(temp_dir.join(".agentenv")).unwrap();
+    fs::write(
+        temp_dir.join(".agentenv").join("credentials.json"),
+        serde_json::json!({
+            "values": {
+                credential_name.clone(): "sk-reset-secret-do-not-leak"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("credentials")
+        .arg("reset")
+        .arg(&credential_name)
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut audit_jsonl = Vec::new();
+    AuditStore::open(temp_dir.join(".agentenv").join("events.db"))
+        .unwrap()
+        .export_jsonl(&mut audit_jsonl)
+        .unwrap();
+    let audit_jsonl = String::from_utf8(audit_jsonl).unwrap();
+    assert!(audit_jsonl.contains("credential_reset"), "{audit_jsonl}");
+    assert!(audit_jsonl.contains(&credential_name), "{audit_jsonl}");
+    assert!(
+        !audit_jsonl.contains("sk-reset-secret-do-not-leak"),
+        "audit log leaked credential value: {audit_jsonl}"
+    );
+}
+
+#[test]
 fn logs_env_json_reads_global_activity_store_when_env_store_absent() {
     let temp_dir = make_temp_dir("logs-global-fallback");
     write_minimal_env_state(&temp_dir, "demo");
