@@ -369,9 +369,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
-    use crate::metrics::{
-        render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric, LATENCY_BUCKET_LABELS,
-    };
+    use crate::metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, LATENCY_BUCKET_LABELS};
     use crate::store::SqliteEventStore;
 
     fn event(ts: &str, kind: ActivityKind, result: ActivityResult) -> ActivityEvent {
@@ -380,25 +378,35 @@ mod tests {
 
     #[test]
     fn prometheus_render_includes_required_series() {
-        let snapshot = MetricsSnapshot {
-            envs_by_status: vec![EnvMetricRow {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    ActivityResult::Ok,
+                )
+                .with_env("demo")
+                .with_actor_value("driver", serde_json::json!("openshell"))
+                .with_latency_ms(5),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressDenied,
+                    ActivityResult::Denied,
+                )
+                .with_env("demo")
+                .with_actor_value("driver", serde_json::json!("openshell")),
+            ])
+            .unwrap();
+        let snapshot = MetricsSnapshot::from_store(
+            &store,
+            &[EnvMetricRow {
                 status: "running".to_owned(),
                 count: 1,
             }],
-            events_total: Vec::new(),
-            policy_blocks_total: Vec::new(),
-            mcp_tool_calls_total: Vec::new(),
-            sandbox_latency: Vec::new(),
-            approvals_pending_total: 1,
-            event_drops_total: vec![SinkCounterMetric {
-                sink: "sqlite".to_owned(),
-                count: 0,
-            }],
-            event_sink_errors_total: vec![SinkCounterMetric {
-                sink: "webhook".to_owned(),
-                count: 0,
-            }],
-        };
+        )
+        .unwrap();
 
         let rendered = render_prometheus(&snapshot);
 
@@ -416,7 +424,13 @@ mod tests {
             assert!(rendered.contains(&format!("# TYPE {series}")));
         }
         assert!(rendered.contains("agentenv_envs_total{status=\"running\"} 1"));
-        assert!(rendered.contains("agentenv_approvals_pending_total 1"));
+        assert!(rendered.contains(
+            "agentenv_events_total{kind=\"sandbox_create\",env=\"demo\",result=\"ok\"} 1"
+        ));
+        assert!(rendered.contains(
+            "agentenv_policy_blocks_total{kind=\"egress_denied\",driver=\"openshell\"} 1"
+        ));
+        assert!(rendered.contains("agentenv_sandbox_latency_seconds_bucket"));
     }
 
     #[test]
