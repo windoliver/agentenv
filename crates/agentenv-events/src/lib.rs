@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod activity;
+pub mod audit;
 pub mod dispatcher;
 pub mod redaction;
 pub mod sink;
