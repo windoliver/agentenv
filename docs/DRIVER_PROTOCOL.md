@@ -34,7 +34,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "name": "nexus",
   "kind": "context",
   "version": "0.1.0",
@@ -218,10 +218,13 @@ Push-only messages (no `id`). Drivers use these for events, logs, and approval r
 
 ### `event/activity`
 
-Structured activity events for the audit log and TUI.
+Structured activity events for the activity log, audit log, metrics, and TUI.
+Schema `1.1` accepts both the legacy flat params shape and the rich params
+shape. The legacy `ActivityEventParams` shape remains valid for compatibility:
 
 ```json
 {
+  "jsonrpc": "2.0",
   "method": "event/activity",
   "params": {
     "kind": "egress_denied",
@@ -229,6 +232,28 @@ Structured activity events for the audit log and TUI.
     "reason": "not in policy",
     "ts": "2026-04-16T14:22:00Z",
     "handle": "sb-01HXY"
+  }
+}
+```
+
+Rich `DriverActivityEventParams` include typed kind/result fields plus structured
+actor, subject, and extras maps:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "event/activity",
+  "params": {
+    "ts": "2026-04-16T14:22:00Z",
+    "kind": "sandbox_create",
+    "env": "myapp",
+    "actor": {"driver": "openshell"},
+    "subject": {"handle": "sb-01HXY"},
+    "result": "ok",
+    "latency_ms": 42,
+    "trace_id": "trace-01HXY",
+    "reason_code": "created",
+    "extras": {"phase": "create"}
   }
 }
 ```
@@ -292,7 +317,8 @@ Errors include `data` with machine-readable context when relevant (e.g., which c
 - **Driver version** is the driver's own versioning; independent of schema version.
 - **Core version** is agentenv's version.
 - Core refuses to run a driver whose `schema_version` major doesn't match its own.
-- This `1.0` schema breaks the old flat `NetworkPolicy` / `NetworkRule` wire shape. Drivers must now speak the four-domain policy object with `network`, `filesystem`, `process`, and `inference`, and `approval_required` replaces the old `approval` field.
+- The `1.0` schema broke the old flat `NetworkPolicy` / `NetworkRule` wire shape. Drivers must speak the four-domain policy object with `network`, `filesystem`, `process`, and `inference`, and `approval_required` replaces the old `approval` field.
+- The `1.1` schema adds rich driver activity notifications. Drivers may continue sending the legacy `event/activity` shape while adopting structured `actor`, `subject`, `result`, `trace_id`, and `extras` fields.
 
 ## Built-in drivers
 

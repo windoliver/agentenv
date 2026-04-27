@@ -1,9 +1,11 @@
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, fmt::Formatter};
 
 use agentenv_core::driver::{ensure_protocol_compatible, ContextDriver, DriverError, DriverResult};
 use agentenv_core::driver_catalog::DiscoveredDriver;
 use agentenv_core::registry::DriverKind as CatalogKind;
+use agentenv_events::{EventEmitter, NoopEventEmitter};
 use agentenv_proto::{
     Capabilities, ContextHandle, ContextHandleRequest, ContextSpec, ContextStatus,
     CredentialRequirementsParams, CredentialRequirementsResult, EmptyResult, InitializeParams,
@@ -18,6 +20,7 @@ pub struct SubprocessContextDriver {
     name: String,
     entry: DiscoveredDriver,
     timeout: Duration,
+    event_emitter: Arc<dyn EventEmitter>,
     client: Option<JsonRpcClient>,
 }
 
@@ -56,8 +59,14 @@ impl SubprocessContextDriver {
             name: entry.name.clone(),
             entry,
             timeout,
+            event_emitter: Arc::new(NoopEventEmitter),
             client: None,
         })
+    }
+
+    pub fn with_event_emitter(mut self, event_emitter: Arc<dyn EventEmitter>) -> Self {
+        self.event_emitter = event_emitter;
+        self
     }
 
     async fn spawn_client(&self) -> DriverResult<JsonRpcClient> {
@@ -69,7 +78,7 @@ impl SubprocessContextDriver {
                 driver: self.name.clone(),
                 message: "discovered subprocess context driver is missing binary".to_owned(),
             })?;
-        let client = JsonRpcClient::spawn(JsonRpcClientConfig {
+        let mut client = JsonRpcClient::spawn(JsonRpcClientConfig {
             binary,
             args: self.entry.args.clone(),
             env: self.entry.env.clone(),
@@ -77,6 +86,7 @@ impl SubprocessContextDriver {
         })
         .await
         .map_err(|err| map_jsonrpc_error(&self.name, err))?;
+        client.set_event_emitter_arc(Arc::clone(&self.event_emitter));
 
         Ok(client)
     }
