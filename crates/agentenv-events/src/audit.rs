@@ -31,6 +31,10 @@ pub enum AuditError {
     Signature(#[from] ed25519_dalek::SignatureError),
     #[error("audit signing key must contain exactly 32 raw bytes")]
     InvalidSigningKeyLength,
+    #[error("audit signing key path or permissions are unsafe: {path}")]
+    UnsafeSigningKey { path: PathBuf },
+    #[error("audit signing key does not match store public key metadata")]
+    PublicKeyMismatch,
     #[error("audit database path is unsafe: {path}")]
     UnsafeDatabasePath { path: PathBuf },
 }
@@ -113,7 +117,7 @@ impl AuditSigningKey {
         })
     }
 
-    fn public_key_hex(&self) -> String {
+    pub fn public_key_hex(&self) -> String {
         hex::encode(self.signing_key.verifying_key().to_bytes())
     }
 
@@ -139,14 +143,21 @@ impl AuditStore {
         let prev_hash = latest_entry_hash(&tx)?.unwrap_or_else(|| ZERO_HASH.to_owned());
         let event_json = serde_json::to_string(event)?;
         let public_key = key.public_key_hex();
-
-        tx.execute(
-            r#"
-            INSERT OR REPLACE INTO audit_metadata(key, value)
-            VALUES (?1, ?2), ('signature_algorithm', 'ed25519'), ('hash_algorithm', 'sha256')
-            "#,
-            params![PUBLIC_KEY_METADATA_KEY, public_key],
-        )?;
+        match metadata_public_key_hex(&tx)? {
+            Some(stored_public_key) if stored_public_key != public_key => {
+                return Err(AuditError::PublicKeyMismatch);
+            }
+            Some(_) => {}
+            None => {
+                tx.execute(
+                    r#"
+                    INSERT OR REPLACE INTO audit_metadata(key, value)
+                    VALUES (?1, ?2), ('signature_algorithm', 'ed25519'), ('hash_algorithm', 'sha256')
+                    "#,
+                    params![PUBLIC_KEY_METADATA_KEY, &public_key],
+                )?;
+            }
+        }
 
         tx.execute(
             r#"
@@ -190,12 +201,54 @@ impl AuditStore {
     pub fn verify(&self) -> AuditResult<AuditVerifyReport> {
         let conn = self.connection()?;
         let rows = load_audit_rows(&conn)?;
+        if rows.is_empty() {
+            return Ok(valid_report(0));
+        }
+
+        let Some(public_key_hex) = metadata_public_key_hex(&conn)? else {
+            return Ok(invalid_report(1, rows[0].sequence));
+        };
+        self.verify_rows_with_public_key_hex(rows, &public_key_hex)
+    }
+
+    pub fn verify_with_public_key_hex(
+        &self,
+        public_key_hex: &str,
+    ) -> AuditResult<AuditVerifyReport> {
+        let conn = self.connection()?;
+        let rows = load_audit_rows(&conn)?;
+        self.verify_rows_with_public_key_hex(rows, public_key_hex)
+    }
+
+    pub fn public_key_hex(&self) -> AuditResult<Option<String>> {
+        let conn = self.connection()?;
+        metadata_public_key_hex(&conn)
+    }
+
+    fn verify_rows_with_public_key_hex(
+        &self,
+        rows: Vec<RawAuditRow>,
+        public_key_hex: &str,
+    ) -> AuditResult<AuditVerifyReport> {
+        let trusted_public_key = match verifying_key_from_hex(public_key_hex) {
+            Ok(public_key) => public_key,
+            Err(_) => {
+                return Ok(rows
+                    .first()
+                    .map(|row| invalid_report(1, row.sequence))
+                    .unwrap_or_else(|| valid_report(0)));
+            }
+        };
+        let trusted_public_key_hex = hex::encode(trusted_public_key.to_bytes());
         let mut checked_entries = 0usize;
         let mut expected_prev_hash = ZERO_HASH.to_owned();
 
         for (expected_sequence, row) in (1i64..).zip(rows) {
             checked_entries += 1;
             if row.sequence != expected_sequence || row.prev_hash != expected_prev_hash {
+                return Ok(invalid_report(checked_entries, row.sequence));
+            }
+            if row.public_key != trusted_public_key_hex {
                 return Ok(invalid_report(checked_entries, row.sequence));
             }
 
@@ -211,26 +264,18 @@ impl AuditStore {
                 return Ok(invalid_report(checked_entries, row.sequence));
             }
 
-            let public_key = match verifying_key_from_hex(&row.public_key) {
-                Ok(public_key) => public_key,
-                Err(_) => return Ok(invalid_report(checked_entries, row.sequence)),
-            };
             let signature = match signature_from_hex(&row.signature) {
                 Ok(signature) => signature,
                 Err(_) => return Ok(invalid_report(checked_entries, row.sequence)),
             };
-            if public_key.verify(&entry_hash, &signature).is_err() {
+            if trusted_public_key.verify(&entry_hash, &signature).is_err() {
                 return Ok(invalid_report(checked_entries, row.sequence));
             }
 
             expected_prev_hash = row.entry_hash;
         }
 
-        Ok(AuditVerifyReport {
-            valid: true,
-            checked_entries,
-            first_invalid_sequence: None,
-        })
+        Ok(valid_report(checked_entries))
     }
 
     pub fn export_jsonl(&self, mut writer: impl Write) -> AuditResult<()> {
@@ -254,8 +299,9 @@ impl AuditStore {
     }
 
     pub fn export_csv(&self, mut writer: impl Write) -> AuditResult<()> {
-        writer
-            .write_all(b"sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,event_json\n")?;
+        writer.write_all(
+            b"sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,signature,public_key,event_json\n",
+        )?;
 
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
@@ -271,6 +317,8 @@ impl AuditStore {
                     event.trace_id,
                     row.prev_hash,
                     row.entry_hash,
+                    row.signature,
+                    row.public_key,
                     row.event_json,
                 ],
             )?;
@@ -357,6 +405,21 @@ fn latest_entry_hash(conn: &Connection) -> AuditResult<Option<String>> {
     })
 }
 
+fn metadata_public_key_hex(conn: &Connection) -> AuditResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT value
+        FROM audit_metadata
+        WHERE key = ?1
+        "#,
+    )?;
+    let mut rows = stmt.query(params![PUBLIC_KEY_METADATA_KEY])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
 fn load_audit_rows(conn: &Connection) -> AuditResult<Vec<RawAuditRow>> {
     let mut stmt = conn.prepare(
         r#"
@@ -411,6 +474,14 @@ fn invalid_report(checked_entries: usize, sequence: i64) -> AuditVerifyReport {
         valid: false,
         checked_entries,
         first_invalid_sequence: Some(sequence),
+    }
+}
+
+fn valid_report(checked_entries: usize) -> AuditVerifyReport {
+    AuditVerifyReport {
+        valid: true,
+        checked_entries,
+        first_invalid_sequence: None,
     }
 }
 
@@ -484,14 +555,16 @@ fn harden_existing_key_file(path: &Path) -> AuditResult<()> {
 
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
-        return Err(AuditError::UnsafeDatabasePath {
+        return Err(AuditError::UnsafeSigningKey {
             path: path.to_owned(),
         });
     }
 
     let mode = metadata.permissions().mode() & 0o777;
     if mode != 0o600 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        return Err(AuditError::UnsafeSigningKey {
+            path: path.to_owned(),
+        });
     }
     Ok(())
 }
@@ -590,7 +663,9 @@ mod tests {
 
     use rusqlite::{params, Connection};
 
-    use super::{AuditPolicy, AuditSigningKey, AuditStore};
+    use super::{
+        canonical_entry_json, sha256_bytes, AuditError, AuditPolicy, AuditSigningKey, AuditStore,
+    };
     use crate::{ActivityEvent, ActivityKind, ActivityResult};
 
     fn event(kind: ActivityKind, result: ActivityResult) -> ActivityEvent {
@@ -749,6 +824,85 @@ mod tests {
     }
 
     #[test]
+    fn audit_verify_with_trusted_key_rejects_row_key_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("events.db");
+        let store = AuditStore::open(&db_path).unwrap();
+        let original_key = AuditSigningKey::load_or_create(temp.path().join("audit.key")).unwrap();
+        store
+            .append(
+                &original_key,
+                &event(ActivityKind::EgressDenied, ActivityResult::Denied),
+            )
+            .unwrap();
+
+        let attacker_key =
+            AuditSigningKey::load_or_create(temp.path().join("attacker.key")).unwrap();
+        let attacker_event = event(ActivityKind::Auth, ActivityResult::Ok);
+        let attacker_event_json = serde_json::to_string(&attacker_event).unwrap();
+        let canonical = canonical_entry_json(
+            1,
+            &attacker_event.ts,
+            &"0".repeat(64),
+            serde_json::to_value(&attacker_event).unwrap(),
+        )
+        .unwrap();
+        let entry_hash = sha256_bytes(&canonical);
+        let signature = attacker_key.sign_hash(&entry_hash);
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            UPDATE audit_entries
+            SET event_json = ?1, entry_hash = ?2, signature = ?3, public_key = ?4
+            WHERE sequence = 1
+            "#,
+            params![
+                attacker_event_json,
+                hex::encode(entry_hash),
+                hex::encode(signature.to_bytes()),
+                attacker_key.public_key_hex(),
+            ],
+        )
+        .unwrap();
+
+        let report = store
+            .verify_with_public_key_hex(&original_key.public_key_hex())
+            .unwrap();
+        assert!(!report.valid);
+        assert_eq!(report.checked_entries, 1);
+        assert_eq!(report.first_invalid_sequence, Some(1));
+    }
+
+    #[test]
+    fn audit_verify_rejects_row_public_key_mismatch_with_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("events.db");
+        let store = AuditStore::open(&db_path).unwrap();
+        let original_key = AuditSigningKey::load_or_create(temp.path().join("audit.key")).unwrap();
+        let attacker_key =
+            AuditSigningKey::load_or_create(temp.path().join("attacker.key")).unwrap();
+        store
+            .append(
+                &original_key,
+                &event(ActivityKind::EgressDenied, ActivityResult::Denied),
+            )
+            .unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE audit_entries SET public_key = ?1 WHERE sequence = 1",
+            params![attacker_key.public_key_hex()],
+        )
+        .unwrap();
+
+        let report = store.verify().unwrap();
+        assert!(!report.valid);
+        assert_eq!(report.checked_entries, 1);
+        assert_eq!(report.first_invalid_sequence, Some(1));
+    }
+
+    #[test]
     fn audit_verify_reports_malformed_signature_as_invalid_entry() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("events.db");
@@ -798,7 +952,7 @@ mod tests {
         store.export_csv(&mut csv).unwrap();
         let csv = String::from_utf8(csv.into_inner()).unwrap();
         assert!(csv
-            .starts_with("sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,event_json\n"));
+            .starts_with("sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,signature,public_key,event_json\n"));
         assert!(csv.contains("egress_denied"));
         assert!(csv.contains("event_json"));
     }
@@ -814,5 +968,25 @@ mod tests {
 
         let mode = std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_signing_key_rejects_existing_permissive_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("audit.key");
+        std::fs::write(&key_path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match AuditSigningKey::load_or_create(&key_path) {
+            Err(AuditError::UnsafeSigningKey { path }) => assert_eq!(path, key_path),
+            Err(error) => panic!("unexpected error: {error}"),
+            Ok(_) => panic!("permissive signing key file was accepted"),
+        }
+
+        let mode = std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
     }
 }
