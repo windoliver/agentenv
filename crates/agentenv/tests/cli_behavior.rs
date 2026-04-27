@@ -655,6 +655,93 @@ fn logs_env_kind_json_reads_sqlite_activity_store() {
 }
 
 #[test]
+fn env_scoped_logs_merge_global_and_per_env_activity() {
+    let temp_dir = make_temp_dir("logs-env-global-plus-per-env");
+    write_minimal_env_state(&temp_dir, "demo");
+    seed_global_activity_db(
+        &temp_dir,
+        &[activity_event(
+            "2026-04-21T00:00:00Z",
+            ActivityKind::SandboxCreate,
+            ActivityResult::Ok,
+            "trace-global-create",
+        )],
+    );
+    seed_activity_db(
+        &temp_dir,
+        "demo",
+        &[activity_event(
+            "2026-04-21T00:00:01Z",
+            ActivityKind::Exec,
+            ActivityResult::Ok,
+            "trace-per-env-exec",
+        )],
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("logs")
+        .arg("--env")
+        .arg("demo")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("trace-global-create"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("trace-per-env-exec"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn env_scoped_logs_parse_legacy_jsonl_fallback() {
+    let temp_dir = make_temp_dir("logs-env-legacy-jsonl");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    fs::write(
+        env_dir.join("events.jsonl"),
+        "{\"ts\":\"2026-04-21T00:00:00Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"legacy context event\"}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("logs")
+        .arg("--env")
+        .arg("demo")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(lines[0]["kind"], "log");
+    assert_eq!(lines[0]["extras"]["msg"], "legacy context event");
+}
+
+#[test]
 fn stats_env_prints_activity_summary() {
     let temp_dir = make_temp_dir("stats-env-summary");
     write_minimal_env_state(&temp_dir, "demo");
@@ -717,6 +804,58 @@ fn stats_without_env_reads_global_activity_summary() {
     assert!(stdout.contains("global"), "stdout was: {stdout}");
     assert!(stdout.contains("egress_denied"), "stdout was: {stdout}");
     assert!(stdout.contains("denied"), "stdout was: {stdout}");
+}
+
+#[test]
+fn env_scoped_audit_export_reads_global_audit_entries() {
+    let temp_dir = make_temp_dir("audit-env-global-export");
+    write_minimal_env_state(&temp_dir, "demo");
+    seed_global_audit_db(
+        &temp_dir,
+        &[
+            activity_event(
+                "2026-04-21T00:00:00Z",
+                ActivityKind::CredentialInjected,
+                ActivityResult::Ok,
+                "trace-demo-credential",
+            )
+            .with_subject_value("name", serde_json::json!("OPENAI_API_KEY")),
+            activity_event(
+                "2026-04-21T00:00:01Z",
+                ActivityKind::CredentialInjected,
+                ActivityResult::Ok,
+                "trace-other-credential",
+            )
+            .with_env("other")
+            .with_subject_value("name", serde_json::json!("OTHER_API_KEY")),
+        ],
+    );
+
+    let export = Command::new(agentenv_bin())
+        .arg("audit")
+        .arg("export")
+        .arg("--env")
+        .arg("demo")
+        .arg("--format")
+        .arg("jsonl")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        export.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&export.stdout);
+    assert!(
+        stdout.contains("trace-demo-credential"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains("trace-other-credential"),
+        "stdout was: {stdout}"
+    );
 }
 
 #[test]

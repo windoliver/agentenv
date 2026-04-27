@@ -921,7 +921,7 @@ async fn create_env_with_input(
             .create(agentenv_proto::SandboxSpec {
                 image: None,
                 env,
-                policy: Some(create_policy),
+                policy: Some(create_policy.clone()),
                 metadata: BTreeMap::new(),
             })
             .await
@@ -937,6 +937,18 @@ async fn create_env_with_input(
                     )
                     .with_subject_value("handle", serde_json::json!(handle.handle.clone()))
                     .with_latency_ms(elapsed_ms(sandbox_create_start)),
+                );
+                emit_runtime_event(
+                    events.as_ref(),
+                    core_policy_applied_event(
+                        ActivityResult::Ok,
+                        &trace_id,
+                        Some(name),
+                        &handle.handle,
+                        "sandbox_create",
+                        &create_policy,
+                        elapsed_ms(sandbox_create_start),
+                    ),
                 );
                 handle
             }
@@ -959,12 +971,49 @@ async fn create_env_with_input(
         rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle_value.clone());
         install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
         if restore_policy_after_install {
-            set.sandbox
+            let apply_policy_start = Instant::now();
+            match set
+                .sandbox
                 .apply_policy(agentenv_proto::ApplyPolicyParams {
                     handle: sandbox_handle_value.clone(),
                     policy: policy.clone(),
                 })
-                .await?;
+                .await
+            {
+                Ok(result) => {
+                    emit_runtime_event(
+                        events.as_ref(),
+                        core_policy_applied_event(
+                            ActivityResult::Ok,
+                            &trace_id,
+                            Some(name),
+                            &sandbox_handle_value,
+                            "restore_after_install",
+                            &policy,
+                            elapsed_ms(apply_policy_start),
+                        )
+                        .with_subject_value("hot_reloaded", serde_json::json!(result.hot_reloaded)),
+                    );
+                }
+                Err(err) => {
+                    emit_runtime_event(
+                        events.as_ref(),
+                        core_policy_applied_event(
+                            ActivityResult::Error,
+                            &trace_id,
+                            Some(name),
+                            &sandbox_handle_value,
+                            "restore_after_install",
+                            &policy,
+                            elapsed_ms(apply_policy_start),
+                        )
+                        .with_reason_code(
+                            crate::admission::ReasonCode::DriverCommandFailed.as_str(),
+                        ),
+                    );
+                    return Err(err.into());
+                }
+            }
         }
 
         let now = now_utc_string();
@@ -2439,6 +2488,26 @@ fn core_activity_event(
         event = event.with_env(env);
     }
     event
+}
+
+fn core_policy_applied_event(
+    result: ActivityResult,
+    trace_id: &str,
+    env: Option<&str>,
+    handle: &str,
+    phase: &str,
+    policy: &agentenv_proto::NetworkPolicy,
+    latency_ms: u64,
+) -> ActivityEvent {
+    core_activity_event(ActivityKind::PolicyApplied, result, trace_id, env)
+        .with_subject_value("handle", serde_json::json!(handle))
+        .with_subject_value("phase", serde_json::json!(phase))
+        .with_subject_value("policy", policy_json_value(policy))
+        .with_latency_ms(latency_ms)
+}
+
+fn policy_json_value(policy: &agentenv_proto::NetworkPolicy) -> serde_json::Value {
+    serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
 }
 
 fn emit_runtime_event(events: &dyn EventEmitter, event: ActivityEvent) {
@@ -4728,6 +4797,7 @@ policy:
                 ActivityKind::SpawnAdmitted,
                 ActivityKind::SpawnStarted,
                 ActivityKind::SandboxCreate,
+                ActivityKind::PolicyApplied,
                 ActivityKind::SpawnReady,
             ]
         );
@@ -4749,6 +4819,18 @@ policy:
             .expect("sandbox create event");
         assert_eq!(sandbox_create.result, ActivityResult::Ok);
         assert_eq!(sandbox_create.subject["handle"], serde_json::json!("sb-1"));
+
+        let policy_applied = recorded
+            .iter()
+            .find(|event| event.kind == ActivityKind::PolicyApplied)
+            .expect("policy applied event");
+        assert_eq!(policy_applied.result, ActivityResult::Ok);
+        assert_eq!(policy_applied.subject["handle"], serde_json::json!("sb-1"));
+        assert_eq!(
+            policy_applied.subject["phase"],
+            serde_json::json!("sandbox_create")
+        );
+        assert!(policy_applied.subject.contains_key("policy"));
 
         let ready = recorded
             .iter()

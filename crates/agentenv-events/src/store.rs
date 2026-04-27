@@ -503,7 +503,7 @@ pub fn read_legacy_jsonl(
             continue;
         }
 
-        let event = match parse_jsonl_activity_event(line) {
+        let event = match parse_legacy_jsonl_activity_event(line) {
             Ok(event) => event,
             Err(_) => continue,
         };
@@ -689,7 +689,7 @@ fn legacy_json_value_to_activity(value: Value) -> StoreResult<ActivityEvent> {
     Ok(event)
 }
 
-fn parse_jsonl_activity_event(line: &str) -> StoreResult<ActivityEvent> {
+pub fn parse_legacy_jsonl_activity_event(line: &str) -> StoreResult<ActivityEvent> {
     let value: Value = serde_json::from_str(line)?;
     if value.get("kind").is_some() && value.get("result").is_some() {
         Ok(serde_json::from_value(value)?)

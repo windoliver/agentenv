@@ -225,6 +225,20 @@ impl AuditStore {
         metadata_public_key_hex(&conn)
     }
 
+    pub fn has_entries_for_env(&self, env: &str) -> AuditResult<bool> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT 1
+            FROM audit_entries
+            WHERE env = ?1
+            LIMIT 1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![env])?;
+        Ok(rows.next()?.is_some())
+    }
+
     fn verify_rows_with_public_key_hex(
         &self,
         rows: Vec<RawAuditRow>,
@@ -288,9 +302,19 @@ impl AuditStore {
         from: Option<&str>,
         to: Option<&str>,
     ) -> AuditResult<()> {
+        self.export_jsonl_range_for_env(&mut writer, from, to, None)
+    }
+
+    pub fn export_jsonl_range_for_env(
+        &self,
+        mut writer: impl Write,
+        from: Option<&str>,
+        to: Option<&str>,
+        env: Option<&str>,
+    ) -> AuditResult<()> {
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
-            if !audit_row_in_range(&row, from, to) {
+            if !audit_row_matches(&row, from, to, env) {
                 continue;
             }
             let event: Value = serde_json::from_str(&row.event_json)?;
@@ -320,13 +344,23 @@ impl AuditStore {
         from: Option<&str>,
         to: Option<&str>,
     ) -> AuditResult<()> {
+        self.export_csv_range_for_env(&mut writer, from, to, None)
+    }
+
+    pub fn export_csv_range_for_env(
+        &self,
+        mut writer: impl Write,
+        from: Option<&str>,
+        to: Option<&str>,
+        env: Option<&str>,
+    ) -> AuditResult<()> {
         writer.write_all(
             b"sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,signature,public_key,event_json\n",
         )?;
 
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
-            if !audit_row_in_range(&row, from, to) {
+            if !audit_row_matches(&row, from, to, env) {
                 continue;
             }
             let event: ActivityEvent = serde_json::from_str(&row.event_json)?;
@@ -389,7 +423,15 @@ impl AuditStore {
     }
 }
 
-fn audit_row_in_range(row: &RawAuditRow, from: Option<&str>, to: Option<&str>) -> bool {
+fn audit_row_matches(
+    row: &RawAuditRow,
+    from: Option<&str>,
+    to: Option<&str>,
+    env: Option<&str>,
+) -> bool {
+    if env.is_some_and(|env| row.env.as_deref() != Some(env)) {
+        return false;
+    }
     if from.is_some_and(|from| row.ts.as_str() < from) {
         return false;
     }

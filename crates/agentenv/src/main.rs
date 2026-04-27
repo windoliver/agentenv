@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use agentenv_events::{
     audit::{AuditPolicy, AuditSigningKey, AuditStore},
     metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric},
     sink::{JsonlSink, SqliteSink},
-    store::{EventQuery, SqliteEventStore, StoredEvent},
+    store::{parse_legacy_jsonl_activity_event, EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
     SinkConfig, WebhookConfig, WebhookSink,
 };
@@ -685,12 +685,18 @@ fn run_audit(args: AuditArgs) -> Result<()> {
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             match format {
-                AuditFormat::Jsonl => {
-                    store.export_jsonl_range(&mut handle, from.as_deref(), to.as_deref())?
-                }
-                AuditFormat::Csv => {
-                    store.export_csv_range(&mut handle, from.as_deref(), to.as_deref())?
-                }
+                AuditFormat::Jsonl => store.export_jsonl_range_for_env(
+                    &mut handle,
+                    from.as_deref(),
+                    to.as_deref(),
+                    env.as_deref(),
+                )?,
+                AuditFormat::Csv => store.export_csv_range_for_env(
+                    &mut handle,
+                    from.as_deref(),
+                    to.as_deref(),
+                    env.as_deref(),
+                )?,
             }
             Ok(())
         }
@@ -928,16 +934,43 @@ async fn print_activity_logs(
     json: bool,
     follow: bool,
 ) -> Result<()> {
-    agentenv_core::runtime::describe_env(options, name)?;
     let kind = parse_activity_kind_opt(kind_filter)?;
+    let mut rows = Vec::new();
+    let mut follow_source = None;
+    let mut empty_follow_source = None;
+    let global_db_path = global_events_db_path(options);
+    if global_db_path.is_file() {
+        match query_sqlite_activity_logs(&global_db_path, name, kind, None) {
+            Ok(global_rows) => {
+                let after_id = global_rows.last().map(|row| row.id);
+                if follow && !global_rows.is_empty() && follow_source.is_none() {
+                    follow_source = Some((global_db_path.clone(), after_id));
+                } else if follow && empty_follow_source.is_none() {
+                    empty_follow_source = Some((global_db_path.clone(), after_id));
+                }
+                rows.extend(global_rows);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %global_db_path.display(),
+                    %error,
+                    "failed to read global activity database; trying fallback"
+                );
+            }
+        }
+    }
+
     let db_path = env_events_db_path(options, name)?;
     if db_path.is_file() {
-        match print_sqlite_activity_logs(&db_path, name, kind, json, None) {
-            Ok(after_id) => {
-                if follow {
-                    return follow_sqlite_activity_logs(&db_path, name, kind, json, after_id).await;
+        match query_sqlite_activity_logs(&db_path, name, kind, None) {
+            Ok(env_rows) => {
+                let after_id = env_rows.last().map(|row| row.id);
+                if follow && !env_rows.is_empty() && follow_source.is_none() {
+                    follow_source = Some((db_path.clone(), after_id));
+                } else if follow && empty_follow_source.is_none() {
+                    empty_follow_source = Some((db_path.clone(), after_id));
                 }
-                return Ok(());
+                rows.extend(env_rows);
             }
             Err(error) => {
                 tracing::warn!(
@@ -948,31 +981,16 @@ async fn print_activity_logs(
             }
         }
     }
+    if follow && follow_source.is_none() {
+        follow_source = empty_follow_source;
+    }
 
-    let global_db_path = global_events_db_path(options);
-    if global_db_path.is_file() {
-        match print_sqlite_activity_logs(&global_db_path, name, kind, json, None) {
-            Ok(after_id) => {
-                if follow {
-                    return follow_sqlite_activity_logs(
-                        &global_db_path,
-                        name,
-                        kind,
-                        json,
-                        after_id,
-                    )
-                    .await;
-                }
-                return Ok(());
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %global_db_path.display(),
-                    %error,
-                    "failed to read global activity database; trying fallback"
-                );
-            }
+    if !rows.is_empty() || follow_source.is_some() {
+        print_activity_rows(dedupe_activity_rows(rows)?, json, None)?;
+        if let Some((db_path, after_id)) = follow_source {
+            return follow_sqlite_activity_logs(&db_path, name, kind, json, after_id).await;
         }
+        return Ok(());
     }
 
     print_legacy_activity_logs(options, name, kind, json, follow)
@@ -1036,6 +1054,25 @@ fn print_activity_rows(
     Ok(last_id)
 }
 
+fn dedupe_activity_rows(rows: Vec<StoredEvent>) -> Result<Vec<StoredEvent>> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for row in rows {
+        let key = serde_json::to_string(&row.event)?;
+        if seen.insert(key) {
+            deduped.push(row);
+        }
+    }
+    deduped.sort_by(|left, right| {
+        left.event
+            .ts
+            .cmp(&right.event.ts)
+            .then(left.event.trace_id.cmp(&right.event.trace_id))
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(deduped)
+}
+
 fn print_legacy_activity_logs(
     options: &agentenv_core::runtime::RuntimeOptions,
     name: &str,
@@ -1095,7 +1132,7 @@ fn print_legacy_activity_log_chunk(
         .with_context(|| format!("read events log `{}`", events_path.display()))?;
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(event) = serde_json::from_str::<ActivityEvent>(line) else {
+        let Ok(event) = parse_legacy_jsonl_activity_event(line) else {
             continue;
         };
         if kind.is_some_and(|kind| event.kind != kind) {
@@ -1480,7 +1517,20 @@ fn audit_reader_db_path(
     env: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(env) = env {
-        agentenv_core::runtime::describe_env(options, env)?;
+        agentenv_core::env::validate_env_name(env)?;
+        let global_path = global_events_db_path(options);
+        if global_path.is_file() {
+            let global_store = AuditStore::open(&global_path)
+                .with_context(|| format!("open audit database `{}`", global_path.display()))?;
+            if global_store.has_entries_for_env(env)? {
+                return Ok(global_path);
+            }
+        }
+        let env_path = env_events_db_path(options, env)?;
+        if env_path.is_file() {
+            return Ok(env_path);
+        }
+        return Ok(global_path);
     }
     activity_reader_db_path(options, env)
 }
