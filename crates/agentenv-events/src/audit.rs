@@ -279,8 +279,20 @@ impl AuditStore {
     }
 
     pub fn export_jsonl(&self, mut writer: impl Write) -> AuditResult<()> {
+        self.export_jsonl_range(&mut writer, None, None)
+    }
+
+    pub fn export_jsonl_range(
+        &self,
+        mut writer: impl Write,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> AuditResult<()> {
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
+            if !audit_row_in_range(&row, from, to) {
+                continue;
+            }
             let event: Value = serde_json::from_str(&row.event_json)?;
             let entry = JsonlAuditEntry {
                 sequence: row.sequence,
@@ -299,12 +311,24 @@ impl AuditStore {
     }
 
     pub fn export_csv(&self, mut writer: impl Write) -> AuditResult<()> {
+        self.export_csv_range(&mut writer, None, None)
+    }
+
+    pub fn export_csv_range(
+        &self,
+        mut writer: impl Write,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> AuditResult<()> {
         writer.write_all(
             b"sequence,ts,env,kind,result,trace_id,prev_hash,entry_hash,signature,public_key,event_json\n",
         )?;
 
         let conn = self.connection()?;
         for row in load_audit_rows(&conn)? {
+            if !audit_row_in_range(&row, from, to) {
+                continue;
+            }
             let event: ActivityEvent = serde_json::from_str(&row.event_json)?;
             write_csv_row(
                 &mut writer,
@@ -363,6 +387,16 @@ impl AuditStore {
         let path = database_open_path(&self.path)?;
         Ok(Connection::open_with_flags(path, database_open_flags())?)
     }
+}
+
+fn audit_row_in_range(row: &RawAuditRow, from: Option<&str>, to: Option<&str>) -> bool {
+    if from.is_some_and(|from| row.ts.as_str() < from) {
+        return false;
+    }
+    if to.is_some_and(|to| row.ts.as_str() > to) {
+        return false;
+    }
+    true
 }
 
 #[derive(Debug)]

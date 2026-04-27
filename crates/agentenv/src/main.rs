@@ -3,7 +3,9 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process, thread,
+    process,
+    sync::{Arc, Mutex},
+    thread,
     time::Duration,
 };
 
@@ -11,12 +13,12 @@ use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
 use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
 use agentenv_events::{
-    audit::AuditStore,
+    audit::{AuditPolicy, AuditSigningKey, AuditStore},
     metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric},
     sink::{JsonlSink, SqliteSink},
     store::{EventQuery, SqliteEventStore},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
-    SinkConfig,
+    SinkConfig, SinkError,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -644,8 +646,8 @@ fn run_audit(args: AuditArgs) -> Result<()> {
     let options = runtime_options(true)?;
     match args.command {
         AuditCommand::Export {
-            from: _,
-            to: _,
+            from,
+            to,
             format,
             env,
         } => {
@@ -656,8 +658,12 @@ fn run_audit(args: AuditArgs) -> Result<()> {
             let stdout = io::stdout();
             let mut handle = stdout.lock();
             match format {
-                AuditFormat::Jsonl => store.export_jsonl(&mut handle)?,
-                AuditFormat::Csv => store.export_csv(&mut handle)?,
+                AuditFormat::Jsonl => {
+                    store.export_jsonl_range(&mut handle, from.as_deref(), to.as_deref())?
+                }
+                AuditFormat::Csv => {
+                    store.export_csv_range(&mut handle, from.as_deref(), to.as_deref())?
+                }
             }
             Ok(())
         }
@@ -1148,36 +1154,120 @@ fn build_event_dispatcher(
     sink_args: &[String],
 ) -> Result<EventDispatcher> {
     let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
-    if sink_args.is_empty() {
-        add_default_sqlite_sinks(&mut sinks, options, env)?;
-    } else {
-        for raw in sink_args {
-            match SinkConfig::parse(raw)? {
-                SinkConfig::DefaultSqlite => add_default_sqlite_sinks(&mut sinks, options, env)?,
-                SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
-                SinkConfig::Jsonl { path } => sinks.push(Box::new(JsonlSink::new(path))),
-                SinkConfig::OtelGrpc { .. } | SinkConfig::Webhook { .. } => {}
-            }
+    add_default_event_sinks(&mut sinks, options, env)?;
+    for raw in sink_args {
+        match SinkConfig::parse(raw)? {
+            SinkConfig::DefaultSqlite => {}
+            SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
+            SinkConfig::Jsonl { path } => sinks.push(Box::new(JsonlSink::new(path))),
+            SinkConfig::OtelGrpc { .. } | SinkConfig::Webhook { .. } => {}
         }
     }
     Ok(EventDispatcher::with_sinks(1024, sinks))
 }
 
-fn add_default_sqlite_sinks(
+fn add_default_event_sinks(
     sinks: &mut Vec<Box<dyn EventSink>>,
     options: &agentenv_core::runtime::RuntimeOptions,
     env: Option<&str>,
 ) -> Result<()> {
-    sinks.push(Box::new(SqliteSink::new(global_events_db_path(options))));
+    let signing_key = Arc::new(Mutex::new(AuditSigningKeyCache::new(
+        audit_signing_key_path(options),
+    )));
+    let global_db_path = global_events_db_path(options);
+    sinks.push(Box::new(SqliteSink::new(global_db_path.clone())));
+    sinks.push(Box::new(AuditSink::new(
+        global_db_path,
+        Arc::clone(&signing_key),
+    )));
     if let Some(env) = env {
-        sinks.push(Box::new(SqliteSink::new(env_events_db_path(options, env)?)));
+        let env_db_path = env_events_db_path(options, env)?;
+        sinks.push(Box::new(SqliteSink::new(env_db_path.clone())));
+        sinks.push(Box::new(AuditSink::new(env_db_path, signing_key)));
     }
     Ok(())
 }
 
+struct AuditSink {
+    db_path: PathBuf,
+    signing_key: Arc<Mutex<AuditSigningKeyCache>>,
+}
+
+impl AuditSink {
+    fn new(db_path: PathBuf, signing_key: Arc<Mutex<AuditSigningKeyCache>>) -> Self {
+        Self {
+            db_path,
+            signing_key,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for AuditSink {
+    fn name(&self) -> &'static str {
+        "audit"
+    }
+
+    async fn write_batch(&self, events: Vec<ActivityEvent>) -> std::result::Result<(), SinkError> {
+        let audit_events = events
+            .into_iter()
+            .filter(AuditPolicy::includes)
+            .map(ActivityEvent::redacted)
+            .collect::<Vec<_>>();
+        if audit_events.is_empty() {
+            return Ok(());
+        }
+
+        let db_path = self.db_path.clone();
+        let signing_key = Arc::clone(&self.signing_key);
+        tokio::task::spawn_blocking(move || {
+            let store = AuditStore::open(db_path).map_err(audit_sink_error)?;
+            let mut signing_key = signing_key.lock().map_err(|_| audit_sink_lock_error())?;
+            let key = signing_key.get_or_load()?;
+            for event in audit_events {
+                store.append(key, &event).map_err(audit_sink_error)?;
+            }
+            Ok(())
+        })
+        .await?
+    }
+}
+
+struct AuditSigningKeyCache {
+    path: PathBuf,
+    key: Option<AuditSigningKey>,
+}
+
+impl AuditSigningKeyCache {
+    fn new(path: PathBuf) -> Self {
+        Self { path, key: None }
+    }
+
+    fn get_or_load(&mut self) -> std::result::Result<&AuditSigningKey, SinkError> {
+        if self.key.is_none() {
+            self.key = Some(AuditSigningKey::load_or_create(&self.path).map_err(audit_sink_error)?);
+        }
+        self.key.as_ref().ok_or_else(audit_sink_lock_error)
+    }
+}
+
+fn audit_sink_error(error: agentenv_events::audit::AuditError) -> SinkError {
+    SinkError::InvalidSinkUri {
+        uri: format!("audit sink failed: {error}"),
+    }
+}
+
+fn audit_sink_lock_error() -> SinkError {
+    SinkError::InvalidSinkUri {
+        uri: "audit sink signing key unavailable".to_owned(),
+    }
+}
+
 async fn flush_dispatcher_best_effort(dispatcher: &EventDispatcher) {
-    if let Err(error) = dispatcher.flush().await {
-        eprintln!("warning: failed to flush event sinks: {error}");
+    match tokio::time::timeout(Duration::from_secs(2), dispatcher.flush()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("warning: failed to flush event sinks: {error}"),
+        Err(_) => eprintln!("warning: timed out flushing event sinks"),
     }
 }
 
@@ -1197,6 +1287,10 @@ fn emit_credential_event(
 
 fn global_events_db_path(options: &agentenv_core::runtime::RuntimeOptions) -> PathBuf {
     options.root.join("events.db")
+}
+
+fn audit_signing_key_path(options: &agentenv_core::runtime::RuntimeOptions) -> PathBuf {
+    options.root.join("audit-signing-key")
 }
 
 fn env_events_db_path(

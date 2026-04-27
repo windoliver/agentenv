@@ -65,6 +65,7 @@ dependencies = [
  "agentenv-proto",
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "bytes",
  "clap",
  "context-filesystem",

@@ -9,7 +9,7 @@ use std::{
 
 use agentenv_events::{
     audit::{AuditSigningKey, AuditStore},
-    store::SqliteEventStore,
+    store::{EventQuery, SqliteEventStore},
     ActivityEvent, ActivityKind, ActivityResult,
 };
 
@@ -743,6 +743,142 @@ fn audit_export_and_verify_use_activity_database() {
     let stdout = String::from_utf8_lossy(&verify.stdout);
     assert!(stdout.contains("valid"), "stdout was: {stdout}");
     assert!(stdout.contains("1"), "stdout was: {stdout}");
+}
+
+#[test]
+fn audit_export_range_filters_activity_database() {
+    let temp_dir = make_temp_dir("audit-export-range");
+    write_minimal_env_state(&temp_dir, "demo");
+    seed_audit_db(
+        &temp_dir,
+        "demo",
+        &[
+            activity_event(
+                "2026-04-21T00:00:00Z",
+                ActivityKind::EgressDenied,
+                ActivityResult::Denied,
+                "trace-audit-first",
+            ),
+            activity_event(
+                "2026-04-21T00:00:01Z",
+                ActivityKind::CredentialReset,
+                ActivityResult::Ok,
+                "trace-audit-second",
+            )
+            .with_subject_value("name", serde_json::json!("OPENAI_API_KEY")),
+        ],
+    );
+
+    let export = Command::new(agentenv_bin())
+        .arg("audit")
+        .arg("export")
+        .arg("--env")
+        .arg("demo")
+        .arg("--format")
+        .arg("jsonl")
+        .arg("--from")
+        .arg("2026-04-21T00:00:01Z")
+        .arg("--to")
+        .arg("2026-04-21T00:00:01Z")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        export.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&export.stdout);
+    assert!(
+        stdout.contains("trace-audit-second"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains("trace-audit-first"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn credential_set_explicit_file_sink_still_writes_default_sqlite_and_audit() {
+    let temp_dir = make_temp_dir("credential-set-additive-sink-audit");
+    let credential_name = format!("AGENTENV_AUDIT_TOKEN_{}", unique_suffix());
+    let source_env = format!("{credential_name}_SOURCE");
+    let secret_value = "sk-secret-do-not-leak";
+    let jsonl_path = temp_dir.join("explicit-events.jsonl");
+
+    let output = Command::new(agentenv_bin())
+        .arg("--events-sink")
+        .arg(format!("file:{}", jsonl_path.display()))
+        .arg("credentials")
+        .arg("set")
+        .arg(&credential_name)
+        .arg("--from-env")
+        .arg(&source_env)
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env(&source_env, secret_value)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let file_events = fs::read_to_string(&jsonl_path).unwrap();
+    assert!(
+        file_events.contains("credential_set"),
+        "events file was: {file_events}"
+    );
+    assert!(
+        file_events.contains(&credential_name),
+        "events file was: {file_events}"
+    );
+    assert!(
+        !file_events.contains(secret_value),
+        "events file leaked credential value: {file_events}"
+    );
+
+    let global_store =
+        SqliteEventStore::open(temp_dir.join(".agentenv").join("events.db")).unwrap();
+    let events = global_store
+        .query(EventQuery {
+            kind: Some(ActivityKind::CredentialSet),
+            limit: 10,
+            ..EventQuery::default()
+        })
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|row| row.event.subject.get("name") == Some(&serde_json::json!(credential_name))),
+        "global activity DB did not contain credential_set for {credential_name:?}"
+    );
+    let rendered_events = events
+        .iter()
+        .map(|row| serde_json::to_string(&row.event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !rendered_events.contains(secret_value),
+        "activity DB leaked credential value: {rendered_events}"
+    );
+
+    let mut audit_jsonl = Vec::new();
+    AuditStore::open(temp_dir.join(".agentenv").join("events.db"))
+        .unwrap()
+        .export_jsonl(&mut audit_jsonl)
+        .unwrap();
+    let audit_jsonl = String::from_utf8(audit_jsonl).unwrap();
+    assert!(audit_jsonl.contains("credential_set"), "{audit_jsonl}");
+    assert!(audit_jsonl.contains(&credential_name), "{audit_jsonl}");
+    assert!(
+        !audit_jsonl.contains(secret_value),
+        "audit log leaked credential value: {audit_jsonl}"
+    );
 }
 
 #[test]

@@ -21,6 +21,7 @@ agent-claude = { path = "../drivers/agent-claude" }
 agent-codex = { path = "../drivers/agent-codex" }
 agent-openclaw = { path = "../drivers/agent-openclaw" }
 anyhow.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 context-filesystem = { path = "../drivers/context-filesystem" }
