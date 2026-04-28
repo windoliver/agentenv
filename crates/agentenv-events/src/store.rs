@@ -477,14 +477,6 @@ impl LocalEventStore {
             }
         };
 
-        let len = file
-            .metadata()
-            .map(|metadata| metadata.len())
-            .map_err(|source| EventStoreError::FileIo {
-                action: "read metadata for",
-                path: events_path.to_path_buf(),
-                source,
-            })?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| EventStoreError::Sqlite {
@@ -494,11 +486,15 @@ impl LocalEventStore {
 
         let result = (|| {
             let stored_offset = self.jsonl_offset(env, events_path)?;
-            let start = if stored_offset <= len {
-                stored_offset
-            } else {
-                0
-            };
+            let len = file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .map_err(|source| EventStoreError::FileIo {
+                    action: "read metadata for",
+                    path: events_path.to_path_buf(),
+                    source,
+                })?;
+            let start = jsonl_start_offset(stored_offset, len);
             file.seek(SeekFrom::Start(start))
                 .map_err(|source| EventStoreError::FileIo {
                     action: "seek",
@@ -643,6 +639,14 @@ fn insert_event(conn: &Connection, path: &Path, event: &StoredEvent) -> EventSto
 
 fn jsonl_path_key(events_path: &Path) -> String {
     events_path.display().to_string()
+}
+
+fn jsonl_start_offset(stored_offset: u64, locked_file_len: u64) -> u64 {
+    if stored_offset <= locked_file_len {
+        stored_offset
+    } else {
+        0
+    }
 }
 
 fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult<Vec<StoredEvent>> {
@@ -1101,5 +1105,12 @@ mod tests {
         let result = store.list_recent(None, 10);
 
         assert!(matches!(result, Err(EventStoreError::KindDecode { .. })));
+    }
+
+    #[test]
+    fn jsonl_start_offset_resets_only_when_locked_file_len_is_behind_offset() {
+        assert_eq!(super::jsonl_start_offset(12, 12), 12);
+        assert_eq!(super::jsonl_start_offset(12, 20), 12);
+        assert_eq!(super::jsonl_start_offset(12, 11), 0);
     }
 }
