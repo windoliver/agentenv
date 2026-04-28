@@ -11,6 +11,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const MAX_LIST_RECENT_LIMIT: usize = 1_000;
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
+const LEGACY_JSONL_FALLBACK_TS: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Error)]
 pub enum EventStoreError {
@@ -484,51 +485,85 @@ impl LocalEventStore {
                 path: events_path.to_path_buf(),
                 source,
             })?;
-        let stored_offset = self.jsonl_offset(env, events_path)?;
-        let start = if stored_offset <= len {
-            stored_offset
-        } else {
-            0
-        };
-        file.seek(SeekFrom::Start(start))
-            .map_err(|source| EventStoreError::FileIo {
-                action: "seek",
-                path: events_path.to_path_buf(),
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
                 source,
             })?;
 
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .map_err(|source| EventStoreError::FileIo {
-                action: "read",
-                path: events_path.to_path_buf(),
-                source,
-            })?;
+        let result = (|| {
+            let stored_offset = self.jsonl_offset(env, events_path)?;
+            let start = if stored_offset <= len {
+                stored_offset
+            } else {
+                0
+            };
+            file.seek(SeekFrom::Start(start))
+                .map_err(|source| EventStoreError::FileIo {
+                    action: "seek",
+                    path: events_path.to_path_buf(),
+                    source,
+                })?;
 
-        let complete_len = content
-            .rfind('\n')
-            .map(|last_newline| last_newline + 1)
-            .unwrap_or(0);
-        let complete_content = &content[..complete_len];
-        let offset = start + complete_len as u64;
-        let mut imported = 0;
-        let mut skipped = 0;
-        let mut events = Vec::new();
-        for line in complete_content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-        {
-            match event_from_jsonl_line(env, line) {
-                Some(event) => {
-                    events.push(event);
-                    imported += 1;
+            let mut content = String::new();
+            file.read_to_string(&mut content)
+                .map_err(|source| EventStoreError::FileIo {
+                    action: "read",
+                    path: events_path.to_path_buf(),
+                    source,
+                })?;
+
+            let complete_len = content
+                .rfind('\n')
+                .map(|last_newline| last_newline + 1)
+                .unwrap_or(0);
+            let complete_content = &content[..complete_len];
+            let offset = start + complete_len as u64;
+            let mut imported = 0;
+            let mut skipped = 0;
+            let mut events = Vec::new();
+            for line in complete_content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                match event_from_jsonl_line(env, line) {
+                    Some(event) => {
+                        events.push(event);
+                        imported += 1;
+                    }
+                    None => skipped += 1,
                 }
-                None => skipped += 1,
+            }
+
+            for event in events {
+                insert_event(&self.conn, &self.path, &event)?;
+            }
+            self.set_jsonl_offset(env, events_path, offset)?;
+            Ok(EventImportReport { imported, skipped })
+        })();
+
+        match result {
+            Ok(report) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|source| EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                Ok(report)
+            }
+            Err(err) => {
+                let rollback = self.conn.execute_batch("ROLLBACK");
+                if let Err(source) = rollback {
+                    return Err(EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+                Err(err)
             }
         }
-
-        self.import_events_and_set_jsonl_offset(events_path, events, env, offset)?;
-        Ok(EventImportReport { imported, skipped })
     }
 
     fn jsonl_offset(&self, env: &str, events_path: &Path) -> EventStoreResult<u64> {
@@ -543,48 +578,6 @@ impl LocalEventStore {
                 path: self.path.clone(),
                 source,
             }),
-        }
-    }
-
-    fn import_events_and_set_jsonl_offset(
-        &self,
-        events_path: &Path,
-        events: Vec<StoredEvent>,
-        env: &str,
-        offset: u64,
-    ) -> EventStoreResult<()> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        let result = (|| {
-            for event in events {
-                insert_event(&self.conn, &self.path, &event)?;
-            }
-            self.set_jsonl_offset(env, events_path, offset)
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                }),
-            Err(err) => {
-                let rollback = self.conn.execute_batch("ROLLBACK");
-                if let Err(source) = rollback {
-                    return Err(EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-                Err(err)
-            }
         }
     }
 
@@ -665,18 +658,22 @@ fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult
 
 fn event_from_jsonl_line(env: &str, line: &str) -> Option<StoredEvent> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    let ts = value.get("ts").and_then(serde_json::Value::as_str)?;
+    let ts = value
+        .get("ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(LEGACY_JSONL_FALLBACK_TS);
     parse_ts_epoch_nanos(ts).ok()?;
     let kind = value
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .map(StoredEventKind::from_str)
-        .unwrap_or(Ok(StoredEventKind::Log))
-        .ok()?;
+        .map(|kind| kind.unwrap_or(StoredEventKind::Runtime))
+        .unwrap_or(StoredEventKind::Log);
     let subject = value
         .get("subject")
         .or_else(|| value.get("msg"))
         .or_else(|| value.get("message"))
+        .or_else(|| value.get("kind"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("event");
     let mut event = StoredEvent::new(env, ts, kind, subject);

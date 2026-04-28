@@ -367,7 +367,7 @@ mod tests {
             &events_path,
             concat!(
                 "{\"ts\":\"not-a-timestamp\",\"msg\":\"bad ts\"}\n",
-                "{\"ts\":\"2026-04-27T12:00:00Z\",\"kind\":\"surprise\",\"msg\":\"bad kind\"}\n",
+                "{\"ts\":\"2026-04-27T12:00:00Z\",\"kind\":\"surprise\",\"msg\":\"unknown kind\"}\n",
                 "{\"ts\":\"2026-04-27T12:00:01Z\",\"msg\":\"good\"}\n",
             ),
         )
@@ -376,11 +376,45 @@ mod tests {
         let report = store
             .import_env_jsonl("demo", &events_path)
             .expect("import jsonl");
-        assert_eq!(report.imported, 1);
-        assert_eq!(report.skipped, 2);
+        assert_eq!(report.imported, 2);
+        assert_eq!(report.skipped, 1);
 
         let events = store.list_recent(Some("demo"), 10).expect("list imported");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].subject, "good");
+        assert_eq!(events[1].subject, "unknown kind");
+        assert_eq!(events[1].kind, StoredEventKind::Runtime);
+    }
+
+    #[test]
+    fn jsonl_import_accepts_core_legacy_progress_and_admission_lines() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let events_path = root.path().join("events.jsonl");
+        fs::write(
+            &events_path,
+            concat!(
+                "{\"kind\":\"progress\",\"step\":\"preflight\",\"ok\":true}\n",
+                "{\"kind\":\"admission\",\"status\":\"accepted\",\"reason_code\":\"created\"}\n",
+            ),
+        )
+        .expect("write jsonl");
+
+        let report = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("import jsonl");
+        assert_eq!(report.imported, 2);
+        assert_eq!(report.skipped, 0);
+
+        let events = store.list_recent(Some("demo"), 10).expect("list imported");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].ts, "1970-01-01T00:00:00Z");
+        assert_eq!(events[0].kind, StoredEventKind::Runtime);
+        assert_eq!(events[0].metadata["kind"], "admission");
+        assert_eq!(events[0].metadata["status"], "accepted");
+        assert_eq!(events[1].ts, "1970-01-01T00:00:00Z");
+        assert_eq!(events[1].kind, StoredEventKind::Runtime);
+        assert_eq!(events[1].metadata["kind"], "progress");
+        assert_eq!(events[1].metadata["step"], "preflight");
     }
 }
