@@ -245,4 +245,142 @@ mod tests {
             3
         );
     }
+
+    #[test]
+    fn jsonl_import_retains_trailing_partial_line_for_next_import() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let events_path = root.path().join("events.jsonl");
+        fs::write(
+            &events_path,
+            concat!(
+                "{\"ts\":\"2026-04-27T12:00:00Z\",\"msg\":\"complete\"}\n",
+                "{\"ts\":\"2026-04-27T12:00:01Z\",\"msg\":\"partial\"",
+            ),
+        )
+        .expect("write jsonl");
+
+        let first = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("first import");
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.skipped, 0);
+        assert_eq!(
+            store
+                .list_recent(Some("demo"), 10)
+                .expect("list imported")
+                .len(),
+            1
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .expect("open append");
+        file.write_all(b"}\n").expect("complete partial line");
+
+        let second = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("second import");
+        assert_eq!(second.imported, 1);
+        assert_eq!(second.skipped, 0);
+
+        let events = store.list_recent(Some("demo"), 10).expect("list imported");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].subject, "partial");
+    }
+
+    #[test]
+    fn jsonl_import_offsets_are_scoped_to_env_and_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let first_path = root.path().join("first.jsonl");
+        let second_path = root.path().join("second.jsonl");
+        fs::write(
+            &first_path,
+            "{\"ts\":\"2026-04-27T12:00:00Z\",\"msg\":\"first\"}\n",
+        )
+        .expect("write first jsonl");
+        fs::write(
+            &second_path,
+            "{\"ts\":\"2026-04-27T12:00:01Z\",\"msg\":\"second\"}\n",
+        )
+        .expect("write second jsonl");
+
+        let first = store
+            .import_env_jsonl("demo", &first_path)
+            .expect("first import");
+        assert_eq!(first.imported, 1);
+
+        let second = store
+            .import_env_jsonl("demo", &second_path)
+            .expect("second path import");
+        assert_eq!(second.imported, 1);
+
+        let events = store.list_recent(Some("demo"), 10).expect("list imported");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].subject, "second");
+        assert_eq!(events[1].subject, "first");
+    }
+
+    #[test]
+    fn jsonl_import_resets_offset_when_file_is_truncated() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let events_path = root.path().join("events.jsonl");
+        fs::write(
+            &events_path,
+            concat!(
+                "{\"ts\":\"2026-04-27T12:00:00Z\",\"msg\":\"first\"}\n",
+                "{\"ts\":\"2026-04-27T12:00:01Z\",\"msg\":\"second\"}\n",
+            ),
+        )
+        .expect("write jsonl");
+
+        let first = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("first import");
+        assert_eq!(first.imported, 2);
+
+        fs::write(
+            &events_path,
+            "{\"ts\":\"2026-04-27T12:00:02Z\",\"msg\":\"after truncate\"}\n",
+        )
+        .expect("truncate jsonl");
+
+        let second = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("second import");
+        assert_eq!(second.imported, 1);
+
+        let events = store.list_recent(Some("demo"), 10).expect("list imported");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].subject, "after truncate");
+    }
+
+    #[test]
+    fn jsonl_import_skips_invalid_timestamps_and_unknown_kinds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let events_path = root.path().join("events.jsonl");
+        fs::write(
+            &events_path,
+            concat!(
+                "{\"ts\":\"not-a-timestamp\",\"msg\":\"bad ts\"}\n",
+                "{\"ts\":\"2026-04-27T12:00:00Z\",\"kind\":\"surprise\",\"msg\":\"bad kind\"}\n",
+                "{\"ts\":\"2026-04-27T12:00:01Z\",\"msg\":\"good\"}\n",
+            ),
+        )
+        .expect("write jsonl");
+
+        let report = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("import jsonl");
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.skipped, 2);
+
+        let events = store.list_recent(Some("demo"), 10).expect("list imported");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subject, "good");
+    }
 }

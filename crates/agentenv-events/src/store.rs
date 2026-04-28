@@ -20,6 +20,13 @@ pub enum EventStoreError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to {action} event file `{path}`: {source}")]
+    FileIo {
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("sqlite event store error at `{path}`: {source}")]
     Sqlite {
         path: PathBuf,
@@ -180,9 +187,10 @@ impl LocalEventStore {
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_env_ts ON events(env, ts DESC);
                 CREATE TABLE IF NOT EXISTS jsonl_offsets (
-                    env TEXT PRIMARY KEY,
+                    env TEXT NOT NULL,
                     path TEXT NOT NULL,
-                    offset INTEGER NOT NULL
+                    offset INTEGER NOT NULL,
+                    PRIMARY KEY (env, path)
                 );
                 "#,
             )
@@ -191,6 +199,7 @@ impl LocalEventStore {
                 source,
             })?;
         self.ensure_ts_epoch_nanos_column()?;
+        self.ensure_jsonl_offsets_path_key()?;
         self.conn
             .execute_batch(
                 r#"
@@ -204,6 +213,94 @@ impl LocalEventStore {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    fn ensure_jsonl_offsets_path_key(&self) -> EventStoreResult<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, pk FROM pragma_table_info('jsonl_offsets')")
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut env_pk = 0;
+        let mut path_pk = 0;
+        for row in rows {
+            let (name, pk) = row.map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+            if name == "env" {
+                env_pk = pk;
+            } else if name == "path" {
+                path_pk = pk;
+            }
+        }
+        drop(stmt);
+
+        if env_pk == 1 && path_pk == 2 {
+            return Ok(());
+        }
+
+        self.migrate_jsonl_offsets_path_key()
+    }
+
+    fn migrate_jsonl_offsets_path_key(&self) -> EventStoreResult<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let result = self
+            .conn
+            .execute_batch(
+                r#"
+                CREATE TABLE jsonl_offsets_new (
+                    env TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    offset INTEGER NOT NULL,
+                    PRIMARY KEY (env, path)
+                );
+                INSERT OR REPLACE INTO jsonl_offsets_new (env, path, offset)
+                    SELECT env, path, offset FROM jsonl_offsets;
+                DROP TABLE jsonl_offsets;
+                ALTER TABLE jsonl_offsets_new RENAME TO jsonl_offsets;
+                "#,
+            )
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            });
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|source| EventStoreError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                }),
+            Err(err) => {
+                let rollback = self.conn.execute_batch("ROLLBACK");
+                if let Err(source) = rollback {
+                    return Err(EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+                Err(err)
+            }
+        }
     }
 
     fn ensure_ts_epoch_nanos_column(&self) -> EventStoreResult<()> {
@@ -310,31 +407,7 @@ impl LocalEventStore {
     }
 
     pub fn append(&self, event: &StoredEvent) -> EventStoreResult<i64> {
-        let metadata_json = serde_json::to_string(&event.metadata)
-            .map_err(|source| EventStoreError::MetadataEncode { source })?;
-        let ts_epoch_nanos = parse_ts_epoch_nanos(&event.ts)?;
-        self.conn
-            .execute(
-                "INSERT INTO events (
-                    env, ts, ts_epoch_nanos, kind, subject, reason, driver, handle, metadata_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    event.env,
-                    event.ts,
-                    ts_epoch_nanos,
-                    event.kind.as_str(),
-                    event.subject,
-                    event.reason,
-                    event.driver,
-                    event.handle,
-                    metadata_json
-                ],
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(self.conn.last_insert_rowid())
+        insert_event(&self.conn, &self.path, event)
     }
 
     pub fn list_recent(
@@ -395,7 +468,8 @@ impl LocalEventStore {
                 });
             }
             Err(source) => {
-                return Err(EventStoreError::CreateDir {
+                return Err(EventStoreError::FileIo {
+                    action: "open",
                     path: events_path.to_path_buf(),
                     source,
                 });
@@ -405,49 +479,62 @@ impl LocalEventStore {
         let len = file
             .metadata()
             .map(|metadata| metadata.len())
-            .map_err(|source| EventStoreError::CreateDir {
+            .map_err(|source| EventStoreError::FileIo {
+                action: "read metadata for",
                 path: events_path.to_path_buf(),
                 source,
             })?;
-        let stored_offset = self.jsonl_offset(env)?;
+        let stored_offset = self.jsonl_offset(env, events_path)?;
         let start = if stored_offset <= len {
             stored_offset
         } else {
             0
         };
         file.seek(SeekFrom::Start(start))
-            .map_err(|source| EventStoreError::CreateDir {
+            .map_err(|source| EventStoreError::FileIo {
+                action: "seek",
                 path: events_path.to_path_buf(),
                 source,
             })?;
 
         let mut content = String::new();
         file.read_to_string(&mut content)
-            .map_err(|source| EventStoreError::CreateDir {
+            .map_err(|source| EventStoreError::FileIo {
+                action: "read",
                 path: events_path.to_path_buf(),
                 source,
             })?;
 
+        let complete_len = content
+            .rfind('\n')
+            .map(|last_newline| last_newline + 1)
+            .unwrap_or(0);
+        let complete_content = &content[..complete_len];
+        let offset = start + complete_len as u64;
         let mut imported = 0;
         let mut skipped = 0;
-        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let mut events = Vec::new();
+        for line in complete_content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
             match event_from_jsonl_line(env, line) {
                 Some(event) => {
-                    self.append(&event)?;
+                    events.push(event);
                     imported += 1;
                 }
                 None => skipped += 1,
             }
         }
 
-        self.set_jsonl_offset(env, events_path, len)?;
+        self.import_events_and_set_jsonl_offset(events_path, events, env, offset)?;
         Ok(EventImportReport { imported, skipped })
     }
 
-    fn jsonl_offset(&self, env: &str) -> EventStoreResult<u64> {
+    fn jsonl_offset(&self, env: &str, events_path: &Path) -> EventStoreResult<u64> {
         match self.conn.query_row(
-            "SELECT offset FROM jsonl_offsets WHERE env = ?1",
-            params![env],
+            "SELECT offset FROM jsonl_offsets WHERE env = ?1 AND path = ?2",
+            params![env, jsonl_path_key(events_path)],
             |row| row.get::<_, i64>(0),
         ) {
             Ok(offset) => Ok(offset.max(0) as u64),
@@ -459,12 +546,54 @@ impl LocalEventStore {
         }
     }
 
+    fn import_events_and_set_jsonl_offset(
+        &self,
+        events_path: &Path,
+        events: Vec<StoredEvent>,
+        env: &str,
+        offset: u64,
+    ) -> EventStoreResult<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let result = (|| {
+            for event in events {
+                insert_event(&self.conn, &self.path, &event)?;
+            }
+            self.set_jsonl_offset(env, events_path, offset)
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|source| EventStoreError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                }),
+            Err(err) => {
+                let rollback = self.conn.execute_batch("ROLLBACK");
+                if let Err(source) = rollback {
+                    return Err(EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+                Err(err)
+            }
+        }
+    }
+
     fn set_jsonl_offset(&self, env: &str, events_path: &Path, offset: u64) -> EventStoreResult<()> {
         self.conn
             .execute(
                 "INSERT INTO jsonl_offsets (env, path, offset) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(env) DO UPDATE SET path = excluded.path, offset = excluded.offset",
-                params![env, events_path.display().to_string(), offset as i64],
+                 ON CONFLICT(env, path) DO UPDATE SET offset = excluded.offset",
+                params![env, jsonl_path_key(events_path), offset as i64],
             )
             .map_err(|source| EventStoreError::Sqlite {
                 path: self.path.clone(),
@@ -490,6 +619,37 @@ impl LocalEventStore {
             })?;
         Ok(count.max(0) as u64)
     }
+}
+
+fn insert_event(conn: &Connection, path: &Path, event: &StoredEvent) -> EventStoreResult<i64> {
+    let metadata_json = serde_json::to_string(&event.metadata)
+        .map_err(|source| EventStoreError::MetadataEncode { source })?;
+    let ts_epoch_nanos = parse_ts_epoch_nanos(&event.ts)?;
+    conn.execute(
+        "INSERT INTO events (
+            env, ts, ts_epoch_nanos, kind, subject, reason, driver, handle, metadata_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            event.env,
+            event.ts,
+            ts_epoch_nanos,
+            event.kind.as_str(),
+            event.subject,
+            event.reason,
+            event.driver,
+            event.handle,
+            metadata_json
+        ],
+    )
+    .map_err(|source| EventStoreError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn jsonl_path_key(events_path: &Path) -> String {
+    events_path.display().to_string()
 }
 
 fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult<Vec<StoredEvent>> {
