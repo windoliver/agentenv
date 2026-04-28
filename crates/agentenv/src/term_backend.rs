@@ -325,18 +325,19 @@ fn now_rfc3339() -> String {
 
 #[cfg(test)]
 mod tests {
-    use agentenv_proto::LogLevel;
+    use std::{fs, path::Path};
 
+    use agentenv_approvals::{ApprovalRequestRecord, ApprovalStatus, LocalApprovalStore};
+    use agentenv_proto::{ApprovalKind, LogLevel};
+    use agentenv_tui::backend::OpsBackend;
+
+    use super::StoredEventKind;
     use super::{legacy_jsonl_import_event, LocalOpsBackend};
 
     #[test]
     fn term_import_diagnostic_events_are_deduped() {
         let root = tempfile::tempdir().expect("tempdir");
-        let options = agentenv_core::runtime::RuntimeOptions {
-            root: root.path().to_path_buf(),
-            log_level: LogLevel::Info,
-            non_interactive: true,
-        };
+        let options = runtime_options(root.path());
         let mut backend = LocalOpsBackend::new(options).expect("backend");
 
         let diagnostic = "demo: legacy event import failed: broken jsonl".to_owned();
@@ -370,5 +371,135 @@ mod tests {
             event.reason.as_deref(),
             Some("demo: legacy event import skipped 2 malformed line(s)")
         );
+    }
+
+    #[tokio::test]
+    async fn local_backend_destroy_env_removes_state_and_records_event() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let env_dir = write_minimal_env_state(root.path(), "demo");
+        let mut backend =
+            LocalOpsBackend::new(runtime_options(root.path())).expect("create backend");
+
+        backend.destroy_env("demo").await.expect("destroy env");
+
+        assert!(!env_dir.exists());
+        let snapshot = backend.load_snapshot(None).await.expect("load snapshot");
+        assert!(snapshot
+            .events
+            .iter()
+            .any(|event| event.subject == "env_destroyed"));
+    }
+
+    #[tokio::test]
+    async fn local_backend_approval_actions_update_queue() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalApprovalStore::open(root.path()).expect("open approval store");
+        store
+            .upsert_pending(ApprovalRequestRecord {
+                request_id: "req_1".to_owned(),
+                env: "demo".to_owned(),
+                agent: None,
+                kind: ApprovalKind::EgressHost,
+                subject: "api.stripe.com:443".to_owned(),
+                reason: "egress".to_owned(),
+                status: ApprovalStatus::Pending,
+                requested_at: "2026-04-27T12:00:00Z".to_owned(),
+                decided_at: None,
+                decided_by: None,
+                scope: None,
+                context: serde_json::json!({}),
+            })
+            .expect("insert pending approval");
+        drop(store);
+        let mut backend =
+            LocalOpsBackend::new(runtime_options(root.path())).expect("create backend");
+
+        backend
+            .allow_approval("req_1")
+            .await
+            .expect("allow approval");
+
+        let snapshot = backend.load_snapshot(None).await.expect("load snapshot");
+        assert!(snapshot.approvals.is_empty());
+        assert!(snapshot
+            .events
+            .iter()
+            .any(|event| event.kind == StoredEventKind::ApprovalAllowed.as_str()));
+    }
+
+    fn runtime_options(root: &Path) -> agentenv_core::runtime::RuntimeOptions {
+        agentenv_core::runtime::RuntimeOptions {
+            root: root.to_path_buf(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        }
+    }
+
+    fn write_minimal_env_state(root: &Path, name: &str) -> std::path::PathBuf {
+        let env_dir = root.join("envs").join(name);
+        fs::create_dir_all(&env_dir).expect("create env dir");
+        let driver_version = env!("CARGO_PKG_VERSION");
+        fs::write(
+            env_dir.join("state.json"),
+            serde_json::json!({
+                "version": "0.1.0",
+                "name": name,
+                "phase": "running",
+                "created_at": "2026-04-21T00:00:00Z",
+                "updated_at": "2026-04-21T00:00:00Z",
+                "drivers": {
+                    "sandbox": {"name": "openshell", "version": driver_version},
+                    "agent": {"name": "codex", "version": driver_version},
+                    "context": {"name": "filesystem", "version": driver_version},
+                    "inference": {"name": "passthrough", "version": driver_version}
+                },
+                "handles": {},
+                "endpoints": {},
+                "credential_names": [],
+                "first_enter_hint_shown": false
+            })
+            .to_string(),
+        )
+        .expect("write state");
+        fs::write(
+            env_dir.join("blueprint.yaml"),
+            r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+        )
+        .expect("write blueprint");
+        fs::write(
+            env_dir.join("lock.yaml"),
+            r#"
+version: 0.1.0
+protocol_version: "0.1"
+blueprint_hash: e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  sandbox:
+    name: openshell
+    version: 0.0.1-alpha0
+  agent:
+    name: codex
+    version: 0.0.1-alpha0
+  context:
+    name: filesystem
+    version: 0.0.1-alpha0
+"#,
+        )
+        .expect("write lock");
+        env_dir
     }
 }
