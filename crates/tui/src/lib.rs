@@ -1,4 +1,13 @@
 #![forbid(unsafe_code)]
 
-/// Placeholder surface for the M1 workspace scaffold.
-pub const CRATE_NAME: &str = "tui";
+pub mod app;
+pub mod backend;
+pub mod command;
+pub mod model;
+pub mod render;
+pub mod terminal;
+pub mod theme;
+
+pub use backend::OpsBackend;
+pub use model::{CommandAction, OpsSnapshot, Pane, ViewMode};
+pub use terminal::{run_terminal, TermOptions};
