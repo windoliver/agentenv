@@ -1,11 +1,13 @@
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
@@ -512,6 +514,49 @@ fn term_remote_reports_unsupported_until_daemon_exists() {
         stderr.contains("remote term requires"),
         "stderr was: {stderr}"
     );
+}
+
+#[test]
+fn term_launches_and_quits_from_pty() {
+    let temp_dir = make_temp_dir("term-pty-quit");
+    write_minimal_env_state(&temp_dir, "demo");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let reader_thread = thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        while let Ok(bytes_read) = reader.read(&mut buffer) {
+            if bytes_read == 0 {
+                break;
+            }
+        }
+    });
+    let mut cmd = CommandBuilder::new(agentenv_bin());
+    cmd.arg("term");
+    cmd.env("HOME", temp_dir.display().to_string());
+    cmd.env("NO_COLOR", "1");
+
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    writer.write_all(b"q").unwrap();
+    writer.flush().unwrap();
+    thread::sleep(Duration::from_millis(500));
+
+    let status = child.wait().unwrap();
+    drop(writer);
+    drop(pair);
+    reader_thread.join().unwrap();
+    assert!(status.success(), "term exited with {status:?}");
 }
 
 #[test]
