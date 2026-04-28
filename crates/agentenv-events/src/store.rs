@@ -167,6 +167,10 @@ impl LocalEventStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_env_ts ON events(env, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_unixepoch_id
+                    ON events(unixepoch(ts) DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_env_unixepoch_id
+                    ON events(env, unixepoch(ts) DESC, id DESC);
                 CREATE TABLE IF NOT EXISTS jsonl_offsets (
                     env TEXT PRIMARY KEY,
                     path TEXT NOT NULL,
@@ -419,6 +423,28 @@ mod tests {
 
         assert_eq!(events[0].subject, "later by instant");
         assert_eq!(events[1].subject, "earlier by instant");
+    }
+
+    #[test]
+    fn local_store_creates_parsed_time_indexes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        for name in ["idx_events_unixepoch_id", "idx_events_env_unixepoch_id"] {
+            let sql: String = store
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .expect("index exists");
+
+            assert!(
+                sql.contains("unixepoch(ts)"),
+                "index `{name}` did not include parsed timestamp expression: {sql}"
+            );
+        }
     }
 
     #[test]
