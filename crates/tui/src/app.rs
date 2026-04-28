@@ -53,6 +53,14 @@ impl App {
             .map(|row| row.name.as_str())
     }
 
+    pub fn selected_env_index(&self) -> usize {
+        self.selected_env
+    }
+
+    pub fn selected_approval_index(&self) -> usize {
+        self.selected_approval
+    }
+
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
