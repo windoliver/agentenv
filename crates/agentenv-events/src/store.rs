@@ -1,1116 +1,1277 @@
-use std::{
-    fs,
-    io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, params_from_iter, Connection, OpenFlags};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-const MAX_LIST_RECENT_LIMIT: usize = 1_000;
-const NANOS_PER_SECOND: i64 = 1_000_000_000;
-const LEGACY_JSONL_FALLBACK_TS: &str = "1970-01-01T00:00:00Z";
+use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
+
+pub type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug, Error)]
-pub enum EventStoreError {
-    #[error("failed to create event store directory `{path}`: {source}")]
-    CreateDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to {action} event file `{path}`: {source}")]
-    FileIo {
-        action: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("sqlite event store error at `{path}`: {source}")]
-    Sqlite {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error("failed to encode event metadata: {source}")]
-    MetadataEncode {
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to decode event metadata: {source}")]
-    MetadataDecode {
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("failed to decode event kind `{value}`")]
-    KindDecode { value: String },
-    #[error("failed to decode event timestamp `{ts}`: {source}")]
-    TimestampDecode {
-        ts: String,
-        #[source]
-        source: time::error::Parse,
-    },
-    #[error("event timestamp `{ts}` is outside the supported nanosecond range")]
-    TimestampRange { ts: String },
+pub enum StoreError {
+    #[error("sqlite activity store error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("activity store IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("activity event JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("activity event field {field} did not serialize to a string")]
+    NonStringEnum { field: &'static str },
+    #[error("activity event latency_ms is outside SQLite integer range: {0}")]
+    LatencyOutOfRange(u64),
+    #[error("activity event stored negative latency_ms: {0}")]
+    NegativeLatency(i64),
+    #[error("activity event count is outside u64 range: {0}")]
+    CountOutOfRange(i64),
+    #[error("unsafe activity database path: {path}")]
+    UnsafeDatabasePath { path: PathBuf },
 }
 
-pub type EventStoreResult<T> = Result<T, EventStoreError>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StoredEventKind {
-    EgressDenied,
-    ApprovalRequested,
-    ApprovalAllowed,
-    ApprovalDenied,
-    Log,
-    Runtime,
-}
-
-impl StoredEventKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::EgressDenied => "egress_denied",
-            Self::ApprovalRequested => "approval_requested",
-            Self::ApprovalAllowed => "approval_allowed",
-            Self::ApprovalDenied => "approval_denied",
-            Self::Log => "log",
-            Self::Runtime => "runtime",
-        }
-    }
-
-    fn from_str(value: &str) -> EventStoreResult<Self> {
-        let kind = match value {
-            "egress_denied" => Self::EgressDenied,
-            "approval_requested" => Self::ApprovalRequested,
-            "approval_allowed" => Self::ApprovalAllowed,
-            "approval_denied" => Self::ApprovalDenied,
-            "log" => Self::Log,
-            "runtime" => Self::Runtime,
-            _ => {
-                return Err(EventStoreError::KindDecode {
-                    value: value.to_owned(),
-                });
-            }
-        };
-        Ok(kind)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredEvent {
-    pub id: Option<i64>,
-    pub env: String,
-    pub ts: String,
-    pub kind: StoredEventKind,
-    pub subject: String,
-    pub reason: Option<String>,
+    pub id: i64,
+    pub event: ActivityEvent,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventQuery {
+    pub env: Option<String>,
+    pub kind: Option<ActivityKind>,
+    pub result: Option<ActivityResult>,
+    pub after_id: Option<i64>,
+    pub from_ts: Option<String>,
+    pub to_ts: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCount {
+    pub kind: ActivityKind,
+    pub env: Option<String>,
+    pub result: ActivityResult,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyBlockCount {
+    pub kind: String,
     pub driver: Option<String>,
-    pub handle: Option<String>,
-    pub metadata: serde_json::Value,
+    pub count: u64,
 }
 
-impl StoredEvent {
-    pub fn new(
-        env: impl Into<String>,
-        ts: impl Into<String>,
-        kind: StoredEventKind,
-        subject: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: None,
-            env: env.into(),
-            ts: ts.into(),
-            kind,
-            subject: subject.into(),
-            reason: None,
-            driver: None,
-            handle: None,
-            metadata: serde_json::Value::Object(serde_json::Map::new()),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCount {
+    pub tool: String,
+    pub env: Option<String>,
+    pub result: ActivityResult,
+    pub count: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventImportReport {
-    pub imported: usize,
-    pub skipped: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLatencyRow {
+    pub op: String,
+    pub driver: Option<String>,
+    pub latency_ms: u64,
 }
 
-pub fn default_store_path(root: &Path) -> PathBuf {
-    root.join("ops.sqlite3")
-}
-
-pub struct LocalEventStore {
+pub struct SqliteEventStore {
     path: PathBuf,
-    conn: Connection,
 }
 
-impl LocalEventStore {
-    pub fn open(root: &Path) -> EventStoreResult<Self> {
-        fs::create_dir_all(root).map_err(|source| EventStoreError::CreateDir {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        let path = default_store_path(root);
-        let conn = Connection::open(&path).map_err(|source| EventStoreError::Sqlite {
-            path: path.clone(),
-            source,
-        })?;
-        let store = Self { path, conn };
-        store.init_schema()?;
+impl SqliteEventStore {
+    pub fn open(path: impl Into<PathBuf>) -> StoreResult<Self> {
+        let store = Self { path: path.into() };
+        store.migrate()?;
         Ok(store)
     }
 
-    pub fn path(&self) -> PathBuf {
-        self.path.clone()
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    fn init_schema(&self) -> EventStoreResult<()> {
-        self.conn
-            .execute_batch(
-                r#"
-                PRAGMA foreign_keys = ON;
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    env TEXT NOT NULL,
-                    ts TEXT NOT NULL,
-                    ts_epoch_nanos INTEGER NOT NULL,
-                    kind TEXT NOT NULL,
-                    subject TEXT NOT NULL,
-                    reason TEXT,
-                    driver TEXT,
-                    handle TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}'
-                );
-                CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_env_ts ON events(env, ts DESC);
-                CREATE TABLE IF NOT EXISTS jsonl_offsets (
-                    env TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    offset INTEGER NOT NULL,
-                    PRIMARY KEY (env, path)
-                );
-                "#,
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        self.ensure_ts_epoch_nanos_column()?;
-        self.ensure_jsonl_offsets_path_key()?;
-        self.conn
-            .execute_batch(
-                r#"
-                CREATE INDEX IF NOT EXISTS idx_events_ts_epoch_nanos_id
-                    ON events(ts_epoch_nanos DESC, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_env_ts_epoch_nanos_id
-                    ON events(env, ts_epoch_nanos DESC, id DESC);
-                "#,
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
-    fn ensure_jsonl_offsets_path_key(&self) -> EventStoreResult<()> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, pk FROM pragma_table_info('jsonl_offsets')")
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut env_pk = 0;
-        let mut path_pk = 0;
-        for row in rows {
-            let (name, pk) = row.map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-            if name == "env" {
-                env_pk = pk;
-            } else if name == "path" {
-                path_pk = pk;
-            }
-        }
-        drop(stmt);
-
-        if env_pk == 1 && path_pk == 2 {
-            return Ok(());
+    pub fn migrate(&self) -> StoreResult<()> {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
-        self.migrate_jsonl_offsets_path_key()
-    }
+        let conn = self.connection()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS activity_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              env TEXT,
+              actor_json TEXT NOT NULL,
+              subject_json TEXT NOT NULL,
+              result TEXT NOT NULL,
+              latency_ms INTEGER,
+              trace_id TEXT NOT NULL,
+              reason_code TEXT,
+              extras_json TEXT NOT NULL
+            );
 
-    fn migrate_jsonl_offsets_path_key(&self) -> EventStoreResult<()> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        let result = self
-            .conn
-            .execute_batch(
-                r#"
-                CREATE TABLE jsonl_offsets_new (
-                    env TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    offset INTEGER NOT NULL,
-                    PRIMARY KEY (env, path)
-                );
-                INSERT OR REPLACE INTO jsonl_offsets_new (env, path, offset)
-                    SELECT env, path, offset FROM jsonl_offsets;
-                DROP TABLE jsonl_offsets;
-                ALTER TABLE jsonl_offsets_new RENAME TO jsonl_offsets;
-                "#,
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            });
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                }),
-            Err(err) => {
-                let rollback = self.conn.execute_batch("ROLLBACK");
-                if let Err(source) = rollback {
-                    return Err(EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-                Err(err)
-            }
-        }
-    }
-
-    fn ensure_ts_epoch_nanos_column(&self) -> EventStoreResult<()> {
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM pragma_table_info('events') WHERE name = 'ts_epoch_nanos'
-                )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        if exists {
-            return Ok(());
-        }
-
-        self.migrate_ts_epoch_nanos_column()
-    }
-
-    fn migrate_ts_epoch_nanos_column(&self) -> EventStoreResult<()> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        let result = self
-            .conn
-            .execute(
-                "ALTER TABLE events ADD COLUMN ts_epoch_nanos INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })
-            .and_then(|_| self.backfill_ts_epoch_nanos());
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                }),
-            Err(err) => {
-                let rollback = self.conn.execute_batch("ROLLBACK");
-                if let Err(source) = rollback {
-                    return Err(EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-                Err(err)
-            }
-        }
-    }
-
-    fn backfill_ts_epoch_nanos(&self) -> EventStoreResult<()> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, ts FROM events")
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut updates = Vec::new();
-        for row in rows {
-            let (id, ts) = row.map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-            updates.push((id, parse_ts_epoch_nanos(&ts)?));
-        }
-        drop(stmt);
-
-        for (id, ts_epoch_nanos) in updates {
-            self.conn
-                .execute(
-                    "UPDATE events SET ts_epoch_nanos = ?1 WHERE id = ?2",
-                    params![ts_epoch_nanos, id],
-                )
-                .map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?;
-        }
-
+            CREATE INDEX IF NOT EXISTS activity_events_ts_idx ON activity_events(ts);
+            CREATE INDEX IF NOT EXISTS activity_events_env_ts_idx ON activity_events(env, ts);
+            CREATE INDEX IF NOT EXISTS activity_events_kind_ts_idx ON activity_events(kind, ts);
+            CREATE INDEX IF NOT EXISTS activity_events_result_ts_idx ON activity_events(result, ts);
+            "#,
+        )?;
         Ok(())
     }
 
-    pub fn append(&self, event: &StoredEvent) -> EventStoreResult<i64> {
-        insert_event(&self.conn, &self.path, event)
-    }
-
-    pub fn list_recent(
-        &self,
-        env: Option<&str>,
-        limit: usize,
-    ) -> EventStoreResult<Vec<StoredEvent>> {
-        let sql_all = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events ORDER BY ts_epoch_nanos DESC, id DESC LIMIT ?1";
-        let sql_env = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events WHERE env = ?1 ORDER BY ts_epoch_nanos DESC, id DESC LIMIT ?2";
-        let limit = bounded_list_recent_limit(limit);
-
-        if let Some(env) = env {
-            let mut stmt =
-                self.conn
-                    .prepare(sql_env)
-                    .map_err(|source| EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            let rows =
-                stmt.query(params![env, limit])
-                    .map_err(|source| EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            collect_events(rows, &self.path)
-        } else {
-            let mut stmt =
-                self.conn
-                    .prepare(sql_all)
-                    .map_err(|source| EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            let rows = stmt
-                .query(params![limit])
-                .map_err(|source| EventStoreError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            collect_events(rows, &self.path)
+    pub fn append_many(&self, events: &[ActivityEvent]) -> StoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
         }
-    }
 
-    pub fn import_env_jsonl(
-        &self,
-        env: &str,
-        events_path: &Path,
-    ) -> EventStoreResult<EventImportReport> {
-        let mut file = match fs::File::open(events_path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(EventImportReport {
-                    imported: 0,
-                    skipped: 0,
-                });
-            }
-            Err(source) => {
-                return Err(EventStoreError::FileIo {
-                    action: "open",
-                    path: events_path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        let result = (|| {
-            let stored_offset = self.jsonl_offset(env, events_path)?;
-            let len = file
-                .metadata()
-                .map(|metadata| metadata.len())
-                .map_err(|source| EventStoreError::FileIo {
-                    action: "read metadata for",
-                    path: events_path.to_path_buf(),
-                    source,
-                })?;
-            let start = jsonl_start_offset(stored_offset, len);
-            file.seek(SeekFrom::Start(start))
-                .map_err(|source| EventStoreError::FileIo {
-                    action: "seek",
-                    path: events_path.to_path_buf(),
-                    source,
-                })?;
-
-            let mut content = String::new();
-            file.read_to_string(&mut content)
-                .map_err(|source| EventStoreError::FileIo {
-                    action: "read",
-                    path: events_path.to_path_buf(),
-                    source,
-                })?;
-
-            let complete_len = content
-                .rfind('\n')
-                .map(|last_newline| last_newline + 1)
-                .unwrap_or(0);
-            let complete_content = &content[..complete_len];
-            let offset = start + complete_len as u64;
-            let mut imported = 0;
-            let mut skipped = 0;
-            let mut events = Vec::new();
-            for line in complete_content
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-            {
-                match event_from_jsonl_line(env, line) {
-                    Some(event) => {
-                        events.push(event);
-                        imported += 1;
-                    }
-                    None => skipped += 1,
-                }
-            }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO activity_events (
+                    ts,
+                    kind,
+                    env,
+                    actor_json,
+                    subject_json,
+                    result,
+                    latency_ms,
+                    trace_id,
+                    reason_code,
+                    extras_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+            )?;
 
             for event in events {
-                insert_event(&self.conn, &self.path, &event)?;
-            }
-            self.set_jsonl_offset(env, events_path, offset)?;
-            Ok(EventImportReport { imported, skipped })
-        })();
+                let kind = enum_to_db_string(event.kind, "kind")?;
+                let result = enum_to_db_string(event.result, "result")?;
+                let actor_json = serde_json::to_string(&event.actor)?;
+                let subject_json = serde_json::to_string(&event.subject)?;
+                let extras_json = serde_json::to_string(&event.extras)?;
+                let latency_ms = match event.latency_ms {
+                    Some(value) => Some(
+                        i64::try_from(value).map_err(|_| StoreError::LatencyOutOfRange(value))?,
+                    ),
+                    None => None,
+                };
 
-        match result {
-            Ok(report) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(|source| EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                Ok(report)
-            }
-            Err(err) => {
-                let rollback = self.conn.execute_batch("ROLLBACK");
-                if let Err(source) = rollback {
-                    return Err(EventStoreError::Sqlite {
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-                Err(err)
+                stmt.execute(params![
+                    event.ts,
+                    kind,
+                    event.env,
+                    actor_json,
+                    subject_json,
+                    result,
+                    latency_ms,
+                    event.trace_id,
+                    event.reason_code,
+                    extras_json,
+                ])?;
             }
         }
-    }
-
-    fn jsonl_offset(&self, env: &str, events_path: &Path) -> EventStoreResult<u64> {
-        match self.conn.query_row(
-            "SELECT offset FROM jsonl_offsets WHERE env = ?1 AND path = ?2",
-            params![env, jsonl_path_key(events_path)],
-            |row| row.get::<_, i64>(0),
-        ) {
-            Ok(offset) => Ok(offset.max(0) as u64),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
-            Err(source) => Err(EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            }),
-        }
-    }
-
-    fn set_jsonl_offset(&self, env: &str, events_path: &Path, offset: u64) -> EventStoreResult<()> {
-        self.conn
-            .execute(
-                "INSERT INTO jsonl_offsets (env, path, offset) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(env, path) DO UPDATE SET offset = excluded.offset",
-                params![env, jsonl_path_key(events_path), offset as i64],
-            )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn events_per_minute(&self) -> EventStoreResult<u64> {
-        let upper = current_epoch_nanos()?;
-        let lower = upper.saturating_sub(60 * NANOS_PER_SECOND);
-        let count: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM events
-                 WHERE ts_epoch_nanos BETWEEN ?1 AND ?2",
-                params![lower, upper],
-                |row| row.get(0),
+    pub fn query(&self, query: EventQuery) -> StoreResult<Vec<StoredEvent>> {
+        let conn = self.connection()?;
+        let mut sql = String::from(
+            r#"
+            SELECT
+                id,
+                ts,
+                kind,
+                env,
+                actor_json,
+                subject_json,
+                result,
+                latency_ms,
+                trace_id,
+                reason_code,
+                extras_json
+            FROM activity_events
+            WHERE 1 = 1
+            "#,
+        );
+        let mut query_params = Vec::new();
+
+        if let Some(env) = query.env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env));
+        }
+        if let Some(kind) = query.kind {
+            sql.push_str(" AND kind = ?");
+            query_params.push(SqlValue::Text(enum_to_db_string(kind, "kind")?));
+        }
+        if let Some(result) = query.result {
+            sql.push_str(" AND result = ?");
+            query_params.push(SqlValue::Text(enum_to_db_string(result, "result")?));
+        }
+        if let Some(after_id) = query.after_id {
+            sql.push_str(" AND id > ?");
+            query_params.push(SqlValue::Integer(after_id));
+        }
+        if let Some(from_ts) = query.from_ts {
+            sql.push_str(" AND ts >= ?");
+            query_params.push(SqlValue::Text(from_ts));
+        }
+        if let Some(to_ts) = query.to_ts {
+            sql.push_str(" AND ts <= ?");
+            query_params.push(SqlValue::Text(to_ts));
+        }
+
+        if query.after_id.is_some() {
+            sql.push_str(" ORDER BY id ASC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY id DESC LIMIT ?");
+        }
+        query_params.push(SqlValue::Integer(query.limit.clamp(1, 10_000) as i64));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let raw_rows = stmt.query_map(params_from_iter(query_params), raw_event_from_row)?;
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            rows.push(raw?.try_into_stored_event()?);
+        }
+        Ok(rows)
+    }
+
+    pub fn has_entries_for_env(&self, env: &str) -> StoreResult<bool> {
+        let conn = self.connection()?;
+        let found = conn.query_row(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM activity_events
+                WHERE env = ?1
+                LIMIT 1
             )
-            .map_err(|source| EventStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(count.max(0) as u64)
+            "#,
+            params![env],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(found != 0)
+    }
+
+    pub fn counts_by_kind_result(&self) -> StoreResult<Vec<EventCount>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT kind, env, result, COUNT(*)
+            FROM activity_events
+            GROUP BY kind, env, result
+            ORDER BY kind ASC, env ASC, result ASC
+            "#,
+        )?;
+        let raw_rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (kind, env, result, count) = raw?;
+            rows.push(EventCount {
+                kind: enum_from_db_string(kind)?,
+                env,
+                result: enum_from_db_string(result)?,
+                count: u64::try_from(count).map_err(|_| StoreError::CountOutOfRange(count))?,
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn policy_blocks_by_kind_driver(&self) -> StoreResult<Vec<PolicyBlockCount>> {
+        self.policy_blocks_by_kind_driver_for_env(None)
+    }
+
+    pub fn policy_blocks_by_kind_driver_for_env(
+        &self,
+        env: Option<&str>,
+    ) -> StoreResult<Vec<PolicyBlockCount>> {
+        let conn = self.connection()?;
+        let egress_denied = enum_to_db_string(ActivityKind::EgressDenied, "kind")?;
+        let mut sql = String::from(
+            r#"
+            SELECT
+                kind,
+                CASE
+                    WHEN json_type(actor_json, '$.driver') = 'text'
+                    THEN json_extract(actor_json, '$.driver')
+                END AS driver,
+                COUNT(*)
+            FROM activity_events
+            WHERE kind = ?
+            "#,
+        );
+        let mut query_params = vec![SqlValue::Text(egress_denied)];
+        if let Some(env) = env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
+            GROUP BY kind, driver
+            ORDER BY kind ASC, driver ASC
+            "#,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let raw_rows = stmt.query_map(params_from_iter(query_params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (kind, driver, count) = raw?;
+            rows.push(PolicyBlockCount {
+                kind,
+                driver,
+                count: count_to_u64(count)?,
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn mcp_tool_calls_by_tool_env_result(&self) -> StoreResult<Vec<McpToolCount>> {
+        let conn = self.connection()?;
+        let mcp_tool_call = enum_to_db_string(ActivityKind::McpToolCall, "kind")?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                COALESCE(
+                    CASE
+                        WHEN json_type(subject_json, '$.tool') = 'text'
+                        THEN json_extract(subject_json, '$.tool')
+                    END,
+                    'unknown'
+                ) AS tool,
+                env,
+                result,
+                COUNT(*)
+            FROM activity_events
+            WHERE kind = ?
+            GROUP BY tool, env, result
+            ORDER BY tool ASC, env ASC, result ASC
+            "#,
+        )?;
+        let raw_rows = stmt.query_map(params![mcp_tool_call], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (tool, env, result, count) = raw?;
+            rows.push(McpToolCount {
+                tool,
+                env,
+                result: enum_from_db_string(result)?,
+                count: count_to_u64(count)?,
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn sandbox_latency_rows(&self) -> StoreResult<Vec<SandboxLatencyRow>> {
+        self.sandbox_latency_rows_for_env(None)
+    }
+
+    pub fn sandbox_latency_rows_for_env(
+        &self,
+        env: Option<&str>,
+    ) -> StoreResult<Vec<SandboxLatencyRow>> {
+        let conn = self.connection()?;
+        let sandbox_create = enum_to_db_string(ActivityKind::SandboxCreate, "kind")?;
+        let sandbox_destroy = enum_to_db_string(ActivityKind::SandboxDestroy, "kind")?;
+        let exec = enum_to_db_string(ActivityKind::Exec, "kind")?;
+        let mut sql = String::from(
+            r#"
+            SELECT
+                kind,
+                CASE
+                    WHEN json_type(actor_json, '$.driver') = 'text'
+                    THEN json_extract(actor_json, '$.driver')
+                END AS driver,
+                latency_ms
+            FROM activity_events
+            WHERE latency_ms IS NOT NULL
+              AND kind IN (?, ?, ?)
+            "#,
+        );
+        let mut query_params = vec![
+            SqlValue::Text(sandbox_create),
+            SqlValue::Text(sandbox_destroy),
+            SqlValue::Text(exec),
+        ];
+        if let Some(env) = env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
+            ORDER BY kind ASC, driver ASC, latency_ms ASC
+            "#,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let raw_rows = stmt.query_map(params_from_iter(query_params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for raw in raw_rows {
+            let (kind, driver, latency_ms) = raw?;
+            if let Some(op) = sandbox_op_from_kind(enum_from_db_string(kind)?) {
+                if latency_ms < 0 {
+                    return Err(StoreError::NegativeLatency(latency_ms));
+                }
+                rows.push(SandboxLatencyRow {
+                    op: op.to_owned(),
+                    driver,
+                    latency_ms: u64::try_from(latency_ms)
+                        .map_err(|_| StoreError::NegativeLatency(latency_ms))?,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn approvals_pending_count(&self) -> StoreResult<u64> {
+        self.approvals_pending_count_for_env(None)
+    }
+
+    pub fn approvals_pending_count_for_env(&self, env: Option<&str>) -> StoreResult<u64> {
+        let conn = self.connection()?;
+        let approval_requested = enum_to_db_string(ActivityKind::ApprovalRequested, "kind")?;
+        let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
+        let mut sql = String::from(
+            r#"
+            SELECT COUNT(DISTINCT requested.request_id)
+            FROM (
+                SELECT
+                    CASE
+                        WHEN json_type(subject_json, '$.request_id') = 'text'
+                        THEN json_extract(subject_json, '$.request_id')
+                    END AS request_id
+                FROM activity_events
+                WHERE kind = ?
+            "#,
+        );
+        let mut query_params = vec![SqlValue::Text(approval_requested)];
+        if let Some(env) = env {
+            sql.push_str(" AND env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
+            ) AS requested
+            WHERE requested.request_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM activity_events AS decided
+                WHERE decided.kind = ?
+                  AND json_type(decided.subject_json, '$.request_id') = 'text'
+                  AND json_extract(decided.subject_json, '$.request_id') = requested.request_id
+            "#,
+        );
+        query_params.push(SqlValue::Text(approval_decided));
+        if let Some(env) = env {
+            sql.push_str(" AND decided.env = ?");
+            query_params.push(SqlValue::Text(env.to_owned()));
+        }
+        sql.push_str(
+            r#"
+              )
+            "#,
+        );
+        let pending = conn.query_row(&sql, params_from_iter(query_params), |row| {
+            row.get::<_, i64>(0)
+        })?;
+
+        count_to_u64(pending)
+    }
+
+    fn connection(&self) -> StoreResult<Connection> {
+        create_private_database_file(&self.path)?;
+        let path = database_open_path(&self.path)?;
+        Ok(Connection::open_with_flags(path, database_open_flags())?)
     }
 }
 
-fn insert_event(conn: &Connection, path: &Path, event: &StoredEvent) -> EventStoreResult<i64> {
-    let metadata_json = serde_json::to_string(&event.metadata)
-        .map_err(|source| EventStoreError::MetadataEncode { source })?;
-    let ts_epoch_nanos = parse_ts_epoch_nanos(&event.ts)?;
-    conn.execute(
-        "INSERT INTO events (
-            env, ts, ts_epoch_nanos, kind, subject, reason, driver, handle, metadata_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            event.env,
-            event.ts,
-            ts_epoch_nanos,
-            event.kind.as_str(),
-            event.subject,
-            event.reason,
-            event.driver,
-            event.handle,
-            metadata_json
-        ],
-    )
-    .map_err(|source| EventStoreError::Sqlite {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(conn.last_insert_rowid())
-}
-
-fn jsonl_path_key(events_path: &Path) -> String {
-    events_path.display().to_string()
-}
-
-fn jsonl_start_offset(stored_offset: u64, locked_file_len: u64) -> u64 {
-    if stored_offset <= locked_file_len {
-        stored_offset
+#[cfg(unix)]
+fn database_open_path(path: &Path) -> StoreResult<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| StoreError::UnsafeDatabasePath {
+            path: path.to_owned(),
+        })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
     } else {
-        0
+        parent
+    };
+
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
+}
+
+#[cfg(not(unix))]
+fn database_open_path(path: &Path) -> StoreResult<PathBuf> {
+    Ok(path.to_owned())
+}
+
+fn database_open_flags() -> OpenFlags {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+    #[cfg(unix)]
+    {
+        flags | OpenFlags::SQLITE_OPEN_NOFOLLOW
+    }
+
+    #[cfg(not(unix))]
+    {
+        flags
     }
 }
 
-fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult<Vec<StoredEvent>> {
+pub fn read_legacy_jsonl(
+    path: impl AsRef<Path>,
+    driver_filter: Option<&str>,
+    kind_filter: Option<ActivityKind>,
+) -> StoreResult<Vec<ActivityEvent>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
     let mut events = Vec::new();
-    while let Some(row) = rows.next().map_err(|source| EventStoreError::Sqlite {
-        path: path.to_path_buf(),
-        source,
-    })? {
-        events.push(row_to_event(row, path)?);
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let event = match parse_legacy_jsonl_activity_event(line) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
+
+        if let Some(kind) = kind_filter {
+            if event.kind != kind {
+                continue;
+            }
+        }
+        if let Some(driver) = driver_filter {
+            if event.actor.get("driver").and_then(Value::as_str) != Some(driver) {
+                continue;
+            }
+        }
+
+        events.push(event);
     }
+
     Ok(events)
 }
 
-fn event_from_jsonl_line(env: &str, line: &str) -> Option<StoredEvent> {
-    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    let ts = value
-        .get("ts")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(LEGACY_JSONL_FALLBACK_TS);
-    parse_ts_epoch_nanos(ts).ok()?;
-    let kind = value
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .map(StoredEventKind::from_str)
-        .map(|kind| kind.unwrap_or(StoredEventKind::Runtime))
-        .unwrap_or(StoredEventKind::Log);
-    let subject = value
-        .get("subject")
-        .or_else(|| value.get("msg"))
-        .or_else(|| value.get("message"))
-        .or_else(|| value.get("kind"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("event");
-    let mut event = StoredEvent::new(env, ts, kind, subject);
-    event.reason = value
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    event.driver = value
-        .get("driver")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    event.handle = value
-        .get("handle")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    event.metadata = value;
-    Some(event)
+#[cfg(unix)]
+fn create_private_database_file(path: &Path) -> StoreResult<()> {
+    use std::fs::OpenOptions;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            harden_existing_database_file(path)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
-fn bounded_list_recent_limit(limit: usize) -> i64 {
-    limit.min(MAX_LIST_RECENT_LIMIT) as i64
+#[cfg(unix)]
+fn harden_existing_database_file(path: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(StoreError::UnsafeDatabasePath {
+            path: path.to_owned(),
+        });
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
 }
 
-fn current_epoch_nanos() -> EventStoreResult<i64> {
-    epoch_nanos_to_i64("now", OffsetDateTime::now_utc().unix_timestamp_nanos())
+#[cfg(not(unix))]
+fn create_private_database_file(_path: &Path) -> StoreResult<()> {
+    Ok(())
 }
 
-fn parse_ts_epoch_nanos(ts: &str) -> EventStoreResult<i64> {
-    let parsed =
-        OffsetDateTime::parse(ts, &Rfc3339).map_err(|source| EventStoreError::TimestampDecode {
-            ts: ts.to_owned(),
-            source,
-        })?;
-    epoch_nanos_to_i64(ts, parsed.unix_timestamp_nanos())
+#[derive(Debug)]
+struct RawStoredEvent {
+    id: i64,
+    ts: String,
+    kind: String,
+    env: Option<String>,
+    actor_json: String,
+    subject_json: String,
+    result: String,
+    latency_ms: Option<i64>,
+    trace_id: String,
+    reason_code: Option<String>,
+    extras_json: String,
 }
 
-fn epoch_nanos_to_i64(ts: &str, nanos: i128) -> EventStoreResult<i64> {
-    i64::try_from(nanos).map_err(|_| EventStoreError::TimestampRange { ts: ts.to_owned() })
+impl RawStoredEvent {
+    fn try_into_stored_event(self) -> StoreResult<StoredEvent> {
+        let latency_ms = match self.latency_ms {
+            Some(value) if value < 0 => return Err(StoreError::NegativeLatency(value)),
+            Some(value) => {
+                Some(u64::try_from(value).map_err(|_| StoreError::NegativeLatency(value))?)
+            }
+            None => None,
+        };
+
+        Ok(StoredEvent {
+            id: self.id,
+            event: ActivityEvent {
+                ts: self.ts,
+                kind: enum_from_db_string(self.kind)?,
+                env: self.env,
+                actor: serde_json::from_str(&self.actor_json)?,
+                subject: serde_json::from_str(&self.subject_json)?,
+                result: enum_from_db_string(self.result)?,
+                latency_ms,
+                trace_id: self.trace_id,
+                reason_code: self.reason_code,
+                extras: serde_json::from_str(&self.extras_json)?,
+            },
+        })
+    }
 }
 
-fn row_to_event(row: &rusqlite::Row<'_>, path: &Path) -> EventStoreResult<StoredEvent> {
-    let metadata_json: String = row.get(8).map_err(|source| EventStoreError::Sqlite {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let metadata = serde_json::from_str(&metadata_json)
-        .map_err(|source| EventStoreError::MetadataDecode { source })?;
-    let kind_value: String = row.get(3).map_err(|source| EventStoreError::Sqlite {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let kind = StoredEventKind::from_str(&kind_value)?;
-    Ok(StoredEvent {
-        id: row.get(0).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        env: row.get(1).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        ts: row.get(2).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        kind,
-        subject: row.get(4).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        reason: row.get(5).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        driver: row.get(6).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        handle: row.get(7).map_err(|source| EventStoreError::Sqlite {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        metadata,
+fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawStoredEvent> {
+    Ok(RawStoredEvent {
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        kind: row.get(2)?,
+        env: row.get(3)?,
+        actor_json: row.get(4)?,
+        subject_json: row.get(5)?,
+        result: row.get(6)?,
+        latency_ms: row.get(7)?,
+        trace_id: row.get(8)?,
+        reason_code: row.get(9)?,
+        extras_json: row.get(10)?,
     })
+}
+
+fn enum_to_db_string<T>(value: T, field: &'static str) -> StoreResult<String>
+where
+    T: Serialize,
+{
+    match serde_json::to_value(value)? {
+        Value::String(value) => Ok(value),
+        _ => Err(StoreError::NonStringEnum { field }),
+    }
+}
+
+fn enum_from_db_string<T>(value: String) -> StoreResult<T>
+where
+    T: DeserializeOwned,
+{
+    Ok(serde_json::from_value(Value::String(value))?)
+}
+
+fn count_to_u64(count: i64) -> StoreResult<u64> {
+    u64::try_from(count).map_err(|_| StoreError::CountOutOfRange(count))
+}
+
+fn sandbox_op_from_kind(kind: ActivityKind) -> Option<&'static str> {
+    match kind {
+        ActivityKind::SandboxCreate => Some("create"),
+        ActivityKind::SandboxDestroy => Some("destroy"),
+        ActivityKind::Exec => Some("exec"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyJsonlEvent {
+    ts: String,
+    driver: Option<String>,
+    level: Option<String>,
+    msg: Option<String>,
+}
+
+fn legacy_json_value_to_activity(value: Value) -> StoreResult<ActivityEvent> {
+    let legacy: LegacyJsonlEvent = serde_json::from_value(value)?;
+    let mut event = ActivityEvent::new(
+        legacy.ts,
+        ActivityKind::Log,
+        ActivityResult::Ok,
+        "legacy-jsonl",
+    );
+
+    if let Some(driver) = legacy.driver {
+        event = event.with_actor_value("driver", Value::String(driver));
+    }
+    if let Some(level) = legacy.level {
+        event = event.with_extra("level", Value::String(level));
+    }
+    if let Some(msg) = legacy.msg {
+        event = event.with_extra("msg", Value::String(msg));
+    }
+
+    Ok(event)
+}
+
+pub fn parse_legacy_jsonl_activity_event(line: &str) -> StoreResult<ActivityEvent> {
+    let value: Value = serde_json::from_str(line)?;
+    if value.get("kind").is_some() && value.get("result").is_some() {
+        Ok(serde_json::from_value(value)?)
+    } else {
+        legacy_json_value_to_activity(value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+    use super::*;
+    use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
 
-    use super::{EventStoreError, LocalEventStore, StoredEvent, StoredEventKind};
+    static CURRENT_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn events_per_minute_excludes_old_rfc3339_same_day_event() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
-        let now = OffsetDateTime::now_utc();
-        let old_ts = (now - Duration::minutes(2))
-            .format(&Rfc3339)
-            .expect("format old timestamp");
-        let current_ts = now.format(&Rfc3339).expect("format current timestamp");
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
 
-        store
-            .append(&StoredEvent::new(
-                "dev",
-                old_ts,
-                StoredEventKind::Log,
-                "old event",
-            ))
-            .expect("append old event");
-        store
-            .append(&StoredEvent::new(
-                "dev",
-                current_ts,
-                StoredEventKind::Log,
-                "current event",
-            ))
-            .expect("append current event");
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
 
-        assert_eq!(store.events_per_minute().expect("count events"), 1);
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
+
+    fn event(ts: &str, kind: ActivityKind, env: &str, result: ActivityResult) -> ActivityEvent {
+        ActivityEvent::new(ts, kind, result, "trace-store").with_env(env)
+    }
+
+    fn query_all(limit: usize) -> EventQuery {
+        EventQuery {
+            limit,
+            ..EventQuery::default()
+        }
     }
 
     #[test]
-    fn events_per_minute_excludes_future_rfc3339_event() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
-        let now = OffsetDateTime::now_utc();
-        let current_ts = now.format(&Rfc3339).expect("format current timestamp");
-        let future_ts = (now + Duration::minutes(2))
-            .format(&Rfc3339)
-            .expect("format future timestamp");
+    fn sqlite_store_appends_and_filters_by_env_kind_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
 
         store
-            .append(&StoredEvent::new(
-                "dev",
-                current_ts,
-                StoredEventKind::Log,
-                "current event",
-            ))
-            .expect("append current event");
-        store
-            .append(&StoredEvent::new(
-                "dev",
-                future_ts,
-                StoredEventKind::Log,
-                "future event",
-            ))
-            .expect("append future event");
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::EgressDenied,
+                    "other",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
 
-        assert_eq!(store.events_per_minute().expect("count events"), 1);
+        let rows = store
+            .query(EventQuery {
+                env: Some("demo".to_owned()),
+                kind: Some(ActivityKind::EgressDenied),
+                result: Some(ActivityResult::Denied),
+                after_id: None,
+                limit: 100,
+                ..EventQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.env.as_deref(), Some("demo"));
+        assert_eq!(rows[0].event.kind, ActivityKind::EgressDenied);
     }
 
     #[test]
-    fn list_recent_orders_rfc3339_offsets_by_instant() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
+    fn sqlite_store_queries_newest_rows_first_with_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
 
         store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T08:30:00-04:00",
-                StoredEventKind::Log,
-                "later by instant",
-            ))
-            .expect("append later event");
-        store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00Z",
-                StoredEventKind::Log,
-                "earlier by instant",
-            ))
-            .expect("append earlier event");
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressAllowed,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
 
-        let events = store.list_recent(None, 10).expect("list recent events");
+        let rows = store.query(query_all(2)).unwrap();
 
-        assert_eq!(events[0].subject, "later by instant");
-        assert_eq!(events[1].subject, "earlier by instant");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event.ts, "2026-04-26T12:00:02Z");
+        assert_eq!(rows[1].event.ts, "2026-04-26T12:00:01Z");
     }
 
     #[test]
-    fn list_recent_orders_fractional_rfc3339_timestamps_by_instant() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
+    fn sqlite_store_queries_oldest_rows_first_after_cursor_with_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
 
         store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00.900Z",
-                StoredEventKind::Log,
-                "later by fraction",
-            ))
-            .expect("append later event");
-        store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00.100Z",
-                StoredEventKind::Log,
-                "earlier by fraction",
-            ))
-            .expect("append earlier event");
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:03Z",
+                    ActivityKind::Log,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+            ])
+            .unwrap();
 
-        let events = store.list_recent(None, 10).expect("list recent events");
+        let rows = store
+            .query(EventQuery {
+                after_id: Some(1),
+                limit: 2,
+                ..EventQuery::default()
+            })
+            .unwrap();
 
-        assert_eq!(events[0].subject, "later by fraction");
-        assert_eq!(events[1].subject, "earlier by fraction");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 2);
+        assert_eq!(rows[1].id, 3);
     }
 
     #[test]
-    fn list_recent_orders_submillisecond_rfc3339_timestamps_by_instant() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
+    fn sqlite_store_filters_by_timestamp_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
 
         store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00.000002Z",
-                StoredEventKind::Log,
-                "later by nanos",
-            ))
-            .expect("append later event");
-        store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00.000001Z",
-                StoredEventKind::Log,
-                "earlier by nanos",
-            ))
-            .expect("append earlier event");
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressAllowed,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
 
-        let events = store.list_recent(None, 10).expect("list recent events");
+        let rows = store
+            .query(EventQuery {
+                from_ts: Some("2026-04-26T12:00:01Z".to_owned()),
+                to_ts: Some("2026-04-26T12:00:01Z".to_owned()),
+                limit: 100,
+                ..EventQuery::default()
+            })
+            .unwrap();
 
-        assert_eq!(events[0].subject, "later by nanos");
-        assert_eq!(events[1].subject, "earlier by nanos");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.ts, "2026-04-26T12:00:01Z");
     }
 
     #[test]
-    fn local_store_creates_parsed_time_indexes() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
+    fn sqlite_store_clamps_zero_limit_to_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
 
-        for name in [
-            "idx_events_ts_epoch_nanos_id",
-            "idx_events_env_ts_epoch_nanos_id",
-        ] {
-            let sql: String = store
-                .conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                    [name],
-                    |row| row.get(0),
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+            ])
+            .unwrap();
+
+        let rows = store.query(query_all(0)).unwrap();
+
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_store_counts_by_kind_env_and_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
+                ),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::SandboxCreate,
+                    "other",
+                    ActivityResult::Ok,
+                ),
+            ])
+            .unwrap();
+
+        let counts = store.counts_by_kind_result().unwrap();
+
+        assert!(counts
+            .iter()
+            .any(|count| count.kind == ActivityKind::EgressDenied
+                && count.env.as_deref() == Some("demo")
+                && count.result == ActivityResult::Denied
+                && count.count == 2));
+        assert!(counts
+            .iter()
+            .any(|count| count.kind == ActivityKind::SandboxCreate
+                && count.env.as_deref() == Some("other")
+                && count.result == ActivityResult::Ok
+                && count.count == 1));
+    }
+
+    #[test]
+    fn sqlite_store_filters_stats_aggregates_by_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::EgressDenied,
+                    "demo",
+                    ActivityResult::Denied,
                 )
-                .expect("index exists");
+                .with_actor_value("driver", serde_json::json!("openshell")),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::SandboxCreate,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_actor_value("driver", serde_json::json!("openshell"))
+                .with_latency_ms(10),
+                event(
+                    "2026-04-26T12:00:02Z",
+                    ActivityKind::ApprovalRequested,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("request-demo")),
+                event(
+                    "2026-04-26T12:00:03Z",
+                    ActivityKind::EgressDenied,
+                    "other",
+                    ActivityResult::Denied,
+                )
+                .with_actor_value("driver", serde_json::json!("other-driver")),
+                event(
+                    "2026-04-26T12:00:04Z",
+                    ActivityKind::Exec,
+                    "other",
+                    ActivityResult::Ok,
+                )
+                .with_actor_value("driver", serde_json::json!("other-driver"))
+                .with_latency_ms(30),
+                event(
+                    "2026-04-26T12:00:05Z",
+                    ActivityKind::ApprovalRequested,
+                    "other",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("request-other")),
+                event(
+                    "2026-04-26T12:00:06Z",
+                    ActivityKind::ApprovalDecided,
+                    "other",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("request-other")),
+            ])
+            .unwrap();
 
-            assert!(
-                sql.contains("ts_epoch_nanos"),
-                "index `{name}` did not include normalized timestamp column: {sql}"
-            );
-        }
-    }
+        assert!(store.has_entries_for_env("demo").unwrap());
+        assert!(!store.has_entries_for_env("missing").unwrap());
 
-    #[test]
-    fn open_backfills_epoch_nanos_for_old_schema_events() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let path = super::default_store_path(root.path());
-        let conn = rusqlite::Connection::open(&path).expect("open old database");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                env TEXT NOT NULL,
-                ts TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                reason TEXT,
-                driver TEXT,
-                handle TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
-            );
-            INSERT INTO events (env, ts, kind, subject, metadata_json)
-            VALUES
-                ('dev', '2026-04-27T12:00:00.000002Z', 'log', 'later old row', '{}'),
-                ('dev', '2026-04-27T12:00:00.000001Z', 'log', 'earlier old row', '{}');
-            "#,
-        )
-        .expect("seed old schema");
-        drop(conn);
+        let blocks = store
+            .policy_blocks_by_kind_driver_for_env(Some("demo"))
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].driver.as_deref(), Some("openshell"));
+        assert_eq!(blocks[0].count, 1);
 
-        let store = LocalEventStore::open(root.path()).expect("migrate old database");
-        let events = store.list_recent(None, 10).expect("list recent events");
+        let latency = store.sandbox_latency_rows_for_env(Some("demo")).unwrap();
+        assert_eq!(latency.len(), 1);
+        assert_eq!(latency[0].op, "create");
+        assert_eq!(latency[0].latency_ms, 10);
 
-        assert_eq!(events[0].subject, "later old row");
-        assert_eq!(events[1].subject, "earlier old row");
-    }
-
-    #[test]
-    fn failed_old_schema_backfill_retries_on_next_open() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let path = super::default_store_path(root.path());
-        let conn = rusqlite::Connection::open(&path).expect("open old database");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                env TEXT NOT NULL,
-                ts TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                reason TEXT,
-                driver TEXT,
-                handle TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
-            );
-            INSERT INTO events (env, ts, kind, subject, metadata_json)
-            VALUES ('dev', 'not-a-timestamp', 'log', 'bad old row', '{}');
-            "#,
-        )
-        .expect("seed invalid old schema");
-        drop(conn);
-
-        let first = LocalEventStore::open(root.path());
-        assert!(matches!(
-            first,
-            Err(EventStoreError::TimestampDecode { .. })
-        ));
-
-        let second = LocalEventStore::open(root.path());
-        assert!(matches!(
-            second,
-            Err(EventStoreError::TimestampDecode { .. })
-        ));
-    }
-
-    #[test]
-    fn append_rejects_invalid_rfc3339_timestamp() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
-
-        let result = store.append(&StoredEvent::new(
-            "dev",
-            "not-a-timestamp",
-            StoredEventKind::Log,
-            "event",
-        ));
-
-        assert!(matches!(
-            result,
-            Err(EventStoreError::TimestampDecode { .. })
-        ));
-    }
-
-    #[test]
-    fn list_recent_errors_on_corrupt_metadata_json() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
-        let id = store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00Z",
-                StoredEventKind::Log,
-                "event",
-            ))
-            .expect("append event");
-
-        store
-            .conn
-            .execute(
-                "UPDATE events SET metadata_json = ?1 WHERE id = ?2",
-                rusqlite::params!["{", id],
-            )
-            .expect("corrupt metadata");
-
-        let result = store.list_recent(None, 10);
-
-        assert!(matches!(
-            result,
-            Err(EventStoreError::MetadataDecode { .. })
-        ));
-    }
-
-    #[test]
-    fn list_recent_huge_limit_is_bounded() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
-
-        for index in 0..1_001 {
+        assert_eq!(
+            store.approvals_pending_count_for_env(Some("demo")).unwrap(),
+            1
+        );
+        assert_eq!(
             store
-                .append(&StoredEvent::new(
-                    "dev",
-                    format!("2026-04-27T12:{:02}:00Z", index % 60),
-                    StoredEventKind::Log,
-                    format!("event-{index}"),
-                ))
-                .expect("append event");
-        }
-
-        let events = store
-            .list_recent(None, usize::MAX)
-            .expect("list recent events");
-
-        assert_eq!(events.len(), 1_000);
+                .approvals_pending_count_for_env(Some("other"))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
-    fn list_recent_errors_on_unknown_event_kind() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = LocalEventStore::open(root.path()).expect("open event store");
-        let id = store
-            .append(&StoredEvent::new(
-                "dev",
-                "2026-04-27T12:00:00Z",
-                StoredEventKind::Log,
-                "event",
-            ))
-            .expect("append event");
+    fn sqlite_store_treats_file_colon_path_as_literal_path_not_uri() {
+        let _lock = CURRENT_DIR_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = CurrentDirGuard::enter(temp.path());
+        let path = PathBuf::from("file:events.db?mode=memory");
+        let store = SqliteEventStore::open(&path).unwrap();
 
         store
-            .conn
-            .execute(
-                "UPDATE events SET kind = ?1 WHERE id = ?2",
-                rusqlite::params!["surprise", id],
-            )
-            .expect("corrupt kind");
+            .append_many(&[event(
+                "2026-04-26T12:00:00Z",
+                ActivityKind::SandboxCreate,
+                "demo",
+                ActivityResult::Ok,
+            )])
+            .unwrap();
+        let rows = store.query(query_all(10)).unwrap();
 
-        let result = store.list_recent(None, 10);
-
-        assert!(matches!(result, Err(EventStoreError::KindDecode { .. })));
+        assert_eq!(rows.len(), 1);
+        assert!(path.exists());
     }
 
     #[test]
-    fn jsonl_start_offset_resets_only_when_locked_file_len_is_behind_offset() {
-        assert_eq!(super::jsonl_start_offset(12, 12), 12);
-        assert_eq!(super::jsonl_start_offset(12, 20), 12);
-        assert_eq!(super::jsonl_start_offset(12, 11), 0);
+    fn legacy_jsonl_reader_accepts_old_event_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            "{\"ts\":\"2026-04-21T00:00:00Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context ready\"}\n",
+        )
+        .unwrap();
+
+        let rows = read_legacy_jsonl(&path, None, None).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ActivityKind::Log);
+        assert_eq!(rows[0].actor["driver"], serde_json::json!("context"));
+        assert_eq!(rows[0].extras["msg"], serde_json::json!("context ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_creates_database_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+
+        let _store = SqliteEventStore::open(&path).unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_rejects_symlink_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.db");
+        let link = temp.path().join("events.db");
+        std::fs::write(&target, "").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(SqliteEventStore::open(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_open_path_resolves_parent_symlinks_but_preserves_final_component() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_parent = temp.path().join("real");
+        let link_parent = temp.path().join("link");
+        std::fs::create_dir(&real_parent).unwrap();
+        symlink(&real_parent, &link_parent).unwrap();
+
+        let target = real_parent.join("target.db");
+        let final_component = real_parent.join("events.db");
+        std::fs::write(&target, "").unwrap();
+        symlink(&target, &final_component).unwrap();
+
+        let open_path = database_open_path(&link_parent.join("events.db")).unwrap();
+        let expected_parent = std::fs::canonicalize(&real_parent).unwrap();
+
+        assert_eq!(open_path, expected_parent.join("events.db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_normalizes_existing_regular_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _store = SqliteEventStore::open(&path).unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_rejects_existing_non_regular_database_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(SqliteEventStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_jsonl_reader_skips_malformed_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"ts\":\"2026-04-21T00:00:00Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context ready\"}\n",
+                "{malformed json}\n",
+                "{\"ts\":\"2026-04-21T00:00:01Z\",\"driver\":\"sandbox\",\"level\":\"warn\",\"msg\":\"sandbox ready\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let rows = read_legacy_jsonl(&path, None, None).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].actor["driver"], serde_json::json!("context"));
+        assert_eq!(rows[1].actor["driver"], serde_json::json!("sandbox"));
     }
 }

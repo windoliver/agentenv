@@ -1,0 +1,142 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DriverActivityEventParams",
+  "anyOf": [
+    {
+      "$ref": "#/definitions/RichActivityEventParams"
+    },
+    {
+      "$ref": "#/definitions/ActivityEventParams"
+    }
+  ],
+  "definitions": {
+    "ActivityEventParams": {
+      "type": "object",
+      "required": [
+        "kind",
+        "subject",
+        "ts"
+      ],
+      "properties": {
+        "handle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/ActivityKind"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "string"
+        }
+      }
+    },
+    "ActivityKind": {
+      "type": "string",
+      "enum": [
+        "egress_denied",
+        "approval_requested",
+        "log"
+      ]
+    },
+    "RichActivityEventParams": {
+      "type": "object",
+      "required": [
+        "kind",
+        "result",
+        "trace_id",
+        "ts"
+      ],
+      "properties": {
+        "actor": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "env": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extras": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "kind": {
+          "$ref": "#/definitions/RichActivityKind"
+        },
+        "latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "$ref": "#/definitions/RichActivityResult"
+        },
+        "subject": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "trace_id": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "string"
+        }
+      }
+    },
+    "RichActivityKind": {
+      "type": "string",
+      "enum": [
+        "sandbox_create",
+        "sandbox_destroy",
+        "exec",
+        "egress_allowed",
+        "egress_denied",
+        "mcp_tool_call",
+        "policy_applied",
+        "credential_injected",
+        "credential_set",
+        "credential_reset",
+        "auth",
+        "approval_requested",
+        "approval_decided",
+        "spawn_requested",
+        "spawn_queued",
+        "spawn_admitted",
+        "spawn_rejected",
+        "spawn_started",
+        "spawn_ready",
+        "log"
+      ]
+    },
+    "RichActivityResult": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "error",
+        "denied",
+        "pending_approval"
+      ]
+    }
+  }
+}

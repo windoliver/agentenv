@@ -61,6 +61,40 @@ pub enum ActivityKind {
     Log,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RichActivityKind {
+    SandboxCreate,
+    SandboxDestroy,
+    Exec,
+    EgressAllowed,
+    EgressDenied,
+    McpToolCall,
+    PolicyApplied,
+    CredentialInjected,
+    CredentialSet,
+    CredentialReset,
+    Auth,
+    ApprovalRequested,
+    ApprovalDecided,
+    SpawnRequested,
+    SpawnQueued,
+    SpawnAdmitted,
+    SpawnRejected,
+    SpawnStarted,
+    SpawnReady,
+    Log,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RichActivityResult {
+    Ok,
+    Error,
+    Denied,
+    PendingApproval,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalKind {
@@ -654,6 +688,33 @@ pub struct ActivityEventParams {
     pub ts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct RichActivityEventParams {
+    pub ts: String,
+    pub kind: RichActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actor: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subject: BTreeMap<String, Value>,
+    pub result: RichActivityResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    pub trace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extras: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(untagged)]
+pub enum DriverActivityEventParams {
+    Rich(RichActivityEventParams),
+    Legacy(ActivityEventParams),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]

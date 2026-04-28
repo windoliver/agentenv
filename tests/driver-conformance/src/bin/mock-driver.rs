@@ -10,7 +10,7 @@ use driver_conformance::{
     read_framed_json, write_framed_json, RpcError, RpcRequestEnvelope, RpcResponseEnvelope,
 };
 use serde::de::DeserializeOwned;
-use serde_json::{to_value, Value};
+use serde_json::{json, to_value, Value};
 
 fn main() -> Result<()> {
     let stdin = std::io::stdin();
@@ -27,6 +27,9 @@ fn main() -> Result<()> {
         let request: RpcRequestEnvelope =
             serde_json::from_value(raw).context("decode JSON-RPC request")?;
         let should_exit = request.method == "shutdown";
+        for notification in notifications_for_request(&request) {
+            write_framed_json(&mut writer, &notification)?;
+        }
         let response = handle_request(request)?;
         write_framed_json(&mut writer, &response)?;
         if should_exit && response.error.is_none() {
@@ -35,6 +38,41 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn notifications_for_request(request: &RpcRequestEnvelope) -> Vec<Value> {
+    if request.method != "preflight" {
+        return Vec::new();
+    }
+
+    vec![
+        json!({
+            "jsonrpc": "2.0",
+            "method": "event/log",
+            "params": {
+                "level": "info",
+                "ts": "2026-04-26T12:00:00Z",
+                "msg": "mock preflight completed",
+                "kv": {
+                    "driver": "mock-driver",
+                    "phase": "preflight"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "method": "event/activity",
+            "params": {
+                "ts": "2026-04-26T12:00:00Z",
+                "kind": "sandbox_create",
+                "actor": {"driver": "mock-driver"},
+                "subject": {"phase": "preflight"},
+                "result": "ok",
+                "trace_id": "trace-mock-driver",
+                "extras": {"source": "driver-conformance"}
+            }
+        }),
+    ]
 }
 
 fn handle_request(request: RpcRequestEnvelope) -> Result<RpcResponseEnvelope> {

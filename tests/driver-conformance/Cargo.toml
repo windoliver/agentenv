@@ -16,5 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+agentenv-events = { path = "../../crates/agentenv-events" }
+agentenv-plugin = { path = "../../crates/agentenv-plugin" }
 async-trait.workspace = true
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -7,6 +7,8 @@ use ipnet::IpNet;
 use thiserror::Error;
 use url::{Host, Url};
 
+use agentenv_events::{ActivityEvent, ActivityKind, ActivityResult};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsrfOptions {
     pub allow_private: bool,
@@ -136,6 +138,47 @@ impl DnsResolver for StaticDnsResolver {
 
 pub fn sanitize_untrusted_url_text(raw: &str) -> String {
     sanitize_url_like_text(raw)
+}
+
+pub fn ssrf_blocked_activity_event(
+    blocked: &SsrfBlocked,
+    ts: impl Into<String>,
+    handle: Option<String>,
+    trace_id: impl Into<String>,
+) -> ActivityEvent {
+    let target = match blocked.host.as_deref() {
+        Some(host) => host.to_owned(),
+        None => sanitize_untrusted_url_text(&blocked.url),
+    };
+    let mut event = ActivityEvent::new(
+        ts,
+        ActivityKind::EgressDenied,
+        ActivityResult::Denied,
+        trace_id,
+    )
+    .with_subject_value("target", serde_json::json!(target))
+    .with_reason_code(ssrf_block_reason_label(&blocked.reason));
+
+    if let Some(handle) = handle {
+        event = event.with_subject_value("handle", serde_json::json!(handle));
+    }
+
+    event
+}
+
+fn ssrf_block_reason_label(reason: &SsrfBlockReason) -> &'static str {
+    match reason {
+        SsrfBlockReason::UnsupportedScheme { .. } => "unsupported_scheme",
+        SsrfBlockReason::MissingHost => "missing_host",
+        SsrfBlockReason::CredentialsInUrl => "credentials_in_url",
+        SsrfBlockReason::DnsResolutionFailed { .. } => "dns_resolution_failed",
+        SsrfBlockReason::DeniedIp { .. } => "denied_ip",
+        SsrfBlockReason::DeniedCloudMetadata => "denied_cloud_metadata",
+        SsrfBlockReason::DeniedExtraCidr { .. } => "denied_extra_cidr",
+        SsrfBlockReason::RedirectLimitExceeded { .. } => "redirect_limit_exceeded",
+        SsrfBlockReason::MalformedRedirect { .. } => "malformed_redirect",
+        SsrfBlockReason::UnsupportedDnsResolver { .. } => "unsupported_dns_resolver",
+    }
 }
 
 pub fn validate_outbound(url: &Url, opts: SsrfOptions) -> Result<ValidatedUrl, SsrfBlocked> {
@@ -507,4 +550,115 @@ fn sanitize_url_like_text(raw: &str) -> String {
 
 fn sanitize_malformed_redirect_location(location: &str) -> String {
     sanitize_untrusted_url_text(location)
+}
+
+#[cfg(test)]
+mod tests {
+    use agentenv_events::activity::{ActivityEvent, ActivityKind, ActivityResult};
+    use serde_json::json;
+
+    use super::{ssrf_blocked_activity_event, SsrfBlockReason, SsrfBlocked};
+
+    #[test]
+    fn ssrf_blocked_denied_cloud_metadata_becomes_egress_denied_activity_event() {
+        let blocked = SsrfBlocked {
+            url: "http://169.254.169.254/latest/meta-data".to_owned(),
+            host: Some("169.254.169.254".to_owned()),
+            resolved_ip: None,
+            reason: SsrfBlockReason::DeniedCloudMetadata,
+        };
+
+        let event: ActivityEvent = ssrf_blocked_activity_event(
+            &blocked,
+            "2026-04-19T12:34:56Z",
+            Some("sandbox-123".to_owned()),
+            "trace-1",
+        );
+
+        assert_eq!(event.kind, ActivityKind::EgressDenied);
+        assert_eq!(event.result, ActivityResult::Denied);
+        assert_eq!(event.subject["target"], json!("169.254.169.254"));
+        assert_eq!(event.subject["handle"], json!("sandbox-123"));
+        assert_eq!(event.reason_code, Some("denied_cloud_metadata".to_owned()));
+        assert_eq!(event.ts, "2026-04-19T12:34:56Z");
+        assert_eq!(event.trace_id, "trace-1");
+    }
+
+    #[test]
+    fn ssrf_blocked_missing_host_falls_back_to_sanitized_url_subject() {
+        let blocked = SsrfBlocked {
+            url: "http:///path".to_owned(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::MissingHost,
+        };
+
+        let event = ssrf_blocked_activity_event(&blocked, "2026-04-19T12:34:57Z", None, "trace-2");
+
+        assert_eq!(event.kind, ActivityKind::EgressDenied);
+        assert_eq!(event.subject["target"], json!("http:///path"));
+        assert_eq!(event.reason_code, Some("missing_host".to_owned()));
+        assert_eq!(event.ts, "2026-04-19T12:34:57Z");
+        assert!(!event.subject.contains_key("handle"));
+    }
+
+    #[test]
+    fn ssrf_blocked_credentials_in_url_reason_uses_stable_label() {
+        let blocked = SsrfBlocked {
+            url: "https://example.test/private".to_owned(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::CredentialsInUrl,
+        };
+
+        let event = ssrf_blocked_activity_event(&blocked, "2026-04-19T12:34:58Z", None, "trace-3");
+
+        assert_eq!(
+            event.subject["target"],
+            json!("https://example.test/private")
+        );
+        assert_eq!(event.reason_code, Some("credentials_in_url".to_owned()));
+    }
+
+    #[test]
+    fn ssrf_blocked_fallback_subject_redacts_credentials_query_and_fragment() {
+        let blocked = SsrfBlocked {
+            url: "https://user:pass@example.test/private?token=secret#frag".to_owned(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::CredentialsInUrl,
+        };
+
+        let event = ssrf_blocked_activity_event(&blocked, "2026-04-19T12:34:59Z", None, "trace-4");
+        let subject = event.subject["target"].as_str().unwrap();
+
+        assert_eq!(subject, "https://example.test/private");
+        for redacted in ["user", "pass", "token", "secret", "?", "#"] {
+            assert!(
+                !subject.contains(redacted),
+                "fallback subject leaked `{redacted}` in `{subject}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_blocked_fallback_subject_redacts_scheme_relative_credentials() {
+        let blocked = SsrfBlocked {
+            url: "//user:pass@example.test/private?token=secret#frag".to_owned(),
+            host: None,
+            resolved_ip: None,
+            reason: SsrfBlockReason::CredentialsInUrl,
+        };
+
+        let event = ssrf_blocked_activity_event(&blocked, "2026-04-19T12:35:00Z", None, "trace-5");
+        let subject = event.subject["target"].as_str().unwrap();
+
+        assert_eq!(subject, "//example.test/private");
+        for redacted in ["user", "pass", "token", "secret", "?", "#"] {
+            assert!(
+                !subject.contains(redacted),
+                "fallback subject leaked `{redacted}` in `{subject}`"
+            );
+        }
+    }
 }

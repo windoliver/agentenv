@@ -24,12 +24,15 @@ agent-codex = { path = "../drivers/agent-codex" }
 agent-openclaw = { path = "../drivers/agent-openclaw" }
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
 context-filesystem = { path = "../drivers/context-filesystem" }
 context-mcp-generic = { path = "../drivers/context-mcp-generic" }
 context-none = { path = "../drivers/context-none" }
 crossterm.workspace = true
 dirs.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
 inference-anthropic = { path = "../drivers/inference-anthropic" }
 inference-ollama = { path = "../drivers/inference-ollama" }
 inference-openai = { path = "../drivers/inference-openai" }
@@ -38,7 +41,7 @@ rpassword = "7"
 sandbox-openshell = { path = "../drivers/sandbox-openshell" }
 serde.workspace = true
 serde_json.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["formatting"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

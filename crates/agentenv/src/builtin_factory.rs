@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use agentenv_core::{
@@ -9,6 +10,7 @@ use agentenv_core::{
         RuntimeResult,
     },
 };
+use agentenv_events::{EventEmitter, NoopEventEmitter};
 
 #[allow(dead_code)]
 pub struct BuiltInDriverFactory;
@@ -17,87 +19,15 @@ const SUBPROCESS_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DriverFactory for BuiltInDriverFactory {
     fn build(&self, selection: &DriverSelection) -> RuntimeResult<DriverSet> {
-        let mut catalog = None;
-        Ok(DriverSet {
-            sandbox: match selection.sandbox.as_str() {
-                "openshell" | "sandbox-openshell" => {
-                    Box::new(sandbox_openshell::OpenShellDriver::default())
-                }
-                other => {
-                    return Err(RuntimeError::UnsupportedDriver {
-                        kind: "sandbox",
-                        name: other.to_owned(),
-                    });
-                }
-            },
-            agent: match selection.agent.as_str() {
-                "claude" | "agent-claude" => Box::new(agent_claude::ClaudeDriver),
-                "codex" | "agent-codex" => Box::new(agent_codex::CodexDriver),
-                "openclaw" | "agent-openclaw" => Box::new(agent_openclaw::OpenClawDriver),
-                other => match subprocess_entry(&mut catalog, CatalogKind::Agent, other)? {
-                    Some(entry) => Box::new(
-                        agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
-                            entry,
-                            SUBPROCESS_DRIVER_TIMEOUT,
-                        )?,
-                    ),
-                    None => {
-                        return Err(RuntimeError::UnsupportedDriver {
-                            kind: "agent",
-                            name: other.to_owned(),
-                        });
-                    }
-                },
-            },
-            context: match selection.context.as_str() {
-                "filesystem" | "context-filesystem" => {
-                    Box::new(context_filesystem::FilesystemContextDriver::default())
-                }
-                "mcp-generic" | "context-mcp-generic" => {
-                    Box::new(context_mcp_generic::GenericMcpContextDriver::default())
-                }
-                "none" | "context-none" => Box::new(context_none::NoneContextDriver),
-                other => match subprocess_entry(&mut catalog, CatalogKind::Context, other)? {
-                    Some(entry) => Box::new(
-                        agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
-                            entry,
-                            SUBPROCESS_DRIVER_TIMEOUT,
-                        )?,
-                    ),
-                    None => {
-                        return Err(RuntimeError::UnsupportedDriver {
-                            kind: "context",
-                            name: other.to_owned(),
-                        });
-                    }
-                },
-            },
-            inference: match selection.inference.as_deref() {
-                None => None,
-                Some("passthrough" | "inference-passthrough") => {
-                    Some(Box::new(inference_passthrough::PassthroughInferenceDriver)
-                        as Box<dyn InferenceDriver>)
-                }
-                Some("openai" | "inference-openai") => {
-                    Some(Box::new(inference_openai::OpenAiInferenceDriver)
-                        as Box<dyn InferenceDriver>)
-                }
-                Some("anthropic" | "inference-anthropic") => {
-                    Some(Box::new(inference_anthropic::AnthropicInferenceDriver)
-                        as Box<dyn InferenceDriver>)
-                }
-                Some("ollama" | "inference-ollama") => {
-                    Some(Box::new(inference_ollama::OllamaInferenceDriver)
-                        as Box<dyn InferenceDriver>)
-                }
-                Some(other) => {
-                    return Err(RuntimeError::UnsupportedDriver {
-                        kind: "inference",
-                        name: other.to_owned(),
-                    });
-                }
-            },
-        })
+        build_driver_set_with_events(selection, Arc::new(NoopEventEmitter))
+    }
+
+    fn build_observed(
+        &self,
+        selection: &DriverSelection,
+        events: Arc<dyn EventEmitter>,
+    ) -> RuntimeResult<DriverSet> {
+        build_driver_set_with_events(selection, events)
     }
 
     fn build_pinned(
@@ -105,13 +35,117 @@ impl DriverFactory for BuiltInDriverFactory {
         selection: &DriverSelection,
         pins: &DriverPinSet,
     ) -> RuntimeResult<DriverSet> {
-        Ok(DriverSet {
-            sandbox: build_pinned_sandbox(selection, pins.get("sandbox"))?,
-            agent: build_pinned_agent(selection, pins.get("agent"))?,
-            context: build_pinned_context(selection, pins.get("context"))?,
-            inference: build_pinned_inference(selection, pins.get("inference"))?,
-        })
+        build_pinned_driver_set_with_events(selection, pins, Arc::new(NoopEventEmitter))
     }
+
+    fn build_pinned_observed(
+        &self,
+        selection: &DriverSelection,
+        pins: &DriverPinSet,
+        events: Arc<dyn EventEmitter>,
+    ) -> RuntimeResult<DriverSet> {
+        build_pinned_driver_set_with_events(selection, pins, events)
+    }
+}
+
+fn build_driver_set_with_events(
+    selection: &DriverSelection,
+    events: Arc<dyn EventEmitter>,
+) -> RuntimeResult<DriverSet> {
+    let mut catalog = None;
+    Ok(DriverSet {
+        sandbox: match selection.sandbox.as_str() {
+            "openshell" | "sandbox-openshell" => {
+                Box::new(sandbox_openshell::OpenShellDriver::default())
+            }
+            other => {
+                return Err(RuntimeError::UnsupportedDriver {
+                    kind: "sandbox",
+                    name: other.to_owned(),
+                });
+            }
+        },
+        agent: match selection.agent.as_str() {
+            "claude" | "agent-claude" => Box::new(agent_claude::ClaudeDriver),
+            "codex" | "agent-codex" => Box::new(agent_codex::CodexDriver),
+            "openclaw" | "agent-openclaw" => Box::new(agent_openclaw::OpenClawDriver),
+            other => match subprocess_entry(&mut catalog, CatalogKind::Agent, other)? {
+                Some(entry) => Box::new(
+                    agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
+                        entry,
+                        SUBPROCESS_DRIVER_TIMEOUT,
+                    )?
+                    .with_event_emitter(Arc::clone(&events)),
+                ),
+                None => {
+                    return Err(RuntimeError::UnsupportedDriver {
+                        kind: "agent",
+                        name: other.to_owned(),
+                    });
+                }
+            },
+        },
+        context: match selection.context.as_str() {
+            "filesystem" | "context-filesystem" => {
+                Box::new(context_filesystem::FilesystemContextDriver::default())
+            }
+            "mcp-generic" | "context-mcp-generic" => {
+                Box::new(context_mcp_generic::GenericMcpContextDriver::default())
+            }
+            "none" | "context-none" => Box::new(context_none::NoneContextDriver),
+            other => match subprocess_entry(&mut catalog, CatalogKind::Context, other)? {
+                Some(entry) => Box::new(
+                    agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
+                        entry,
+                        SUBPROCESS_DRIVER_TIMEOUT,
+                    )?
+                    .with_event_emitter(Arc::clone(&events)),
+                ),
+                None => {
+                    return Err(RuntimeError::UnsupportedDriver {
+                        kind: "context",
+                        name: other.to_owned(),
+                    });
+                }
+            },
+        },
+        inference: match selection.inference.as_deref() {
+            None => None,
+            Some("passthrough" | "inference-passthrough") => {
+                Some(Box::new(inference_passthrough::PassthroughInferenceDriver)
+                    as Box<dyn InferenceDriver>)
+            }
+            Some("openai" | "inference-openai") => {
+                Some(Box::new(inference_openai::OpenAiInferenceDriver) as Box<dyn InferenceDriver>)
+            }
+            Some("anthropic" | "inference-anthropic") => {
+                Some(Box::new(inference_anthropic::AnthropicInferenceDriver)
+                    as Box<dyn InferenceDriver>)
+            }
+            Some("ollama" | "inference-ollama") => {
+                Some(Box::new(inference_ollama::OllamaInferenceDriver) as Box<dyn InferenceDriver>)
+            }
+            Some(other) => {
+                return Err(RuntimeError::UnsupportedDriver {
+                    kind: "inference",
+                    name: other.to_owned(),
+                });
+            }
+        },
+    })
+}
+
+fn build_pinned_driver_set_with_events(
+    selection: &DriverSelection,
+    pins: &DriverPinSet,
+    events: Arc<dyn EventEmitter>,
+) -> RuntimeResult<DriverSet> {
+    Ok(DriverSet {
+        sandbox: build_pinned_sandbox(selection, pins.get("sandbox"))?,
+        agent: build_pinned_agent(selection, pins.get("agent"), Arc::clone(&events))?,
+        context: build_pinned_context(selection, pins.get("context"), events)?,
+        inference: build_pinned_inference(selection, pins.get("inference"))?,
+    })
 }
 
 fn build_pinned_sandbox(
@@ -138,6 +172,7 @@ fn build_pinned_sandbox(
 fn build_pinned_agent(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::AgentDriver>> {
     match pin {
         Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
@@ -146,7 +181,8 @@ fn build_pinned_agent(
                 agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
                     entry,
                     SUBPROCESS_DRIVER_TIMEOUT,
-                )?,
+                )?
+                .with_event_emitter(events),
             ))
         }
         _ => match selection.agent.as_str() {
@@ -188,6 +224,7 @@ fn build_pinned_agent(
 fn build_pinned_context(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::ContextDriver>> {
     match pin {
         Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
@@ -196,7 +233,8 @@ fn build_pinned_context(
                 agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
                     entry,
                     SUBPROCESS_DRIVER_TIMEOUT,
-                )?,
+                )?
+                .with_event_emitter(events),
             ))
         }
         _ => match selection.context.as_str() {

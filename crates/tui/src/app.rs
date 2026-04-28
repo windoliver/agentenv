@@ -85,8 +85,14 @@ impl App {
 
     pub fn apply_snapshot(&mut self, snapshot: OpsSnapshot) {
         if self.snapshot != snapshot {
+            let selected_env_name = self.selected_env_name().map(str::to_owned);
             self.snapshot = snapshot;
-            if self.selected_env >= self.snapshot.envs.len() {
+            if let Some(index) = selected_env_name
+                .as_deref()
+                .and_then(|name| self.snapshot.envs.iter().position(|env| env.name == name))
+            {
+                self.selected_env = index;
+            } else if self.selected_env >= self.snapshot.envs.len() {
                 self.selected_env = self.snapshot.envs.len().saturating_sub(1);
             }
             if self.selected_approval >= self.snapshot.approvals.len() {
@@ -452,6 +458,43 @@ mod tests {
         });
 
         assert_eq!(app.selected_env_name(), Some("alpha"));
+    }
+
+    #[test]
+    fn snapshot_update_preserves_selected_env_by_name() {
+        let mut app = app_with_rows();
+        assert_eq!(app.handle_key(key(KeyCode::Char('b'))), AppIntent::Refresh);
+        assert_eq!(app.selected_env_name(), Some("beta"));
+
+        app.apply_snapshot(OpsSnapshot {
+            envs: vec![
+                EnvRow {
+                    name: "aardvark".to_owned(),
+                    agent: "codex".to_owned(),
+                    sandbox: "openshell".to_owned(),
+                    context: "filesystem".to_owned(),
+                    status: "running".to_owned(),
+                },
+                EnvRow {
+                    name: "alpha".to_owned(),
+                    agent: "codex".to_owned(),
+                    sandbox: "openshell".to_owned(),
+                    context: "filesystem".to_owned(),
+                    status: "running".to_owned(),
+                },
+                EnvRow {
+                    name: "beta".to_owned(),
+                    agent: "claude".to_owned(),
+                    sandbox: "openshell".to_owned(),
+                    context: "mcp".to_owned(),
+                    status: "running".to_owned(),
+                },
+            ],
+            ..OpsSnapshot::empty()
+        });
+
+        assert_eq!(app.selected_env_name(), Some("beta"));
+        assert_eq!(app.selected_env_index(), 2);
     }
 
     #[test]
