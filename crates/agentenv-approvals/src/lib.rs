@@ -150,15 +150,7 @@ impl LocalApprovalStore {
                  (request_id, env, agent, kind, subject, reason, status, requested_at,
                   decided_at, decided_by, scope, context_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, NULL, NULL, ?8)
-                 ON CONFLICT(request_id) DO UPDATE SET
-                    env = excluded.env,
-                    agent = excluded.agent,
-                    kind = excluded.kind,
-                    subject = excluded.subject,
-                    reason = excluded.reason,
-                    requested_at = excluded.requested_at,
-                    context_json = excluded.context_json
-                 WHERE approvals.status = 'pending'",
+                 ON CONFLICT(request_id) DO NOTHING",
                 params![
                     request.request_id,
                     request.env,
@@ -819,6 +811,30 @@ mod tests {
 
         let pending = store.list_pending(None).expect("list pending");
         assert_eq!(pending[0].context, request.context);
+    }
+
+    #[test]
+    fn upserting_pending_request_preserves_original_payload() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalApprovalStore::open(root.path()).expect("open approval store");
+        let original = pending_request("req_pending_replay");
+        let mut replayed = pending_request("req_pending_replay");
+        replayed.env = "other".to_owned();
+        replayed.agent = Some("claude".to_owned());
+        replayed.kind = ApprovalKind::McpTool;
+        replayed.subject = "dangerous_tool".to_owned();
+        replayed.reason = "different replay reason".to_owned();
+        replayed.requested_at = "2026-04-27T12:10:00Z".to_owned();
+        replayed.context = serde_json::json!({"driver": "replayed"});
+
+        store
+            .upsert_pending(original.clone())
+            .expect("insert pending");
+        store.upsert_pending(replayed).expect("replay pending");
+
+        let pending = store.list_pending(None).expect("list pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], original);
     }
 
     #[test]
