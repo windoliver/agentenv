@@ -1,4 +1,12 @@
-use std::{io, thread, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -23,24 +31,46 @@ pub struct TermOptions {
     pub refresh_interval: Duration,
 }
 
-pub async fn execute_intent<B>(backend: &mut B, intent: AppIntent) -> Result<bool>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentOutcome {
+    pub quit: bool,
+    pub refresh: bool,
+}
+
+impl IntentOutcome {
+    const NONE: Self = Self {
+        quit: false,
+        refresh: false,
+    };
+    const QUIT: Self = Self {
+        quit: true,
+        refresh: false,
+    };
+    const REFRESH: Self = Self {
+        quit: false,
+        refresh: true,
+    };
+}
+
+pub async fn execute_intent<B>(backend: &mut B, intent: AppIntent) -> Result<IntentOutcome>
 where
     B: OpsBackend,
 {
     match intent {
-        AppIntent::None | AppIntent::Refresh => Ok(false),
-        AppIntent::Quit => Ok(true),
+        AppIntent::None => Ok(IntentOutcome::NONE),
+        AppIntent::Refresh => Ok(IntentOutcome::REFRESH),
+        AppIntent::Quit => Ok(IntentOutcome::QUIT),
         AppIntent::Execute(CommandAction::DestroyEnv(env)) => {
             backend.destroy_env(&env).await?;
-            Ok(false)
+            Ok(IntentOutcome::REFRESH)
         }
         AppIntent::AllowApproval(request_id) => {
             backend.allow_approval(&request_id).await?;
-            Ok(false)
+            Ok(IntentOutcome::REFRESH)
         }
         AppIntent::DenyApproval(request_id) => {
             backend.deny_approval(&request_id).await?;
-            Ok(false)
+            Ok(IntentOutcome::REFRESH)
         }
     }
 }
@@ -102,13 +132,7 @@ where
     B: OpsBackend,
 {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    thread::spawn(move || {
-        while let Ok(event) = event::read() {
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
+    let _input_reader = InputReader::spawn(tx);
 
     let mut interval = time::interval(nonzero_interval(refresh_interval));
     loop {
@@ -127,8 +151,9 @@ where
                 if let CrosstermEvent::Key(key) = event {
                     let intent = app.handle_key(key);
                     match execute_intent(backend, intent).await {
-                        Ok(true) => break,
-                        Ok(false) => refresh_snapshot(app, backend).await,
+                        Ok(outcome) if outcome.quit => break,
+                        Ok(outcome) if outcome.refresh => refresh_snapshot(app, backend).await,
+                        Ok(_) => {}
                         Err(error) => app.set_status(error.to_string()),
                     }
                 }
@@ -138,6 +163,52 @@ where
     }
 
     Ok(())
+}
+
+struct InputReader {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl InputReader {
+    fn spawn(tx: mpsc::UnboundedSender<CrosstermEvent>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                match event::poll(Duration::from_millis(50)) {
+                    Ok(true) => match event::read() {
+                        Ok(event) => {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 async fn refresh_snapshot<B>(app: &mut App, backend: &mut B)
@@ -173,7 +244,7 @@ fn nonzero_interval(interval: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::execute_intent;
+    use super::{execute_intent, nonzero_interval, IntentOutcome};
     use crate::{
         app::AppIntent,
         backend::OpsBackend,
@@ -181,9 +252,11 @@ mod tests {
     };
     use anyhow::Result;
     use async_trait::async_trait;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingBackend {
+        loaded: usize,
         destroyed: Vec<String>,
         allowed: Vec<String>,
         denied: Vec<String>,
@@ -192,6 +265,7 @@ mod tests {
     #[async_trait(?Send)]
     impl OpsBackend for RecordingBackend {
         async fn load_snapshot(&mut self, _selected_env: Option<&str>) -> Result<OpsSnapshot> {
+            self.loaded += 1;
             Ok(OpsSnapshot::empty())
         }
 
@@ -215,19 +289,23 @@ mod tests {
     async fn execute_intent_calls_backend() {
         let mut backend = RecordingBackend::default();
 
-        execute_intent(
+        let destroy = execute_intent(
             &mut backend,
             AppIntent::Execute(CommandAction::DestroyEnv("demo".to_owned())),
         )
         .await
         .expect("destroy intent");
-        execute_intent(&mut backend, AppIntent::AllowApproval("req_1".to_owned()))
+        let allow = execute_intent(&mut backend, AppIntent::AllowApproval("req_1".to_owned()))
             .await
             .expect("allow intent");
-        execute_intent(&mut backend, AppIntent::DenyApproval("req_2".to_owned()))
+        let deny = execute_intent(&mut backend, AppIntent::DenyApproval("req_2".to_owned()))
             .await
             .expect("deny intent");
 
+        assert_eq!(destroy, IntentOutcome::REFRESH);
+        assert_eq!(allow, IntentOutcome::REFRESH);
+        assert_eq!(deny, IntentOutcome::REFRESH);
+        assert_eq!(backend.loaded, 0);
         assert_eq!(backend.destroyed, ["demo"]);
         assert_eq!(backend.allowed, ["req_1"]);
         assert_eq!(backend.denied, ["req_2"]);
@@ -237,15 +315,48 @@ mod tests {
     async fn execute_intent_reports_quit_without_backend_call() {
         let mut backend = RecordingBackend::default();
 
-        assert!(execute_intent(&mut backend, AppIntent::Quit)
-            .await
-            .expect("quit intent"));
-        assert!(!execute_intent(&mut backend, AppIntent::None)
-            .await
-            .expect("none intent"));
+        assert_eq!(
+            execute_intent(&mut backend, AppIntent::Quit)
+                .await
+                .expect("quit intent"),
+            IntentOutcome::QUIT
+        );
+        assert_eq!(
+            execute_intent(&mut backend, AppIntent::None)
+                .await
+                .expect("none intent"),
+            IntentOutcome::NONE
+        );
 
+        assert_eq!(backend.loaded, 0);
         assert!(backend.destroyed.is_empty());
         assert!(backend.allowed.is_empty());
         assert!(backend.denied.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_intent_refresh_indicates_refresh_without_backend_call() {
+        let mut backend = RecordingBackend::default();
+
+        assert_eq!(
+            execute_intent(&mut backend, AppIntent::Refresh)
+                .await
+                .expect("refresh intent"),
+            IntentOutcome::REFRESH
+        );
+
+        assert_eq!(backend.loaded, 0);
+        assert!(backend.destroyed.is_empty());
+        assert!(backend.allowed.is_empty());
+        assert!(backend.denied.is_empty());
+    }
+
+    #[test]
+    fn nonzero_interval_replaces_zero_with_fallback() {
+        assert_eq!(nonzero_interval(Duration::ZERO), Duration::from_millis(250));
+        assert_eq!(
+            nonzero_interval(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
     }
 }
