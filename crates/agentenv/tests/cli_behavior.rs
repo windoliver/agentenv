@@ -480,6 +480,18 @@ fn term_help_lists_flags_and_key_bindings() {
     assert!(stdout.contains("--no-color"), "stdout was: {stdout}");
     assert!(stdout.contains("--remote"), "stdout was: {stdout}");
     assert!(stdout.contains("[Tab] switch pane"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("[j]/[k] move selection"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("[a]/[y] allow selected approval"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("[d]/[n] deny selected approval"),
+        "stdout was: {stdout}"
+    );
     assert!(stdout.contains(":destroy <env>"), "stdout was: {stdout}");
 }
 

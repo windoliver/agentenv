@@ -189,8 +189,11 @@ struct ExecArgs {
 Key bindings:
   [Tab] switch pane
   [Shift+Tab] switch pane backward
+  [j]/[k] move selection
   [a-z] jump env
   [A] approvals
+  [a]/[y] allow selected approval
+  [d]/[n] deny selected approval
   [L] logs
   [P] policy
   [?] help
