@@ -88,6 +88,15 @@ dependencies = [
 [[package]]
 name = "agentenv-approvals"
 version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-events",
+ "agentenv-proto",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "agentenv-core"
