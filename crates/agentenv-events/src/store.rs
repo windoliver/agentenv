@@ -6,8 +6,10 @@ use std::{
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const MAX_LIST_RECENT_LIMIT: usize = 1_000;
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 #[derive(Debug, Error)]
 pub enum EventStoreError {
@@ -35,6 +37,14 @@ pub enum EventStoreError {
     },
     #[error("failed to decode event kind `{value}`")]
     KindDecode { value: String },
+    #[error("failed to decode event timestamp `{ts}`: {source}")]
+    TimestampDecode {
+        ts: String,
+        #[source]
+        source: time::error::Parse,
+    },
+    #[error("event timestamp `{ts}` is outside the supported nanosecond range")]
+    TimestampRange { ts: String },
 }
 
 pub type EventStoreResult<T> = Result<T, EventStoreError>;
@@ -158,6 +168,7 @@ impl LocalEventStore {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     env TEXT NOT NULL,
                     ts TEXT NOT NULL,
+                    ts_epoch_nanos INTEGER NOT NULL,
                     kind TEXT NOT NULL,
                     subject TEXT NOT NULL,
                     reason TEXT,
@@ -167,10 +178,6 @@ impl LocalEventStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_env_ts ON events(env, ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_julianday_id
-                    ON events(julianday(ts) DESC, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_env_julianday_id
-                    ON events(env, julianday(ts) DESC, id DESC);
                 CREATE TABLE IF NOT EXISTS jsonl_offsets (
                     env TEXT PRIMARY KEY,
                     path TEXT NOT NULL,
@@ -181,19 +188,66 @@ impl LocalEventStore {
             .map_err(|source| EventStoreError::Sqlite {
                 path: self.path.clone(),
                 source,
+            })?;
+        self.ensure_ts_epoch_nanos_column()?;
+        self.conn
+            .execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_events_ts_epoch_nanos_id
+                    ON events(ts_epoch_nanos DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_env_ts_epoch_nanos_id
+                    ON events(env, ts_epoch_nanos DESC, id DESC);
+                "#,
+            )
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
             })
+    }
+
+    fn ensure_ts_epoch_nanos_column(&self) -> EventStoreResult<()> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('events') WHERE name = 'ts_epoch_nanos'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        if exists {
+            return Ok(());
+        }
+
+        self.conn
+            .execute(
+                "ALTER TABLE events ADD COLUMN ts_epoch_nanos INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
     }
 
     pub fn append(&self, event: &StoredEvent) -> EventStoreResult<i64> {
         let metadata_json = serde_json::to_string(&event.metadata)
             .map_err(|source| EventStoreError::MetadataEncode { source })?;
+        let ts_epoch_nanos = parse_ts_epoch_nanos(&event.ts)?;
         self.conn
             .execute(
-                "INSERT INTO events (env, ts, kind, subject, reason, driver, handle, metadata_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO events (
+                    env, ts, ts_epoch_nanos, kind, subject, reason, driver, handle, metadata_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     event.env,
                     event.ts,
+                    ts_epoch_nanos,
                     event.kind.as_str(),
                     event.subject,
                     event.reason,
@@ -215,9 +269,9 @@ impl LocalEventStore {
         limit: usize,
     ) -> EventStoreResult<Vec<StoredEvent>> {
         let sql_all = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events ORDER BY julianday(ts) DESC, id DESC LIMIT ?1";
+             FROM events ORDER BY ts_epoch_nanos DESC, id DESC LIMIT ?1";
         let sql_env = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events WHERE env = ?1 ORDER BY julianday(ts) DESC, id DESC LIMIT ?2";
+             FROM events WHERE env = ?1 ORDER BY ts_epoch_nanos DESC, id DESC LIMIT ?2";
         let limit = bounded_list_recent_limit(limit);
 
         if let Some(env) = env {
@@ -254,13 +308,14 @@ impl LocalEventStore {
     }
 
     pub fn events_per_minute(&self) -> EventStoreResult<u64> {
+        let upper = current_epoch_nanos()?;
+        let lower = upper.saturating_sub(60 * NANOS_PER_SECOND);
         let count: i64 = self
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM events
-                 WHERE julianday(ts) BETWEEN julianday('now') - (60.0 / 86400.0)
-                     AND julianday('now')",
-                [],
+                 WHERE ts_epoch_nanos BETWEEN ?1 AND ?2",
+                params![lower, upper],
                 |row| row.get(0),
             )
             .map_err(|source| EventStoreError::Sqlite {
@@ -284,6 +339,23 @@ fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult
 
 fn bounded_list_recent_limit(limit: usize) -> i64 {
     limit.min(MAX_LIST_RECENT_LIMIT) as i64
+}
+
+fn current_epoch_nanos() -> EventStoreResult<i64> {
+    epoch_nanos_to_i64("now", OffsetDateTime::now_utc().unix_timestamp_nanos())
+}
+
+fn parse_ts_epoch_nanos(ts: &str) -> EventStoreResult<i64> {
+    let parsed =
+        OffsetDateTime::parse(ts, &Rfc3339).map_err(|source| EventStoreError::TimestampDecode {
+            ts: ts.to_owned(),
+            source,
+        })?;
+    epoch_nanos_to_i64(ts, parsed.unix_timestamp_nanos())
+}
+
+fn epoch_nanos_to_i64(ts: &str, nanos: i128) -> EventStoreResult<i64> {
+    i64::try_from(nanos).map_err(|_| EventStoreError::TimestampRange { ts: ts.to_owned() })
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>, path: &Path) -> EventStoreResult<StoredEvent> {
@@ -455,11 +527,42 @@ mod tests {
     }
 
     #[test]
+    fn list_recent_orders_submillisecond_rfc3339_timestamps_by_instant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00.000002Z",
+                StoredEventKind::Log,
+                "later by nanos",
+            ))
+            .expect("append later event");
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00.000001Z",
+                StoredEventKind::Log,
+                "earlier by nanos",
+            ))
+            .expect("append earlier event");
+
+        let events = store.list_recent(None, 10).expect("list recent events");
+
+        assert_eq!(events[0].subject, "later by nanos");
+        assert_eq!(events[1].subject, "earlier by nanos");
+    }
+
+    #[test]
     fn local_store_creates_parsed_time_indexes() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = LocalEventStore::open(root.path()).expect("open event store");
 
-        for name in ["idx_events_julianday_id", "idx_events_env_julianday_id"] {
+        for name in [
+            "idx_events_ts_epoch_nanos_id",
+            "idx_events_env_ts_epoch_nanos_id",
+        ] {
             let sql: String = store
                 .conn
                 .query_row(
@@ -470,10 +573,28 @@ mod tests {
                 .expect("index exists");
 
             assert!(
-                sql.contains("julianday(ts)"),
-                "index `{name}` did not include parsed timestamp expression: {sql}"
+                sql.contains("ts_epoch_nanos"),
+                "index `{name}` did not include normalized timestamp column: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn append_rejects_invalid_rfc3339_timestamp() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        let result = store.append(&StoredEvent::new(
+            "dev",
+            "not-a-timestamp",
+            StoredEventKind::Log,
+            "event",
+        ));
+
+        assert!(matches!(
+            result,
+            Err(EventStoreError::TimestampDecode { .. })
+        ));
     }
 
     #[test]
