@@ -46,9 +46,10 @@ fn ssrf_block_reason_label(reason: &SsrfBlockReason) -> &'static str {
 mod tests {
     use agentenv_core::security::ssrf::{SsrfBlockReason, SsrfBlocked};
     use agentenv_proto::ActivityKind;
+    use std::{fs, io::Write};
 
     use super::ssrf_blocked_event;
-    use super::{default_store_path, LocalEventStore};
+    use super::{default_store_path, LocalEventStore, StoredEvent, StoredEventKind};
 
     #[test]
     fn local_store_initializes_ops_database() {
@@ -158,5 +159,90 @@ mod tests {
                 event.subject
             );
         }
+    }
+
+    #[test]
+    fn local_store_appends_and_filters_recent_events() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        store
+            .append(&StoredEvent::new(
+                "alpha",
+                "2026-04-27T12:00:00Z",
+                StoredEventKind::Log,
+                "alpha ready",
+            ))
+            .expect("append alpha");
+        store
+            .append(&StoredEvent::new(
+                "beta",
+                "2026-04-27T12:00:01Z",
+                StoredEventKind::EgressDenied,
+                "169.254.169.254",
+            ))
+            .expect("append beta");
+
+        let alpha = store
+            .list_recent(Some("alpha"), 10)
+            .expect("list alpha events");
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].subject, "alpha ready");
+
+        let all = store.list_recent(None, 10).expect("list all events");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].env, "beta");
+    }
+
+    #[test]
+    fn jsonl_import_skips_bad_lines_and_tracks_offset() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let env_dir = root.path().join("envs").join("demo");
+        fs::create_dir_all(&env_dir).expect("create env dir");
+        let events_path = env_dir.join("events.jsonl");
+        fs::write(
+            &events_path,
+            concat!(
+                "{\"ts\":\"2026-04-27T12:00:00Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context ready\"}\n",
+                "not json\n",
+                "{\"ts\":\"2026-04-27T12:00:01Z\",\"kind\":\"egress_denied\",\"subject\":\"metadata\"}\n",
+            ),
+        )
+        .expect("write jsonl");
+
+        let first = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("first import");
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.skipped, 1);
+
+        let second = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("second import");
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped, 0);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&events_path)
+            .expect("open append");
+        file.write_all(
+            b"{\"ts\":\"2026-04-27T12:00:02Z\",\"driver\":\"agent\",\"msg\":\"agent ready\"}\n",
+        )
+        .expect("append jsonl");
+
+        let third = store
+            .import_env_jsonl("demo", &events_path)
+            .expect("third import");
+        assert_eq!(third.imported, 1);
+        assert_eq!(third.skipped, 0);
+        assert_eq!(
+            store
+                .list_recent(Some("demo"), 10)
+                .expect("list imported")
+                .len(),
+            3
+        );
     }
 }

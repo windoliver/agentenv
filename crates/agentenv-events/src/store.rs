@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -380,6 +381,98 @@ impl LocalEventStore {
         }
     }
 
+    pub fn import_env_jsonl(
+        &self,
+        env: &str,
+        events_path: &Path,
+    ) -> EventStoreResult<EventImportReport> {
+        let mut file = match fs::File::open(events_path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(EventImportReport {
+                    imported: 0,
+                    skipped: 0,
+                });
+            }
+            Err(source) => {
+                return Err(EventStoreError::CreateDir {
+                    path: events_path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        let len = file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|source| EventStoreError::CreateDir {
+                path: events_path.to_path_buf(),
+                source,
+            })?;
+        let stored_offset = self.jsonl_offset(env)?;
+        let start = if stored_offset <= len {
+            stored_offset
+        } else {
+            0
+        };
+        file.seek(SeekFrom::Start(start))
+            .map_err(|source| EventStoreError::CreateDir {
+                path: events_path.to_path_buf(),
+                source,
+            })?;
+
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .map_err(|source| EventStoreError::CreateDir {
+                path: events_path.to_path_buf(),
+                source,
+            })?;
+
+        let mut imported = 0;
+        let mut skipped = 0;
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match event_from_jsonl_line(env, line) {
+                Some(event) => {
+                    self.append(&event)?;
+                    imported += 1;
+                }
+                None => skipped += 1,
+            }
+        }
+
+        self.set_jsonl_offset(env, events_path, len)?;
+        Ok(EventImportReport { imported, skipped })
+    }
+
+    fn jsonl_offset(&self, env: &str) -> EventStoreResult<u64> {
+        match self.conn.query_row(
+            "SELECT offset FROM jsonl_offsets WHERE env = ?1",
+            params![env],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(offset) => Ok(offset.max(0) as u64),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(source) => Err(EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+
+    fn set_jsonl_offset(&self, env: &str, events_path: &Path, offset: u64) -> EventStoreResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO jsonl_offsets (env, path, offset) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(env) DO UPDATE SET path = excluded.path, offset = excluded.offset",
+                params![env, events_path.display().to_string(), offset as i64],
+            )
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(())
+    }
+
     pub fn events_per_minute(&self) -> EventStoreResult<u64> {
         let upper = current_epoch_nanos()?;
         let lower = upper.saturating_sub(60 * NANOS_PER_SECOND);
@@ -408,6 +501,39 @@ fn collect_events(mut rows: rusqlite::Rows<'_>, path: &Path) -> EventStoreResult
         events.push(row_to_event(row, path)?);
     }
     Ok(events)
+}
+
+fn event_from_jsonl_line(env: &str, line: &str) -> Option<StoredEvent> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let ts = value.get("ts").and_then(serde_json::Value::as_str)?;
+    parse_ts_epoch_nanos(ts).ok()?;
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(StoredEventKind::from_str)
+        .unwrap_or(Ok(StoredEventKind::Log))
+        .ok()?;
+    let subject = value
+        .get("subject")
+        .or_else(|| value.get("msg"))
+        .or_else(|| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("event");
+    let mut event = StoredEvent::new(env, ts, kind, subject);
+    event.reason = value
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    event.driver = value
+        .get("driver")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    event.handle = value
+        .get("handle")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    event.metadata = value;
+    Some(event)
 }
 
 fn bounded_list_recent_limit(limit: usize) -> i64 {
