@@ -6,7 +6,8 @@ use agentenv_core::security::ssrf::{sanitize_untrusted_url_text, SsrfBlockReason
 use agentenv_proto::{ActivityEventParams, ActivityKind};
 
 pub use store::{
-    default_store_path, EventImportReport, LocalEventStore, StoredEvent, StoredEventKind,
+    default_store_path, EventImportReport, EventStoreError, EventStoreResult, LocalEventStore,
+    StoredEvent, StoredEventKind,
 };
 
 pub fn ssrf_blocked_event(
