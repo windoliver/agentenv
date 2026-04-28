@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{self, Command},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -533,11 +533,17 @@ fn term_launches_and_quits_from_pty() {
     let mut reader = pair.master.try_clone_reader().unwrap();
     let reader_thread = thread::spawn(move || {
         let mut buffer = [0; 4096];
+        let mut captured = Vec::new();
         while let Ok(bytes_read) = reader.read(&mut buffer) {
             if bytes_read == 0 {
                 break;
             }
+            let remaining = 16_384_usize.saturating_sub(captured.len());
+            if remaining > 0 {
+                captured.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+            }
         }
+        captured
     });
     let mut cmd = CommandBuilder::new(agentenv_bin());
     cmd.arg("term");
@@ -550,12 +556,30 @@ fn term_launches_and_quits_from_pty() {
     thread::sleep(Duration::from_millis(500));
     writer.write_all(b"q").unwrap();
     writer.flush().unwrap();
-    thread::sleep(Duration::from_millis(500));
 
-    let status = child.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let process_id = child.process_id();
+            let kill_result = child.kill();
+            let reap_result = child.wait();
+            drop(writer);
+            drop(pair);
+            let pty_output = reader_thread.join().unwrap();
+            panic!(
+                "term did not exit within 5s after `q`; pid: {process_id:?}; kill: {kill_result:?}; reap: {reap_result:?}; pty output:\n{}",
+                String::from_utf8_lossy(&pty_output)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
     drop(writer);
     drop(pair);
-    reader_thread.join().unwrap();
+    let _pty_output = reader_thread.join().unwrap();
     assert!(status.success(), "term exited with {status:?}");
 }
 
