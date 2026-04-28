@@ -16,6 +16,22 @@ pub fn render_app(frame: &mut Frame<'_>, app: &App, theme: Theme) {
         return;
     }
 
+    match app.mode() {
+        ViewMode::Help => {
+            render_help(frame, area, theme);
+            return;
+        }
+        ViewMode::Logs => {
+            render_logs(frame, area, app, theme);
+            return;
+        }
+        ViewMode::Policy => {
+            render_policy(frame, area, app, theme);
+            return;
+        }
+        ViewMode::Normal | ViewMode::Command => {}
+    }
+
     let root = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
@@ -26,6 +42,77 @@ pub fn render_app(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     render_header(frame, root[0], app, theme);
     render_body(frame, root[1], app, theme);
     render_footer(frame, root[2], app);
+}
+
+fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+    render_fullscreen(
+        frame,
+        area,
+        "Help",
+        vec![
+            Line::from("[Tab] switch pane"),
+            Line::from("[Shift+Tab] switch pane backward"),
+            Line::from("[a-z] jump env"),
+            Line::from("[A] approvals"),
+            Line::from("[L] logs"),
+            Line::from("[P] policy"),
+            Line::from(":destroy <env>"),
+            Line::from("[q] quit"),
+        ],
+        theme,
+    );
+}
+
+fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
+    let rows = app
+        .snapshot()
+        .events
+        .iter()
+        .map(|event| {
+            Line::from(format!(
+                "{} [{}] {} {}",
+                event.ts, event.env, event.kind, event.subject
+            ))
+        })
+        .collect::<Vec<_>>();
+    render_fullscreen(frame, area, "Logs", rows_or_empty(rows, "No logs"), theme);
+}
+
+fn render_policy(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
+    let rows = app
+        .snapshot()
+        .detail
+        .as_ref()
+        .map(|detail| {
+            detail
+                .lines
+                .iter()
+                .filter(|line| line.contains("policy"))
+                .cloned()
+                .map(Line::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    render_fullscreen(
+        frame,
+        area,
+        "Policy",
+        rows_or_empty(rows, "No policy detail"),
+        theme,
+    );
+}
+
+fn render_fullscreen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    rows: Vec<Line<'static>>,
+    theme: Theme,
+) {
+    let block = Block::bordered()
+        .title(title)
+        .border_style(theme.active_border());
+    frame.render_widget(Paragraph::new(rows).block(block), area);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
@@ -191,6 +278,7 @@ mod tests {
         model::{ApprovalRow, DetailState, EnvRow, EventRow, OpsSnapshot},
         theme::Theme,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
     fn text_from_terminal(terminal: &Terminal<TestBackend>) -> String {
@@ -344,5 +432,29 @@ mod tests {
 
         let rendered = text_from_terminal(&terminal);
         assert!(rendered.contains("* Envs"), "rendered was {rendered}");
+    }
+
+    #[test]
+    fn help_logs_and_policy_modes_render_expected_titles() {
+        for (key, expected) in [
+            (KeyCode::Char('?'), "Help"),
+            (KeyCode::Char('L'), "Logs"),
+            (KeyCode::Char('P'), "Policy"),
+        ] {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut app = sample_app();
+
+            app.handle_key(KeyEvent::new(key, KeyModifiers::SHIFT));
+            terminal
+                .draw(|frame| render_app(frame, &app, Theme::mono()))
+                .expect("draw");
+
+            let rendered = text_from_terminal(&terminal);
+            assert!(
+                rendered.contains(expected),
+                "missing {expected} in {rendered}"
+            );
+        }
     }
 }
