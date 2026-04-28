@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agentenv_events::{LocalEventStore, StoredEvent, StoredEventKind};
+use agentenv_events::{LocalEventStore, StoredEventKind};
 use agentenv_proto::{ApprovalDecision, ApprovalKind, ApprovalScope};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +61,17 @@ pub enum ApprovalStoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to encode approval event metadata: {source}")]
+    EventMetadataEncode {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to decode approval {field} `{value}`")]
+    Decode { field: &'static str, value: String },
+    #[error("failed to decode approval timestamp `{ts}` as RFC3339")]
+    TimestampDecode { ts: String },
+    #[error("approval timestamp `{ts}` is outside the supported nanosecond range")]
+    TimestampRange { ts: String },
     #[error("failed to append approval event: {source}")]
     Event {
         #[source]
@@ -71,7 +84,6 @@ pub type ApprovalStoreResult<T> = Result<T, ApprovalStoreError>;
 pub struct LocalApprovalStore {
     path: PathBuf,
     conn: Connection,
-    events: LocalEventStore,
 }
 
 impl LocalApprovalStore {
@@ -85,9 +97,9 @@ impl LocalApprovalStore {
             path: path.clone(),
             source,
         })?;
-        let events =
+        let _events =
             LocalEventStore::open(root).map_err(|source| ApprovalStoreError::Event { source })?;
-        let store = Self { path, conn, events };
+        let store = Self { path, conn };
         store.init_schema()?;
         Ok(store)
     }
@@ -104,14 +116,19 @@ impl LocalApprovalStore {
                     request_id TEXT PRIMARY KEY,
                     env TEXT NOT NULL,
                     agent TEXT,
-                    kind TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('egress_host', 'mcp_tool', 'zone_access')),
                     subject TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('pending', 'allowed', 'denied', 'stale')),
                     requested_at TEXT NOT NULL,
                     decided_at TEXT,
                     decided_by TEXT,
-                    scope TEXT,
+                    scope TEXT CHECK (scope IS NULL OR scope IN (
+                        'once',
+                        'session',
+                        'persist-sandbox',
+                        'propose-for-baseline'
+                    )),
                     context_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX IF NOT EXISTS idx_approvals_status_env
@@ -139,12 +156,9 @@ impl LocalApprovalStore {
                     kind = excluded.kind,
                     subject = excluded.subject,
                     reason = excluded.reason,
-                    status = 'pending',
                     requested_at = excluded.requested_at,
-                    decided_at = NULL,
-                    decided_by = NULL,
-                    scope = NULL,
-                    context_json = excluded.context_json",
+                    context_json = excluded.context_json
+                 WHERE approvals.status = 'pending'",
                 params![
                     request.request_id,
                     request.env,
@@ -210,7 +224,21 @@ impl LocalApprovalStore {
             ApprovalDecision::Allow => ApprovalStatus::Allowed,
             ApprovalDecision::Deny => ApprovalStatus::Denied,
         };
-        self.conn
+        let scope_value = approval_scope_str(&scope);
+        parse_ts_epoch_nanos(decided_at)?;
+
+        record.status = status;
+        record.decided_at = Some(decided_at.to_owned());
+        record.decided_by = Some(decided_by.to_owned());
+        record.scope = Some(scope.clone());
+        let tx =
+            self.conn
+                .unchecked_transaction()
+                .map_err(|source| ApprovalStoreError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        let updated = tx
             .execute(
                 "UPDATE approvals
                  SET status = ?1, decided_at = ?2, decided_by = ?3, scope = ?4
@@ -219,7 +247,7 @@ impl LocalApprovalStore {
                     approval_status_str(status),
                     decided_at,
                     decided_by,
-                    approval_scope_str(&scope),
+                    scope_value,
                     request_id
                 ],
             )
@@ -227,12 +255,18 @@ impl LocalApprovalStore {
                 path: self.path.clone(),
                 source,
             })?;
-
-        record.status = status;
-        record.decided_at = Some(decided_at.to_owned());
-        record.decided_by = Some(decided_by.to_owned());
-        record.scope = Some(scope);
-        self.emit_decision_event(&record)?;
+        if updated == 0 {
+            tx.rollback().map_err(|source| ApprovalStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+            return self.stale_request_after_race(request_id, scope, decided_by, decided_at);
+        }
+        insert_decision_event(&tx, &self.path, &record)?;
+        tx.commit().map_err(|source| ApprovalStoreError::Sqlite {
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(record)
     }
 
@@ -286,27 +320,20 @@ impl LocalApprovalStore {
         raw.map(ApprovalRow::into_record).transpose()
     }
 
-    fn emit_decision_event(&self, record: &ApprovalRequestRecord) -> ApprovalStoreResult<()> {
-        let kind = match record.status {
-            ApprovalStatus::Allowed => StoredEventKind::ApprovalAllowed,
-            ApprovalStatus::Denied => StoredEventKind::ApprovalDenied,
-            ApprovalStatus::Pending | ApprovalStatus::Stale => return Ok(()),
+    fn stale_request_after_race(
+        &self,
+        request_id: &str,
+        scope: ApprovalScope,
+        decided_by: &str,
+        decided_at: &str,
+    ) -> ApprovalStoreResult<ApprovalRequestRecord> {
+        let Some(mut record) = self.get_request(request_id)? else {
+            return Ok(stale_missing_request(
+                request_id, scope, decided_by, decided_at,
+            ));
         };
-        let ts = record
-            .decided_at
-            .as_deref()
-            .unwrap_or(record.requested_at.as_str());
-        let mut event = StoredEvent::new(&record.env, ts, kind, &record.subject);
-        event.reason = Some(record.reason.clone());
-        event.metadata = serde_json::json!({
-            "request_id": record.request_id,
-            "decided_by": record.decided_by,
-            "scope": record.scope,
-        });
-        self.events
-            .append(&event)
-            .map_err(|source| ApprovalStoreError::Event { source })?;
-        Ok(())
+        record.status = ApprovalStatus::Stale;
+        Ok(record)
     }
 }
 
@@ -333,14 +360,18 @@ impl ApprovalRow {
             request_id: self.request_id,
             env: self.env,
             agent: self.agent,
-            kind: approval_kind_from_str(&self.kind),
+            kind: approval_kind_from_str(&self.kind)?,
             subject: self.subject,
             reason: self.reason,
-            status: approval_status_from_str(&self.status),
+            status: approval_status_from_str(&self.status)?,
             requested_at: self.requested_at,
             decided_at: self.decided_at,
             decided_by: self.decided_by,
-            scope: self.scope.as_deref().map(approval_scope_from_str),
+            scope: self
+                .scope
+                .as_deref()
+                .map(approval_scope_from_str)
+                .transpose()?,
             context,
         })
     }
@@ -393,12 +424,19 @@ fn approval_kind_str(kind: &ApprovalKind) -> &'static str {
     }
 }
 
-fn approval_kind_from_str(value: &str) -> ApprovalKind {
-    match value {
+fn approval_kind_from_str(value: &str) -> ApprovalStoreResult<ApprovalKind> {
+    let kind = match value {
+        "egress_host" => ApprovalKind::EgressHost,
         "mcp_tool" => ApprovalKind::McpTool,
         "zone_access" => ApprovalKind::ZoneAccess,
-        _ => ApprovalKind::EgressHost,
-    }
+        _ => {
+            return Err(ApprovalStoreError::Decode {
+                field: "kind",
+                value: value.to_owned(),
+            });
+        }
+    };
+    Ok(kind)
 }
 
 fn approval_status_str(status: ApprovalStatus) -> &'static str {
@@ -410,13 +448,20 @@ fn approval_status_str(status: ApprovalStatus) -> &'static str {
     }
 }
 
-fn approval_status_from_str(value: &str) -> ApprovalStatus {
-    match value {
+fn approval_status_from_str(value: &str) -> ApprovalStoreResult<ApprovalStatus> {
+    let status = match value {
+        "pending" => ApprovalStatus::Pending,
         "allowed" => ApprovalStatus::Allowed,
         "denied" => ApprovalStatus::Denied,
         "stale" => ApprovalStatus::Stale,
-        _ => ApprovalStatus::Pending,
-    }
+        _ => {
+            return Err(ApprovalStoreError::Decode {
+                field: "status",
+                value: value.to_owned(),
+            });
+        }
+    };
+    Ok(status)
 }
 
 fn approval_scope_str(scope: &ApprovalScope) -> &'static str {
@@ -428,13 +473,199 @@ fn approval_scope_str(scope: &ApprovalScope) -> &'static str {
     }
 }
 
-fn approval_scope_from_str(value: &str) -> ApprovalScope {
-    match value {
+fn approval_scope_from_str(value: &str) -> ApprovalStoreResult<ApprovalScope> {
+    let scope = match value {
+        "once" => ApprovalScope::Once,
         "session" => ApprovalScope::Session,
         "persist-sandbox" => ApprovalScope::PersistSandbox,
         "propose-for-baseline" => ApprovalScope::ProposeForBaseline,
-        _ => ApprovalScope::Once,
+        _ => {
+            return Err(ApprovalStoreError::Decode {
+                field: "scope",
+                value: value.to_owned(),
+            });
+        }
+    };
+    Ok(scope)
+}
+
+fn insert_decision_event(
+    conn: &Connection,
+    path: &Path,
+    record: &ApprovalRequestRecord,
+) -> ApprovalStoreResult<i64> {
+    let kind = match record.status {
+        ApprovalStatus::Allowed => StoredEventKind::ApprovalAllowed,
+        ApprovalStatus::Denied => StoredEventKind::ApprovalDenied,
+        ApprovalStatus::Pending | ApprovalStatus::Stale => return Ok(0),
+    };
+    let ts = record
+        .decided_at
+        .as_deref()
+        .unwrap_or(record.requested_at.as_str());
+    let metadata = serde_json::json!({
+        "request_id": record.request_id,
+        "decided_by": record.decided_by,
+        "scope": record.scope,
+    });
+    let metadata_json = serde_json::to_string(&metadata)
+        .map_err(|source| ApprovalStoreError::EventMetadataEncode { source })?;
+    let ts_epoch_nanos = parse_ts_epoch_nanos(ts)?;
+
+    conn.execute(
+        "INSERT INTO events (
+            env, ts, ts_epoch_nanos, kind, subject, reason, driver, handle, metadata_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7)",
+        params![
+            record.env,
+            ts,
+            ts_epoch_nanos,
+            kind.as_str(),
+            record.subject,
+            record.reason,
+            metadata_json
+        ],
+    )
+    .map_err(|source| ApprovalStoreError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn parse_ts_epoch_nanos(ts: &str) -> ApprovalStoreResult<i64> {
+    let parsed = parse_rfc3339(ts)
+        .ok_or_else(|| ApprovalStoreError::TimestampDecode { ts: ts.to_owned() })?;
+    epoch_nanos_to_i64(ts, parsed)
+}
+
+fn epoch_nanos_to_i64(ts: &str, nanos: i128) -> ApprovalStoreResult<i64> {
+    i64::try_from(nanos).map_err(|_| ApprovalStoreError::TimestampRange { ts: ts.to_owned() })
+}
+
+fn parse_rfc3339(ts: &str) -> Option<i128> {
+    let bytes = ts.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
     }
+
+    let year = parse_digits_i32(bytes, 0, 4)?;
+    let month = parse_digits_u32(bytes, 5, 2)?;
+    let day = parse_digits_u32(bytes, 8, 2)?;
+    let hour = parse_digits_u32(bytes, 11, 2)?;
+    let minute = parse_digits_u32(bytes, 14, 2)?;
+    let second = parse_digits_u32(bytes, 17, 2)?;
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let mut index = 19;
+    let mut nanos = 0_i128;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        let mut digits = 0;
+        while let Some(byte) = bytes.get(index) {
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            if digits < 9 {
+                nanos = nanos * 10 + i128::from(byte - b'0');
+            }
+            digits += 1;
+            index += 1;
+        }
+        if index == start {
+            return None;
+        }
+        for _ in digits..9 {
+            nanos *= 10;
+        }
+    }
+
+    let offset_seconds = match bytes.get(index) {
+        Some(b'Z') => {
+            if index + 1 != bytes.len() {
+                return None;
+            }
+            0_i128
+        }
+        Some(sign @ (b'+' | b'-')) => {
+            if index + 6 != bytes.len() || bytes.get(index + 3) != Some(&b':') {
+                return None;
+            }
+            let offset_hour = parse_digits_u32(bytes, index + 1, 2)?;
+            let offset_minute = parse_digits_u32(bytes, index + 4, 2)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            let seconds = i128::from(offset_hour * 3600 + offset_minute * 60);
+            if *sign == b'+' {
+                seconds
+            } else {
+                -seconds
+            }
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_seconds = i128::from(days) * 86_400 + i128::from(hour * 3_600 + minute * 60 + second);
+    Some((local_seconds - offset_seconds) * i128::from(NANOS_PER_SECOND) + nanos)
+}
+
+fn parse_digits_i32(bytes: &[u8], start: usize, len: usize) -> Option<i32> {
+    let value = parse_digits_u32(bytes, start, len)?;
+    i32::try_from(value).ok()
+}
+
+fn parse_digits_u32(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let mut value = 0_u32;
+    for index in start..start + len {
+        let byte = *bytes.get(index)?;
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + u32::from(byte - b'0');
+    }
+    Some(value)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i32::try_from(month).unwrap_or(0);
+    let day = i32::try_from(day).unwrap_or(0);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    i64::from(era * 146_097 + day_of_era - 719_468)
 }
 
 #[cfg(test)]
@@ -655,5 +886,125 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn upserting_decided_request_does_not_reopen_or_emit_second_event() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalApprovalStore::open(root.path()).expect("open approval store");
+
+        store
+            .upsert_pending(pending_request("req_replay"))
+            .expect("insert pending");
+        store
+            .decide(
+                "req_replay",
+                ApprovalDecision::Allow,
+                ApprovalScope::Session,
+                "operator",
+                "2026-04-27T12:01:00Z",
+            )
+            .expect("allow request");
+        let mut replayed = pending_request("req_replay");
+        replayed.subject = "replayed.example.com:443".to_owned();
+        store.upsert_pending(replayed).expect("replay pending");
+
+        assert!(store.list_pending(None).expect("list pending").is_empty());
+        let stale = store
+            .decide(
+                "req_replay",
+                ApprovalDecision::Deny,
+                ApprovalScope::Once,
+                "operator",
+                "2026-04-27T12:02:00Z",
+            )
+            .expect("second decision");
+        assert_eq!(stale.status, ApprovalStatus::Stale);
+        assert_eq!(
+            LocalEventStore::open(root.path())
+                .expect("open events")
+                .list_recent(Some("demo"), 10)
+                .expect("list decision events")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_decided_at_leaves_request_pending_and_emits_no_event() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalApprovalStore::open(root.path()).expect("open approval store");
+
+        store
+            .upsert_pending(pending_request("req_bad_ts"))
+            .expect("insert pending");
+        let err = store
+            .decide(
+                "req_bad_ts",
+                ApprovalDecision::Allow,
+                ApprovalScope::Session,
+                "operator",
+                "not-rfc3339",
+            )
+            .expect_err("invalid timestamp should fail");
+
+        assert!(matches!(err, ApprovalStoreError::TimestampDecode { .. }));
+        assert_eq!(
+            store
+                .list_pending(None)
+                .expect("list pending")
+                .first()
+                .expect("pending request")
+                .request_id,
+            "req_bad_ts"
+        );
+        assert!(LocalEventStore::open(root.path())
+            .expect("open events")
+            .list_recent(Some("demo"), 10)
+            .expect("list decision events")
+            .is_empty());
+    }
+
+    #[test]
+    fn unknown_persisted_values_fail_closed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalApprovalStore::open(root.path()).expect("open approval store");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals
+                 (request_id, env, agent, kind, subject, reason, status, requested_at,
+                  decided_at, decided_by, scope, context_json)
+                 VALUES (?1, 'demo', NULL, ?2, 'subject', 'reason', 'pending',
+                         '2026-04-27T12:00:00Z', NULL, NULL, NULL, '{}')",
+                params!["req_bad_kind", "future_kind"],
+            )
+            .expect_err("unknown kind should be rejected by constraint");
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals
+                 (request_id, env, agent, kind, subject, reason, status, requested_at,
+                  decided_at, decided_by, scope, context_json)
+                 VALUES (?1, 'demo', NULL, 'egress_host', 'subject', 'reason', ?2,
+                         '2026-04-27T12:00:00Z', NULL, NULL, NULL, '{}')",
+                params!["req_bad_status", "future_status"],
+            )
+            .expect_err("unknown status should be rejected by constraint");
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals
+                 (request_id, env, agent, kind, subject, reason, status, requested_at,
+                  decided_at, decided_by, scope, context_json)
+                 VALUES (?1, 'demo', NULL, 'egress_host', 'subject', 'reason', 'allowed',
+                         '2026-04-27T12:00:00Z', '2026-04-27T12:01:00Z',
+                         'operator', ?2, '{}')",
+                params!["req_bad_scope", "future_scope"],
+            )
+            .expect_err("unknown scope should be rejected by constraint");
+
+        assert!(store.list_pending(None).expect("list pending").is_empty());
     }
 }
