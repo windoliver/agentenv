@@ -8,6 +8,14 @@ use crate::{
 
 pub fn render_app(frame: &mut Frame<'_>, app: &App, theme: Theme) {
     let area = frame.area();
+    if area.height < 10 || area.width < 40 {
+        frame.render_widget(
+            Paragraph::new("agentenv\nterminal too small").style(theme.active_border()),
+            area,
+        );
+        return;
+    }
+
     let root = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
@@ -61,14 +69,14 @@ fn render_envs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .iter()
         .enumerate()
         .map(|(index, env)| {
-            let letter = jump_letter(index);
+            let jump = jump_label(index);
             let marker = if index == app.selected_env_index() {
                 ">"
             } else {
                 " "
             };
             let line = Line::from(format!(
-                "{marker} [{letter}] {:<16} {:<8} {:<10} {:<10} {}",
+                "{marker} {jump} {:<16} {:<8} {:<10} {:<10} {}",
                 env.name, env.agent, env.sandbox, env.context, env.status
             ));
             if index == app.selected_env_index() {
@@ -147,6 +155,11 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
 }
 
 fn pane_block(title: &'static str, active: bool, theme: Theme) -> Block<'static> {
+    let title = if active {
+        format!("* {title}")
+    } else {
+        title.to_owned()
+    };
     let style = if active {
         theme.active_border()
     } else {
@@ -162,8 +175,12 @@ fn rows_or_empty<'a>(mut rows: Vec<Line<'a>>, empty: &'static str) -> Vec<Line<'
     rows
 }
 
-fn jump_letter(index: usize) -> char {
-    (b'a' + (index % 26) as u8) as char
+fn jump_label(index: usize) -> String {
+    if index < 26 {
+        format!("[{}]", (b'a' + index as u8) as char)
+    } else {
+        "[ ]".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +235,16 @@ mod tests {
         })
     }
 
+    fn env_row(name: impl Into<String>) -> EnvRow {
+        EnvRow {
+            name: name.into(),
+            agent: "codex".to_owned(),
+            sandbox: "openshell".to_owned(),
+            context: "filesystem".to_owned(),
+            status: "running".to_owned(),
+        }
+    }
+
     #[test]
     fn renders_all_four_panes() {
         let backend = TestBackend::new(100, 30);
@@ -258,5 +285,64 @@ mod tests {
 
         let rendered = text_from_terminal(&terminal);
         assert!(rendered.contains("> [a] alpha"), "rendered was {rendered}");
+    }
+
+    #[test]
+    fn jump_labels_do_not_repeat_after_z() {
+        let backend = TestBackend::new(120, 80);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let app = App::new(OpsSnapshot {
+            envs: (0..27)
+                .map(|index| env_row(format!("env-{index:02}")))
+                .collect(),
+            ..OpsSnapshot::empty()
+        });
+
+        terminal
+            .draw(|frame| render_app(frame, &app, Theme::mono()))
+            .expect("draw");
+
+        let rendered = text_from_terminal(&terminal);
+        assert_eq!(
+            rendered.matches("[a]").count(),
+            1,
+            "rendered was {rendered}"
+        );
+        assert!(
+            rendered.contains("  [ ] env-26"),
+            "27th env should not advertise [a]: {rendered}"
+        );
+    }
+
+    #[test]
+    fn small_terminal_renders_clear_fallback() {
+        let backend = TestBackend::new(39, 9);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let app = sample_app();
+
+        terminal
+            .draw(|frame| render_app(frame, &app, Theme::mono()))
+            .expect("draw");
+
+        let rendered = text_from_terminal(&terminal);
+        assert!(rendered.contains("agentenv"), "rendered was {rendered}");
+        assert!(
+            rendered.contains("terminal too small"),
+            "rendered was {rendered}"
+        );
+    }
+
+    #[test]
+    fn monochrome_render_marks_active_pane_in_text() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let app = sample_app();
+
+        terminal
+            .draw(|frame| render_app(frame, &app, Theme::mono()))
+            .expect("draw");
+
+        let rendered = text_from_terminal(&terminal);
+        assert!(rendered.contains("* Envs"), "rendered was {rendered}");
     }
 }
