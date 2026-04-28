@@ -9,3 +9,14 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Approval flow scaffolding for agentenv"
+
+[dependencies]
+agentenv-events = { path = "../agentenv-events" }
+agentenv-proto = { path = "../agentenv-proto" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "=3.16.0"

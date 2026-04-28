@@ -1,10 +1,10 @@
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agentenv_events::{
@@ -12,6 +12,7 @@ use agentenv_events::{
     store::{EventQuery, SqliteEventStore},
     ActivityEvent, ActivityKind, ActivityResult,
 };
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
@@ -471,6 +472,120 @@ fn sessions_help_includes_list_and_kill_commands() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("list"), "stdout was: {stdout}");
     assert!(stdout.contains("kill"), "stdout was: {stdout}");
+}
+
+#[test]
+fn term_help_lists_flags_and_key_bindings() {
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--no-color"), "stdout was: {stdout}");
+    assert!(stdout.contains("--remote"), "stdout was: {stdout}");
+    assert!(stdout.contains("[Tab] switch pane"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("[j]/[k] move selection"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("[a]/[y] allow selected approval"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("[d]/[n] deny selected approval"),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains(":destroy <env>"), "stdout was: {stdout}");
+}
+
+#[test]
+fn term_remote_reports_unsupported_until_daemon_exists() {
+    let temp_dir = make_temp_dir("term-remote-unsupported");
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--remote")
+        .arg("http://127.0.0.1:9898")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("remote term requires"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn term_launches_and_quits_from_pty() {
+    let temp_dir = make_temp_dir("term-pty-quit");
+    write_minimal_env_state(&temp_dir, "demo");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let reader_thread = thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        let mut captured = Vec::new();
+        while let Ok(bytes_read) = reader.read(&mut buffer) {
+            if bytes_read == 0 {
+                break;
+            }
+            let remaining = 16_384_usize.saturating_sub(captured.len());
+            if remaining > 0 {
+                captured.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+            }
+        }
+        captured
+    });
+    let mut cmd = CommandBuilder::new(agentenv_bin());
+    cmd.arg("term");
+    cmd.env("HOME", temp_dir.display().to_string());
+    cmd.env("NO_COLOR", "1");
+
+    let mut child = pair.slave.spawn_command(cmd).unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    writer.write_all(b"q").unwrap();
+    writer.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let process_id = child.process_id();
+            let kill_result = child.kill();
+            let reap_result = child.wait();
+            drop(writer);
+            drop(pair);
+            let pty_output = reader_thread.join().unwrap();
+            panic!(
+                "term did not exit within 5s after `q`; pid: {process_id:?}; kill: {kill_result:?}; reap: {reap_result:?}; pty output:\n{}",
+                String::from_utf8_lossy(&pty_output)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    drop(writer);
+    drop(pair);
+    let _pty_output = reader_thread.join().unwrap();
+    assert!(status.success(), "term exited with {status:?}");
 }
 
 #[test]

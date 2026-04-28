@@ -9,3 +9,16 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Terminal UI scaffolding for agentenv"
+
+[dependencies]
+agentenv-approvals = { path = "../agentenv-approvals" }
+agentenv-core = { path = "../agentenv-core" }
+agentenv-events = { path = "../agentenv-events" }
+agentenv-proto = { path = "../agentenv-proto" }
+anyhow.workspace = true
+async-trait.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+tokio.workspace = true
+time.workspace = true
