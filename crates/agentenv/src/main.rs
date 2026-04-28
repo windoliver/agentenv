@@ -1219,6 +1219,7 @@ mod tests {
                 "status".to_string(),
                 "logs".to_string(),
                 "exec".to_string(),
+                "term".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
                 "verify-blueprint".to_string(),
