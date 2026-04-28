@@ -340,7 +340,7 @@ mod tests {
         let mut backend = LocalOpsBackend::new(options).expect("backend");
 
         let diagnostic = "demo: legacy event import failed: broken jsonl".to_owned();
-        backend.append_import_diagnostics(&[diagnostic.clone()]);
+        backend.append_import_diagnostics(std::slice::from_ref(&diagnostic));
         backend.append_import_diagnostics(&[diagnostic]);
 
         let events = backend
