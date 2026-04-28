@@ -223,7 +223,19 @@ impl LocalEventStore {
             return Ok(());
         }
 
+        self.migrate_ts_epoch_nanos_column()
+    }
+
+    fn migrate_ts_epoch_nanos_column(&self) -> EventStoreResult<()> {
         self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let result = self
+            .conn
             .execute(
                 "ALTER TABLE events ADD COLUMN ts_epoch_nanos INTEGER NOT NULL DEFAULT 0",
                 [],
@@ -231,9 +243,28 @@ impl LocalEventStore {
             .map_err(|source| EventStoreError::Sqlite {
                 path: self.path.clone(),
                 source,
-            })?;
-        self.backfill_ts_epoch_nanos()?;
-        Ok(())
+            })
+            .and_then(|_| self.backfill_ts_epoch_nanos());
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|source| EventStoreError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                }),
+            Err(err) => {
+                let rollback = self.conn.execute_batch("ROLLBACK");
+                if let Err(source) = rollback {
+                    return Err(EventStoreError::Sqlite {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+                Err(err)
+            }
+        }
     }
 
     fn backfill_ts_epoch_nanos(&self) -> EventStoreResult<()> {
@@ -653,6 +684,44 @@ mod tests {
 
         assert_eq!(events[0].subject, "later old row");
         assert_eq!(events[1].subject, "earlier old row");
+    }
+
+    #[test]
+    fn failed_old_schema_backfill_retries_on_next_open() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = super::default_store_path(root.path());
+        let conn = rusqlite::Connection::open(&path).expect("open old database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                env TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                reason TEXT,
+                driver TEXT,
+                handle TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO events (env, ts, kind, subject, metadata_json)
+            VALUES ('dev', 'not-a-timestamp', 'log', 'bad old row', '{}');
+            "#,
+        )
+        .expect("seed invalid old schema");
+        drop(conn);
+
+        let first = LocalEventStore::open(root.path());
+        assert!(matches!(
+            first,
+            Err(EventStoreError::TimestampDecode { .. })
+        ));
+
+        let second = LocalEventStore::open(root.path());
+        assert!(matches!(
+            second,
+            Err(EventStoreError::TimestampDecode { .. })
+        ));
     }
 
     #[test]
