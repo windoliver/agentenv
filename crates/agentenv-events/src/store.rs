@@ -167,10 +167,10 @@ impl LocalEventStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
                 CREATE INDEX IF NOT EXISTS idx_events_env_ts ON events(env, ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_unixepoch_id
-                    ON events(unixepoch(ts) DESC, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_env_unixepoch_id
-                    ON events(env, unixepoch(ts) DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_julianday_id
+                    ON events(julianday(ts) DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_env_julianday_id
+                    ON events(env, julianday(ts) DESC, id DESC);
                 CREATE TABLE IF NOT EXISTS jsonl_offsets (
                     env TEXT PRIMARY KEY,
                     path TEXT NOT NULL,
@@ -215,9 +215,9 @@ impl LocalEventStore {
         limit: usize,
     ) -> EventStoreResult<Vec<StoredEvent>> {
         let sql_all = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events ORDER BY unixepoch(ts) DESC, id DESC LIMIT ?1";
+             FROM events ORDER BY julianday(ts) DESC, id DESC LIMIT ?1";
         let sql_env = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events WHERE env = ?1 ORDER BY unixepoch(ts) DESC, id DESC LIMIT ?2";
+             FROM events WHERE env = ?1 ORDER BY julianday(ts) DESC, id DESC LIMIT ?2";
         let limit = bounded_list_recent_limit(limit);
 
         if let Some(env) = env {
@@ -258,7 +258,8 @@ impl LocalEventStore {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM events
-                 WHERE unixepoch(ts) BETWEEN unixepoch('now') - 60 AND unixepoch('now')",
+                 WHERE julianday(ts) BETWEEN julianday('now') - (60.0 / 86400.0)
+                     AND julianday('now')",
                 [],
                 |row| row.get(0),
             )
@@ -426,11 +427,39 @@ mod tests {
     }
 
     #[test]
+    fn list_recent_orders_fractional_rfc3339_timestamps_by_instant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00.900Z",
+                StoredEventKind::Log,
+                "later by fraction",
+            ))
+            .expect("append later event");
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00.100Z",
+                StoredEventKind::Log,
+                "earlier by fraction",
+            ))
+            .expect("append earlier event");
+
+        let events = store.list_recent(None, 10).expect("list recent events");
+
+        assert_eq!(events[0].subject, "later by fraction");
+        assert_eq!(events[1].subject, "earlier by fraction");
+    }
+
+    #[test]
     fn local_store_creates_parsed_time_indexes() {
         let root = tempfile::tempdir().expect("tempdir");
         let store = LocalEventStore::open(root.path()).expect("open event store");
 
-        for name in ["idx_events_unixepoch_id", "idx_events_env_unixepoch_id"] {
+        for name in ["idx_events_julianday_id", "idx_events_env_julianday_id"] {
             let sql: String = store
                 .conn
                 .query_row(
@@ -441,7 +470,7 @@ mod tests {
                 .expect("index exists");
 
             assert!(
-                sql.contains("unixepoch(ts)"),
+                sql.contains("julianday(ts)"),
                 "index `{name}` did not include parsed timestamp expression: {sql}"
             );
         }
