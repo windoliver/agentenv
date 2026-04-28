@@ -1,4 +1,4 @@
-use std::fs;
+use std::{collections::HashSet, fs};
 
 use agentenv_approvals::{ApprovalStatus, LocalApprovalStore};
 use agentenv_core::env::EnvStateFile;
@@ -18,6 +18,7 @@ pub struct LocalOpsBackend {
     options: RuntimeOptions,
     events: LocalEventStore,
     approvals: LocalApprovalStore,
+    emitted_import_diagnostics: HashSet<String>,
 }
 
 impl LocalOpsBackend {
@@ -28,10 +29,11 @@ impl LocalOpsBackend {
             options,
             events,
             approvals,
+            emitted_import_diagnostics: HashSet::new(),
         })
     }
 
-    fn import_jsonl_for_envs(&self, envs: &[runtime::EnvListRow]) -> Vec<String> {
+    fn import_jsonl_for_envs(&mut self, envs: &[runtime::EnvListRow]) -> Vec<String> {
         let mut diagnostics = Vec::new();
         for env in envs {
             if let Ok(name) = agentenv_core::env::validate_env_name(&env.name) {
@@ -50,7 +52,22 @@ impl LocalOpsBackend {
                 }
             }
         }
+        self.append_import_diagnostics(&diagnostics);
         diagnostics
+    }
+
+    fn append_import_diagnostics(&mut self, diagnostics: &[String]) {
+        for diagnostic in diagnostics {
+            let Some((env, _detail)) = diagnostic.split_once(':') else {
+                continue;
+            };
+            let key = format!("{env}\0{diagnostic}");
+            if !self.emitted_import_diagnostics.insert(key) {
+                continue;
+            }
+            let event = legacy_jsonl_import_event(env, diagnostic);
+            let _ = self.events.append(&event);
+        }
     }
 }
 
@@ -289,8 +306,69 @@ fn file_summary(path: &std::path::Path) -> &'static str {
     }
 }
 
+fn legacy_jsonl_import_event(env: &str, diagnostic: &str) -> StoredEvent {
+    let mut event = StoredEvent::new(
+        env,
+        now_rfc3339(),
+        StoredEventKind::Runtime,
+        "legacy_jsonl_import",
+    );
+    event.reason = Some(diagnostic.to_owned());
+    event
+}
+
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use agentenv_proto::LogLevel;
+
+    use super::{legacy_jsonl_import_event, LocalOpsBackend};
+
+    #[test]
+    fn term_import_diagnostic_events_are_deduped() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let options = agentenv_core::runtime::RuntimeOptions {
+            root: root.path().to_path_buf(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let mut backend = LocalOpsBackend::new(options).expect("backend");
+
+        let diagnostic = "demo: legacy event import failed: broken jsonl".to_owned();
+        backend.append_import_diagnostics(&[diagnostic.clone()]);
+        backend.append_import_diagnostics(&[diagnostic]);
+
+        let events = backend
+            .events
+            .list_recent(Some("demo"), 10)
+            .expect("list diagnostic events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, agentenv_events::StoredEventKind::Runtime);
+        assert_eq!(events[0].subject, "legacy_jsonl_import");
+        assert_eq!(
+            events[0].reason.as_deref(),
+            Some("demo: legacy event import failed: broken jsonl")
+        );
+    }
+
+    #[test]
+    fn term_import_diagnostic_event_uses_runtime_subject() {
+        let event = legacy_jsonl_import_event(
+            "demo",
+            "demo: legacy event import skipped 2 malformed line(s)",
+        );
+
+        assert_eq!(event.env, "demo");
+        assert_eq!(event.kind, agentenv_events::StoredEventKind::Runtime);
+        assert_eq!(event.subject, "legacy_jsonl_import");
+        assert_eq!(
+            event.reason.as_deref(),
+            Some("demo: legacy event import skipped 2 malformed line(s)")
+        );
+    }
 }
