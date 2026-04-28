@@ -211,9 +211,9 @@ impl LocalEventStore {
         limit: usize,
     ) -> EventStoreResult<Vec<StoredEvent>> {
         let sql_all = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events ORDER BY ts DESC, id DESC LIMIT ?1";
+             FROM events ORDER BY unixepoch(ts) DESC, id DESC LIMIT ?1";
         let sql_env = "SELECT id, env, ts, kind, subject, reason, driver, handle, metadata_json
-             FROM events WHERE env = ?1 ORDER BY ts DESC, id DESC LIMIT ?2";
+             FROM events WHERE env = ?1 ORDER BY unixepoch(ts) DESC, id DESC LIMIT ?2";
         let limit = bounded_list_recent_limit(limit);
 
         if let Some(env) = env {
@@ -253,7 +253,8 @@ impl LocalEventStore {
         let count: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM events WHERE unixepoch(ts) >= unixepoch('now') - 60",
+                "SELECT COUNT(*) FROM events
+                 WHERE unixepoch(ts) BETWEEN unixepoch('now') - 60 AND unixepoch('now')",
                 [],
                 |row| row.get(0),
             )
@@ -360,6 +361,64 @@ mod tests {
             .expect("append current event");
 
         assert_eq!(store.events_per_minute().expect("count events"), 1);
+    }
+
+    #[test]
+    fn events_per_minute_excludes_future_rfc3339_event() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+        let now = OffsetDateTime::now_utc();
+        let current_ts = now.format(&Rfc3339).expect("format current timestamp");
+        let future_ts = (now + Duration::minutes(2))
+            .format(&Rfc3339)
+            .expect("format future timestamp");
+
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                current_ts,
+                StoredEventKind::Log,
+                "current event",
+            ))
+            .expect("append current event");
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                future_ts,
+                StoredEventKind::Log,
+                "future event",
+            ))
+            .expect("append future event");
+
+        assert_eq!(store.events_per_minute().expect("count events"), 1);
+    }
+
+    #[test]
+    fn list_recent_orders_rfc3339_offsets_by_instant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = LocalEventStore::open(root.path()).expect("open event store");
+
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T08:30:00-04:00",
+                StoredEventKind::Log,
+                "later by instant",
+            ))
+            .expect("append later event");
+        store
+            .append(&StoredEvent::new(
+                "dev",
+                "2026-04-27T12:00:00Z",
+                StoredEventKind::Log,
+                "earlier by instant",
+            ))
+            .expect("append earlier event");
+
+        let events = store.list_recent(None, 10).expect("list recent events");
+
+        assert_eq!(events[0].subject, "later by instant");
+        assert_eq!(events[1].subject, "earlier by instant");
     }
 
     #[test]
