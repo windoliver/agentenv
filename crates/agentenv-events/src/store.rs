@@ -232,6 +232,48 @@ impl LocalEventStore {
                 path: self.path.clone(),
                 source,
             })?;
+        self.backfill_ts_epoch_nanos()?;
+        Ok(())
+    }
+
+    fn backfill_ts_epoch_nanos(&self) -> EventStoreResult<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, ts FROM events")
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, ts) = row.map_err(|source| EventStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+            updates.push((id, parse_ts_epoch_nanos(&ts)?));
+        }
+        drop(stmt);
+
+        for (id, ts_epoch_nanos) in updates {
+            self.conn
+                .execute(
+                    "UPDATE events SET ts_epoch_nanos = ?1 WHERE id = ?2",
+                    params![ts_epoch_nanos, id],
+                )
+                .map_err(|source| EventStoreError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
         Ok(())
     }
 
@@ -577,6 +619,40 @@ mod tests {
                 "index `{name}` did not include normalized timestamp column: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn open_backfills_epoch_nanos_for_old_schema_events() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = super::default_store_path(root.path());
+        let conn = rusqlite::Connection::open(&path).expect("open old database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                env TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                reason TEXT,
+                driver TEXT,
+                handle TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO events (env, ts, kind, subject, metadata_json)
+            VALUES
+                ('dev', '2026-04-27T12:00:00.000002Z', 'log', 'later old row', '{}'),
+                ('dev', '2026-04-27T12:00:00.000001Z', 'log', 'earlier old row', '{}');
+            "#,
+        )
+        .expect("seed old schema");
+        drop(conn);
+
+        let store = LocalEventStore::open(root.path()).expect("migrate old database");
+        let events = store.list_recent(None, 10).expect("list recent events");
+
+        assert_eq!(events[0].subject, "later old row");
+        assert_eq!(events[1].subject, "earlier old row");
     }
 
     #[test]
