@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
 mod render;
+mod term_backend;
 
 const SELF_ENV_SENTINEL: &str = "__self__";
 
@@ -41,6 +42,7 @@ enum Commands {
     Status(StatusArgs),
     Logs(LogsArgs),
     Exec(ExecArgs),
+    Term(TermArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
     VerifyBlueprint {
@@ -183,6 +185,26 @@ struct ExecArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(after_long_help = "\
+Key bindings:
+  [Tab] switch pane
+  [Shift+Tab] switch pane backward
+  [a-z] jump env
+  [A] approvals
+  [L] logs
+  [P] policy
+  [?] help
+  [:] command mode
+  :destroy <env>
+  [q] quit")]
+struct TermArgs {
+    #[arg(long)]
+    no_color: bool,
+    #[arg(long, value_name = "ENDPOINT")]
+    remote: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct CredentialsArgs {
     #[command(subcommand)]
     command: CredentialCommand,
@@ -263,6 +285,7 @@ async fn run() -> Result<()> {
         Some(Commands::Status(args)) => run_status(args).await,
         Some(Commands::Logs(args)) => run_logs(args).await,
         Some(Commands::Exec(args)) => run_exec(args).await,
+        Some(Commands::Term(args)) => run_term(args).await,
         Some(Commands::Credentials(command)) => run_credentials(command),
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
@@ -581,6 +604,22 @@ async fn run_exec(args: ExecArgs) -> Result<()> {
     io::stdout().flush().context("flush forwarded stdout")?;
     io::stderr().flush().context("flush forwarded stderr")?;
     process::exit(result.status);
+}
+
+async fn run_term(args: TermArgs) -> Result<()> {
+    if let Some(endpoint) = args.remote {
+        bail!("remote term requires a future agentenv daemon; unsupported endpoint `{endpoint}`");
+    }
+    let options = runtime_options(true)?;
+    let backend = term_backend::LocalOpsBackend::new(options)?;
+    agentenv_tui::run_terminal(
+        backend,
+        agentenv_tui::terminal::TermOptions {
+            no_color: args.no_color,
+            refresh_interval: Duration::from_millis(250),
+        },
+    )
+    .await
 }
 
 fn exit_json_error(reason_code: ReasonCode, error: impl std::fmt::Display) -> ! {

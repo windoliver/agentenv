@@ -468,6 +468,41 @@ fn sessions_help_includes_list_and_kill_commands() {
 }
 
 #[test]
+fn term_help_lists_flags_and_key_bindings() {
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--no-color"), "stdout was: {stdout}");
+    assert!(stdout.contains("--remote"), "stdout was: {stdout}");
+    assert!(stdout.contains("[Tab] switch pane"), "stdout was: {stdout}");
+    assert!(stdout.contains(":destroy <env>"), "stdout was: {stdout}");
+}
+
+#[test]
+fn term_remote_reports_unsupported_until_daemon_exists() {
+    let temp_dir = make_temp_dir("term-remote-unsupported");
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--remote")
+        .arg("http://127.0.0.1:9898")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("remote term requires"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn list_json_registry_error_uses_stable_error() {
     let temp_dir = make_temp_dir("list-json-corrupt");
     let env_dir = temp_dir.join(".agentenv").join("envs").join("demo");
