@@ -22,7 +22,7 @@ use agentenv_events::{
     sink::{JsonlSink, SqliteSink},
     store::{parse_legacy_jsonl_activity_event, EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
-    NoopEventEmitter, SinkConfig, WebhookConfig, WebhookSink,
+    SinkConfig, WebhookConfig, WebhookSink,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -433,7 +433,7 @@ async fn run() -> Result<()> {
         Some(Commands::Stats(args)) => run_stats(args),
         Some(Commands::Audit(args)) => run_audit(args),
         Some(Commands::Metrics(args)) => run_metrics(args).await,
-        Some(Commands::Approvals(args)) => run_approvals(args).await,
+        Some(Commands::Approvals(args)) => run_approvals(args, &cli.events_sink).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
@@ -917,7 +917,7 @@ async fn run_metrics(args: MetricsArgs) -> Result<()> {
     }
 }
 
-async fn run_approvals(args: ApprovalsArgs) -> Result<()> {
+async fn run_approvals(args: ApprovalsArgs, event_sink_args: &[String]) -> Result<()> {
     let options = runtime_options(true)?;
     match args.command {
         ApprovalsCommand::List(args) => {
@@ -937,6 +937,7 @@ async fn run_approvals(args: ApprovalsArgs) -> Result<()> {
                 ApprovalDecisionValue::Allow,
                 args.scope.map(Into::into),
                 args.reason,
+                event_sink_args,
             )
             .await?;
             println!("approved: {}", args.request_id);
@@ -950,6 +951,7 @@ async fn run_approvals(args: ApprovalsArgs) -> Result<()> {
                 ApprovalDecisionValue::Deny,
                 Some(ApprovalScope::Once),
                 args.reason,
+                event_sink_args,
             )
             .await?;
             println!("denied: {}", args.request_id);
@@ -1017,6 +1019,7 @@ async fn decide_approval(
     decision: ApprovalDecisionValue,
     scope: Option<ApprovalScope>,
     reason: Option<String>,
+    event_sink_args: &[String],
 ) -> Result<ApprovalDecisionRecord> {
     let store = open_approval_store(options, env)?;
     let request = store
@@ -1024,30 +1027,54 @@ async fn decide_approval(
         .with_context(|| format!("load approval request `{request_id}`"))?
         .with_context(|| format!("approval request `{request_id}` was not found"))?;
     let scope = scope.unwrap_or(request.default_scope);
-    let coordinator = approval_coordinator(options, env, store)?;
-    coordinator
-        .decide(ApprovalDecisionRecord {
-            request_id: request.id.clone(),
-            decision,
-            scope,
-            decided_by: "agentenv:cli".to_owned(),
-            decided_at: ::time::OffsetDateTime::now_utc(),
-            reason,
-            context: serde_json::json!({"source": "cli"}),
-            trace_id: new_cli_trace_id(),
-        })
-        .await
-        .with_context(|| format!("record approval decision for `{request_id}`"))
+    let dispatcher = build_event_dispatcher(options, Some(env), event_sink_args)?;
+    let emitter = Arc::new(AuditingEventEmitter::new(
+        dispatcher.emitter(),
+        audit_signing_key_path(options),
+        audit_write_db_paths(options, Some(env))?,
+    ));
+    let coordinator = approval_coordinator(
+        options,
+        env,
+        store,
+        Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+    )?;
+    let record = ApprovalDecisionRecord {
+        request_id: request.id.clone(),
+        decision,
+        scope,
+        decided_by: "agentenv:cli".to_owned(),
+        decided_at: ::time::OffsetDateTime::now_utc(),
+        reason,
+        context: serde_json::json!({"source": "cli"}),
+        trace_id: new_cli_trace_id(),
+    };
+
+    match coordinator.decide(record).await {
+        Ok(record) => {
+            emitter.check_audit()?;
+            flush_dispatcher_best_effort(&dispatcher).await;
+            Ok(record)
+        }
+        Err(error) => {
+            flush_dispatcher_best_effort(&dispatcher).await;
+            if let Err(audit_error) = emitter.check_audit() {
+                return Err(audit_error_after_original(audit_error, &error));
+            }
+            Err(error).with_context(|| format!("record approval decision for `{request_id}`"))
+        }
+    }
 }
 
 fn approval_coordinator(
     options: &agentenv_core::runtime::RuntimeOptions,
     env: &str,
     store: ApprovalStore,
+    events: Arc<dyn EventEmitter>,
 ) -> Result<ApprovalCoordinator> {
     Ok(ApprovalCoordinator::new(ApprovalCoordinatorConfig {
         store,
-        events: Arc::new(NoopEventEmitter),
+        events,
         poll_interval: Duration::from_millis(250),
         overlay_path: Some(agentenv_core::runtime::env_approval_overlay_path(
             options, env,

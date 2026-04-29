@@ -982,6 +982,35 @@ fn approvals_approve_records_decision() {
 }
 
 #[test]
+fn approvals_approve_writes_decision_event_to_explicit_sink() {
+    let temp = tempfile::tempdir().unwrap();
+    let events_path = temp.path().join("approval-events.jsonl");
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .arg("--events-sink")
+        .arg(format!("file:{}", events_path.display()))
+        .args([
+            "approvals",
+            "approve",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "ok",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("approved: req-1"));
+
+    let events = fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("approval_decided"), "events were: {events}");
+    assert!(events.contains("req-1"), "events were: {events}");
+}
+
+#[test]
 fn approvals_deny_records_reason() {
     let temp = tempfile::tempdir().unwrap();
     seed_pending_approval(temp.path(), "demo", "req-1");
