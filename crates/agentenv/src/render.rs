@@ -50,12 +50,14 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         }
         RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
         | RuntimeError::FrozenLockfileDriverMismatch { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Driver(error) => reason_for_driver_error(error),
         RuntimeError::Env(EnvError::Io { .. })
         | RuntimeError::Env(EnvError::Json { .. })
+        | RuntimeError::ApprovalNotification(_)
         | RuntimeError::DriverArtifact(_)
         | RuntimeError::CommandStatus { .. }
         | RuntimeError::MissingSandboxHandle { .. }

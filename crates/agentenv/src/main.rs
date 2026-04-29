@@ -13,7 +13,8 @@ use std::{
 use agentenv_approvals::{
     verify_payload, verify_slack_signature, ApprovalConfig, ApprovalCoordinator,
     ApprovalCoordinatorConfig, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind,
-    ApprovalRequest, ApprovalRequestFilter, ApprovalScope, ApprovalStatus, ApprovalStore,
+    ApprovalNotifier, ApprovalRequest, ApprovalRequestFilter, ApprovalScope, ApprovalStatus,
+    ApprovalStore, UrlValidator,
 };
 use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
@@ -1523,7 +1524,32 @@ fn approval_coordinator(
         proposal_path: Some(agentenv_core::runtime::env_approval_proposals_path(
             options, env,
         )?),
+        notifications: approval_notifications(options)?,
     }))
+}
+
+fn approval_notifications(
+    options: &agentenv_core::runtime::RuntimeOptions,
+) -> Result<Option<Arc<ApprovalNotifier>>> {
+    let config = ApprovalConfig::load(&approval_config_path(options)).with_context(|| {
+        format!(
+            "load approval config `{}`",
+            approval_config_path(options).display()
+        )
+    })?;
+    Ok(ApprovalNotifier::from_config(config, approval_url_validator())?.map(Arc::new))
+}
+
+fn approval_url_validator() -> UrlValidator {
+    Arc::new(|raw_url| {
+        let url = url::Url::parse(raw_url).map_err(|error| error.to_string())?;
+        agentenv_core::security::ssrf::validate_outbound(
+            &url,
+            agentenv_core::security::ssrf::SsrfOptions::default(),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    })
 }
 
 fn open_approval_store(

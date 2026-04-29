@@ -1684,6 +1684,7 @@ mod async_client_tests {
                 poll_interval: Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
         let decision_file = temp_fixture_path("approval-decision");
@@ -1753,6 +1754,7 @@ mod async_client_tests {
                 poll_interval: Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
         let decision_file = temp_fixture_path("approval-dynamic-request-id");
@@ -1818,6 +1820,7 @@ mod async_client_tests {
                 poll_interval: Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
         let decision_file = temp_fixture_path("approval-auto-deny");
@@ -1862,6 +1865,7 @@ mod async_client_tests {
                 poll_interval: Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
         let decision_file = temp_fixture_path("approval-delayed-auto-deny");

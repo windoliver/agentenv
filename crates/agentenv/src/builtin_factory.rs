@@ -704,6 +704,7 @@ mod tests {
                 poll_interval: std::time::Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
         let context = super::SubprocessApprovalContext {
@@ -758,6 +759,7 @@ mod tests {
                 poll_interval: std::time::Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
 
@@ -949,6 +951,7 @@ mod tests {
                 poll_interval: std::time::Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
 

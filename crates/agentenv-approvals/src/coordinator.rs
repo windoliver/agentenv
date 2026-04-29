@@ -18,6 +18,7 @@ use crate::policy::{
     append_baseline_proposal, append_overlay_grant, ApprovalGrant, ApprovalPolicyError,
 };
 use crate::store::{ApprovalStore, ApprovalStoreError};
+use crate::webhook::{ApprovalNotificationError, ApprovalNotifier};
 
 type Waiter = oneshot::Sender<ApprovalDecisionRecord>;
 type WaiterMap = BTreeMap<String, Vec<Waiter>>;
@@ -31,6 +32,7 @@ pub struct ApprovalCoordinator {
     poll_interval: Duration,
     overlay_path: Option<PathBuf>,
     proposal_path: Option<PathBuf>,
+    notifications: Option<Arc<ApprovalNotifier>>,
 }
 
 pub struct ApprovalCoordinatorConfig {
@@ -39,6 +41,7 @@ pub struct ApprovalCoordinatorConfig {
     pub poll_interval: Duration,
     pub overlay_path: Option<PathBuf>,
     pub proposal_path: Option<PathBuf>,
+    pub notifications: Option<Arc<ApprovalNotifier>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +54,8 @@ pub enum ApprovalCoordinatorError {
     LockPoisoned { name: &'static str },
     #[error(transparent)]
     Policy(#[from] ApprovalPolicyError),
+    #[error(transparent)]
+    Notification(#[from] ApprovalNotificationError),
 }
 
 impl ApprovalCoordinator {
@@ -63,6 +68,7 @@ impl ApprovalCoordinator {
             poll_interval: config.poll_interval,
             overlay_path: config.overlay_path,
             proposal_path: config.proposal_path,
+            notifications: config.notifications,
         }
     }
 
@@ -72,7 +78,26 @@ impl ApprovalCoordinator {
     ) -> Result<(), ApprovalCoordinatorError> {
         self.store.insert_request(&request)?;
         self.events.emit(approval_requested_event(&request));
+        if let Some(notifications) = &self.notifications {
+            notifications
+                .notify_request(self.store.as_ref(), &request)
+                .await?;
+        }
         Ok(())
+    }
+
+    pub async fn retry_due_deliveries(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<usize, ApprovalCoordinatorError> {
+        if let Some(notifications) = &self.notifications {
+            notifications
+                .retry_due(self.store.as_ref(), now)
+                .await
+                .map_err(Into::into)
+        } else {
+            Ok(0)
+        }
     }
 
     pub async fn decide(
@@ -130,6 +155,7 @@ impl ApprovalCoordinator {
                     });
                 }
                 () = tokio::time::sleep(self.poll_interval) => {
+                    self.retry_due_deliveries(OffsetDateTime::now_utc()).await?;
                     if let Some(decision) = self.store.get_decision(&request_id)? {
                         self.wake_waiters(&request_id, &decision)?;
                         return Ok(decision);
@@ -274,6 +300,7 @@ impl ApprovalCoordinatorConfig {
             poll_interval: Duration::from_millis(10),
             overlay_path: None,
             proposal_path: None,
+            notifications: None,
         }
     }
 }
@@ -414,6 +441,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             overlay_path: Some(overlay_path.clone()),
             proposal_path: None,
+            notifications: None,
         });
         let request = test_request("req-persist");
 
@@ -444,6 +472,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             overlay_path: None,
             proposal_path: Some(proposal_path.clone()),
+            notifications: None,
         });
         let request = test_request("req-propose");
 
@@ -483,6 +512,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             overlay_path: Some(overlay_path.clone()),
             proposal_path: None,
+            notifications: None,
         });
 
         let returned = coordinator.decide(decision.clone()).await.unwrap();

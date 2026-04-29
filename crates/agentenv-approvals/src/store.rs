@@ -39,6 +39,24 @@ pub struct ApprovalStore {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalDeliveryTargetRecord {
+    pub id: i64,
+    pub env: Option<String>,
+    pub kind_filter: Vec<crate::model::ApprovalKind>,
+    pub channel: String,
+    pub url: String,
+    pub secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalDeliveryAttemptRecord {
+    pub id: i64,
+    pub request: ApprovalRequest,
+    pub target: ApprovalDeliveryTargetRecord,
+    pub attempt_count: u32,
+}
+
 impl ApprovalStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, ApprovalStoreError> {
         let store = Self { path: path.into() };
@@ -222,12 +240,38 @@ impl ApprovalStore {
         rows.next().transpose()
     }
 
+    pub fn insert_delivery_target(
+        &self,
+        env: Option<&str>,
+        kind_filter: &[crate::model::ApprovalKind],
+        channel: &str,
+        url: &str,
+        secret_ref: Option<&str>,
+    ) -> Result<i64, ApprovalStoreError> {
+        let conn = self.connection()?;
+        let kind_filter_json = serde_json::to_string(kind_filter)?;
+        conn.execute(
+            r#"
+            INSERT INTO approval_delivery_targets (
+                env,
+                kind_filter_json,
+                channel,
+                url,
+                secret_ref
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![env, kind_filter_json, channel, url, secret_ref],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     pub fn enqueue_delivery_attempt(
         &self,
         request_id: &str,
         target_id: i64,
         next_attempt_at: OffsetDateTime,
-    ) -> Result<(), ApprovalStoreError> {
+    ) -> Result<i64, ApprovalStoreError> {
         let conn = self.connection()?;
         conn.execute(
             r#"
@@ -249,7 +293,7 @@ impl ApprovalStore {
                 format_rfc3339_utc(next_attempt_at)
             ],
         )?;
-        Ok(())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn record_delivery_failure(
@@ -292,6 +336,43 @@ impl ApprovalStore {
         Ok(())
     }
 
+    pub fn record_delivery_terminal_failure(
+        &self,
+        delivery_id: i64,
+        error: &str,
+    ) -> Result<(), ApprovalStoreError> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let Some(status) = delivery_status_in_transaction(&tx, delivery_id)? else {
+            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
+        };
+
+        if status == "delivered" {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        tx.execute(
+            r#"
+            UPDATE approval_delivery_attempts
+            SET
+                status = ?1,
+                attempt_count = attempt_count + 1,
+                last_error = ?2,
+                last_attempt_at = ?3
+            WHERE id = ?4
+            "#,
+            params![
+                "failed",
+                error,
+                format_rfc3339_utc(OffsetDateTime::now_utc()),
+                delivery_id
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn record_delivery_success(&self, delivery_id: i64) -> Result<(), ApprovalStoreError> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
@@ -322,6 +403,56 @@ impl ApprovalStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn due_delivery_attempts(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Vec<ApprovalDeliveryAttemptRecord>, ApprovalStoreError> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                r.id,
+                r.env,
+                r.kind,
+                r.subject,
+                r.reason,
+                r.context_json,
+                r.requested_at,
+                r.default_scope,
+                r.auto_deny_after_ms,
+                r.status,
+                r.driver_name,
+                r.driver_request_handle,
+                r.expires_at,
+                r.created_trace_id,
+                a.id,
+                t.id,
+                t.env,
+                t.kind_filter_json,
+                t.channel,
+                t.url,
+                t.secret_ref,
+                a.attempt_count
+            FROM approval_delivery_attempts a
+            JOIN approval_delivery_targets t ON t.id = a.target_id
+            JOIN approval_requests r ON r.id = a.request_id
+            WHERE a.status = ?1
+              AND a.next_attempt_at <= ?2
+              AND r.status = ?3
+            ORDER BY a.next_attempt_at ASC, a.id ASC
+            "#,
+        )?;
+        let rows = stmt.query_and_then(
+            params![
+                "pending",
+                format_rfc3339_utc(now),
+                enum_to_db_string(ApprovalStatus::Pending, "status")?,
+            ],
+            delivery_attempt_from_row,
+        )?;
+        collect_rows(rows)
     }
 
     pub fn due_pending_requests(
@@ -454,6 +585,11 @@ impl ApprovalStore {
         create_private_database_file(&self.path)?;
         let path = database_open_path(&self.path)?;
         Ok(Connection::open_with_flags(path, database_open_flags())?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -596,6 +732,25 @@ fn decision_from_row(
         reason: row.get(5)?,
         context: serde_json::from_str(&row.get::<_, String>(6)?)?,
         trace_id: row.get(7)?,
+    })
+}
+
+fn delivery_attempt_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ApprovalDeliveryAttemptRecord, ApprovalStoreError> {
+    let attempt_count = row.get::<_, i64>(21)?;
+    Ok(ApprovalDeliveryAttemptRecord {
+        id: row.get(14)?,
+        request: request_from_row(row)?,
+        target: ApprovalDeliveryTargetRecord {
+            id: row.get(15)?,
+            env: row.get(16)?,
+            kind_filter: serde_json::from_str(&row.get::<_, String>(17)?)?,
+            channel: row.get(18)?,
+            url: row.get(19)?,
+            secret_ref: row.get(20)?,
+        },
+        attempt_count: sql_integer_to_u32(attempt_count, 21)?,
     })
 }
 
@@ -743,6 +898,10 @@ fn unix_timestamp_nanos_to_sql(value: OffsetDateTime) -> Result<i64, ApprovalSto
 
 fn sql_integer_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+fn sql_integer_to_u32(value: i64, column: usize) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
 fn add_column_if_missing(

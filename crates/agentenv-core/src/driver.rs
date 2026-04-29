@@ -583,6 +583,7 @@ mod tests {
                 poll_interval: Duration::from_millis(1),
                 overlay_path: None,
                 proposal_path: None,
+                notifications: None,
             },
         );
         let request = agentenv_approvals::ApprovalRequest::new(

@@ -9,7 +9,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use agentenv_approvals::{ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalStore};
+use agentenv_approvals::{
+    ApprovalConfig, ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalNotifier,
+    ApprovalStore, UrlValidator,
+};
 use agentenv_events::{
     ActivityEvent, ActivityKind, ActivityResult, EventEmitter, NoopEventEmitter,
 };
@@ -278,6 +281,10 @@ pub enum RuntimeError {
     Lockfile(#[from] crate::lockfile::LockfileError),
     #[error(transparent)]
     PortableLockfile(#[from] crate::portable_lockfile::PortableLockfileError),
+    #[error(transparent)]
+    ApprovalConfig(#[from] agentenv_approvals::ApprovalConfigError),
+    #[error(transparent)]
+    ApprovalNotification(#[from] agentenv_approvals::ApprovalNotificationError),
     #[error("unsupported driver `{name}` for {kind}")]
     UnsupportedDriver { kind: &'static str, name: String },
     #[error("unknown policy tier `{tier}`")]
@@ -563,7 +570,27 @@ pub fn approval_coordinator_for_env(
         poll_interval: Duration::from_millis(250),
         overlay_path: Some(env_approval_overlay_path(options, env)?),
         proposal_path: Some(env_approval_proposals_path(options, env)?),
+        notifications: approval_notifications(options)?,
     }))
+}
+
+fn approval_notifications(
+    options: &RuntimeOptions,
+) -> RuntimeResult<Option<Arc<ApprovalNotifier>>> {
+    let config = ApprovalConfig::load(&options.root.join("config.yaml"))?;
+    Ok(ApprovalNotifier::from_config(config, approval_url_validator())?.map(Arc::new))
+}
+
+fn approval_url_validator() -> UrlValidator {
+    Arc::new(|raw_url| {
+        let url = url::Url::parse(raw_url).map_err(|error| error.to_string())?;
+        crate::security::ssrf::validate_outbound(
+            &url,
+            crate::security::ssrf::SsrfOptions::default(),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    })
 }
 
 fn env_paths(options: &RuntimeOptions, env: &str) -> RuntimeResult<crate::env::EnvPaths> {
@@ -2979,6 +3006,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::Lifecycle(_)
         | RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
         | RuntimeError::ComponentConfigConversion { .. }
@@ -2997,6 +3025,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         }
         RuntimeError::Env(EnvError::Io { .. })
         | RuntimeError::Env(EnvError::Json { .. })
+        | RuntimeError::ApprovalNotification(_)
         | RuntimeError::Driver(_)
         | RuntimeError::DriverArtifact(_)
         | RuntimeError::CommandStatus { .. } => {
