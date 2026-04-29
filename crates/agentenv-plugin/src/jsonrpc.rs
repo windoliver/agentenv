@@ -18,6 +18,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -444,6 +445,15 @@ fn duration_until_utc(deadline: time::OffsetDateTime) -> Duration {
     remaining.try_into().unwrap_or(Duration::ZERO)
 }
 
+fn duration_until_instant(deadline: Instant) -> Duration {
+    let now = Instant::now();
+    if deadline > now {
+        deadline - now
+    } else {
+        Duration::ZERO
+    }
+}
+
 fn invalid_notification_event(
     method: &str,
     params: Value,
@@ -725,7 +735,8 @@ impl JsonRpcClient {
     {
         let _rpc_guard = self.rpc.lock().await;
         self.ensure_open().await?;
-        match tokio::time::timeout(self.timeout, self.call_inner(method, params)).await {
+        let deadline = Instant::now() + self.timeout;
+        match tokio::time::timeout_at(deadline, self.call_inner(method, params, deadline)).await {
             Ok(result) => result,
             Err(_) => {
                 self.poison_and_terminate(format!("request `{method}` timed out"))
@@ -738,9 +749,14 @@ impl JsonRpcClient {
     pub async fn shutdown(&mut self) -> Result<(), JsonRpcError> {
         let _rpc_guard = self.rpc.lock().await;
         self.ensure_open().await?;
-        let shutdown_result = tokio::time::timeout(
-            self.timeout,
-            self.call_inner::<_, agentenv_proto::EmptyResult>("shutdown", &ShutdownParams {}),
+        let deadline = Instant::now() + self.timeout;
+        let shutdown_result = tokio::time::timeout_at(
+            deadline,
+            self.call_inner::<_, agentenv_proto::EmptyResult>(
+                "shutdown",
+                &ShutdownParams {},
+                deadline,
+            ),
         )
         .await;
         match shutdown_result {
@@ -778,7 +794,12 @@ impl JsonRpcClient {
         Ok(())
     }
 
-    async fn call_inner<P, R>(&self, method: &str, params: &P) -> Result<R, JsonRpcError>
+    async fn call_inner<P, R>(
+        &self,
+        method: &str,
+        params: &P,
+        rpc_deadline: Instant,
+    ) -> Result<R, JsonRpcError>
     where
         P: Serialize + ?Sized,
         R: DeserializeOwned,
@@ -804,7 +825,7 @@ impl JsonRpcClient {
             };
             if raw.get("method").is_some() && raw.get("id").is_none() {
                 let notification: RpcNotificationEnvelope = serde_json::from_value(raw)?;
-                self.handle_notification(notification, &fallback_trace_id)
+                self.handle_notification(notification, &fallback_trace_id, rpc_deadline)
                     .await?;
                 continue;
             }
@@ -832,6 +853,7 @@ impl JsonRpcClient {
         &self,
         notification: RpcNotificationEnvelope,
         fallback_trace_id: &str,
+        rpc_deadline: Instant,
     ) -> Result<(), JsonRpcError> {
         if notification.method == "event/approval_requested" {
             if let (Some(coordinator), Some(env_name)) =
@@ -843,6 +865,7 @@ impl JsonRpcClient {
                         fallback_trace_id,
                         env_name,
                         coordinator,
+                        rpc_deadline,
                     )
                     .await;
             }
@@ -859,6 +882,7 @@ impl JsonRpcClient {
         fallback_trace_id: &str,
         env_name: &str,
         coordinator: &agentenv_approvals::ApprovalCoordinator,
+        rpc_deadline: Instant,
     ) -> Result<(), JsonRpcError> {
         let event = notification_to_activity_event(notification.clone(), fallback_trace_id)?;
         let params: agentenv_proto::ApprovalRequestedParams =
@@ -874,7 +898,7 @@ impl JsonRpcClient {
             env_name,
             params,
             fallback_trace_id,
-            bounded_approval_auto_deny_after(self.timeout),
+            bounded_approval_auto_deny_after(duration_until_instant(rpc_deadline)),
         )?;
         let expires_at = request.expires_at;
 
@@ -1755,6 +1779,45 @@ mod async_client_tests {
         client.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn delayed_approval_requested_notification_auto_denies_before_client_timeout() {
+        let store_path = temp_fixture_artifact_path("approvals-delayed-auto-deny", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-delayed-auto-deny");
+        let mut client = spawn_fixture_client(
+            "delayed_approval_before_preflight",
+            Duration::from_secs(2),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator);
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decision["method"], json!("approval/decision"));
+        assert_eq!(decision["params"]["request_id"], json!("req-1"));
+        assert_eq!(decision["params"]["decision"], json!("deny"));
+        client.shutdown().await.unwrap();
+    }
+
     async fn spawn_fixture_client(
         mode: &str,
         timeout: Duration,
@@ -1833,7 +1896,9 @@ def response(request):
                     "extras": {},
                 },
             })
-        if MODE == "approval_before_preflight":
+        if MODE == "approval_before_preflight" or MODE == "delayed_approval_before_preflight":
+            if MODE == "delayed_approval_before_preflight":
+                time.sleep(1.1)
             write_message({
                 "jsonrpc": "2.0",
                 "method": "event/approval_requested",
