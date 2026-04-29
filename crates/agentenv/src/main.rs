@@ -930,30 +930,34 @@ async fn run_approvals(args: ApprovalsArgs, event_sink_args: &[String]) -> Resul
         }
         ApprovalsCommand::Watch(args) => run_approvals_watch(&options, args).await,
         ApprovalsCommand::Approve(args) => {
-            decide_approval(
+            let decision = ApprovalDecisionValue::Allow;
+            let record = decide_approval(
                 &options,
                 &args.env,
                 &args.request_id,
-                ApprovalDecisionValue::Allow,
+                decision,
                 args.scope.map(Into::into),
                 args.reason,
                 event_sink_args,
             )
             .await?;
+            ensure_requested_decision(&record, decision)?;
             println!("approved: {}", args.request_id);
             Ok(())
         }
         ApprovalsCommand::Deny(args) => {
-            decide_approval(
+            let decision = ApprovalDecisionValue::Deny;
+            let record = decide_approval(
                 &options,
                 &args.env,
                 &args.request_id,
-                ApprovalDecisionValue::Deny,
+                decision,
                 Some(ApprovalScope::Once),
                 args.reason,
                 event_sink_args,
             )
             .await?;
+            ensure_requested_decision(&record, decision)?;
             println!("denied: {}", args.request_id);
             Ok(())
         }
@@ -963,6 +967,27 @@ async fn run_approvals(args: ApprovalsArgs, event_sink_args: &[String]) -> Resul
                 args.addr
             )
         }
+    }
+}
+
+fn ensure_requested_decision(
+    record: &ApprovalDecisionRecord,
+    requested: ApprovalDecisionValue,
+) -> Result<()> {
+    if record.decision != requested {
+        bail!(
+            "approval request {} already decided as {}",
+            record.request_id,
+            approval_decision_label(record.decision)
+        );
+    }
+    Ok(())
+}
+
+fn approval_decision_label(decision: ApprovalDecisionValue) -> &'static str {
+    match decision {
+        ApprovalDecisionValue::Allow => "allow",
+        ApprovalDecisionValue::Deny => "deny",
     }
 }
 

@@ -1033,6 +1033,44 @@ fn approvals_deny_records_reason() {
 }
 
 #[test]
+fn approvals_approve_fails_when_request_was_already_denied() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "deny",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "no",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("denied: req-1"));
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "approve",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "ok",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already decided as deny"));
+}
+
+#[test]
 fn approvals_watch_once_json_prints_pending_requests() {
     let temp = tempfile::tempdir().unwrap();
     seed_pending_approval(temp.path(), "demo", "req-1");
