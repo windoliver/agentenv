@@ -872,6 +872,100 @@ mod tests {
     }
 
     #[test]
+    fn pinned_env_aware_factory_path_builds_subprocess_agent_and_context_with_approval_context() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let installed_parent = temp.path().join("verified-drivers");
+        let hermes_driver = installed_parent.join("agent-hermes");
+        let nexus_driver = installed_parent.join("context-nexus");
+        let built_in_binary = temp.path().join("agentenv-test-binary");
+        std::fs::write(&built_in_binary, "fake agentenv binary\n").expect("built-in binary");
+        write_manifest(&hermes_driver, "agent", "hermes", "agentenv-driver-hermes");
+        write_manifest(&nexus_driver, "context", "nexus", "agentenv-driver-nexus");
+        let artifacts = discover_driver_artifacts(
+            DriverDiscoveryConfig::new(installed_parent, Vec::new()),
+            Some(built_in_binary),
+        )
+        .expect("discover artifacts");
+        let hermes = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == CatalogKind::Agent
+                    && artifact.name == "hermes"
+                    && artifact.source == DriverSource::InstalledSubprocess
+            })
+            .expect("hermes artifact");
+        let nexus = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == CatalogKind::Context
+                    && artifact.name == "nexus"
+                    && artifact.source == DriverSource::InstalledSubprocess
+            })
+            .expect("nexus artifact");
+        let mut lockfile = lockfile_with_pin(
+            "agent",
+            ProtoDriverKind::Agent,
+            "hermes",
+            "0.1.0",
+            DriverSourcePin::Installed,
+            &hermes.digest,
+        );
+        lockfile.drivers.insert(
+            "context".to_owned(),
+            PortableDriverPin {
+                kind: proto_kind_label(ProtoDriverKind::Context).to_owned(),
+                name: "nexus".to_owned(),
+                version: "0.1.0".to_owned(),
+                source: DriverSourcePin::Installed,
+                digest: nexus.digest.clone(),
+            },
+        );
+        let pins = DriverPinSet::from_portable_lockfile_and_artifacts(&lockfile, &artifacts)
+            .expect("pin set");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            (
+                "AGENTENV_DRIVER_PATH",
+                temp.path().join("missing-driver-path").into_os_string(),
+            ),
+        ]);
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "hermes".to_owned(),
+            context: "nexus".to_owned(),
+            inference: None,
+        };
+        let store = agentenv_approvals::ApprovalStore::open(
+            temp.path().join("envs").join("demo").join("events.db"),
+        )
+        .expect("store");
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: std::time::Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+            },
+        );
+
+        let set = BuiltInDriverFactory
+            .build_pinned_for_env_observed(
+                &selection,
+                &pins,
+                "demo",
+                std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                Some(coordinator),
+            )
+            .expect("pinned env-aware factory path should build subprocess agent and context");
+
+        drop(set);
+    }
+
+    #[test]
     fn pinned_build_rejects_non_builtin_sandbox_pin() {
         let selection = DriverSelection {
             sandbox: "openshell".to_owned(),
