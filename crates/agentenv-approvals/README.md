@@ -1,3 +1,3 @@
 # agentenv-approvals
 
-M1 scaffold crate for the `agentenv` workspace.
+`agentenv-approvals` stores pending approval requests and operator decisions in `~/.agentenv/ops.sqlite3`.

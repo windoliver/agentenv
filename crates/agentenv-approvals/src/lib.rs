@@ -3,6 +3,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod events;
+pub mod local_store;
 pub mod model;
 pub mod policy;
 pub mod signing;
@@ -15,6 +16,10 @@ pub use config::{
 };
 pub use coordinator::{ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalCoordinatorError};
 pub use events::{approval_decided_event, approval_requested_event};
+pub use local_store::{
+    ApprovalRequestRecord, LocalApprovalStatus, LocalApprovalStore, LocalApprovalStoreError,
+    LocalApprovalStoreResult,
+};
 pub use model::{
     format_rfc3339, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind, ApprovalRequest,
     ApprovalRequestFilter, ApprovalScope, ApprovalStatus,

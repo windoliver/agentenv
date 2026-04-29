@@ -194,16 +194,17 @@ pub fn print_sessions_text(rows: &[SessionListRow]) {
 
 pub fn print_approval_rows_text(rows: &[ApprovalRowJson]) {
     println!(
-        "{:<20} {:<26} {:<16} {:<24} {:<22} REQUESTED",
-        "ENV", "REQUEST", "KIND", "SUBJECT", "DEFAULT_SCOPE"
+        "{:<20} {:<26} {:<16} {:<24} {:<24} {:<22} REQUESTED",
+        "ENV", "REQUEST", "KIND", "SUBJECT", "REASON", "DEFAULT_SCOPE"
     );
     for row in rows {
         println!(
-            "{:<20} {:<26} {:<16} {:<24} {:<22} {}",
+            "{:<20} {:<26} {:<16} {:<24} {:<24} {:<22} {}",
             row.env,
             row.request_id,
             approval_kind_label(row.kind),
             truncate_table_cell(&row.subject, 24),
+            truncate_table_cell(&row.reason, 24),
             approval_scope_label(row.default_scope),
             row.requested_at
         );
