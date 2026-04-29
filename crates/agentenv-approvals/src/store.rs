@@ -29,6 +29,8 @@ pub enum ApprovalStoreError {
     NonStringEnum { field: &'static str },
     #[error("unsafe approval database path: {path}")]
     UnsafeDatabasePath { path: PathBuf },
+    #[error("approval timestamp is outside SQLite integer nanosecond range: {0}")]
+    TimestampOutOfRange(i128),
 }
 
 pub struct ApprovalStore {
@@ -49,6 +51,8 @@ impl ApprovalStore {
         let default_scope = enum_to_db_string(request.default_scope, "default_scope")?;
         let status = enum_to_db_string(request.status, "status")?;
         let auto_deny_after_ms = u64_to_sql_integer(request.auto_deny_after_ms)?;
+        let requested_at_unix_ns = unix_timestamp_nanos_to_sql(request.requested_at)?;
+        let expires_at_unix_ns = unix_timestamp_nanos_to_sql(request.expires_at)?;
 
         conn.execute(
             r#"
@@ -66,9 +70,11 @@ impl ApprovalStore {
                 driver_name,
                 driver_request_handle,
                 expires_at,
-                created_trace_id
+                created_trace_id,
+                requested_at_unix_ns,
+                expires_at_unix_ns
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             "#,
             params![
                 request.id,
@@ -85,6 +91,8 @@ impl ApprovalStore {
                 request.driver_request_handle,
                 format_rfc3339_utc(request.expires_at),
                 request.created_trace_id,
+                requested_at_unix_ns,
+                expires_at_unix_ns,
             ],
         )?;
         Ok(())
@@ -119,7 +127,7 @@ impl ApprovalStore {
             query_params.push(SqlValue::Text(enum_to_db_string(status, "status")?));
         }
 
-        sql.push_str(" ORDER BY requested_at ASC, id ASC");
+        sql.push_str(" ORDER BY requested_at_unix_ns ASC, id ASC");
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_and_then(params_from_iter(query_params), request_from_row)?;
@@ -218,13 +226,13 @@ impl ApprovalStore {
     ) -> Result<Vec<ApprovalRequest>, ApprovalStoreError> {
         let conn = self.connection()?;
         let sql = request_select_sql(
-            "WHERE status = ?1 AND expires_at <= ?2 ORDER BY expires_at ASC, id ASC",
+            "WHERE status = ?1 AND expires_at_unix_ns <= ?2 ORDER BY expires_at_unix_ns ASC, id ASC",
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_and_then(
             params![
                 enum_to_db_string(ApprovalStatus::Pending, "status")?,
-                format_rfc3339_utc(now)
+                unix_timestamp_nanos_to_sql(now)?
             ],
             request_from_row,
         )?;
@@ -238,12 +246,12 @@ impl ApprovalStore {
     ) -> Result<(), ApprovalStoreError> {
         let conn = self.connection()?;
         let changed = conn.execute(
-            "UPDATE approval_requests SET status = ?1 WHERE id = ?2 AND status = ?3 AND expires_at <= ?4",
+            "UPDATE approval_requests SET status = ?1 WHERE id = ?2 AND status = ?3 AND expires_at_unix_ns <= ?4",
             params![
                 enum_to_db_string(ApprovalStatus::Expired, "status")?,
                 request_id,
                 enum_to_db_string(ApprovalStatus::Pending, "status")?,
-                format_rfc3339_utc(now)
+                unix_timestamp_nanos_to_sql(now)?
             ],
         )?;
 
@@ -289,13 +297,15 @@ impl ApprovalStore {
               driver_name TEXT,
               driver_request_handle TEXT,
               expires_at TEXT NOT NULL,
-              created_trace_id TEXT NOT NULL
+              created_trace_id TEXT NOT NULL,
+              requested_at_unix_ns INTEGER NOT NULL,
+              expires_at_unix_ns INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS approval_requests_env_status_requested_at_idx
-              ON approval_requests(env, status, requested_at);
+              ON approval_requests(env, status, requested_at_unix_ns);
             CREATE INDEX IF NOT EXISTS approval_requests_status_expires_at_idx
-              ON approval_requests(status, expires_at);
+              ON approval_requests(status, expires_at_unix_ns);
 
             CREATE TABLE IF NOT EXISTS approval_decisions (
               request_id TEXT PRIMARY KEY,
@@ -531,6 +541,11 @@ fn u64_to_sql_integer(value: u64) -> Result<i64, ApprovalStoreError> {
     })
 }
 
+fn unix_timestamp_nanos_to_sql(value: OffsetDateTime) -> Result<i64, ApprovalStoreError> {
+    let nanos = value.unix_timestamp_nanos();
+    i64::try_from(nanos).map_err(|_| ApprovalStoreError::TimestampOutOfRange(nanos))
+}
+
 fn sql_integer_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
@@ -725,6 +740,24 @@ mod tests {
 
         assert_eq!(
             store.get_request("req-future").unwrap().unwrap().status,
+            ApprovalStatus::Pending
+        );
+    }
+
+    #[test]
+    fn fractional_expiry_later_in_same_second_is_not_due() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::open(temp.path().join("events.db")).unwrap();
+        let mut request = request("req-fractional", 0);
+        request.expires_at = OffsetDateTime::parse("2026-04-29T12:00:00.5Z", &Rfc3339).unwrap();
+        store.insert_request(&request).unwrap();
+
+        let now = OffsetDateTime::parse("2026-04-29T12:00:00Z", &Rfc3339).unwrap();
+
+        assert!(store.due_pending_requests(now).unwrap().is_empty());
+        store.expire_without_waiter("req-fractional", now).unwrap();
+        assert_eq!(
+            store.get_request("req-fractional").unwrap().unwrap().status,
             ApprovalStatus::Pending
         );
     }
