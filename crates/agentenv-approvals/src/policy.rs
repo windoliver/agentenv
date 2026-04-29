@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{format_rfc3339, ApprovalDecisionRecord, ApprovalKind, ApprovalRequest, ApprovalScope};
 
+#[cfg(not(test))]
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
