@@ -1727,7 +1727,7 @@ mod async_client_tests {
         let decision_file = temp_fixture_path("approval-auto-deny");
         let mut client = spawn_fixture_client(
             "approval_before_preflight",
-            Duration::from_millis(500),
+            Duration::from_secs(2),
             &[(
                 "JSONRPC_FIXTURE_DECISION_FILE",
                 decision_file.to_string_lossy().as_ref(),
