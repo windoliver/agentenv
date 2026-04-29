@@ -22,6 +22,9 @@ use tokio::sync::Mutex;
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_HEADER_LINES: usize = 32;
+const DEFAULT_APPROVAL_AUTO_DENY_AFTER: Duration = Duration::from_secs(300);
+const APPROVAL_DECISION_WRITE_MARGIN: Duration = Duration::from_secs(1);
+const MIN_SHORT_APPROVAL_AUTO_DENY_AFTER: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum JsonRpcError {
@@ -336,10 +339,25 @@ fn approval_requested_params_to_activity_event(
     event
 }
 
+#[cfg(test)]
 pub(crate) fn approval_request_from_params(
     env: impl Into<String>,
     params: agentenv_proto::ApprovalRequestedParams,
     trace_id: impl Into<String>,
+) -> Result<agentenv_approvals::ApprovalRequest, JsonRpcError> {
+    approval_request_from_params_with_auto_deny(
+        env,
+        params,
+        trace_id,
+        DEFAULT_APPROVAL_AUTO_DENY_AFTER,
+    )
+}
+
+fn approval_request_from_params_with_auto_deny(
+    env: impl Into<String>,
+    params: agentenv_proto::ApprovalRequestedParams,
+    trace_id: impl Into<String>,
+    auto_deny_after: Duration,
 ) -> Result<agentenv_approvals::ApprovalRequest, JsonRpcError> {
     let requested_at = time::OffsetDateTime::now_utc();
     Ok(agentenv_approvals::ApprovalRequest::new(
@@ -351,7 +369,7 @@ pub(crate) fn approval_request_from_params(
         Value::Object(params.context.into_iter().collect()),
         requested_at,
         approval_scope_from_default_ttl(params.default_ttl.as_deref()),
-        Duration::from_secs(300),
+        auto_deny_after,
         trace_id,
     ))
 }
@@ -409,6 +427,21 @@ fn approval_scope_to_proto(
             agentenv_proto::ApprovalScope::ProposeForBaseline
         }
     }
+}
+
+fn bounded_approval_auto_deny_after(timeout: Duration) -> Duration {
+    if timeout > APPROVAL_DECISION_WRITE_MARGIN + MIN_SHORT_APPROVAL_AUTO_DENY_AFTER {
+        DEFAULT_APPROVAL_AUTO_DENY_AFTER.min(timeout - APPROVAL_DECISION_WRITE_MARGIN)
+    } else if timeout > MIN_SHORT_APPROVAL_AUTO_DENY_AFTER {
+        timeout / 2
+    } else {
+        timeout
+    }
+}
+
+fn duration_until_utc(deadline: time::OffsetDateTime) -> Duration {
+    let remaining = deadline - time::OffsetDateTime::now_utc();
+    remaining.try_into().unwrap_or(Duration::ZERO)
 }
 
 fn invalid_notification_event(
@@ -837,10 +870,18 @@ impl JsonRpcClient {
                 }
             };
         let request_id = params.request_id.clone();
-        let request = approval_request_from_params(env_name, params, fallback_trace_id)?;
+        let request = approval_request_from_params_with_auto_deny(
+            env_name,
+            params,
+            fallback_trace_id,
+            bounded_approval_auto_deny_after(self.timeout),
+        )?;
+        let expires_at = request.expires_at;
 
         coordinator.submit_request(request).await?;
-        let decision = coordinator.wait_for_decision(&request_id).await?;
+        let decision =
+            Self::wait_for_approval_decision_or_expire(coordinator, &request_id, expires_at)
+                .await?;
         let params = approval_decision_params_from_record(decision);
         let notification = approval_decision_notification(params)?;
         {
@@ -849,6 +890,30 @@ impl JsonRpcClient {
         }
         self.event_emitter.emit(event.redacted());
         Ok(())
+    }
+
+    async fn wait_for_approval_decision_or_expire(
+        coordinator: &agentenv_approvals::ApprovalCoordinator,
+        request_id: &str,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<agentenv_approvals::ApprovalDecisionRecord, JsonRpcError> {
+        match tokio::time::timeout(
+            duration_until_utc(expires_at),
+            coordinator.wait_for_decision(request_id),
+        )
+        .await
+        {
+            Ok(decision) => Ok(decision?),
+            Err(_) => {
+                if time::OffsetDateTime::now_utc() < expires_at {
+                    tokio::time::sleep(duration_until_utc(expires_at)).await;
+                }
+                coordinator
+                    .expire_due(time::OffsetDateTime::now_utc())
+                    .await?;
+                Ok(coordinator.wait_for_decision(request_id).await?)
+            }
+        }
     }
 
     async fn ensure_open(&self) -> Result<(), JsonRpcError> {
@@ -1643,6 +1708,50 @@ mod async_client_tests {
         assert_eq!(decision["params"]["decision"], json!("allow"));
         assert_eq!(decision["params"]["scope"], json!("session"));
         assert_eq!(decision["params"]["decided_by"], json!("alice"));
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_requested_notification_auto_denies_before_client_timeout() {
+        let store_path = temp_fixture_artifact_path("approvals-auto-deny", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-auto-deny");
+        let mut client = spawn_fixture_client(
+            "approval_before_preflight",
+            Duration::from_millis(500),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator);
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decision["method"], json!("approval/decision"));
+        assert_eq!(decision["params"]["request_id"], json!("req-1"));
+        assert_eq!(decision["params"]["decision"], json!("deny"));
+        assert_eq!(decision["params"]["scope"], json!("once"));
+        assert_eq!(
+            decision["params"]["decided_by"],
+            json!("agentenv:auto-deny")
+        );
         client.shutdown().await.unwrap();
     }
 
