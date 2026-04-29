@@ -1117,6 +1117,32 @@ fn term_once_prints_pending_approvals_across_envs() {
 }
 
 #[test]
+fn term_once_does_not_create_missing_approval_database() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_env_state(temp.path(), "demo");
+    let db_path = env_activity_db_path(temp.path(), "demo");
+    assert!(!db_path.exists());
+
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--once")
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !db_path.exists(),
+        "read-only term --once created {}",
+        db_path.display()
+    );
+}
+
+#[test]
 fn approvals_serve_healthz_responds_ok() {
     let temp = tempfile::tempdir().unwrap();
     let port = reserve_tcp_port();
