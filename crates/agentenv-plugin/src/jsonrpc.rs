@@ -1743,6 +1743,71 @@ mod async_client_tests {
     }
 
     #[tokio::test]
+    async fn approval_decision_round_trips_same_request_id_before_original_response() {
+        let store_path = temp_fixture_artifact_path("approvals-dynamic-request-id", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-dynamic-request-id");
+        let mut client = spawn_fixture_client(
+            "approval_with_dynamic_request_id",
+            Duration::from_secs(5),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator.clone());
+
+        let decider = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                wait_for_approval_request(&coordinator, "req-for-rpc-1").await;
+                coordinator
+                    .decide(agentenv_approvals::ApprovalDecisionRecord {
+                        request_id: "req-for-rpc-1".to_owned(),
+                        decision: agentenv_approvals::ApprovalDecisionValue::Allow,
+                        scope: agentenv_approvals::ApprovalScope::Session,
+                        decided_by: "alice".to_owned(),
+                        decided_at: time::OffsetDateTime::UNIX_EPOCH,
+                        reason: None,
+                        context: json!({}),
+                        trace_id: "trace-approval".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        decider.await.unwrap();
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(recorded["original_request_id"], json!(1));
+        assert_eq!(recorded["approval_request_id"], json!("req-for-rpc-1"));
+        assert_eq!(recorded["decision"]["method"], json!("approval/decision"));
+        assert!(recorded["decision"].get("id").is_none());
+        assert_eq!(
+            recorded["decision"]["params"]["request_id"],
+            recorded["approval_request_id"]
+        );
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn approval_requested_notification_auto_denies_before_client_timeout() {
         let store_path = temp_fixture_artifact_path("approvals-auto-deny", "db");
         let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
@@ -1922,6 +1987,29 @@ def response(request):
             decision_file = os.environ["JSONRPC_FIXTURE_DECISION_FILE"]
             with open(decision_file, "w", encoding="utf-8") as handle:
                 json.dump(decision, handle, separators=(",", ":"))
+                handle.flush()
+        if MODE == "approval_with_dynamic_request_id":
+            approval_request_id = f"req-for-rpc-{request['id']}"
+            write_message({
+                "jsonrpc": "2.0",
+                "method": "event/approval_requested",
+                "params": {
+                    "request_id": approval_request_id,
+                    "kind": "egress_host",
+                    "subject": "api.example.test:443",
+                    "reason": "network",
+                    "context": {},
+                    "default_ttl": "session",
+                },
+            })
+            decision = read_message()
+            decision_file = os.environ["JSONRPC_FIXTURE_DECISION_FILE"]
+            with open(decision_file, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "original_request_id": request["id"],
+                    "approval_request_id": approval_request_id,
+                    "decision": decision,
+                }, handle, separators=(",", ":"))
                 handle.flush()
         return {
             "jsonrpc": "2.0",

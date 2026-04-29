@@ -471,10 +471,61 @@ impl SqliteEventStore {
 
     pub fn approvals_pending_count_for_env(&self, env: Option<&str>) -> StoreResult<u64> {
         let conn = self.connection()?;
-        let approval_requested = enum_to_db_string(ActivityKind::ApprovalRequested, "kind")?;
-        let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
-        let mut sql = String::from(
-            r#"
+        if approval_requests_table_exists(&conn)? {
+            return durable_approvals_pending_count(&conn, env);
+        }
+
+        derived_approvals_pending_count(&conn, env)
+    }
+
+    fn connection(&self) -> StoreResult<Connection> {
+        create_private_database_file(&self.path)?;
+        let path = database_open_path(&self.path)?;
+        Ok(Connection::open_with_flags(path, database_open_flags())?)
+    }
+}
+
+fn approval_requests_table_exists(conn: &Connection) -> StoreResult<bool> {
+    let found = conn.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'approval_requests'
+        )
+        "#,
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(found != 0)
+}
+
+fn durable_approvals_pending_count(conn: &Connection, env: Option<&str>) -> StoreResult<u64> {
+    let mut sql = String::from(
+        r#"
+        SELECT COUNT(*)
+        FROM approval_requests
+        WHERE status = ?
+        "#,
+    );
+    let mut query_params = vec![SqlValue::Text("pending".to_owned())];
+    if let Some(env) = env {
+        sql.push_str(" AND env = ?");
+        query_params.push(SqlValue::Text(env.to_owned()));
+    }
+
+    let pending = conn.query_row(&sql, params_from_iter(query_params), |row| {
+        row.get::<_, i64>(0)
+    })?;
+    count_to_u64(pending)
+}
+
+fn derived_approvals_pending_count(conn: &Connection, env: Option<&str>) -> StoreResult<u64> {
+    let approval_requested = enum_to_db_string(ActivityKind::ApprovalRequested, "kind")?;
+    let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
+    let mut sql = String::from(
+        r#"
             SELECT COUNT(DISTINCT requested.request_id)
             FROM (
                 SELECT
@@ -485,14 +536,14 @@ impl SqliteEventStore {
                 FROM activity_events
                 WHERE kind = ?
             "#,
-        );
-        let mut query_params = vec![SqlValue::Text(approval_requested)];
-        if let Some(env) = env {
-            sql.push_str(" AND env = ?");
-            query_params.push(SqlValue::Text(env.to_owned()));
-        }
-        sql.push_str(
-            r#"
+    );
+    let mut query_params = vec![SqlValue::Text(approval_requested)];
+    if let Some(env) = env {
+        sql.push_str(" AND env = ?");
+        query_params.push(SqlValue::Text(env.to_owned()));
+    }
+    sql.push_str(
+        r#"
             ) AS requested
             WHERE requested.request_id IS NOT NULL
               AND NOT EXISTS (
@@ -502,29 +553,22 @@ impl SqliteEventStore {
                   AND json_type(decided.subject_json, '$.request_id') = 'text'
                   AND json_extract(decided.subject_json, '$.request_id') = requested.request_id
             "#,
-        );
-        query_params.push(SqlValue::Text(approval_decided));
-        if let Some(env) = env {
-            sql.push_str(" AND decided.env = ?");
-            query_params.push(SqlValue::Text(env.to_owned()));
-        }
-        sql.push_str(
-            r#"
+    );
+    query_params.push(SqlValue::Text(approval_decided));
+    if let Some(env) = env {
+        sql.push_str(" AND decided.env = ?");
+        query_params.push(SqlValue::Text(env.to_owned()));
+    }
+    sql.push_str(
+        r#"
               )
             "#,
-        );
-        let pending = conn.query_row(&sql, params_from_iter(query_params), |row| {
-            row.get::<_, i64>(0)
-        })?;
+    );
+    let pending = conn.query_row(&sql, params_from_iter(query_params), |row| {
+        row.get::<_, i64>(0)
+    })?;
 
-        count_to_u64(pending)
-    }
-
-    fn connection(&self) -> StoreResult<Connection> {
-        create_private_database_file(&self.path)?;
-        let path = database_open_path(&self.path)?;
-        Ok(Connection::open_with_flags(path, database_open_flags())?)
-    }
+    count_to_u64(pending)
 }
 
 #[cfg(unix)]
@@ -809,6 +853,28 @@ mod tests {
         EventQuery {
             limit,
             ..EventQuery::default()
+        }
+    }
+
+    fn create_approval_requests_table(store: &SqliteEventStore, rows: &[(&str, &str, &str)]) {
+        let conn = Connection::open(store.path()).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE approval_requests (
+              id TEXT PRIMARY KEY,
+              env TEXT NOT NULL,
+              status TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+
+        for (id, env, status) in rows {
+            conn.execute(
+                "INSERT INTO approval_requests (id, env, status) VALUES (?1, ?2, ?3)",
+                params![id, env, status],
+            )
+            .unwrap();
         }
     }
 
@@ -1133,6 +1199,50 @@ mod tests {
         assert_eq!(
             store
                 .approvals_pending_count_for_env(Some("other"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn sqlite_store_uses_durable_approval_requests_for_env_filtered_pending_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        create_approval_requests_table(
+            &store,
+            &[
+                ("req-demo", "demo", "pending"),
+                ("req-other", "other", "pending"),
+                ("req-denied", "demo", "denied"),
+            ],
+        );
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::ApprovalRequested,
+                    "demo",
+                    ActivityResult::PendingApproval,
+                )
+                .with_subject_value("request_id", serde_json::json!("event-req")),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::ApprovalDecided,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("event-req")),
+            ])
+            .unwrap();
+
+        assert_eq!(store.approvals_pending_count().unwrap(), 2);
+        assert_eq!(
+            store.approvals_pending_count_for_env(Some("demo")).unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .approvals_pending_count_for_env(Some("missing"))
                 .unwrap(),
             0
         );
