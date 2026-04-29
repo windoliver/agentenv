@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 
 use serde::{de, Deserialize, Deserializer};
@@ -29,7 +30,7 @@ pub struct ApprovalConfigBody {
     pub auto_deny_after: BTreeMap<ApprovalKind, humantime::Duration>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub struct WebhookTargetConfig {
     pub url: String,
     #[serde(default)]
@@ -44,7 +45,7 @@ pub struct WebhookTargetConfig {
     pub max_attempts: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 pub struct SlackConfig {
     pub webhook_url: String,
     #[serde(default)]
@@ -53,6 +54,34 @@ pub struct SlackConfig {
     pub signing_secret: Option<String>,
     #[serde(default)]
     pub callback_url: Option<String>,
+}
+
+impl fmt::Debug for WebhookTargetConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secret = self.secret.as_deref().map(|_| "<redacted>");
+        formatter
+            .debug_struct("WebhookTargetConfig")
+            .field("url", &self.url)
+            .field("secret", &secret)
+            .field("secret_ref", &self.secret_ref)
+            .field("kinds", &self.kinds)
+            .field("callback_url", &self.callback_url)
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SlackConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let signing_secret = self.signing_secret.as_deref().map(|_| "<redacted>");
+        formatter
+            .debug_struct("SlackConfig")
+            .field("webhook_url", &self.webhook_url)
+            .field("channel", &self.channel)
+            .field("signing_secret", &signing_secret)
+            .field("callback_url", &self.callback_url)
+            .finish()
+    }
 }
 
 impl ApprovalConfig {
@@ -154,5 +183,36 @@ approvals:
             config.approvals.auto_deny_after[&ApprovalKind::PackageInstall],
             humantime::Duration::from(Duration::from_secs(120))
         );
+    }
+
+    #[test]
+    fn debug_output_redacts_inline_secret_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r##"
+approvals:
+  webhooks:
+    - url: https://approvals.company.com/agentenv
+      secret: inline-webhook-secret
+      secret_ref: env:WEBHOOK_SECRET
+  slack:
+    webhook_url: https://hooks.slack.com/services/test
+    signing_secret: inline-slack-secret
+"##,
+        )
+        .unwrap();
+
+        let config = ApprovalConfig::load(&path).unwrap();
+        let webhook_debug = format!("{:?}", config.approvals.webhooks[0]);
+        let slack_debug = format!("{:?}", config.approvals.slack.as_ref().unwrap());
+        let config_debug = format!("{config:?}");
+
+        for rendered in [&webhook_debug, &slack_debug, &config_debug] {
+            assert!(!rendered.contains("inline-webhook-secret"));
+            assert!(!rendered.contains("inline-slack-secret"));
+        }
+        assert!(webhook_debug.contains("env:WEBHOOK_SECRET"));
     }
 }

@@ -258,8 +258,18 @@ impl ApprovalStore {
         next_attempt_at: OffsetDateTime,
         error: &str,
     ) -> Result<(), ApprovalStoreError> {
-        let conn = self.connection()?;
-        let changed = conn.execute(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let Some(status) = delivery_status_in_transaction(&tx, delivery_id)? else {
+            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
+        };
+
+        if status == "delivered" {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        tx.execute(
             r#"
             UPDATE approval_delivery_attempts
             SET
@@ -278,17 +288,23 @@ impl ApprovalStore {
                 delivery_id
             ],
         )?;
-
-        if changed == 0 {
-            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
-        }
-
+        tx.commit()?;
         Ok(())
     }
 
     pub fn record_delivery_success(&self, delivery_id: i64) -> Result<(), ApprovalStoreError> {
-        let conn = self.connection()?;
-        let changed = conn.execute(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let Some(status) = delivery_status_in_transaction(&tx, delivery_id)? else {
+            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
+        };
+
+        if status == "delivered" {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        tx.execute(
             r#"
             UPDATE approval_delivery_attempts
             SET
@@ -304,11 +320,7 @@ impl ApprovalStore {
                 delivery_id
             ],
         )?;
-
-        if changed == 0 {
-            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
-        }
-
+        tx.commit()?;
         Ok(())
     }
 
@@ -636,6 +648,19 @@ fn request_status_in_transaction(
     .transpose()
 }
 
+fn delivery_status_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    delivery_id: i64,
+) -> Result<Option<String>, ApprovalStoreError> {
+    Ok(tx
+        .query_row(
+            "SELECT status FROM approval_delivery_attempts WHERE id = ?1",
+            params![delivery_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn u64_to_sql_integer(value: u64) -> Result<i64, ApprovalStoreError> {
     i64::try_from(value).map_err(|error| {
         ApprovalStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
@@ -950,6 +975,46 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.0, "delivered");
         assert_eq!(delivered.1, 2);
+        assert_eq!(delivered.2, None);
+    }
+
+    #[test]
+    fn delivery_attempt_success_ignores_late_failure_and_duplicate_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        let store = ApprovalStore::open(&path).unwrap();
+
+        let first_retry = OffsetDateTime::parse("2026-04-29T12:00:01Z", &Rfc3339).unwrap();
+        store
+            .enqueue_delivery_attempt("req-1", 42, first_retry)
+            .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let delivery_id: i64 = conn
+            .query_row(
+                "SELECT id FROM approval_delivery_attempts WHERE request_id = ?1",
+                params!["req-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        store.record_delivery_success(delivery_id).unwrap();
+        store.record_delivery_success(delivery_id).unwrap();
+
+        let late_retry = OffsetDateTime::parse("2026-04-29T12:00:02Z", &Rfc3339).unwrap();
+        store
+            .record_delivery_failure(delivery_id, late_retry, "late timeout")
+            .unwrap();
+
+        let delivered: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, attempt_count, last_error FROM approval_delivery_attempts WHERE id = ?1",
+                params![delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1, 1);
         assert_eq!(delivered.2, None);
     }
 }
