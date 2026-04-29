@@ -406,11 +406,6 @@ impl ApprovalStore {
               expires_at_unix_ns INTEGER NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS approval_requests_env_status_requested_at_idx
-              ON approval_requests(env, status, requested_at_unix_ns);
-            CREATE INDEX IF NOT EXISTS approval_requests_status_expires_at_idx
-              ON approval_requests(status, expires_at_unix_ns);
-
             CREATE TABLE IF NOT EXISTS approval_decisions (
               request_id TEXT PRIMARY KEY,
               decision TEXT NOT NULL,
@@ -443,6 +438,8 @@ impl ApprovalStore {
             );
             "#,
         )?;
+        migrate_request_timestamp_columns(&conn)?;
+        recreate_request_timestamp_indexes(&conn)?;
         add_column_if_missing(&conn, "approval_delivery_attempts", "last_error", "TEXT")?;
         add_column_if_missing(
             &conn,
@@ -632,6 +629,78 @@ fn parse_rfc3339(value: String) -> Result<OffsetDateTime, ApprovalStoreError> {
 
 fn format_rfc3339_utc(value: OffsetDateTime) -> String {
     format_rfc3339(value.to_offset(UtcOffset::UTC))
+}
+
+fn migrate_request_timestamp_columns(conn: &Connection) -> Result<(), ApprovalStoreError> {
+    add_column_if_missing(
+        conn,
+        "approval_requests",
+        "requested_at_unix_ns",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "approval_requests",
+        "expires_at_unix_ns",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
+    let rows = {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, requested_at, expires_at
+            FROM approval_requests
+            WHERE requested_at_unix_ns IS NULL
+               OR requested_at_unix_ns = 0
+               OR expires_at_unix_ns IS NULL
+               OR expires_at_unix_ns = 0
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        let mut collected = Vec::new();
+        for row in rows {
+            collected.push(row?);
+        }
+        collected
+    };
+
+    for (id, requested_at, expires_at) in rows {
+        let requested_at_unix_ns = unix_timestamp_nanos_to_sql(parse_rfc3339(requested_at)?)?;
+        let expires_at_unix_ns = unix_timestamp_nanos_to_sql(parse_rfc3339(expires_at)?)?;
+        conn.execute(
+            r#"
+            UPDATE approval_requests
+            SET requested_at_unix_ns = ?1,
+                expires_at_unix_ns = ?2
+            WHERE id = ?3
+            "#,
+            params![requested_at_unix_ns, expires_at_unix_ns, id],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn recreate_request_timestamp_indexes(conn: &Connection) -> Result<(), ApprovalStoreError> {
+    conn.execute_batch(
+        r#"
+        DROP INDEX IF EXISTS approval_requests_env_status_requested_at_idx;
+        DROP INDEX IF EXISTS approval_requests_status_expires_at_idx;
+
+        CREATE INDEX approval_requests_env_status_requested_at_idx
+          ON approval_requests(env, status, requested_at_unix_ns);
+        CREATE INDEX approval_requests_status_expires_at_idx
+          ON approval_requests(status, expires_at_unix_ns);
+        "#,
+    )?;
+    Ok(())
 }
 
 fn request_status_in_transaction(
@@ -924,6 +993,144 @@ mod tests {
         assert_eq!(
             store.get_request("req-fractional").unwrap().unwrap().status,
             ApprovalStatus::Pending
+        );
+    }
+
+    #[test]
+    fn migration_backfills_legacy_timestamp_columns_for_due_pending_and_expire_without_waiter() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE approval_requests (
+              id TEXT PRIMARY KEY,
+              env TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              subject TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              context_json TEXT NOT NULL,
+              requested_at TEXT NOT NULL,
+              default_scope TEXT NOT NULL,
+              auto_deny_after_ms INTEGER NOT NULL,
+              status TEXT NOT NULL,
+              driver_name TEXT,
+              driver_request_handle TEXT,
+              expires_at TEXT NOT NULL,
+              created_trace_id TEXT NOT NULL
+            );
+
+            CREATE INDEX approval_requests_env_status_requested_at_idx
+              ON approval_requests(env, status, requested_at);
+            CREATE INDEX approval_requests_status_expires_at_idx
+              ON approval_requests(status, expires_at);
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO approval_requests (
+                id,
+                env,
+                kind,
+                subject,
+                reason,
+                context_json,
+                requested_at,
+                default_scope,
+                auto_deny_after_ms,
+                status,
+                driver_name,
+                driver_request_handle,
+                expires_at,
+                created_trace_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                "req-legacy",
+                "demo",
+                "egress_host",
+                "api.example.test:443",
+                "network access",
+                r#"{"url":"https://api.example.test/v1"}"#,
+                "2026-04-29T12:00:00Z",
+                "session",
+                30_000_i64,
+                "pending",
+                Option::<String>::None,
+                Option::<String>::None,
+                "2026-04-29T12:00:30Z",
+                "trace-legacy",
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = ApprovalStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert!(column_exists(&conn, "approval_requests", "requested_at_unix_ns").unwrap());
+        assert!(column_exists(&conn, "approval_requests", "expires_at_unix_ns").unwrap());
+        let stored_ns: (i64, i64) = conn
+            .query_row(
+                "SELECT requested_at_unix_ns, expires_at_unix_ns FROM approval_requests WHERE id = ?1",
+                params!["req-legacy"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_ns,
+            (
+                unix_timestamp_nanos_to_sql(
+                    OffsetDateTime::parse("2026-04-29T12:00:00Z", &Rfc3339).unwrap()
+                )
+                .unwrap(),
+                unix_timestamp_nanos_to_sql(
+                    OffsetDateTime::parse("2026-04-29T12:00:30Z", &Rfc3339).unwrap()
+                )
+                .unwrap()
+            )
+        );
+
+        let indexed_sql: Vec<String> = conn
+            .prepare(
+                r#"
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'index'
+                  AND name IN (
+                    'approval_requests_env_status_requested_at_idx',
+                    'approval_requests_status_expires_at_idx'
+                  )
+                ORDER BY name
+                "#,
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(indexed_sql.len(), 2);
+        assert!(indexed_sql.iter().all(|sql| sql.contains("_unix_ns")));
+
+        let rows = store
+            .list_requests(ApprovalRequestFilter {
+                env: Some("demo".to_owned()),
+                status: Some(ApprovalStatus::Pending),
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "req-legacy");
+
+        let now = OffsetDateTime::parse("2026-04-29T12:00:31Z", &Rfc3339).unwrap();
+        let due = store.due_pending_requests(now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "req-legacy");
+
+        store.expire_without_waiter("req-legacy", now).unwrap();
+        assert_eq!(
+            store.get_request("req-legacy").unwrap().unwrap().status,
+            ApprovalStatus::Expired
         );
     }
 
