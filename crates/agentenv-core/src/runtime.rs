@@ -598,7 +598,7 @@ async fn run_preflight_with_pins(
     pins: Option<&DriverPinSet>,
     events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<crate::admission::AdmissionReport> {
-    let mut set = build_driver_set(options, factory, env, selection, pins, events)?;
+    let mut set = build_driver_set(factory, selection, pins, events)?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
     initialize_agent_driver(options, set.agent.as_mut()).await?;
     initialize_context_driver(options, set.context.as_mut()).await?;
@@ -651,27 +651,14 @@ async fn run_preflight_with_pins(
 }
 
 fn build_driver_set(
-    options: &RuntimeOptions,
     factory: &dyn DriverFactory,
-    env: &str,
     selection: &DriverSelection,
     pins: Option<&DriverPinSet>,
     events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<DriverSet> {
-    let approval_coordinator = Some(approval_coordinator_for_env(
-        options,
-        env,
-        Arc::clone(&events),
-    )?);
     match pins {
-        Some(pins) if !pins.is_empty() => factory.build_pinned_for_env_observed(
-            selection,
-            pins,
-            env,
-            events,
-            approval_coordinator,
-        ),
-        _ => factory.build_for_env_observed(selection, env, events, approval_coordinator),
+        Some(pins) if !pins.is_empty() => factory.build_pinned_observed(selection, pins, events),
+        _ => factory.build_observed(selection, events),
     }
 }
 
@@ -843,9 +830,7 @@ async fn create_env_with_input(
     );
 
     let mut set = build_driver_set(
-        options,
         factory,
-        name,
         &selection,
         input.driver_pins.as_ref(),
         Arc::clone(&events),

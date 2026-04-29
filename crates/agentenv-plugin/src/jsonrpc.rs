@@ -912,7 +912,6 @@ impl JsonRpcClient {
             let mut stdin = self.stdin.lock().await;
             write_framed_json_bytes_async(&mut *stdin, notification.as_bytes()).await?;
         }
-        self.event_emitter.emit(event.redacted());
         Ok(())
     }
 
@@ -1677,10 +1676,11 @@ mod async_client_tests {
     async fn approval_requested_notification_waits_and_sends_decision() {
         let store_path = temp_fixture_artifact_path("approvals", "db");
         let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let emitter = agentenv_events::RecordingEventEmitter::default();
         let coordinator = agentenv_approvals::ApprovalCoordinator::new(
             agentenv_approvals::ApprovalCoordinatorConfig {
                 store,
-                events: Arc::new(agentenv_events::NoopEventEmitter),
+                events: Arc::new(emitter.clone()),
                 poll_interval: Duration::from_millis(10),
                 overlay_path: None,
                 proposal_path: None,
@@ -1696,6 +1696,7 @@ mod async_client_tests {
             )],
         )
         .await;
+        client.set_event_emitter(emitter.clone());
         client.set_approval_coordinator("demo", coordinator.clone());
 
         let decider = tokio::spawn({
@@ -1732,6 +1733,12 @@ mod async_client_tests {
         assert_eq!(decision["params"]["decision"], json!("allow"));
         assert_eq!(decision["params"]["scope"], json!("session"));
         assert_eq!(decision["params"]["decided_by"], json!("alice"));
+        let approval_requested_events = emitter
+            .recorded()
+            .into_iter()
+            .filter(|event| event.kind == agentenv_events::ActivityKind::ApprovalRequested)
+            .count();
+        assert_eq!(approval_requested_events, 1);
         client.shutdown().await.unwrap();
     }
 
