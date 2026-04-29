@@ -508,6 +508,29 @@ pub async fn initialize_inference_driver(
     Ok(result)
 }
 
+pub fn env_events_db_path(options: &RuntimeOptions, env: &str) -> RuntimeResult<PathBuf> {
+    Ok(env_paths(options, env)?.env_dir().join("events.db"))
+}
+
+pub fn env_approval_overlay_path(options: &RuntimeOptions, env: &str) -> RuntimeResult<PathBuf> {
+    Ok(env_paths(options, env)?
+        .env_dir()
+        .join("approval-policy-overlay.yaml"))
+}
+
+pub fn env_approval_proposals_path(options: &RuntimeOptions, env: &str) -> RuntimeResult<PathBuf> {
+    Ok(env_paths(options, env)?
+        .env_dir()
+        .join("approval-policy-proposals.yaml"))
+}
+
+fn env_paths(options: &RuntimeOptions, env: &str) -> RuntimeResult<crate::env::EnvPaths> {
+    Ok(crate::env::EnvPaths::new(
+        options.root.clone(),
+        crate::env::validate_env_name(env)?,
+    ))
+}
+
 pub async fn run_preflight_only(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
@@ -3181,8 +3204,9 @@ mod tests {
     use crate::driver::{ContextDriver, DriverResult, InferenceDriver, SandboxDriver};
 
     use super::{
-        component_spec, initialize_context_driver, initialize_sandbox_driver, DriverFactory,
-        DriverSet, RuntimeError, RuntimeOptions, RuntimeSecret,
+        component_spec, env_approval_overlay_path, env_approval_proposals_path, env_events_db_path,
+        initialize_context_driver, initialize_sandbox_driver, DriverFactory, DriverSet,
+        RuntimeError, RuntimeOptions, RuntimeSecret,
     };
 
     fn unique_root(prefix: &str) -> std::path::PathBuf {
@@ -3219,6 +3243,37 @@ mod tests {
         fs::create_dir_all(env_dir).unwrap();
         let rendered = serde_json::to_string_pretty(&state).unwrap();
         fs::write(env_dir.join("state.json"), rendered).unwrap();
+    }
+
+    #[test]
+    fn approval_overlay_path_helpers_validate_env_and_stay_under_env_dir() {
+        let root = unique_root("agentenv-approval-paths");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: false,
+        };
+
+        assert_eq!(
+            env_events_db_path(&options, "demo").unwrap(),
+            root.join("envs").join("demo").join("events.db")
+        );
+        assert_eq!(
+            env_approval_overlay_path(&options, "demo").unwrap(),
+            root.join("envs")
+                .join("demo")
+                .join("approval-policy-overlay.yaml")
+        );
+        assert_eq!(
+            env_approval_proposals_path(&options, "demo").unwrap(),
+            root.join("envs")
+                .join("demo")
+                .join("approval-policy-proposals.yaml")
+        );
+        assert!(matches!(
+            env_approval_overlay_path(&options, "../demo"),
+            Err(RuntimeError::Env(crate::env::EnvError::InvalidName { .. }))
+        ));
     }
 
     #[derive(Default)]

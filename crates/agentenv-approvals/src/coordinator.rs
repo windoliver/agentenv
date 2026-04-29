@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -13,6 +14,9 @@ use crate::events::{approval_decided_event, approval_requested_event};
 use crate::model::{
     ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind, ApprovalRequest, ApprovalScope,
 };
+use crate::policy::{
+    append_baseline_proposal, append_overlay_grant, ApprovalGrant, ApprovalPolicyError,
+};
 use crate::store::{ApprovalStore, ApprovalStoreError};
 
 type Waiter = oneshot::Sender<ApprovalDecisionRecord>;
@@ -25,12 +29,16 @@ pub struct ApprovalCoordinator {
     waiters: Arc<Mutex<WaiterMap>>,
     session_grants: Arc<Mutex<BTreeSet<SessionGrantKey>>>,
     poll_interval: Duration,
+    overlay_path: Option<PathBuf>,
+    proposal_path: Option<PathBuf>,
 }
 
 pub struct ApprovalCoordinatorConfig {
     pub store: ApprovalStore,
     pub events: Arc<dyn EventEmitter>,
     pub poll_interval: Duration,
+    pub overlay_path: Option<PathBuf>,
+    pub proposal_path: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +49,8 @@ pub enum ApprovalCoordinatorError {
     WaiterClosed { request_id: String },
     #[error("approval coordinator mutex `{name}` was poisoned")]
     LockPoisoned { name: &'static str },
+    #[error(transparent)]
+    Policy(#[from] ApprovalPolicyError),
 }
 
 impl ApprovalCoordinator {
@@ -51,6 +61,8 @@ impl ApprovalCoordinator {
             waiters: Arc::new(Mutex::new(BTreeMap::new())),
             session_grants: Arc::new(Mutex::new(BTreeSet::new())),
             poll_interval: config.poll_interval,
+            overlay_path: config.overlay_path,
+            proposal_path: config.proposal_path,
         }
     }
 
@@ -71,7 +83,7 @@ impl ApprovalCoordinator {
         self.store.record_decision(&decision)?;
         self.events
             .emit(approval_decided_event(&request, &decision));
-        self.remember_session_grant(&request, &decision)?;
+        self.apply_allow_side_effects(&request, &decision)?;
         self.wake_waiters(&decision.request_id, &decision)?;
         Ok(decision)
     }
@@ -169,17 +181,40 @@ impl ApprovalCoordinator {
     fn remember_session_grant(
         &self,
         request: &ApprovalRequest,
-        decision: &ApprovalDecisionRecord,
     ) -> Result<(), ApprovalCoordinatorError> {
-        if decision.decision != ApprovalDecisionValue::Allow
-            || decision.scope != ApprovalScope::Session
-        {
-            return Ok(());
-        }
-
         let mut grants = self.lock_session_grants()?;
         grants.insert(SessionGrantKey::from_request(request));
         Ok(())
+    }
+
+    fn apply_allow_side_effects(
+        &self,
+        request: &ApprovalRequest,
+        decision: &ApprovalDecisionRecord,
+    ) -> Result<(), ApprovalCoordinatorError> {
+        if decision.decision != ApprovalDecisionValue::Allow {
+            return Ok(());
+        }
+
+        match decision.scope {
+            ApprovalScope::Once => Ok(()),
+            ApprovalScope::Session => self.remember_session_grant(request),
+            ApprovalScope::PersistSandbox => {
+                if let Some(path) = &self.overlay_path {
+                    append_overlay_grant(
+                        path,
+                        &ApprovalGrant::from_request_and_decision(request, decision),
+                    )?;
+                }
+                Ok(())
+            }
+            ApprovalScope::ProposeForBaseline => {
+                if let Some(path) = &self.proposal_path {
+                    append_baseline_proposal(path, request, decision)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn wake_waiters(
@@ -223,6 +258,8 @@ impl ApprovalCoordinatorConfig {
             store,
             events: Arc::new(NoopEventEmitter),
             poll_interval: Duration::from_millis(10),
+            overlay_path: None,
+            proposal_path: None,
         }
     }
 }
@@ -255,8 +292,9 @@ fn approval_kind_key(kind: ApprovalKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use agentenv_events::NoopEventEmitter;
     use serde_json::json;
     use time::OffsetDateTime;
 
@@ -287,10 +325,18 @@ mod tests {
     }
 
     fn test_decision(request_id: &str, decision: ApprovalDecisionValue) -> ApprovalDecisionRecord {
+        test_decision_with_scope(request_id, decision, ApprovalScope::Session)
+    }
+
+    fn test_decision_with_scope(
+        request_id: &str,
+        decision: ApprovalDecisionValue,
+        scope: ApprovalScope,
+    ) -> ApprovalDecisionRecord {
         ApprovalDecisionRecord {
             request_id: request_id.to_owned(),
             decision,
-            scope: ApprovalScope::Session,
+            scope,
             decided_by: "alice".to_owned(),
             decided_at: OffsetDateTime::from_unix_timestamp(1_777_443_205).unwrap(),
             reason: Some("approved for test".to_owned()),
@@ -341,5 +387,65 @@ mod tests {
         let decision = waiter.await.unwrap();
         assert_eq!(decision.decision, ApprovalDecisionValue::Deny);
         assert_eq!(decision.decided_by, "agentenv:auto-deny");
+    }
+
+    #[tokio::test]
+    async fn persist_sandbox_allow_appends_overlay_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::open(temp.path().join("events.db")).unwrap();
+        let overlay_path = temp.path().join("approval-policy-overlay.yaml");
+        let coordinator = ApprovalCoordinator::new(ApprovalCoordinatorConfig {
+            store,
+            events: Arc::new(NoopEventEmitter),
+            poll_interval: Duration::from_millis(10),
+            overlay_path: Some(overlay_path.clone()),
+            proposal_path: None,
+        });
+        let request = test_request("req-persist");
+
+        coordinator.submit_request(request).await.unwrap();
+        coordinator
+            .decide(test_decision_with_scope(
+                "req-persist",
+                ApprovalDecisionValue::Allow,
+                ApprovalScope::PersistSandbox,
+            ))
+            .await
+            .unwrap();
+
+        let overlay = crate::policy::read_overlay(&overlay_path).unwrap();
+        assert_eq!(overlay.grants.len(), 1);
+        assert_eq!(overlay.grants[0].id, "req-persist");
+        assert_eq!(overlay.grants[0].subject, "api.example.test:443");
+    }
+
+    #[tokio::test]
+    async fn propose_for_baseline_allow_appends_proposal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::open(temp.path().join("events.db")).unwrap();
+        let proposal_path = temp.path().join("approval-policy-proposals.yaml");
+        let coordinator = ApprovalCoordinator::new(ApprovalCoordinatorConfig {
+            store,
+            events: Arc::new(NoopEventEmitter),
+            poll_interval: Duration::from_millis(10),
+            overlay_path: None,
+            proposal_path: Some(proposal_path.clone()),
+        });
+        let request = test_request("req-propose");
+
+        coordinator.submit_request(request).await.unwrap();
+        coordinator
+            .decide(test_decision_with_scope(
+                "req-propose",
+                ApprovalDecisionValue::Allow,
+                ApprovalScope::ProposeForBaseline,
+            ))
+            .await
+            .unwrap();
+
+        let rendered = std::fs::read_to_string(proposal_path).unwrap();
+        assert!(rendered.contains("req-propose"));
+        assert!(rendered.contains("propose-for-baseline"));
+        assert!(rendered.contains("https://api.example.test/v1"));
     }
 }
