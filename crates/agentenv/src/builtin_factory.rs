@@ -663,11 +663,13 @@ mod tests {
     }
 
     #[test]
-    fn subprocess_approval_context_helper_preserves_driver_construction() {
+    fn subprocess_approval_context_helpers_preserve_driver_construction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let hermes = temp.path().join("agent-hermes");
+        let nexus = temp.path().join("context-nexus");
         write_manifest(&hermes, "agent", "hermes", "agentenv-driver-hermes");
-        let driver = agentenv_core::driver_catalog::DiscoveredDriver {
+        write_manifest(&nexus, "context", "nexus", "agentenv-driver-nexus");
+        let agent_entry = agentenv_core::driver_catalog::DiscoveredDriver {
             kind: CatalogKind::Agent,
             name: "hermes".to_owned(),
             version: "0.1.0".parse().expect("version"),
@@ -675,6 +677,18 @@ mod tests {
             description: None,
             binary: Some(hermes.join("bin").join("agentenv-driver-hermes")),
             manifest_path: Some(hermes.join("manifest.json")),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            capabilities_preview: serde_json::Value::Null,
+        };
+        let context_entry = agentenv_core::driver_catalog::DiscoveredDriver {
+            kind: CatalogKind::Context,
+            name: "nexus".to_owned(),
+            version: "0.1.0".parse().expect("version"),
+            source: DriverSource::DevelopmentOverride,
+            description: None,
+            binary: Some(nexus.join("bin").join("agentenv-driver-nexus")),
+            manifest_path: Some(nexus.join("manifest.json")),
             args: Vec::new(),
             env: BTreeMap::new(),
             capabilities_preview: serde_json::Value::Null,
@@ -697,13 +711,66 @@ mod tests {
             coordinator,
         };
 
-        let driver = super::subprocess_agent_driver(
-            driver,
+        let agent = super::subprocess_agent_driver(
+            agent_entry,
             std::sync::Arc::new(agentenv_events::NoopEventEmitter),
             Some(&context),
         )
-        .expect("driver should build with approval context");
-        drop(driver);
+        .expect("agent driver should build with approval context");
+        let context = super::subprocess_context_driver(
+            context_entry,
+            std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+            Some(&context),
+        )
+        .expect("context driver should build with approval context");
+        drop((agent, context));
+    }
+
+    #[test]
+    fn env_aware_factory_path_builds_subprocess_agent_and_context_with_approval_context() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let hermes = temp.path().join("agent-hermes");
+        let nexus = temp.path().join("context-nexus");
+        write_manifest(&hermes, "agent", "hermes", "agentenv-driver-hermes");
+        write_manifest(&nexus, "context", "nexus", "agentenv-driver-nexus");
+        let driver_path = std::env::join_paths([&hermes, &nexus]).expect("join driver path");
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            ("AGENTENV_DRIVER_PATH", driver_path),
+        ]);
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "hermes".to_owned(),
+            context: "nexus".to_owned(),
+            inference: None,
+        };
+        let store = agentenv_approvals::ApprovalStore::open(
+            temp.path().join("envs").join("demo").join("events.db"),
+        )
+        .expect("store");
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: std::time::Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+            },
+        );
+
+        let set = BuiltInDriverFactory
+            .build_for_env_observed(
+                &selection,
+                "demo",
+                std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                Some(coordinator),
+            )
+            .expect("env-aware factory path should build subprocess agent and context");
+
+        drop(set);
     }
 
     #[test]
