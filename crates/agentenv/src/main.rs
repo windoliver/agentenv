@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex},
@@ -10,7 +11,8 @@ use std::{
 };
 
 use agentenv_approvals::{
-    ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalDecisionRecord, ApprovalDecisionValue,
+    verify_payload, verify_slack_signature, ApprovalConfig, ApprovalCoordinator,
+    ApprovalCoordinatorConfig, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalRequest,
     ApprovalRequestFilter, ApprovalScope, ApprovalStatus, ApprovalStore,
 };
 use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
@@ -27,7 +29,7 @@ use agentenv_events::{
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use hyper::{Method, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
@@ -961,12 +963,7 @@ async fn run_approvals(args: ApprovalsArgs, event_sink_args: &[String]) -> Resul
             println!("denied: {}", args.request_id);
             Ok(())
         }
-        ApprovalsCommand::Serve(args) => {
-            bail!(
-                "approvals serve is not implemented yet (requested {})",
-                args.addr
-            )
-        }
+        ApprovalsCommand::Serve(args) => serve_approvals(args, event_sink_args).await,
     }
 }
 
@@ -1046,6 +1043,32 @@ async fn decide_approval(
     reason: Option<String>,
     event_sink_args: &[String],
 ) -> Result<ApprovalDecisionRecord> {
+    decide_approval_as(
+        options,
+        env,
+        request_id,
+        decision,
+        scope,
+        reason,
+        "agentenv:cli".to_owned(),
+        "cli",
+        event_sink_args,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_approval_as(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: &str,
+    request_id: &str,
+    decision: ApprovalDecisionValue,
+    scope: Option<ApprovalScope>,
+    reason: Option<String>,
+    decided_by: String,
+    source: &str,
+    event_sink_args: &[String],
+) -> Result<ApprovalDecisionRecord> {
     let store = open_approval_store(options, env)?;
     let request = store
         .get_request(request_id)
@@ -1068,10 +1091,10 @@ async fn decide_approval(
         request_id: request.id.clone(),
         decision,
         scope,
-        decided_by: "agentenv:cli".to_owned(),
+        decided_by,
         decided_at: ::time::OffsetDateTime::now_utc(),
         reason,
-        context: serde_json::json!({"source": "cli"}),
+        context: serde_json::json!({"source": source}),
         trace_id: new_cli_trace_id(),
     };
 
@@ -1117,6 +1140,670 @@ fn open_approval_store(
     let db_path = agentenv_core::runtime::env_events_db_path(options, env)?;
     ApprovalStore::open(&db_path)
         .with_context(|| format!("open approval database `{}`", db_path.display()))
+}
+
+#[derive(Clone)]
+struct ApprovalServerState {
+    options: agentenv_core::runtime::RuntimeOptions,
+    config: ApprovalConfig,
+    event_sink_args: Arc<Vec<String>>,
+}
+
+struct HttpRequest {
+    method: Option<Method>,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+struct HttpResponse {
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct CallbackDecisionBody {
+    decision: CallbackDecisionValue,
+    scope: Option<ApprovalScope>,
+    decided_by: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CallbackDecisionValue {
+    Allow,
+    Deny,
+}
+
+#[derive(Deserialize)]
+struct SlackInteractionPayload {
+    user: Option<SlackInteractionUser>,
+    actions: Vec<SlackInteractionAction>,
+}
+
+#[derive(Deserialize)]
+struct SlackInteractionUser {
+    id: Option<String>,
+    username: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SlackInteractionAction {
+    value: Option<String>,
+}
+
+struct SlackActionDecision {
+    request_id: String,
+    decision: ApprovalDecisionValue,
+    scope: Option<ApprovalScope>,
+}
+
+const MAX_APPROVAL_HTTP_REQUEST_BYTES: usize = 64 * 1024;
+
+async fn serve_approvals(args: ApprovalsServeArgs, event_sink_args: &[String]) -> Result<()> {
+    let options = runtime_options(true)?;
+    let addr = args
+        .addr
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid approvals server address `{}`", args.addr))?;
+    let config = ApprovalConfig::load(&approval_config_path(&options))
+        .context("load approval callback config")?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind approvals listener on {addr}"))?;
+    let state = ApprovalServerState {
+        options,
+        config,
+        event_sink_args: Arc::new(event_sink_args.to_vec()),
+    };
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("accept approvals callback request")?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_approvals_connection(stream, state).await {
+                tracing::warn!(%error, "approvals callback request failed");
+            }
+        });
+    }
+}
+
+async fn handle_approvals_connection(
+    mut stream: tokio::net::TcpStream,
+    state: ApprovalServerState,
+) -> Result<()> {
+    let response = match read_http_request(&mut stream).await {
+        Ok(request) => route_approval_request(request, &state)
+            .await
+            .unwrap_or_else(internal_server_error_response),
+        Err(error) => {
+            tracing::warn!(%error, "failed to parse approvals callback request");
+            bad_request_response("bad request\n")
+        }
+    };
+    write_http_response(
+        &mut stream,
+        response.status,
+        response.content_type,
+        &response.body,
+    )
+    .await
+}
+
+async fn route_approval_request(
+    request: HttpRequest,
+    state: &ApprovalServerState,
+) -> Result<HttpResponse> {
+    let path = path_without_query(&request.path);
+
+    if request.method == Some(Method::GET) && path == "/healthz" {
+        return Ok(text_response(StatusCode::OK, "ok\n"));
+    }
+
+    if request.method == Some(Method::POST) {
+        if let Some(request_id) = approval_decision_request_id(path) {
+            return handle_agentenv_decision_callback(request_id, &request, state).await;
+        }
+        if path == "/slack/interactions" {
+            return handle_slack_interaction_callback(&request, state).await;
+        }
+    }
+
+    Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
+}
+
+async fn handle_agentenv_decision_callback(
+    request_id: &str,
+    request: &HttpRequest,
+    state: &ApprovalServerState,
+) -> Result<HttpResponse> {
+    if !verify_agentenv_callback_signature(&state.config, &request.headers, &request.body)? {
+        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
+    }
+
+    let body = match serde_json::from_slice::<CallbackDecisionBody>(&request.body) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(%error, "invalid approval decision callback body");
+            return Ok(bad_request_response("invalid decision body\n"));
+        }
+    };
+    let decision = ApprovalDecisionValue::from(body.decision);
+    let record = decide_callback_approval(
+        state,
+        request_id,
+        decision,
+        body.scope,
+        body.reason,
+        non_empty_or(body.decided_by, "agentenv:webhook"),
+        "webhook",
+    )
+    .await?;
+
+    if record.decision != decision {
+        return Ok(text_response(
+            StatusCode::CONFLICT,
+            "approval already decided differently\n",
+        ));
+    }
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "request_id": record.request_id,
+            "decision": record.decision,
+            "scope": record.scope,
+        }),
+    )
+}
+
+async fn handle_slack_interaction_callback(
+    request: &HttpRequest,
+    state: &ApprovalServerState,
+) -> Result<HttpResponse> {
+    if !verify_slack_callback_signature(&state.config, &request.headers, &request.body)? {
+        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
+    }
+
+    let Some(payload) = form_field(&request.body, "payload")? else {
+        return Ok(bad_request_response("missing slack payload\n"));
+    };
+    let payload = match serde_json::from_str::<SlackInteractionPayload>(&payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, "invalid Slack interaction payload");
+            return Ok(bad_request_response("invalid slack payload\n"));
+        }
+    };
+    let Some(action_value) = payload
+        .actions
+        .iter()
+        .find_map(|action| action.value.as_deref())
+    else {
+        return Ok(bad_request_response("missing slack action value\n"));
+    };
+    let action = match parse_slack_action_value(action_value) {
+        Ok(action) => action,
+        Err(error) => {
+            tracing::warn!(%error, "invalid Slack action value");
+            return Ok(bad_request_response("invalid slack action value\n"));
+        }
+    };
+    let source_decided_by = payload.decided_by();
+    let record = decide_callback_approval(
+        state,
+        &action.request_id,
+        action.decision,
+        action.scope,
+        Some("slack interaction".to_owned()),
+        source_decided_by,
+        "slack",
+    )
+    .await?;
+
+    if record.decision != action.decision {
+        return Ok(text_response(
+            StatusCode::CONFLICT,
+            "approval already decided differently\n",
+        ));
+    }
+
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "response_type": "ephemeral",
+            "text": format!("recorded {} for {}", approval_decision_label(record.decision), record.request_id),
+        }),
+    )
+}
+
+async fn decide_callback_approval(
+    state: &ApprovalServerState,
+    request_id: &str,
+    decision: ApprovalDecisionValue,
+    scope: Option<ApprovalScope>,
+    reason: Option<String>,
+    decided_by: String,
+    source: &str,
+) -> Result<ApprovalDecisionRecord> {
+    let request = find_approval_request(&state.options, request_id)?;
+    let scope = match decision {
+        ApprovalDecisionValue::Allow => scope,
+        ApprovalDecisionValue::Deny => scope.or(Some(ApprovalScope::Once)),
+    };
+    decide_approval_as(
+        &state.options,
+        &request.env,
+        request_id,
+        decision,
+        scope,
+        reason,
+        decided_by,
+        source,
+        state.event_sink_args.as_ref().as_slice(),
+    )
+    .await
+}
+
+fn find_approval_request(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    request_id: &str,
+) -> Result<ApprovalRequest> {
+    let mut found = None;
+    for row in agentenv_core::runtime::list_envs(options).context("list environments")? {
+        let store = open_approval_store(options, &row.name)?;
+        if let Some(request) = store
+            .get_request(request_id)
+            .with_context(|| format!("load approval request `{request_id}` for `{}`", row.name))?
+        {
+            if found.is_some() {
+                bail!("approval request `{request_id}` matched multiple environments");
+            }
+            found = Some(request);
+        }
+    }
+
+    found.with_context(|| format!("approval request `{request_id}` was not found"))
+}
+
+fn verify_agentenv_callback_signature(
+    config: &ApprovalConfig,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+) -> Result<bool> {
+    let Some(signature) = header_value(headers, "x-agentenv-signature") else {
+        return Ok(false);
+    };
+    let Some(timestamp) =
+        header_value(headers, "x-agentenv-timestamp").and_then(|value| value.parse::<i64>().ok())
+    else {
+        return Ok(false);
+    };
+    let Some(delivery_id) = header_value(headers, "x-agentenv-delivery") else {
+        return Ok(false);
+    };
+
+    for secret in configured_webhook_secrets(config) {
+        if verify_payload(&secret, timestamp, delivery_id, body, signature)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_slack_callback_signature(
+    config: &ApprovalConfig,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+) -> Result<bool> {
+    let Some(secret) = configured_slack_signing_secret(config) else {
+        return Ok(false);
+    };
+    let Some(signature) = header_value(headers, "x-slack-signature") else {
+        return Ok(false);
+    };
+    let Some(timestamp) =
+        header_value(headers, "x-slack-request-timestamp").and_then(|value| value.parse().ok())
+    else {
+        return Ok(false);
+    };
+    Ok(verify_slack_signature(
+        &secret,
+        timestamp,
+        signature,
+        body,
+        ::time::OffsetDateTime::now_utc().unix_timestamp(),
+    )?)
+}
+
+fn configured_webhook_secrets(config: &ApprovalConfig) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for target in &config.approvals.webhooks {
+        if let Some(secret) = target
+            .secret
+            .as_deref()
+            .and_then(resolve_inline_or_env_secret)
+        {
+            secrets.push(secret);
+        }
+        if let Some(secret) = target
+            .secret_ref
+            .as_deref()
+            .and_then(resolve_env_secret_ref)
+        {
+            secrets.push(secret);
+        }
+    }
+    secrets
+}
+
+fn configured_slack_signing_secret(config: &ApprovalConfig) -> Option<String> {
+    config
+        .approvals
+        .slack
+        .as_ref()?
+        .signing_secret
+        .as_deref()
+        .and_then(resolve_inline_or_env_secret)
+}
+
+fn resolve_inline_or_env_secret(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(name) = env_placeholder_name(trimmed) {
+        return std::env::var(name)
+            .ok()
+            .filter(|secret| !secret.trim().is_empty());
+    }
+    if let Some(name) = trimmed.strip_prefix("env:") {
+        return std::env::var(name)
+            .ok()
+            .filter(|secret| !secret.trim().is_empty());
+    }
+    Some(trimmed.to_owned())
+}
+
+fn resolve_env_secret_ref(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name = env_placeholder_name(trimmed)
+        .or_else(|| trimmed.strip_prefix("env:"))
+        .unwrap_or(trimmed);
+    std::env::var(name)
+        .ok()
+        .filter(|secret| !secret.trim().is_empty())
+}
+
+fn env_placeholder_name(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .filter(|name| !name.trim().is_empty())
+}
+
+fn parse_slack_action_value(value: &str) -> Result<SlackActionDecision> {
+    let mut parts = value.split(':');
+    let action = parts.next().unwrap_or_default();
+    let request_id = parts
+        .next()
+        .filter(|request_id| !request_id.trim().is_empty())
+        .context("Slack action value missing request id")?;
+    let parsed_scope = parts
+        .next()
+        .filter(|scope| !scope.trim().is_empty())
+        .map(parse_approval_scope)
+        .transpose()?;
+    let decision = match action {
+        "approve" | "allow" => ApprovalDecisionValue::Allow,
+        "deny" => ApprovalDecisionValue::Deny,
+        _ => bail!("unsupported Slack action `{action}`"),
+    };
+    let scope = match decision {
+        ApprovalDecisionValue::Allow => parsed_scope,
+        ApprovalDecisionValue::Deny => parsed_scope.or(Some(ApprovalScope::Once)),
+    };
+
+    Ok(SlackActionDecision {
+        request_id: request_id.to_owned(),
+        decision,
+        scope,
+    })
+}
+
+fn parse_approval_scope(value: &str) -> Result<ApprovalScope> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .with_context(|| format!("invalid approval scope `{value}`"))
+}
+
+impl From<CallbackDecisionValue> for ApprovalDecisionValue {
+    fn from(value: CallbackDecisionValue) -> Self {
+        match value {
+            CallbackDecisionValue::Allow => Self::Allow,
+            CallbackDecisionValue::Deny => Self::Deny,
+        }
+    }
+}
+
+impl SlackInteractionPayload {
+    fn decided_by(&self) -> String {
+        let Some(user) = &self.user else {
+            return "agentenv:slack".to_owned();
+        };
+        if let Some(id) = user.id.as_deref().filter(|value| !value.trim().is_empty()) {
+            return format!("slack:{id}");
+        }
+        if let Some(username) = user
+            .username
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return format!("slack:{username}");
+        }
+        if let Some(name) = user
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return format!("slack:{name}");
+        }
+        "agentenv:slack".to_owned()
+    }
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<HttpRequest> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .context("read approvals HTTP request")?;
+        if read == 0 {
+            bail!("HTTP request ended before headers were complete");
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > MAX_APPROVAL_HTTP_REQUEST_BYTES {
+            bail!("HTTP request exceeded maximum size");
+        }
+        if let Some(position) = find_header_end(&buffer) {
+            break position;
+        }
+    };
+
+    let header_text = std::str::from_utf8(&buffer[..header_end])
+        .context("HTTP request headers were not UTF-8")?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().context("HTTP request line is missing")?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .and_then(|value| Method::from_bytes(value.as_bytes()).ok());
+    let path = request_parts.next().unwrap_or_default().to_owned();
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > MAX_APPROVAL_HTTP_REQUEST_BYTES {
+        bail!("HTTP request body exceeded maximum size");
+    }
+    let body_start = header_end + b"\r\n\r\n".len();
+    while buffer.len().saturating_sub(body_start) < content_length {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .context("read approvals HTTP request body")?;
+        if read == 0 {
+            bail!("HTTP request body ended before content-length was satisfied");
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > MAX_APPROVAL_HTTP_REQUEST_BYTES {
+            bail!("HTTP request exceeded maximum size");
+        }
+    }
+
+    let body_end = body_start + content_length;
+    let body = buffer
+        .get(body_start..body_end)
+        .context("HTTP request body bounds were invalid")?
+        .to_vec();
+
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(b"\r\n\r\n".len())
+        .position(|window| window == b"\r\n\r\n")
+}
+
+fn form_field(body: &[u8], field: &str) -> Result<Option<String>> {
+    let body = std::str::from_utf8(body).context("form body was not UTF-8")?;
+    for pair in body.split('&') {
+        let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode_form(raw_name)? == field {
+            return Ok(Some(percent_decode_form(raw_value)?));
+        }
+    }
+    Ok(None)
+}
+
+fn percent_decode_form(value: &str) -> Result<String> {
+    let raw = value.as_bytes();
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < raw.len() => {
+                let high = hex_nibble(raw[index + 1]).context("invalid form percent encoding")?;
+                let low = hex_nibble(raw[index + 2]).context("invalid form percent encoding")?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => bail!("truncated form percent encoding"),
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).context("decoded form field was not UTF-8")
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn approval_decision_request_id(path: &str) -> Option<&str> {
+    let mut segments = path.trim_start_matches('/').split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("approvals"), Some(request_id), Some("decision"), None) if !request_id.is_empty() => {
+            Some(request_id)
+        }
+        _ => None,
+    }
+}
+
+fn path_without_query(path: &str) -> &str {
+    path.split_once('?')
+        .map(|(path, _query)| path)
+        .unwrap_or(path)
+}
+
+fn header_value<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str)
+}
+
+fn non_empty_or(value: String, default: &str) -> String {
+    if value.trim().is_empty() {
+        default.to_owned()
+    } else {
+        value
+    }
+}
+
+fn approval_config_path(options: &agentenv_core::runtime::RuntimeOptions) -> PathBuf {
+    options.root.join("config.yaml")
+}
+
+fn text_response(status: StatusCode, body: impl Into<String>) -> HttpResponse {
+    HttpResponse {
+        status,
+        content_type: "text/plain; charset=utf-8",
+        body: body.into(),
+    }
+}
+
+fn bad_request_response(body: impl Into<String>) -> HttpResponse {
+    text_response(StatusCode::BAD_REQUEST, body)
+}
+
+fn internal_server_error_response(error: anyhow::Error) -> HttpResponse {
+    tracing::warn!(%error, "approval callback handler failed");
+    text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error\n")
+}
+
+fn json_response(status: StatusCode, value: serde_json::Value) -> Result<HttpResponse> {
+    Ok(HttpResponse {
+        status,
+        content_type: "application/json",
+        body: serde_json::to_string(&value)?,
+    })
 }
 
 async fn serve_metrics(port: u16) -> Result<()> {

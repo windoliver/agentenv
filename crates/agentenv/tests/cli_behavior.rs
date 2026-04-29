@@ -1085,6 +1085,21 @@ fn approvals_watch_once_json_prints_pending_requests() {
 }
 
 #[test]
+fn approvals_serve_healthz_responds_ok() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = reserve_tcp_port();
+    let mut child = Command::new(agentenv_bin())
+        .env("HOME", temp.path())
+        .args(["approvals", "serve", "--addr", &format!("127.0.0.1:{port}")])
+        .spawn()
+        .unwrap();
+
+    wait_for_http_ok(port, "/healthz");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
 fn env_scoped_audit_export_reads_global_audit_entries() {
     let temp_dir = make_temp_dir("audit-env-global-export");
     write_minimal_env_state(&temp_dir, "demo");
@@ -2235,6 +2250,38 @@ fn seed_pending_approval(home: &Path, env: &str, request_id: &str) {
         "trace-approval-1",
     );
     store.insert_request(&request).unwrap();
+}
+
+fn reserve_tcp_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn wait_for_http_ok(port: u16, path: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_error = None;
+
+    while std::time::Instant::now() < deadline {
+        match client.get(&url).send() {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "timed out waiting for {url}: {}",
+        last_error.unwrap_or_else(|| "no attempts were made".to_owned())
+    );
 }
 
 fn env_activity_db_path(home: &Path, env: &str) -> PathBuf {

@@ -6,6 +6,7 @@ pub mod events;
 pub mod model;
 pub mod policy;
 pub mod signing;
+pub mod slack;
 pub mod store;
 pub mod webhook;
 
@@ -23,5 +24,6 @@ pub use policy::{
     ApprovalPolicyError, ApprovalPolicyOverlay,
 };
 pub use signing::{sign_payload, verify_payload, PayloadSignature, SigningError};
+pub use slack::{verify_slack_signature, SlackApprovalMessage, SlackSignatureError};
 pub use store::{ApprovalStore, ApprovalStoreError};
 pub use webhook::{retry_delay_for_attempt, WebhookPayload};
