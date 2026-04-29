@@ -2483,6 +2483,7 @@ mod tests {
                 "stats".to_string(),
                 "audit".to_string(),
                 "metrics".to_string(),
+                "approvals".to_string(),
                 "exec".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
