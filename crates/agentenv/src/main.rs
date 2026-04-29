@@ -1164,6 +1164,7 @@ struct HttpResponse {
 
 #[derive(Deserialize)]
 struct CallbackDecisionBody {
+    request_id: String,
     decision: CallbackDecisionValue,
     scope: Option<ApprovalScope>,
     decided_by: String,
@@ -1283,10 +1284,6 @@ async fn handle_agentenv_decision_callback(
     request: &HttpRequest,
     state: &ApprovalServerState,
 ) -> Result<HttpResponse> {
-    if !verify_agentenv_callback_signature(&state.config, &request.headers, &request.body)? {
-        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
-    }
-
     let body = match serde_json::from_slice::<CallbackDecisionBody>(&request.body) {
         Ok(body) => body,
         Err(error) => {
@@ -1294,6 +1291,14 @@ async fn handle_agentenv_decision_callback(
             return Ok(bad_request_response("invalid decision body\n"));
         }
     };
+    if body.request_id != request_id {
+        return Ok(bad_request_response("request id mismatch\n"));
+    }
+
+    if !verify_agentenv_callback_signature(&state.config, &request.headers, &request.body)? {
+        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
+    }
+
     let decision = ApprovalDecisionValue::from(body.decision);
     let record = decide_callback_approval(
         state,
@@ -1437,6 +1442,20 @@ fn verify_agentenv_callback_signature(
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> Result<bool> {
+    verify_agentenv_callback_signature_at(
+        config,
+        headers,
+        body,
+        ::time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
+}
+
+fn verify_agentenv_callback_signature_at(
+    config: &ApprovalConfig,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    now_unix_seconds: i64,
+) -> Result<bool> {
     let Some(signature) = header_value(headers, "x-agentenv-signature") else {
         return Ok(false);
     };
@@ -1445,6 +1464,9 @@ fn verify_agentenv_callback_signature(
     else {
         return Ok(false);
     };
+    if timestamp.abs_diff(now_unix_seconds) > 300 {
+        return Ok(false);
+    }
     let Some(delivery_id) = header_value(headers, "x-agentenv-delivery") else {
         return Ok(false);
     };
