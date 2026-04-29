@@ -89,7 +89,7 @@ mod tests {
             1_777_443_200,
             "delivery-1",
             body,
-            &signature.header_value()
+            signature.header_value()
         )
         .unwrap());
         assert!(
