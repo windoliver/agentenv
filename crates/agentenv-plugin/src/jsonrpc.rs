@@ -366,6 +366,7 @@ fn approval_kind_name(kind: &agentenv_proto::ApprovalKind) -> &'static str {
         agentenv_proto::ApprovalKind::EgressHost => "egress_host",
         agentenv_proto::ApprovalKind::McpTool => "mcp_tool",
         agentenv_proto::ApprovalKind::ZoneAccess => "zone_access",
+        agentenv_proto::ApprovalKind::PackageInstall => "package_install",
     }
 }
 
@@ -1102,6 +1103,27 @@ mod tests {
             json!("https://api.example.test/v1")
         );
         assert_eq!(event.extras["default_ttl"], json!("session"));
+    }
+
+    #[test]
+    fn approval_requested_notification_preserves_package_install_kind() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/approval_requested",
+            "params": {
+                "request_id": "req-package",
+                "kind": "package_install",
+                "subject": "ripgrep",
+                "reason": "agent requested package install",
+                "context": {"package": "ripgrep"}
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::ApprovalRequested);
+        assert_eq!(event.subject["kind"], json!("package_install"));
     }
 
     #[test]
