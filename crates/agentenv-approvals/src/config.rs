@@ -73,10 +73,15 @@ impl fmt::Debug for WebhookTargetConfig {
 
 impl fmt::Debug for SlackConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let webhook_url = if self.webhook_url.is_empty() {
+            None
+        } else {
+            Some("<redacted>")
+        };
         let signing_secret = self.signing_secret.as_deref().map(|_| "<redacted>");
         formatter
             .debug_struct("SlackConfig")
-            .field("webhook_url", &self.webhook_url)
+            .field("webhook_url", &webhook_url)
             .field("channel", &self.channel)
             .field("signing_secret", &signing_secret)
             .field("callback_url", &self.callback_url)
@@ -198,8 +203,10 @@ approvals:
       secret: inline-webhook-secret
       secret_ref: env:WEBHOOK_SECRET
   slack:
-    webhook_url: https://hooks.slack.com/services/test
+    webhook_url: https://hooks.slack.com/services/T00000000/B00000000/very-secret-webhook-token
+    channel: "#agentenv-approvals"
     signing_secret: inline-slack-secret
+    callback_url: https://approvals.example.com/slack/interactions
 "##,
         )
         .unwrap();
@@ -212,6 +219,13 @@ approvals:
         for rendered in [&webhook_debug, &slack_debug, &config_debug] {
             assert!(!rendered.contains("inline-webhook-secret"));
             assert!(!rendered.contains("inline-slack-secret"));
+        }
+        for rendered in [&slack_debug, &config_debug] {
+            assert!(!rendered.contains(
+                "https://hooks.slack.com/services/T00000000/B00000000/very-secret-webhook-token"
+            ));
+            assert!(rendered.contains("#agentenv-approvals"));
+            assert!(rendered.contains("https://approvals.example.com/slack/interactions"));
         }
         assert!(webhook_debug.contains("env:WEBHOOK_SECRET"));
     }
