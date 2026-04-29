@@ -195,6 +195,7 @@ dependencies = [
 name = "agentenv-plugin"
 version = "0.0.1-alpha0"
 dependencies = [
+ "agentenv-approvals",
  "agentenv-core",
  "agentenv-events",
  "agentenv-proto",

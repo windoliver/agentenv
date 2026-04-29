@@ -45,6 +45,8 @@ pub enum JsonRpcError {
     TooManyHeaders { count: usize, max: usize },
     #[error("JSON-RPC protocol error: {0}")]
     Protocol(String),
+    #[error("approval coordinator error: {0}")]
+    Approval(#[from] agentenv_approvals::ApprovalCoordinatorError),
     #[error("JSON-RPC request `{0}` timed out")]
     Timeout(String),
     #[error("remote JSON-RPC error {code}: {message}")]
@@ -66,6 +68,8 @@ pub struct JsonRpcClient {
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
     event_emitter: Arc<dyn EventEmitter>,
+    approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+    env_name: Option<String>,
     next_id: AtomicU64,
     timeout: Duration,
 }
@@ -151,6 +155,13 @@ pub struct RpcNotificationEnvelope {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+#[derive(Serialize)]
+struct RpcNotificationWithParams<T> {
+    jsonrpc: &'static str,
+    method: &'static str,
+    params: T,
 }
 
 pub fn notification_to_activity_event(
@@ -323,6 +334,81 @@ fn approval_requested_params_to_activity_event(
     }
 
     event
+}
+
+pub(crate) fn approval_request_from_params(
+    env: impl Into<String>,
+    params: agentenv_proto::ApprovalRequestedParams,
+    trace_id: impl Into<String>,
+) -> Result<agentenv_approvals::ApprovalRequest, JsonRpcError> {
+    let requested_at = time::OffsetDateTime::now_utc();
+    Ok(agentenv_approvals::ApprovalRequest::new(
+        params.request_id,
+        env,
+        agentenv_approvals::ApprovalKind::from(params.kind),
+        params.subject,
+        params.reason,
+        Value::Object(params.context.into_iter().collect()),
+        requested_at,
+        approval_scope_from_default_ttl(params.default_ttl.as_deref()),
+        Duration::from_secs(300),
+        trace_id,
+    ))
+}
+
+pub(crate) fn approval_decision_notification(
+    params: agentenv_proto::ApprovalDecisionParams,
+) -> Result<String, JsonRpcError> {
+    Ok(serde_json::to_string(
+        &approval_decision_notification_envelope(params),
+    )?)
+}
+
+fn approval_decision_notification_envelope(
+    params: agentenv_proto::ApprovalDecisionParams,
+) -> RpcNotificationWithParams<agentenv_proto::ApprovalDecisionParams> {
+    RpcNotificationWithParams {
+        jsonrpc: "2.0",
+        method: "approval/decision",
+        params,
+    }
+}
+
+fn approval_decision_params_from_record(
+    decision: agentenv_approvals::ApprovalDecisionRecord,
+) -> agentenv_proto::ApprovalDecisionParams {
+    agentenv_proto::ApprovalDecisionParams {
+        request_id: decision.request_id,
+        decision: agentenv_proto::ApprovalDecision::from(decision.decision),
+        scope: approval_scope_to_proto(decision.scope),
+        decided_by: decision.decided_by,
+        decided_at: agentenv_approvals::format_rfc3339(decision.decided_at),
+    }
+}
+
+fn approval_scope_from_default_ttl(default_ttl: Option<&str>) -> agentenv_approvals::ApprovalScope {
+    match default_ttl {
+        Some("once") => agentenv_approvals::ApprovalScope::Once,
+        Some("persist-sandbox") => agentenv_approvals::ApprovalScope::PersistSandbox,
+        Some("propose-for-baseline") => agentenv_approvals::ApprovalScope::ProposeForBaseline,
+        Some("session") | None => agentenv_approvals::ApprovalScope::Session,
+        Some(_) => agentenv_approvals::ApprovalScope::Session,
+    }
+}
+
+fn approval_scope_to_proto(
+    scope: agentenv_approvals::ApprovalScope,
+) -> agentenv_proto::ApprovalScope {
+    match scope {
+        agentenv_approvals::ApprovalScope::Once => agentenv_proto::ApprovalScope::Once,
+        agentenv_approvals::ApprovalScope::Session => agentenv_proto::ApprovalScope::Session,
+        agentenv_approvals::ApprovalScope::PersistSandbox => {
+            agentenv_proto::ApprovalScope::PersistSandbox
+        }
+        agentenv_approvals::ApprovalScope::ProposeForBaseline => {
+            agentenv_proto::ApprovalScope::ProposeForBaseline
+        }
+    }
 }
 
 fn invalid_notification_event(
@@ -559,6 +645,8 @@ impl JsonRpcClient {
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
             event_emitter: Arc::new(NoopEventEmitter),
+            approval_coordinator: None,
+            env_name: None,
             next_id: AtomicU64::new(1),
             timeout: config.timeout,
         })
@@ -573,6 +661,15 @@ impl JsonRpcClient {
 
     pub fn set_event_emitter_arc(&mut self, event_emitter: Arc<dyn EventEmitter>) {
         self.event_emitter = event_emitter;
+    }
+
+    pub fn set_approval_coordinator(
+        &mut self,
+        env_name: impl Into<String>,
+        coordinator: agentenv_approvals::ApprovalCoordinator,
+    ) {
+        self.env_name = Some(env_name.into());
+        self.approval_coordinator = Some(coordinator);
     }
 
     pub fn with_event_emitter<E>(mut self, event_emitter: E) -> Self
@@ -674,8 +771,8 @@ impl JsonRpcClient {
             };
             if raw.get("method").is_some() && raw.get("id").is_none() {
                 let notification: RpcNotificationEnvelope = serde_json::from_value(raw)?;
-                let event = notification_to_activity_event(notification, &fallback_trace_id)?;
-                self.event_emitter.emit(event.redacted());
+                self.handle_notification(notification, &fallback_trace_id)
+                    .await?;
                 continue;
             }
             let response: RpcResponseEnvelope = serde_json::from_value(raw)?;
@@ -696,6 +793,62 @@ impl JsonRpcClient {
                 .ok_or_else(|| JsonRpcError::Protocol(format!("missing result for `{method}`")))?;
             return Ok(serde_json::from_value(result)?);
         }
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: RpcNotificationEnvelope,
+        fallback_trace_id: &str,
+    ) -> Result<(), JsonRpcError> {
+        if notification.method == "event/approval_requested" {
+            if let (Some(coordinator), Some(env_name)) =
+                (&self.approval_coordinator, &self.env_name)
+            {
+                return self
+                    .handle_approval_requested_notification(
+                        notification,
+                        fallback_trace_id,
+                        env_name,
+                        coordinator,
+                    )
+                    .await;
+            }
+        }
+
+        let event = notification_to_activity_event(notification, fallback_trace_id)?;
+        self.event_emitter.emit(event.redacted());
+        Ok(())
+    }
+
+    async fn handle_approval_requested_notification(
+        &self,
+        notification: RpcNotificationEnvelope,
+        fallback_trace_id: &str,
+        env_name: &str,
+        coordinator: &agentenv_approvals::ApprovalCoordinator,
+    ) -> Result<(), JsonRpcError> {
+        let event = notification_to_activity_event(notification.clone(), fallback_trace_id)?;
+        let params: agentenv_proto::ApprovalRequestedParams =
+            match serde_json::from_value(notification.params) {
+                Ok(params) => params,
+                Err(_) => {
+                    self.event_emitter.emit(event.redacted());
+                    return Ok(());
+                }
+            };
+        let request_id = params.request_id.clone();
+        let request = approval_request_from_params(env_name, params, fallback_trace_id)?;
+
+        coordinator.submit_request(request).await?;
+        let decision = coordinator.wait_for_decision(&request_id).await?;
+        let params = approval_decision_params_from_record(decision);
+        let notification = approval_decision_notification(params)?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            write_framed_json_bytes_async(&mut *stdin, notification.as_bytes()).await?;
+        }
+        self.event_emitter.emit(event.redacted());
+        Ok(())
     }
 
     async fn ensure_open(&self) -> Result<(), JsonRpcError> {
@@ -753,10 +906,20 @@ where
     T: Serialize + ?Sized,
 {
     let payload = serde_json::to_vec(message)?;
+    write_framed_json_bytes_async(writer, &payload).await
+}
+
+async fn write_framed_json_bytes_async<W>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<(), JsonRpcError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     writer
         .write_all(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes())
         .await?;
-    writer.write_all(&payload).await?;
+    writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -858,6 +1021,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        approval_decision_notification, approval_request_from_params,
         notification_to_activity_event, read_framed_json_blocking, write_framed_json_blocking,
         JsonRpcError, RpcNotificationEnvelope, RpcResponseEnvelope, DEFAULT_MAX_FRAME_BYTES,
         DEFAULT_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_LINES,
@@ -1103,6 +1267,44 @@ mod tests {
             json!("https://api.example.test/v1")
         );
         assert_eq!(event.extras["default_ttl"], json!("session"));
+    }
+
+    #[test]
+    fn approval_requested_notification_converts_to_domain_request() {
+        let params = agentenv_proto::ApprovalRequestedParams {
+            request_id: "req-1".to_owned(),
+            kind: agentenv_proto::ApprovalKind::EgressHost,
+            subject: "api.example.test:443".to_owned(),
+            reason: "network".to_owned(),
+            context: std::collections::BTreeMap::new(),
+            default_ttl: Some("session".to_owned()),
+        };
+
+        let request = approval_request_from_params("demo", params, "trace-1").unwrap();
+
+        assert_eq!(request.env, "demo");
+        assert_eq!(request.id, "req-1");
+        assert_eq!(request.kind, agentenv_approvals::ApprovalKind::EgressHost);
+        assert_eq!(
+            request.default_scope,
+            agentenv_approvals::ApprovalScope::Session
+        );
+        assert_eq!(request.created_trace_id, "trace-1");
+    }
+
+    #[test]
+    fn approval_decision_notification_serializes_as_jsonrpc_notification() {
+        let body = approval_decision_notification(agentenv_proto::ApprovalDecisionParams {
+            request_id: "req-1".to_owned(),
+            decision: agentenv_proto::ApprovalDecision::Allow,
+            scope: agentenv_proto::ApprovalScope::Session,
+            decided_by: "alice".to_owned(),
+            decided_at: "2026-04-29T12:00:00Z".to_owned(),
+        })
+        .unwrap();
+
+        assert!(body.contains("\"method\":\"approval/decision\""));
+        assert!(body.contains("\"request_id\":\"req-1\""));
     }
 
     #[test]
@@ -1382,6 +1584,68 @@ mod async_client_tests {
         client.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn approval_requested_notification_waits_and_sends_decision() {
+        let store_path = temp_fixture_artifact_path("approvals", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-decision");
+        let mut client = spawn_fixture_client(
+            "approval_before_preflight",
+            Duration::from_secs(5),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator.clone());
+
+        let decider = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                wait_for_approval_request(&coordinator, "req-1").await;
+                coordinator
+                    .decide(agentenv_approvals::ApprovalDecisionRecord {
+                        request_id: "req-1".to_owned(),
+                        decision: agentenv_approvals::ApprovalDecisionValue::Allow,
+                        scope: agentenv_approvals::ApprovalScope::Session,
+                        decided_by: "alice".to_owned(),
+                        decided_at: time::OffsetDateTime::UNIX_EPOCH,
+                        reason: None,
+                        context: json!({}),
+                        trace_id: "trace-approval".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        decider.await.unwrap();
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decision["method"], json!("approval/decision"));
+        assert_eq!(decision["params"]["request_id"], json!("req-1"));
+        assert_eq!(decision["params"]["decision"], json!("allow"));
+        assert_eq!(decision["params"]["scope"], json!("session"));
+        assert_eq!(decision["params"]["decided_by"], json!("alice"));
+        client.shutdown().await.unwrap();
+    }
+
     async fn spawn_fixture_client(
         mode: &str,
         timeout: Duration,
@@ -1460,6 +1724,24 @@ def response(request):
                     "extras": {},
                 },
             })
+        if MODE == "approval_before_preflight":
+            write_message({
+                "jsonrpc": "2.0",
+                "method": "event/approval_requested",
+                "params": {
+                    "request_id": "req-1",
+                    "kind": "egress_host",
+                    "subject": "api.example.test:443",
+                    "reason": "network",
+                    "context": {},
+                    "default_ttl": "session",
+                },
+            })
+            decision = read_message()
+            decision_file = os.environ["JSONRPC_FIXTURE_DECISION_FILE"]
+            with open(decision_file, "w", encoding="utf-8") as handle:
+                json.dump(decision, handle, separators=(",", ":"))
+                handle.flush()
         return {
             "jsonrpc": "2.0",
             "id": request["id"],
@@ -1544,6 +1826,27 @@ while True:
                 panic!("process {} did not exit in time", pid);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_approval_request(
+        coordinator: &agentenv_approvals::ApprovalCoordinator,
+        request_id: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if coordinator
+                .store()
+                .get_request(request_id)
+                .unwrap()
+                .is_some()
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("approval request {request_id} was not submitted");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
