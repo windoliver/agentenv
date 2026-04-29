@@ -79,6 +79,7 @@ fn reason_for_driver_error(error: &DriverError) -> ReasonCode {
         | DriverError::CommandSpawn { .. }
         | DriverError::CommandFailed { .. }
         | DriverError::Subprocess { .. }
+        | DriverError::ApprovalUnavailable { .. }
         | DriverError::PolicyTranslation { .. }
         | DriverError::PolicyRequiresRecreate { .. } => ReasonCode::DriverCommandFailed,
     }

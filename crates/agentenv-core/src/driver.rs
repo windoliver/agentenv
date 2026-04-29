@@ -52,6 +52,10 @@ pub enum DriverError {
     PolicyRequiresRecreate {
         domains: String,
     },
+    ApprovalUnavailable {
+        request_id: String,
+        message: String,
+    },
     CleanupFailed {
         message: String,
     },
@@ -159,6 +163,12 @@ impl fmt::Display for DriverError {
             DriverError::PolicyRequiresRecreate { domains } => {
                 write!(f, "policy update requires recreate for domains: {domains}")
             }
+            DriverError::ApprovalUnavailable {
+                request_id,
+                message,
+            } => {
+                write!(f, "approval request `{request_id}` unavailable: {message}")
+            }
             DriverError::CleanupFailed { message } => {
                 write!(f, "driver cleanup failed: {message}")
             }
@@ -207,6 +217,36 @@ pub trait SandboxDriver: Send + Sync {
     async fn stop(&self, params: StopParams) -> DriverResult<EmptyResult>;
     async fn destroy(&self, params: DestroyParams) -> DriverResult<EmptyResult>;
     async fn shutdown(&mut self, params: ShutdownParams) -> DriverResult<EmptyResult>;
+}
+
+#[async_trait]
+pub trait ApprovalRequester: Send + Sync {
+    async fn request_approval(
+        &self,
+        request: agentenv_approvals::ApprovalRequest,
+    ) -> DriverResult<agentenv_approvals::ApprovalDecisionRecord>;
+}
+
+#[async_trait]
+impl ApprovalRequester for agentenv_approvals::ApprovalCoordinator {
+    async fn request_approval(
+        &self,
+        request: agentenv_approvals::ApprovalRequest,
+    ) -> DriverResult<agentenv_approvals::ApprovalDecisionRecord> {
+        let request_id = request.id.clone();
+        self.submit_request(request)
+            .await
+            .map_err(|err| DriverError::ApprovalUnavailable {
+                request_id: request_id.clone(),
+                message: err.to_string(),
+            })?;
+        self.wait_for_decision(&request_id)
+            .await
+            .map_err(|err| DriverError::ApprovalUnavailable {
+                request_id,
+                message: err.to_string(),
+            })
+    }
 }
 
 #[async_trait]
@@ -461,6 +501,19 @@ mod tests {
             .expect_err("unsupported capability should fail");
 
         assert!(matches!(err, DriverError::CapabilityMissing { .. }));
+    }
+
+    #[test]
+    fn approval_unavailable_error_mentions_request() {
+        let error = DriverError::ApprovalUnavailable {
+            request_id: "req-1".to_owned(),
+            message: "approval coordinator not configured".to_owned(),
+        };
+
+        assert!(error.to_string().contains("req-1"));
+        assert!(error
+            .to_string()
+            .contains("approval coordinator not configured"));
     }
 
     #[test]

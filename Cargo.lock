@@ -120,6 +120,7 @@ dependencies = [
 name = "agentenv-core"
 version = "0.0.1-alpha0"
 dependencies = [
+ "agentenv-approvals",
  "agentenv-events",
  "agentenv-policy",
  "agentenv-proto",
