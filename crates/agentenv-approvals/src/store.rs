@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 use crate::model::{
     format_rfc3339, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalRequest,
@@ -27,6 +27,8 @@ pub enum ApprovalStoreError {
     AlreadyDecided { request_id: String },
     #[error("approval field `{field}` was not a string after serialization")]
     NonStringEnum { field: &'static str },
+    #[error("unsafe approval database path: {path}")]
+    UnsafeDatabasePath { path: PathBuf },
 }
 
 pub struct ApprovalStore {
@@ -75,13 +77,13 @@ impl ApprovalStore {
                 request.subject,
                 request.reason,
                 context_json,
-                format_rfc3339(request.requested_at),
+                format_rfc3339_utc(request.requested_at),
                 default_scope,
                 auto_deny_after_ms,
                 status,
                 request.driver_name,
                 request.driver_request_handle,
-                format_rfc3339(request.expires_at),
+                format_rfc3339_utc(request.expires_at),
                 request.created_trace_id,
             ],
         )?;
@@ -130,25 +132,27 @@ impl ApprovalStore {
     ) -> Result<(), ApprovalStoreError> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
-        let stored_status = tx
-            .query_row(
-                "SELECT status FROM approval_requests WHERE id = ?1",
-                params![decision.request_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-
-        let Some(stored_status) = stored_status else {
-            return Err(ApprovalStoreError::NotFound {
-                request_id: decision.request_id.clone(),
-            });
+        let terminal_status = match decision.decision {
+            ApprovalDecisionValue::Allow => ApprovalStatus::Approved,
+            ApprovalDecisionValue::Deny => ApprovalStatus::Denied,
         };
-
-        let status: ApprovalStatus = enum_from_db_string(stored_status)?;
-        if status != ApprovalStatus::Pending {
-            return Err(ApprovalStoreError::AlreadyDecided {
-                request_id: decision.request_id.clone(),
-            });
+        let changed = tx.execute(
+            "UPDATE approval_requests SET status = ?1 WHERE id = ?2 AND status = ?3",
+            params![
+                enum_to_db_string(terminal_status, "status")?,
+                decision.request_id,
+                enum_to_db_string(ApprovalStatus::Pending, "status")?
+            ],
+        )?;
+        if changed == 0 {
+            return match request_status_in_transaction(&tx, &decision.request_id)? {
+                Some(_) => Err(ApprovalStoreError::AlreadyDecided {
+                    request_id: decision.request_id.clone(),
+                }),
+                None => Err(ApprovalStoreError::NotFound {
+                    request_id: decision.request_id.clone(),
+                }),
+            };
         }
 
         let decision_value = enum_to_db_string(decision.decision, "decision")?;
@@ -173,22 +177,10 @@ impl ApprovalStore {
                 decision_value,
                 scope,
                 decision.decided_by,
-                format_rfc3339(decision.decided_at),
+                format_rfc3339_utc(decision.decided_at),
                 decision.reason,
                 context_json,
                 decision.trace_id,
-            ],
-        )?;
-
-        let terminal_status = match decision.decision {
-            ApprovalDecisionValue::Allow => ApprovalStatus::Approved,
-            ApprovalDecisionValue::Deny => ApprovalStatus::Denied,
-        };
-        tx.execute(
-            "UPDATE approval_requests SET status = ?1 WHERE id = ?2",
-            params![
-                enum_to_db_string(terminal_status, "status")?,
-                decision.request_id
             ],
         )?;
         tx.commit()?;
@@ -232,7 +224,7 @@ impl ApprovalStore {
         let rows = stmt.query_and_then(
             params![
                 enum_to_db_string(ApprovalStatus::Pending, "status")?,
-                format_rfc3339(now)
+                format_rfc3339_utc(now)
             ],
             request_from_row,
         )?;
@@ -242,22 +234,30 @@ impl ApprovalStore {
     pub fn expire_without_waiter(
         &self,
         request_id: &str,
-        _now: OffsetDateTime,
+        now: OffsetDateTime,
     ) -> Result<(), ApprovalStoreError> {
         let conn = self.connection()?;
         let changed = conn.execute(
-            "UPDATE approval_requests SET status = ?1 WHERE id = ?2 AND status = ?3",
+            "UPDATE approval_requests SET status = ?1 WHERE id = ?2 AND status = ?3 AND expires_at <= ?4",
             params![
                 enum_to_db_string(ApprovalStatus::Expired, "status")?,
                 request_id,
-                enum_to_db_string(ApprovalStatus::Pending, "status")?
+                enum_to_db_string(ApprovalStatus::Pending, "status")?,
+                format_rfc3339_utc(now)
             ],
         )?;
 
-        if changed == 0 && self.get_request(request_id)?.is_none() {
-            return Err(ApprovalStoreError::NotFound {
-                request_id: request_id.to_owned(),
-            });
+        if changed == 0 {
+            let Some(request) = self.get_request(request_id)? else {
+                return Err(ApprovalStoreError::NotFound {
+                    request_id: request_id.to_owned(),
+                });
+            };
+            if request.status != ApprovalStatus::Pending {
+                return Err(ApprovalStoreError::AlreadyDecided {
+                    request_id: request_id.to_owned(),
+                });
+            }
         }
 
         Ok(())
@@ -331,17 +331,93 @@ impl ApprovalStore {
     }
 
     fn connection(&self) -> Result<Connection, ApprovalStoreError> {
-        Ok(Connection::open_with_flags(
-            &self.path,
-            database_open_flags(),
-        )?)
+        create_private_database_file(&self.path)?;
+        let path = database_open_path(&self.path)?;
+        Ok(Connection::open_with_flags(path, database_open_flags())?)
     }
 }
 
+#[cfg(unix)]
+fn database_open_path(path: &Path) -> Result<PathBuf, ApprovalStoreError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| ApprovalStoreError::UnsafeDatabasePath {
+            path: path.to_owned(),
+        })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
+}
+
+#[cfg(not(unix))]
+fn database_open_path(path: &Path) -> Result<PathBuf, ApprovalStoreError> {
+    Ok(path.to_owned())
+}
+
 fn database_open_flags() -> OpenFlags {
-    OpenFlags::SQLITE_OPEN_READ_WRITE
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+    #[cfg(unix)]
+    {
+        flags | OpenFlags::SQLITE_OPEN_NOFOLLOW
+    }
+
+    #[cfg(not(unix))]
+    {
+        flags
+    }
+}
+
+#[cfg(unix)]
+fn create_private_database_file(path: &Path) -> Result<(), ApprovalStoreError> {
+    use std::fs::OpenOptions;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            harden_existing_database_file(path)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn harden_existing_database_file(path: &Path) -> Result<(), ApprovalStoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(ApprovalStoreError::UnsafeDatabasePath {
+            path: path.to_owned(),
+        });
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_database_file(_path: &Path) -> Result<(), ApprovalStoreError> {
+    Ok(())
 }
 
 fn request_select_sql(where_clause: &str) -> String {
@@ -431,6 +507,24 @@ fn parse_rfc3339(value: String) -> Result<OffsetDateTime, ApprovalStoreError> {
     Ok(OffsetDateTime::parse(&value, &Rfc3339)?)
 }
 
+fn format_rfc3339_utc(value: OffsetDateTime) -> String {
+    format_rfc3339(value.to_offset(UtcOffset::UTC))
+}
+
+fn request_status_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    request_id: &str,
+) -> Result<Option<ApprovalStatus>, ApprovalStoreError> {
+    tx.query_row(
+        "SELECT status FROM approval_requests WHERE id = ?1",
+        params![request_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(enum_from_db_string)
+    .transpose()
+}
+
 fn u64_to_sql_integer(value: u64) -> Result<i64, ApprovalStoreError> {
     i64::try_from(value).map_err(|error| {
         ApprovalStoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
@@ -445,8 +539,9 @@ fn sql_integer_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
 mod tests {
     use std::time::Duration;
 
+    use rusqlite::params;
     use serde_json::json;
-    use time::OffsetDateTime;
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
     use crate::model::{
         ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind, ApprovalRequest,
@@ -535,6 +630,102 @@ mod tests {
         assert_eq!(
             due.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             vec!["req-due"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_store_creates_database_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+
+        let _store = ApprovalStore::open(&path).unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn non_utc_timestamps_are_normalized_for_due_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        let store = ApprovalStore::open(&path).unwrap();
+
+        let requested_at = OffsetDateTime::parse("2026-04-29T05:00:00-07:00", &Rfc3339).unwrap();
+        let mut request = ApprovalRequest::new(
+            "req-offset",
+            "demo",
+            ApprovalKind::EgressHost,
+            "api.example.test:443",
+            "network access",
+            json!({"url": "https://api.example.test/v1"}),
+            requested_at,
+            ApprovalScope::Session,
+            Duration::from_secs(30),
+            "trace-offset",
+        );
+        request.expires_at = OffsetDateTime::parse("2026-04-29T05:00:30-07:00", &Rfc3339).unwrap();
+        store.insert_request(&request).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let stored_requested_at: String = conn
+            .query_row(
+                "SELECT requested_at FROM approval_requests WHERE id = ?1",
+                params!["req-offset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_expires_at: String = conn
+            .query_row(
+                "SELECT expires_at FROM approval_requests WHERE id = ?1",
+                params!["req-offset"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(stored_requested_at, "2026-04-29T12:00:00Z");
+        assert_eq!(stored_expires_at, "2026-04-29T12:00:30Z");
+        let now = OffsetDateTime::parse("2026-04-29T05:00:31-07:00", &Rfc3339).unwrap();
+        assert_eq!(store.due_pending_requests(now).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_status_without_decision_returns_already_decided() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        let store = ApprovalStore::open(&path).unwrap();
+        store.insert_request(&request("req-terminal", 0)).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE approval_requests SET status = ?1 WHERE id = ?2",
+            params!["denied", "req-terminal"],
+        )
+        .unwrap();
+
+        let error = store
+            .record_decision(&decision("req-terminal"))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ApprovalStoreError::AlreadyDecided { request_id } if request_id == "req-terminal")
+        );
+    }
+
+    #[test]
+    fn expire_without_waiter_does_not_expire_before_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::open(temp.path().join("events.db")).unwrap();
+        store.insert_request(&request("req-future", 60)).unwrap();
+
+        let now = OffsetDateTime::from_unix_timestamp(1_777_443_240).unwrap();
+        store.expire_without_waiter("req-future", now).unwrap();
+
+        assert_eq!(
+            store.get_request("req-future").unwrap().unwrap().status,
+            ApprovalStatus::Pending
         );
     }
 }
