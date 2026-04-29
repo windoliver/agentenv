@@ -101,6 +101,7 @@ pub enum ApprovalKind {
     EgressHost,
     McpTool,
     ZoneAccess,
+    PackageInstall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -736,4 +737,16 @@ pub struct ApprovalDecisionParams {
     pub scope: ApprovalScope,
     pub decided_by: String,
     pub decided_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_kind_accepts_package_install_wire_value() {
+        let kind: ApprovalKind =
+            serde_json::from_value(serde_json::json!("package_install")).unwrap();
+        assert_eq!(kind, ApprovalKind::PackageInstall);
+    }
 }

@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
 
-/// Placeholder surface for the M1 workspace scaffold.
-pub const CRATE_NAME: &str = "agentenv-approvals";
+pub mod model;
+
+pub use model::{
+    format_rfc3339, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind, ApprovalRequest,
+    ApprovalRequestFilter, ApprovalScope, ApprovalStatus,
+};
