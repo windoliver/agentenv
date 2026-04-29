@@ -80,12 +80,26 @@ impl ApprovalCoordinator {
         decision: ApprovalDecisionRecord,
     ) -> Result<ApprovalDecisionRecord, ApprovalCoordinatorError> {
         let request = self.request_for_decision(&decision)?;
-        self.store.record_decision(&decision)?;
-        self.events
-            .emit(approval_decided_event(&request, &decision));
-        self.apply_allow_side_effects(&request, &decision)?;
-        self.wake_waiters(&decision.request_id, &decision)?;
-        Ok(decision)
+        match self.store.record_decision(&decision) {
+            Ok(()) => {
+                self.events
+                    .emit(approval_decided_event(&request, &decision));
+                self.apply_allow_side_effects(&request, &decision)?;
+                self.wake_waiters(&decision.request_id, &decision)?;
+                Ok(decision)
+            }
+            Err(ApprovalStoreError::AlreadyDecided { request_id }) => {
+                let existing = self.store.get_decision(&request_id)?.ok_or_else(|| {
+                    ApprovalStoreError::NotFound {
+                        request_id: request_id.clone(),
+                    }
+                })?;
+                self.apply_allow_side_effects(&request, &existing)?;
+                self.wake_waiters(&request_id, &existing)?;
+                Ok(existing)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn wait_for_decision(
@@ -294,7 +308,7 @@ fn approval_kind_key(kind: ApprovalKind) -> &'static str {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use agentenv_events::NoopEventEmitter;
+    use agentenv_events::{NoopEventEmitter, RecordingEventEmitter};
     use serde_json::json;
     use time::OffsetDateTime;
 
@@ -447,5 +461,36 @@ mod tests {
         assert!(rendered.contains("req-propose"));
         assert!(rendered.contains("propose-for-baseline"));
         assert!(rendered.contains("https://api.example.test/v1"));
+    }
+
+    #[tokio::test]
+    async fn retrying_already_decided_request_applies_missing_overlay_without_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::open(temp.path().join("events.db")).unwrap();
+        let overlay_path = temp.path().join("approval-policy-overlay.yaml");
+        let request = test_request("req-retry");
+        let decision = test_decision_with_scope(
+            "req-retry",
+            ApprovalDecisionValue::Allow,
+            ApprovalScope::PersistSandbox,
+        );
+        store.insert_request(&request).unwrap();
+        store.record_decision(&decision).unwrap();
+        let events = RecordingEventEmitter::default();
+        let coordinator = ApprovalCoordinator::new(ApprovalCoordinatorConfig {
+            store,
+            events: Arc::new(events.clone()),
+            poll_interval: Duration::from_millis(10),
+            overlay_path: Some(overlay_path.clone()),
+            proposal_path: None,
+        });
+
+        let returned = coordinator.decide(decision.clone()).await.unwrap();
+
+        assert_eq!(returned, decision);
+        let overlay = crate::policy::read_overlay(&overlay_path).unwrap();
+        assert_eq!(overlay.grants.len(), 1);
+        assert_eq!(overlay.grants[0].id, "req-retry");
+        assert!(events.recorded().is_empty());
     }
 }

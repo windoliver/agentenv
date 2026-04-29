@@ -1,12 +1,16 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{format_rfc3339, ApprovalDecisionRecord, ApprovalKind, ApprovalRequest, ApprovalScope};
+
+const LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApprovalPolicyOverlay {
@@ -39,6 +43,8 @@ pub enum ApprovalPolicyError {
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("timed out waiting for approval policy lock `{path}`")]
+    LockTimeout { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -92,7 +98,16 @@ pub fn read_overlay(path: &Path) -> Result<ApprovalPolicyOverlay, ApprovalPolicy
 }
 
 pub fn append_overlay_grant(path: &Path, grant: &ApprovalGrant) -> Result<(), ApprovalPolicyError> {
+    let _lock = ApprovalPolicyLock::acquire(path)?;
     let mut overlay = read_overlay(path)?;
+    if overlay
+        .grants
+        .iter()
+        .any(|existing| existing.id == grant.id)
+    {
+        return Ok(());
+    }
+
     overlay.grants.push(grant.clone());
     write_yaml_atomic(path, &overlay)
 }
@@ -102,11 +117,73 @@ pub fn append_baseline_proposal(
     request: &ApprovalRequest,
     decision: &ApprovalDecisionRecord,
 ) -> Result<(), ApprovalPolicyError> {
+    let _lock = ApprovalPolicyLock::acquire(path)?;
     let mut proposals = read_baseline_proposals(path)?;
+    if proposals
+        .iter()
+        .any(|existing| existing.request_id == request.id)
+    {
+        return Ok(());
+    }
+
     proposals.push(BaselineProposal::from_request_and_decision(
         request, decision,
     ));
     write_yaml_atomic(path, &proposals)
+}
+
+struct ApprovalPolicyLock {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl ApprovalPolicyLock {
+    fn acquire(path: &Path) -> Result<Self, ApprovalPolicyError> {
+        let lock_path = lock_path_for(path);
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| ApprovalPolicyError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path: lock_path,
+                        _file: file,
+                    });
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err(ApprovalPolicyError::LockTimeout { path: lock_path });
+                    }
+                    thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+                Err(source) => {
+                    return Err(ApprovalPolicyError::Io {
+                        path: lock_path,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ApprovalPolicyLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 impl BaselineProposal {
@@ -188,6 +265,14 @@ fn temp_path_for(path: &Path) -> Result<PathBuf, ApprovalPolicyError> {
     )))
 }
 
+fn lock_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("approval-policy");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -253,6 +338,39 @@ mod tests {
     }
 
     #[test]
+    fn append_overlay_grant_is_idempotent_by_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("approval-policy-overlay.yaml");
+        let grant =
+            ApprovalGrant::from_request_and_decision(&test_request(), &test_allow_decision());
+
+        append_overlay_grant(&path, &grant).unwrap();
+        append_overlay_grant(&path, &grant).unwrap();
+        let loaded = read_overlay(&path).unwrap();
+
+        assert_eq!(loaded.grants.len(), 1);
+        assert_eq!(loaded.grants[0].id, "req-1");
+    }
+
+    #[test]
+    fn append_overlay_grant_returns_error_when_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("approval-policy-overlay.yaml");
+        let lock_path = temp.path().join(".approval-policy-overlay.yaml.lock");
+        let _held_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+            .unwrap();
+        let grant =
+            ApprovalGrant::from_request_and_decision(&test_request(), &test_allow_decision());
+
+        let error = append_overlay_grant(&path, &grant).unwrap_err();
+
+        assert!(matches!(error, ApprovalPolicyError::LockTimeout { .. }));
+    }
+
+    #[test]
     fn baseline_proposal_includes_request_context() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("proposals.yaml");
@@ -263,5 +381,18 @@ mod tests {
         assert!(rendered.contains("req-1"));
         assert!(rendered.contains("https://api.example.test/v1"));
         assert!(rendered.contains("propose-for-baseline"));
+    }
+
+    #[test]
+    fn append_baseline_proposal_is_idempotent_by_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("proposals.yaml");
+
+        append_baseline_proposal(&path, &test_request(), &test_allow_decision()).unwrap();
+        append_baseline_proposal(&path, &test_request(), &test_allow_decision()).unwrap();
+        let proposals = read_baseline_proposals(&path).unwrap();
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].request_id, "req-1");
     }
 }
