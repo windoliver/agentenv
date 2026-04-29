@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod coordinator;
 pub mod events;
 pub mod model;
 pub mod store;
 
+pub use coordinator::{ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalCoordinatorError};
 pub use events::{approval_decided_event, approval_requested_event};
 pub use model::{
     format_rfc3339, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind, ApprovalRequest,
