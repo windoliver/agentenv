@@ -9,6 +9,10 @@ use std::{
     time::Duration,
 };
 
+use agentenv_approvals::{
+    ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalDecisionRecord, ApprovalDecisionValue,
+    ApprovalRequestFilter, ApprovalScope, ApprovalStatus, ApprovalStore,
+};
 use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
 use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
@@ -18,7 +22,7 @@ use agentenv_events::{
     sink::{JsonlSink, SqliteSink},
     store::{parse_legacy_jsonl_activity_event, EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
-    SinkConfig, WebhookConfig, WebhookSink,
+    NoopEventEmitter, SinkConfig, WebhookConfig, WebhookSink,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -59,6 +63,7 @@ enum Commands {
     Stats(StatsArgs),
     Audit(AuditArgs),
     Metrics(MetricsArgs),
+    Approvals(ApprovalsArgs),
     Exec(ExecArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
@@ -252,6 +257,84 @@ struct MetricsArgs {
     command: MetricsCommand,
 }
 
+#[derive(Debug, Args)]
+struct ApprovalsArgs {
+    #[command(subcommand)]
+    command: ApprovalsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ApprovalsCommand {
+    List(ApprovalsListArgs),
+    Watch(ApprovalsWatchArgs),
+    Approve(ApprovalsApproveArgs),
+    Deny(ApprovalsDenyArgs),
+    Serve(ApprovalsServeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ApprovalsListArgs {
+    #[arg(long)]
+    env: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalsWatchArgs {
+    #[arg(long)]
+    env: Option<String>,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, hide = true)]
+    once: bool,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalsApproveArgs {
+    request_id: String,
+    #[arg(long)]
+    env: String,
+    #[arg(long)]
+    scope: Option<ApprovalScopeArg>,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalsDenyArgs {
+    request_id: String,
+    #[arg(long)]
+    env: String,
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalsServeArgs {
+    #[arg(long, default_value = "127.0.0.1:9181")]
+    addr: String,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ApprovalScopeArg {
+    Once,
+    Session,
+    PersistSandbox,
+    ProposeForBaseline,
+}
+
+impl From<ApprovalScopeArg> for ApprovalScope {
+    fn from(value: ApprovalScopeArg) -> Self {
+        match value {
+            ApprovalScopeArg::Once => Self::Once,
+            ApprovalScopeArg::Session => Self::Session,
+            ApprovalScopeArg::PersistSandbox => Self::PersistSandbox,
+            ApprovalScopeArg::ProposeForBaseline => Self::ProposeForBaseline,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum MetricsCommand {
     Serve {
@@ -350,6 +433,7 @@ async fn run() -> Result<()> {
         Some(Commands::Stats(args)) => run_stats(args),
         Some(Commands::Audit(args)) => run_audit(args),
         Some(Commands::Metrics(args)) => run_metrics(args).await,
+        Some(Commands::Approvals(args)) => run_approvals(args).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
@@ -831,6 +915,156 @@ async fn run_metrics(args: MetricsArgs) -> Result<()> {
     match args.command {
         MetricsCommand::Serve { port } => serve_metrics(port).await,
     }
+}
+
+async fn run_approvals(args: ApprovalsArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    match args.command {
+        ApprovalsCommand::List(args) => {
+            let env = args
+                .env
+                .as_deref()
+                .context("approvals list requires --env <name>")?;
+            let rows = pending_approval_rows(&options, env)?;
+            print_approval_rows(&rows, args.json)
+        }
+        ApprovalsCommand::Watch(args) => run_approvals_watch(&options, args).await,
+        ApprovalsCommand::Approve(args) => {
+            decide_approval(
+                &options,
+                &args.env,
+                &args.request_id,
+                ApprovalDecisionValue::Allow,
+                args.scope.map(Into::into),
+                args.reason,
+            )
+            .await?;
+            println!("approved: {}", args.request_id);
+            Ok(())
+        }
+        ApprovalsCommand::Deny(args) => {
+            decide_approval(
+                &options,
+                &args.env,
+                &args.request_id,
+                ApprovalDecisionValue::Deny,
+                Some(ApprovalScope::Once),
+                args.reason,
+            )
+            .await?;
+            println!("denied: {}", args.request_id);
+            Ok(())
+        }
+        ApprovalsCommand::Serve(args) => {
+            bail!(
+                "approvals serve is not implemented yet (requested {})",
+                args.addr
+            )
+        }
+    }
+}
+
+async fn run_approvals_watch(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    args: ApprovalsWatchArgs,
+) -> Result<()> {
+    let env = args
+        .env
+        .as_deref()
+        .context("approvals watch requires --env <name>")?;
+    loop {
+        let rows = pending_approval_rows(options, env)?;
+        print_approval_rows(&rows, args.json)?;
+        if args.once {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn pending_approval_rows(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: &str,
+) -> Result<Vec<render::ApprovalRowJson>> {
+    let store = open_approval_store(options, env)?;
+    let requests = store
+        .list_requests(ApprovalRequestFilter {
+            env: Some(env.to_owned()),
+            status: Some(ApprovalStatus::Pending),
+        })
+        .with_context(|| format!("list pending approval requests for `{env}`"))?;
+    Ok(requests
+        .iter()
+        .map(render::ApprovalRowJson::from_request)
+        .collect())
+}
+
+fn print_approval_rows(rows: &[render::ApprovalRowJson], json: bool) -> Result<()> {
+    if json {
+        render::print_json(&render::ApprovalsListJson {
+            approvals: rows.to_vec(),
+        })
+    } else {
+        render::print_approval_rows_text(rows);
+        Ok(())
+    }
+}
+
+async fn decide_approval(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: &str,
+    request_id: &str,
+    decision: ApprovalDecisionValue,
+    scope: Option<ApprovalScope>,
+    reason: Option<String>,
+) -> Result<ApprovalDecisionRecord> {
+    let store = open_approval_store(options, env)?;
+    let request = store
+        .get_request(request_id)
+        .with_context(|| format!("load approval request `{request_id}`"))?
+        .with_context(|| format!("approval request `{request_id}` was not found"))?;
+    let scope = scope.unwrap_or(request.default_scope);
+    let coordinator = approval_coordinator(options, env, store)?;
+    coordinator
+        .decide(ApprovalDecisionRecord {
+            request_id: request.id.clone(),
+            decision,
+            scope,
+            decided_by: "agentenv:cli".to_owned(),
+            decided_at: ::time::OffsetDateTime::now_utc(),
+            reason,
+            context: serde_json::json!({"source": "cli"}),
+            trace_id: new_cli_trace_id(),
+        })
+        .await
+        .with_context(|| format!("record approval decision for `{request_id}`"))
+}
+
+fn approval_coordinator(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: &str,
+    store: ApprovalStore,
+) -> Result<ApprovalCoordinator> {
+    Ok(ApprovalCoordinator::new(ApprovalCoordinatorConfig {
+        store,
+        events: Arc::new(NoopEventEmitter),
+        poll_interval: Duration::from_millis(250),
+        overlay_path: Some(agentenv_core::runtime::env_approval_overlay_path(
+            options, env,
+        )?),
+        proposal_path: Some(agentenv_core::runtime::env_approval_proposals_path(
+            options, env,
+        )?),
+    }))
+}
+
+fn open_approval_store(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: &str,
+) -> Result<ApprovalStore> {
+    let db_path = agentenv_core::runtime::env_events_db_path(options, env)?;
+    ApprovalStore::open(&db_path)
+        .with_context(|| format!("open approval database `{}`", db_path.display()))
 }
 
 async fn serve_metrics(port: u16) -> Result<()> {
@@ -1698,9 +1932,7 @@ fn env_events_db_path(
     options: &agentenv_core::runtime::RuntimeOptions,
     name: &str,
 ) -> Result<PathBuf> {
-    let env_name = agentenv_core::env::validate_env_name(name)?;
-    let paths = agentenv_core::env::EnvPaths::new(options.root.clone(), env_name);
-    Ok(paths.env_dir().join("events.db"))
+    Ok(agentenv_core::runtime::env_events_db_path(options, name)?)
 }
 
 fn parse_activity_kind_opt(value: Option<&str>) -> Result<Option<ActivityKind>> {

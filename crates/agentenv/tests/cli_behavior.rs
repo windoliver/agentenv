@@ -7,11 +7,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use agentenv_approvals::{ApprovalKind, ApprovalRequest, ApprovalScope, ApprovalStore};
 use agentenv_events::{
     audit::{AuditSigningKey, AuditStore},
     store::{EventQuery, SqliteEventStore},
     ActivityEvent, ActivityKind, ActivityResult,
 };
+use serde_json::json;
+use time::OffsetDateTime;
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
@@ -939,6 +942,79 @@ fn stats_without_env_reads_global_activity_summary() {
     assert!(stdout.contains("global"), "stdout was: {stdout}");
     assert!(stdout.contains("egress_denied"), "stdout was: {stdout}");
     assert!(stdout.contains("denied"), "stdout was: {stdout}");
+}
+
+#[test]
+fn approvals_list_json_prints_pending_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    let mut cmd = assert_cmd::Command::cargo_bin("agentenv").unwrap();
+    cmd.env("HOME", temp.path())
+        .args(["approvals", "list", "--env", "demo", "--json"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"request_id\": \"req-1\""));
+}
+
+#[test]
+fn approvals_approve_records_decision() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "approve",
+            "req-1",
+            "--env",
+            "demo",
+            "--scope",
+            "session",
+            "--reason",
+            "ok",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("approved: req-1"));
+}
+
+#[test]
+fn approvals_deny_records_reason() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "deny",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "no",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("denied: req-1"));
+}
+
+#[test]
+fn approvals_watch_once_json_prints_pending_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args(["approvals", "watch", "--env", "demo", "--json", "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"request_id\": \"req-1\""));
 }
 
 #[test]
@@ -2072,6 +2148,26 @@ fn seed_activity_db(home: &Path, env: &str, events: &[ActivityEvent]) {
     let db_path = env_activity_db_path(home, env);
     let store = SqliteEventStore::open(db_path).unwrap();
     store.append_many(events).unwrap();
+}
+
+fn seed_pending_approval(home: &Path, env: &str, request_id: &str) {
+    let db_path = env_activity_db_path(home, env);
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let store = ApprovalStore::open(db_path).unwrap();
+    let requested_at = OffsetDateTime::from_unix_timestamp(1_777_000_000).unwrap();
+    let request = ApprovalRequest::new(
+        request_id,
+        env,
+        ApprovalKind::EgressHost,
+        "api.example.test:443",
+        "network access",
+        json!({"url": "https://api.example.test/v1"}),
+        requested_at,
+        ApprovalScope::Session,
+        Duration::from_secs(300),
+        "trace-approval-1",
+    );
+    store.insert_request(&request).unwrap();
 }
 
 fn env_activity_db_path(home: &Path, env: &str) -> PathBuf {

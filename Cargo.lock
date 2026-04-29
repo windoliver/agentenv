@@ -57,6 +57,7 @@ dependencies = [
  "agent-claude",
  "agent-codex",
  "agent-openclaw",
+ "agentenv-approvals",
  "agentenv-core",
  "agentenv-credstore",
  "agentenv-events",
