@@ -12,8 +12,8 @@ use std::{
 
 use agentenv_approvals::{
     verify_payload, verify_slack_signature, ApprovalConfig, ApprovalCoordinator,
-    ApprovalCoordinatorConfig, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalRequest,
-    ApprovalRequestFilter, ApprovalScope, ApprovalStatus, ApprovalStore,
+    ApprovalCoordinatorConfig, ApprovalDecisionRecord, ApprovalDecisionValue, ApprovalKind,
+    ApprovalRequest, ApprovalRequestFilter, ApprovalScope, ApprovalStatus, ApprovalStore,
 };
 use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
@@ -66,6 +66,7 @@ enum Commands {
     Audit(AuditArgs),
     Metrics(MetricsArgs),
     Approvals(ApprovalsArgs),
+    Term(TermArgs),
     Exec(ExecArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
@@ -318,6 +319,14 @@ struct ApprovalsServeArgs {
     addr: String,
 }
 
+#[derive(Debug, Args)]
+struct TermArgs {
+    #[arg(long)]
+    json: bool,
+    #[arg(long, hide = true)]
+    once: bool,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum ApprovalScopeArg {
     Once,
@@ -436,6 +445,7 @@ async fn run() -> Result<()> {
         Some(Commands::Audit(args)) => run_audit(args),
         Some(Commands::Metrics(args)) => run_metrics(args).await,
         Some(Commands::Approvals(args)) => run_approvals(args, &cli.events_sink).await,
+        Some(Commands::Term(args)) => run_term(args, &cli.events_sink).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
@@ -916,6 +926,297 @@ fn run_audit(args: AuditArgs) -> Result<()> {
 async fn run_metrics(args: MetricsArgs) -> Result<()> {
     match args.command {
         MetricsCommand::Serve { port } => serve_metrics(port).await,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermKeyAction {
+    OpenApprovalsPane,
+    Pane(tui::ApprovalPaneKey),
+    ApproveScope(ApprovalScope),
+}
+
+fn term_key_action_for_char(value: char) -> Option<TermKeyAction> {
+    match value {
+        'A' => Some(TermKeyAction::OpenApprovalsPane),
+        'a' => Some(TermKeyAction::Pane(tui::ApprovalPaneKey::ApproveDefault)),
+        'd' => Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Deny)),
+        's' => Some(TermKeyAction::ApproveScope(ApprovalScope::Session)),
+        'r' => Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Refresh)),
+        'q' => Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Close)),
+        _ => None,
+    }
+}
+
+fn term_key_action_for_escape() -> TermKeyAction {
+    TermKeyAction::Pane(tui::ApprovalPaneKey::Close)
+}
+
+fn term_key_action_for_key_code(code: crossterm::event::KeyCode) -> Option<TermKeyAction> {
+    match code {
+        crossterm::event::KeyCode::Char(value) => term_key_action_for_char(value),
+        crossterm::event::KeyCode::Esc => Some(term_key_action_for_escape()),
+        crossterm::event::KeyCode::Down => Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Down)),
+        crossterm::event::KeyCode::Up => Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Up)),
+        _ => None,
+    }
+}
+
+async fn run_term(args: TermArgs, event_sink_args: &[String]) -> Result<()> {
+    let options = runtime_options(true)?;
+    if args.json {
+        let rows = pending_approval_rows_all_envs(&options)?;
+        return print_approval_rows(&rows, true);
+    }
+
+    if args.once {
+        let state = tui::ApprovalPaneState::new(pending_approval_pane_rows(&options)?);
+        print!("{}", tui::render_approval_pane_text(&state));
+        io::stdout().flush().context("flush term output")?;
+        return Ok(());
+    }
+
+    run_term_interactive(&options, event_sink_args).await
+}
+
+async fn run_term_interactive(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    event_sink_args: &[String],
+) -> Result<()> {
+    crossterm::terminal::enable_raw_mode().context("enable terminal raw mode")?;
+    let _terminal_guard = TerminalModeGuard;
+    let mut stdout = io::stdout();
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )
+    .context("enter terminal screen")?;
+
+    let mut state = tui::ApprovalPaneState::new(pending_approval_pane_rows(options)?);
+    loop {
+        render_term_state(&mut stdout, &state)?;
+        let event = crossterm::event::read().context("read terminal input")?;
+        let crossterm::event::Event::Key(key_event) = event else {
+            continue;
+        };
+        if key_event.kind != crossterm::event::KeyEventKind::Press {
+            continue;
+        }
+        let Some(action) = term_key_action_for_key_code(key_event.code) else {
+            continue;
+        };
+        if !handle_term_key_action(options, event_sink_args, &mut state, action).await? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+struct TerminalModeGuard;
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+    }
+}
+
+fn render_term_state(stdout: &mut io::Stdout, state: &tui::ApprovalPaneState) -> Result<()> {
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )
+    .context("clear terminal screen")?;
+    write!(stdout, "{}", tui::render_approval_pane_text(state)).context("render term output")?;
+    stdout.flush().context("flush term output")?;
+    Ok(())
+}
+
+async fn handle_term_key_action(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    event_sink_args: &[String],
+    state: &mut tui::ApprovalPaneState,
+    action: TermKeyAction,
+) -> Result<bool> {
+    match action {
+        TermKeyAction::OpenApprovalsPane => {
+            state.set_rows(pending_approval_pane_rows(options)?);
+            Ok(true)
+        }
+        TermKeyAction::Pane(key) => {
+            let selected_env = state.selected_row().map(|row| row.env.clone());
+            match state.handle_key(key) {
+                Some(tui::ApprovalPaneAction::Approve { request_id, scope }) => {
+                    let env = selected_env
+                        .with_context(|| format!("approval request `{request_id}` has no env"))?;
+                    let scope = parse_approval_scope(&scope)?;
+                    let record = decide_approval(
+                        options,
+                        &env,
+                        &request_id,
+                        ApprovalDecisionValue::Allow,
+                        Some(scope),
+                        None,
+                        event_sink_args,
+                    )
+                    .await?;
+                    ensure_requested_decision(&record, ApprovalDecisionValue::Allow)?;
+                    state.set_rows(pending_approval_pane_rows(options)?);
+                    Ok(true)
+                }
+                Some(tui::ApprovalPaneAction::Deny { request_id }) => {
+                    let env = selected_env
+                        .with_context(|| format!("approval request `{request_id}` has no env"))?;
+                    let record = decide_approval(
+                        options,
+                        &env,
+                        &request_id,
+                        ApprovalDecisionValue::Deny,
+                        Some(ApprovalScope::Once),
+                        None,
+                        event_sink_args,
+                    )
+                    .await?;
+                    ensure_requested_decision(&record, ApprovalDecisionValue::Deny)?;
+                    state.set_rows(pending_approval_pane_rows(options)?);
+                    Ok(true)
+                }
+                Some(tui::ApprovalPaneAction::Refresh) => {
+                    state.set_rows(pending_approval_pane_rows(options)?);
+                    Ok(true)
+                }
+                Some(tui::ApprovalPaneAction::Close) => Ok(false),
+                None => Ok(true),
+            }
+        }
+        TermKeyAction::ApproveScope(scope) => {
+            let Some(row) = state.selected_row() else {
+                return Ok(true);
+            };
+            let env = row.env.clone();
+            let request_id = row.request_id.clone();
+            let record = decide_approval(
+                options,
+                &env,
+                &request_id,
+                ApprovalDecisionValue::Allow,
+                Some(scope),
+                None,
+                event_sink_args,
+            )
+            .await?;
+            ensure_requested_decision(&record, ApprovalDecisionValue::Allow)?;
+            state.set_rows(pending_approval_pane_rows(options)?);
+            Ok(true)
+        }
+    }
+}
+
+fn pending_approval_rows_all_envs(
+    options: &agentenv_core::runtime::RuntimeOptions,
+) -> Result<Vec<render::ApprovalRowJson>> {
+    let mut rows = Vec::new();
+    for env in approval_env_names(options)? {
+        rows.extend(pending_approval_rows(options, &env)?);
+    }
+    Ok(rows)
+}
+
+fn pending_approval_pane_rows(
+    options: &agentenv_core::runtime::RuntimeOptions,
+) -> Result<Vec<tui::ApprovalPaneRow>> {
+    let now = ::time::OffsetDateTime::now_utc();
+    let mut rows = Vec::new();
+    for env in approval_env_names(options)? {
+        let store = open_approval_store(options, &env)?;
+        let requests = store
+            .list_requests(ApprovalRequestFilter {
+                env: Some(env.clone()),
+                status: Some(ApprovalStatus::Pending),
+            })
+            .with_context(|| format!("list pending approval requests for `{env}`"))?;
+        rows.extend(
+            requests
+                .iter()
+                .map(|request| approval_pane_row_from_request(request, now)),
+        );
+    }
+    Ok(rows)
+}
+
+fn approval_env_names(options: &agentenv_core::runtime::RuntimeOptions) -> Result<Vec<String>> {
+    Ok(agentenv_core::runtime::list_envs(options)?
+        .into_iter()
+        .map(|row| row.name)
+        .collect())
+}
+
+fn approval_pane_row_from_request(
+    request: &ApprovalRequest,
+    now: ::time::OffsetDateTime,
+) -> tui::ApprovalPaneRow {
+    tui::ApprovalPaneRow {
+        request_id: request.id.clone(),
+        env: request.env.clone(),
+        kind: approval_kind_label(request.kind).to_owned(),
+        subject: request.subject.clone(),
+        reason: request.reason.clone(),
+        age: approval_age_label(request.requested_at, now),
+        expires_in: approval_expires_in_label(request.expires_at, now),
+        default_scope: approval_scope_label(request.default_scope).to_owned(),
+    }
+}
+
+fn approval_age_label(requested_at: ::time::OffsetDateTime, now: ::time::OffsetDateTime) -> String {
+    approval_duration_label(now - requested_at)
+}
+
+fn approval_expires_in_label(
+    expires_at: ::time::OffsetDateTime,
+    now: ::time::OffsetDateTime,
+) -> String {
+    if expires_at <= now {
+        "expired".to_owned()
+    } else {
+        approval_duration_label(expires_at - now)
+    }
+}
+
+fn approval_duration_label(duration: ::time::Duration) -> String {
+    let seconds = duration.whole_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+fn approval_kind_label(kind: ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::EgressHost => "egress_host",
+        ApprovalKind::McpTool => "mcp_tool",
+        ApprovalKind::ZoneAccess => "zone_access",
+        ApprovalKind::PackageInstall => "package_install",
+    }
+}
+
+fn approval_scope_label(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Session => "session",
+        ApprovalScope::PersistSandbox => "persist-sandbox",
+        ApprovalScope::ProposeForBaseline => "propose-for-baseline",
     }
 }
 
@@ -3193,6 +3494,7 @@ mod tests {
                 "audit".to_string(),
                 "metrics".to_string(),
                 "approvals".to_string(),
+                "term".to_string(),
                 "exec".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
@@ -3201,6 +3503,34 @@ mod tests {
                 "freeze".to_string(),
                 "reproduce".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn term_key_mapping_exposes_approval_keys() {
+        assert_eq!(
+            term_key_action_for_char('A'),
+            Some(TermKeyAction::OpenApprovalsPane)
+        );
+        assert_eq!(
+            term_key_action_for_char('a'),
+            Some(TermKeyAction::Pane(tui::ApprovalPaneKey::ApproveDefault))
+        );
+        assert_eq!(
+            term_key_action_for_char('d'),
+            Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Deny))
+        );
+        assert_eq!(
+            term_key_action_for_char('s'),
+            Some(TermKeyAction::ApproveScope(ApprovalScope::Session))
+        );
+        assert_eq!(
+            term_key_action_for_char('r'),
+            Some(TermKeyAction::Pane(tui::ApprovalPaneKey::Refresh))
+        );
+        assert_eq!(
+            term_key_action_for_escape(),
+            TermKeyAction::Pane(tui::ApprovalPaneKey::Close)
         );
     }
 

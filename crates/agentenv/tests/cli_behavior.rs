@@ -1087,6 +1087,36 @@ fn approvals_watch_once_json_prints_pending_requests() {
 }
 
 #[test]
+fn term_once_prints_pending_approvals_across_envs() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_env_state(temp.path(), "demo");
+    write_minimal_env_state(temp.path(), "tools");
+    seed_pending_approval(temp.path(), "demo", "req-1");
+    seed_pending_approval(temp.path(), "tools", "req-2");
+
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--once")
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("req-1"), "stdout was: {stdout}");
+    assert!(stdout.contains("req-2"), "stdout was: {stdout}");
+    assert!(stdout.contains("demo"), "stdout was: {stdout}");
+    assert!(stdout.contains("tools"), "stdout was: {stdout}");
+    assert!(stdout.contains("egress_host"), "stdout was: {stdout}");
+    assert!(stdout.contains("network access"), "stdout was: {stdout}");
+    assert!(stdout.contains("session"), "stdout was: {stdout}");
+}
+
+#[test]
 fn approvals_serve_healthz_responds_ok() {
     let temp = tempfile::tempdir().unwrap();
     let port = reserve_tcp_port();

@@ -9,3 +9,9 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 description = "Terminal UI scaffolding for agentenv"
+
+[dependencies]
+agentenv-approvals = { path = "../agentenv-approvals" }
+ratatui.workspace = true
+crossterm.workspace = true
+serde.workspace = true
