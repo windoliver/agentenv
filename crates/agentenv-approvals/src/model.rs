@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, PrimitiveDateTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +88,7 @@ impl ApprovalRequest {
         auto_deny_after: Duration,
         created_trace_id: impl Into<String>,
     ) -> Self {
-        let expires_at = requested_at + auto_deny_after;
+        let expires_at = saturating_expires_at(requested_at, auto_deny_after);
         Self {
             id: id.into(),
             env: env.into(),
@@ -116,6 +116,15 @@ pub fn format_rfc3339(value: OffsetDateTime) -> String {
     value
         .format(&Rfc3339)
         .expect("RFC3339 format always succeeds")
+}
+
+fn saturating_expires_at(
+    requested_at: OffsetDateTime,
+    auto_deny_after: Duration,
+) -> OffsetDateTime {
+    requested_at
+        .checked_add(auto_deny_after.try_into().unwrap_or(time::Duration::MAX))
+        .unwrap_or_else(|| PrimitiveDateTime::MAX.assume_utc())
 }
 
 impl From<agentenv_proto::ApprovalKind> for ApprovalKind {
@@ -187,6 +196,28 @@ mod tests {
         );
 
         assert_eq!(request.expires_at_rfc3339(), "2026-04-29T12:00:30Z");
+        assert_eq!(request.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn request_expiry_saturates_when_ttl_overflows() {
+        let request = ApprovalRequest::new(
+            "req_overflow",
+            "demo",
+            ApprovalKind::EgressHost,
+            "api.example.test:443",
+            "network access",
+            json!({}),
+            time::PrimitiveDateTime::MAX.assume_utc(),
+            ApprovalScope::Session,
+            Duration::from_nanos(1),
+            "trace-overflow",
+        );
+
+        assert_eq!(
+            request.expires_at,
+            time::PrimitiveDateTime::MAX.assume_utc()
+        );
         assert_eq!(request.status, ApprovalStatus::Pending);
     }
 
