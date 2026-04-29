@@ -31,6 +31,8 @@ pub enum ApprovalStoreError {
     UnsafeDatabasePath { path: PathBuf },
     #[error("approval timestamp is outside SQLite integer nanosecond range: {0}")]
     TimestampOutOfRange(i128),
+    #[error("approval delivery attempt `{delivery_id}` was not found")]
+    DeliveryNotFound { delivery_id: i64 },
 }
 
 pub struct ApprovalStore {
@@ -220,6 +222,96 @@ impl ApprovalStore {
         rows.next().transpose()
     }
 
+    pub fn enqueue_delivery_attempt(
+        &self,
+        request_id: &str,
+        target_id: i64,
+        next_attempt_at: OffsetDateTime,
+    ) -> Result<(), ApprovalStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO approval_delivery_attempts (
+                request_id,
+                target_id,
+                status,
+                attempt_count,
+                next_attempt_at,
+                last_error,
+                last_attempt_at
+            )
+            VALUES (?1, ?2, ?3, 0, ?4, NULL, NULL)
+            "#,
+            params![
+                request_id,
+                target_id,
+                "pending",
+                format_rfc3339_utc(next_attempt_at)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_delivery_failure(
+        &self,
+        delivery_id: i64,
+        next_attempt_at: OffsetDateTime,
+        error: &str,
+    ) -> Result<(), ApprovalStoreError> {
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            r#"
+            UPDATE approval_delivery_attempts
+            SET
+                status = ?1,
+                attempt_count = attempt_count + 1,
+                next_attempt_at = ?2,
+                last_error = ?3,
+                last_attempt_at = ?4
+            WHERE id = ?5
+            "#,
+            params![
+                "pending",
+                format_rfc3339_utc(next_attempt_at),
+                error,
+                format_rfc3339_utc(OffsetDateTime::now_utc()),
+                delivery_id
+            ],
+        )?;
+
+        if changed == 0 {
+            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
+        }
+
+        Ok(())
+    }
+
+    pub fn record_delivery_success(&self, delivery_id: i64) -> Result<(), ApprovalStoreError> {
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            r#"
+            UPDATE approval_delivery_attempts
+            SET
+                status = ?1,
+                attempt_count = attempt_count + 1,
+                last_error = NULL,
+                last_attempt_at = ?2
+            WHERE id = ?3
+            "#,
+            params![
+                "delivered",
+                format_rfc3339_utc(OffsetDateTime::now_utc()),
+                delivery_id
+            ],
+        )?;
+
+        if changed == 0 {
+            return Err(ApprovalStoreError::DeliveryNotFound { delivery_id });
+        }
+
+        Ok(())
+    }
+
     pub fn due_pending_requests(
         &self,
         now: OffsetDateTime,
@@ -333,9 +425,18 @@ impl ApprovalStore {
               target_id INTEGER NOT NULL,
               status TEXT NOT NULL,
               attempt_count INTEGER NOT NULL,
-              next_attempt_at TEXT NOT NULL
+              next_attempt_at TEXT NOT NULL,
+              last_error TEXT,
+              last_attempt_at TEXT
             );
             "#,
+        )?;
+        add_column_if_missing(&conn, "approval_delivery_attempts", "last_error", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "approval_delivery_attempts",
+            "last_attempt_at",
+            "TEXT",
         )?;
         Ok(())
     }
@@ -550,6 +651,45 @@ fn sql_integer_to_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), ApprovalStoreError> {
+    if column_exists(conn, table, column)? {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    match conn.execute(&sql, []) {
+        Ok(_) => Ok(()),
+        Err(error) if is_duplicate_column_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, ApprovalStoreError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn is_duplicate_column_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.contains("duplicate column name")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -760,5 +900,56 @@ mod tests {
             store.get_request("req-fractional").unwrap().unwrap().status,
             ApprovalStatus::Pending
         );
+    }
+
+    #[test]
+    fn delivery_attempt_failure_and_success_update_retry_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.db");
+        let store = ApprovalStore::open(&path).unwrap();
+
+        let first_retry = OffsetDateTime::parse("2026-04-29T12:00:01Z", &Rfc3339).unwrap();
+        store
+            .enqueue_delivery_attempt("req-1", 42, first_retry)
+            .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let delivery_id: i64 = conn
+            .query_row(
+                "SELECT id FROM approval_delivery_attempts WHERE request_id = ?1",
+                params!["req-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let second_retry = OffsetDateTime::parse("2026-04-29T12:00:02Z", &Rfc3339).unwrap();
+        store
+            .record_delivery_failure(delivery_id, second_retry, "http 503")
+            .unwrap();
+
+        let failed: (String, i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT status, attempt_count, next_attempt_at, last_error FROM approval_delivery_attempts WHERE id = ?1",
+                params![delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(failed.0, "pending");
+        assert_eq!(failed.1, 1);
+        assert_eq!(failed.2, "2026-04-29T12:00:02Z");
+        assert_eq!(failed.3.as_deref(), Some("http 503"));
+
+        store.record_delivery_success(delivery_id).unwrap();
+
+        let delivered: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status, attempt_count, last_error FROM approval_delivery_attempts WHERE id = ?1",
+                params![delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(delivered.0, "delivered");
+        assert_eq!(delivered.1, 2);
+        assert_eq!(delivered.2, None);
     }
 }
