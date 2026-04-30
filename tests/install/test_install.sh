@@ -529,6 +529,113 @@ test_uninstall_second_run_is_noop() {
     pass
 }
 
+test_uninstall_preserves_unconfirmed_shell_sentinel_lines() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'before\n# agentenv installer\nafter\n' > "${HOME}/.zshrc"
+    printf '# agentenv installer\nexport PATH="/other/bin:$PATH"\n' > "${HOME}/.bashrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "standalone sentinel should be preserved"
+    assert_contains "after" "${HOME}/.zshrc" "line after standalone sentinel should be preserved"
+    assert_contains "# agentenv installer" "${HOME}/.bashrc" "sentinel before unrelated export should be preserved"
+    assert_contains 'export PATH="/other/bin:$PATH"' "${HOME}/.bashrc" "unrelated PATH export should be preserved"
+
+    zsh_backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    bash_backup_count=$(find "${HOME}" -name '.bashrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${zsh_backup_count}" "unchanged standalone sentinel rc should not be backed up"
+    assert_eq "0" "${bash_backup_count}" "unchanged unrelated export rc should not be backed up"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_only_confirmed_shell_path_block() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'before\n# agentenv installer\nexport PATH="%s:$PATH"\nafter\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_not_contains "# agentenv installer" "${HOME}/.zshrc" "confirmed installer sentinel should be removed"
+    assert_not_contains "${INSTALL_DIR}" "${HOME}/.zshrc" "confirmed installer PATH export should be removed"
+    assert_contains "before" "${HOME}/.zshrc" "confirmed block cleanup should keep preexisting rc content"
+    assert_contains "after" "${HOME}/.zshrc" "confirmed block cleanup should keep trailing rc content"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "1" "${backup_count}" "confirmed block cleanup should back up changed rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_home_as_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${HOME}/envs/demo" "${HOME}/drivers/context-nexus" "${HOME}/work"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'user work\n' > "${HOME}/work/README.md"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_HOME should report unsafe path"
+    assert_exists "${HOME}" "unsafe AGENTENV_HOME should not delete HOME"
+    assert_exists "${HOME}/work/README.md" "unsafe AGENTENV_HOME should not delete unrelated home files"
+    assert_exists "${HOME}/envs/demo" "unsafe AGENTENV_HOME should not delete home envs directory"
+    assert_exists "${INSTALL_DIR}/agentenv" "unsafe AGENTENV_HOME should not delete derived binary"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_agentenv_bin_outside_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    unsafe_bin="${tmp_root}/outside/agentenv"
+    mkdir -p "${INSTALL_DIR}" "$(dirname "${unsafe_bin}")"
+    printf '#!/bin/sh\n' > "${unsafe_bin}"
+    chmod +x "${unsafe_bin}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" AGENTENV_BIN="${unsafe_bin}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_BIN should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_BIN should report unsafe path"
+    assert_exists "${unsafe_bin}" "unsafe AGENTENV_BIN should not be deleted"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_prints_plan_without_removing() {
     tmp_root=$(mktemp -d)
 
@@ -582,6 +689,10 @@ main() {
     test_uninstall_removes_owned_files_and_shell_block
     test_uninstall_keep_flags_preserve_selected_state
     test_uninstall_second_run_is_noop
+    test_uninstall_preserves_unconfirmed_shell_sentinel_lines
+    test_uninstall_removes_only_confirmed_shell_path_block
+    test_uninstall_rejects_home_as_agentenv_home
+    test_uninstall_rejects_agentenv_bin_outside_install_dir
     test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path

@@ -193,27 +193,62 @@ backup_uninstall_file() {
     fi
 }
 
+installer_path_export_line() {
+    printf 'export PATH="%s:$PATH"' "${INSTALL_DIR}"
+}
+
+has_installer_block() {
+    rc_file=$1
+    expected_export=$(installer_path_export_line)
+    awk -v sentinel="${INSTALLER_SENTINEL}" -v expected_export="${expected_export}" '
+        pending == 1 {
+            if ($0 == expected_export) {
+                found = 1
+            }
+            pending = 0
+        }
+        $0 == sentinel {
+            pending = 1
+            next
+        }
+        END {
+            exit found ? 0 : 1
+        }
+    ' "${rc_file}"
+}
+
 remove_installer_block() {
     rc_file=$1
     [ -f "${rc_file}" ] || return 0
     if ! grep -F "${INSTALLER_SENTINEL}" "${rc_file}" >/dev/null 2>&1; then
         return 0
     fi
+    if ! has_installer_block "${rc_file}"; then
+        return 0
+    fi
 
     backup_uninstall_file "${rc_file}" || return 1
     tmp_file="${TMP_ROOT}/$(basename "${rc_file}").uninstall.$$"
-    awk -v sentinel="${INSTALLER_SENTINEL}" -v install_dir="${INSTALL_DIR}" '
-        $0 == sentinel {
-            skip_path = 1
-            next
-        }
-        skip_path == 1 {
-            skip_path = 0
-            if (index($0, "export PATH=") == 1 && index($0, install_dir) > 0) {
+    expected_export=$(installer_path_export_line)
+    awk -v sentinel="${INSTALLER_SENTINEL}" -v expected_export="${expected_export}" '
+        pending == 1 {
+            if ($0 == expected_export) {
+                pending = 0
                 next
             }
+            print sentinel
+            pending = 0
+        }
+        $0 == sentinel {
+            pending = 1
+            next
         }
         { print }
+        END {
+            if (pending == 1) {
+                print sentinel
+            }
+        }
     ' "${rc_file}" > "${tmp_file}" || {
         record_error "failed to rewrite ${rc_file}"
         rm -f "${tmp_file}"
@@ -229,8 +264,62 @@ remove_installer_block() {
     fi
 }
 
+path_is_under_dir() {
+    child_path=$1
+    parent_dir=$2
+    case "${child_path}" in
+        "${parent_dir}"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+path_is_agentenv_bin() {
+    path=$1
+    [ "${path}" = "${AGENTENV_BIN}" ] || return 1
+    [ "${path}" = "${INSTALL_DIR}/${APP_NAME}" ] || return 1
+    path_is_under_dir "${path}" "${INSTALL_DIR}"
+}
+
+validate_remove_path() {
+    path=$1
+    case "${AGENTENV_HOME}" in
+        ""|"/"|".")
+            record_error "unsafe path ${path}: AGENTENV_HOME is unsafe (${AGENTENV_HOME})"
+            return 1
+            ;;
+    esac
+    if [ "${AGENTENV_HOME}" = "${HOME}" ]; then
+        record_error "unsafe path ${path}: AGENTENV_HOME must not be HOME"
+        return 1
+    fi
+
+    case "${path}" in
+        ""|"/"|".")
+            record_error "unsafe path ${path}"
+            return 1
+            ;;
+    esac
+    if [ "${path}" = "${HOME}" ]; then
+        record_error "unsafe path ${path}: refusing to remove HOME"
+        return 1
+    fi
+
+    if path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
+        return 0
+    fi
+    if path_is_agentenv_bin "${path}"; then
+        return 0
+    fi
+
+    record_error "unsafe path ${path}: outside ${AGENTENV_HOME}"
+    return 1
+}
+
 remove_path_if_present() {
     path=$1
+    if ! validate_remove_path "${path}"; then
+        return 1
+    fi
     if [ ! -e "${path}" ] && [ ! -L "${path}" ]; then
         log_action "already absent ${path}"
         return 0
@@ -303,7 +392,7 @@ main() {
     if [ "${DRY_RUN}" -eq 1 ]; then
         return 0
     fi
-    confirm_uninstall
+    confirm_uninstall || return 1
     execute_uninstall
     if [ "${FAILURE_COUNT}" -gt 0 ]; then
         cat "${ERRORS_LOG}" >&2
