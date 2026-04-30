@@ -482,6 +482,47 @@ test_install_driver_launcher_prepends_venv_bin_to_path() {
     pass
 }
 
+test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/envs/bad" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AGENTENV_STUB_CALLS"
+if [ "$1" = "destroy" ] && [ "$2" = "bad" ]; then
+    printf 'destroy failed for bad\n' >&2
+    exit 7
+fi
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+    printf '{"name":"bad"}\n' > "${AGENTENV_HOME}/envs/bad/state.json"
+    calls_file="${tmp_root}/calls.log"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_STUB_CALLS="${calls_file}" AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "partial destroy failure should make uninstall exit non-zero"
+    assert_contains "destroy demo --yes" "${calls_file}" "uninstall should destroy demo through CLI"
+    assert_contains "destroy bad --yes" "${calls_file}" "uninstall should continue to bad env"
+    assert_contains "destroy failed for bad" "${diagnostics_dir}/errors.log" "diagnostics should contain destroy failure"
+    assert_contains "Uninstall plan" "${diagnostics_dir}/plan.txt" "diagnostics should include plan"
+    assert_contains "Diagnostics:" "${tmp_root}/uninstall.err" "stderr should print diagnostic path"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_removes_owned_files_and_shell_block() {
     tmp_root=$(mktemp -d)
 
@@ -1170,6 +1211,7 @@ main() {
     test_detect_target_macos
     test_verify_sha256_value
     test_archive_name_candidates_cover_legacy_and_dist_formats
+    test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure
     test_uninstall_removes_owned_files_and_shell_block
     test_uninstall_keep_flags_preserve_selected_state
     test_uninstall_removes_binary_from_custom_install_dir

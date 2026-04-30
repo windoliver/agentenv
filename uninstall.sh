@@ -21,6 +21,7 @@ INSTALL_DIR="${AGENTENV_INSTALL_DIR:-$HOME/.agentenv/bin}"
 AGENTENV_HOME="${AGENTENV_HOME:-$HOME/.agentenv}"
 AGENTENV_BIN="${AGENTENV_BIN:-$INSTALL_DIR/$APP_NAME}"
 TMP_ROOT=""
+TMP_ROOT_IS_OVERRIDE=0
 PLAN_FILE=""
 ACTIONS_LOG=""
 ERRORS_LOG=""
@@ -478,6 +479,35 @@ remove_shell_path_blocks() {
     done
 }
 
+destroy_registered_envs() {
+    if [ "${KEEP_DATA}" -eq 1 ]; then
+        log_action "preserved env registry data ${AGENTENV_HOME}/envs"
+        return 0
+    fi
+
+    envs_dir="${AGENTENV_HOME}/envs"
+    if [ ! -d "${envs_dir}" ]; then
+        log_action "no env registry found ${envs_dir}"
+        return 0
+    fi
+
+    if [ ! -x "${AGENTENV_BIN}" ]; then
+        record_error "agentenv binary unavailable; removing env registry without driver destroy: ${AGENTENV_BIN}"
+        return 0
+    fi
+
+    for state_file in "${envs_dir}"/*/state.json; do
+        [ -f "${state_file}" ] || continue
+        env_dir=${state_file%/state.json}
+        env_name=${env_dir##*/}
+        if "${AGENTENV_BIN}" destroy "${env_name}" --yes >> "${ACTIONS_LOG}" 2>> "${ERRORS_LOG}"; then
+            log_action "destroyed env ${env_name}"
+        else
+            record_error "failed to destroy env ${env_name}"
+        fi
+    done
+}
+
 remove_selected_paths() {
     remove_path_if_present "${AGENTENV_BIN}" || true
     if [ "${KEEP_DATA}" -eq 0 ]; then
@@ -505,11 +535,12 @@ remove_selected_paths() {
 execute_uninstall() {
     validate_configured_roots || return 1
     remove_shell_path_blocks
+    destroy_registered_envs
     remove_selected_paths
 }
 
 cleanup_uninstall_tmp() {
-    if [ -n "${TMP_ROOT}" ] && [ -d "${TMP_ROOT}" ] && [ "${FAILURE_COUNT}" -eq 0 ]; then
+    if [ -n "${TMP_ROOT}" ] && [ -d "${TMP_ROOT}" ] && [ "${TMP_ROOT_IS_OVERRIDE}" -eq 0 ] && [ "${FAILURE_COUNT}" -eq 0 ]; then
         rm -rf "${TMP_ROOT}"
     fi
 }
@@ -521,7 +552,14 @@ report_uninstall_failures() {
 
 main() {
     parse_uninstall_args "$@"
-    TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-uninstall.XXXXXX")
+    if [ -n "${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR:-}" ]; then
+        TMP_ROOT=${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR}
+        TMP_ROOT_IS_OVERRIDE=1
+        mkdir -p "${TMP_ROOT}"
+    else
+        TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-uninstall.XXXXXX")
+        TMP_ROOT_IS_OVERRIDE=0
+    fi
     PLAN_FILE="${TMP_ROOT}/plan.txt"
     ACTIONS_LOG="${TMP_ROOT}/actions.log"
     ERRORS_LOG="${TMP_ROOT}/errors.log"
