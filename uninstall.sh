@@ -337,10 +337,14 @@ validate_remove_path() {
     if [ "${path}" = "${AGENTENV_HOME}" ]; then
         return 0
     fi
-    if path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
-        return 0
+    if [ "${path}" = "${AGENTENV_BIN}" ]; then
+        if path_is_agentenv_bin "${path}" && path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
+            return 0
+        fi
+        record_error "unsafe path ${path}: AGENTENV_BIN must be under ${INSTALL_DIR}"
+        return 1
     fi
-    if path_is_agentenv_bin "${path}" && path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
+    if path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
         return 0
     fi
 
