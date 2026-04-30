@@ -324,6 +324,10 @@ validate_configured_roots() {
     validate_configured_path "AGENTENV_HOME" "${AGENTENV_HOME}" || return 1
     validate_configured_path "AGENTENV_INSTALL_DIR" "${INSTALL_DIR}" || return 1
     validate_configured_path "AGENTENV_BIN" "${AGENTENV_BIN}" || return 1
+    if ! path_is_agentenv_bin "${AGENTENV_BIN}" || ! path_is_under_dir "${AGENTENV_BIN}" "${AGENTENV_HOME}"; then
+        record_error "unsafe path ${AGENTENV_BIN}: AGENTENV_BIN must be under ${INSTALL_DIR}"
+        return 1
+    fi
     return 0
 }
 
