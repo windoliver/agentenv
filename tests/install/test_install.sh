@@ -6,9 +6,33 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)
 
 AGENTENV_INSTALLER_SOURCE_ONLY=1 . "${REPO_ROOT}/install.sh"
+AGENTENV_UNINSTALLER_SOURCE_ONLY=1 . "${REPO_ROOT}/uninstall.sh"
+unset AGENTENV_UNINSTALLER_SOURCE_ONLY
 
 ORIGINAL_PATH=${PATH}
+TEST_TMPDIR="${REPO_ROOT}/target/install-test-tmp"
+mkdir -p "${TEST_TMPDIR}"
+TMPDIR="${TEST_TMPDIR}"
+export TMPDIR
 TEST_COUNT=0
+
+mktemp() {
+    case "$#" in
+        0)
+            command mktemp "${TMPDIR}/tmp.XXXXXX"
+            ;;
+        1)
+            if [ "$1" = "-d" ]; then
+                command mktemp -d "${TMPDIR}/tmp.XXXXXX"
+            else
+                command mktemp "$@"
+            fi
+            ;;
+        *)
+            command mktemp "$@"
+            ;;
+    esac
+}
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -35,6 +59,40 @@ assert_contains() {
     if ! grep -F "${needle}" "${haystack_file}" >/dev/null 2>&1; then
         fail "${context}: did not find '${needle}' in ${haystack_file}"
     fi
+}
+
+assert_not_contains() {
+    needle=$1
+    haystack_file=$2
+    context=$3
+    if grep -F "${needle}" "${haystack_file}" >/dev/null 2>&1; then
+        fail "${context}: found '${needle}' in ${haystack_file}"
+    fi
+}
+
+assert_not_exists() {
+    path=$1
+    context=$2
+    if [ -e "${path}" ] || [ -L "${path}" ]; then
+        fail "${context}: ${path} should not exist"
+    fi
+}
+
+assert_exists() {
+    path=$1
+    context=$2
+    if [ ! -e "${path}" ]; then
+        fail "${context}: ${path} should exist"
+    fi
+}
+
+file_mode() {
+    path=$1
+    if stat -f %Lp "${path}" >/dev/null 2>&1; then
+        stat -f %Lp "${path}"
+        return 0
+    fi
+    stat -c %a "${path}"
 }
 
 make_stub_cmd() {
@@ -424,6 +482,1109 @@ test_install_driver_launcher_prepends_venv_bin_to_path() {
     pass
 }
 
+test_uninstall_cleans_agentenv_docker_resources_and_optional_models() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/models" "${tmp_root}/bin"
+    printf '#!/bin/sh\nexit 0\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'model cache\n' > "${AGENTENV_HOME}/models/model.bin"
+    cat > "${tmp_root}/bin/docker" <<'STUB'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DOCKER_CALLS"
+if [ "$1" = "volume" ] && [ "$2" = "ls" ]; then
+    printf 'agentenv_demo\nother_volume\n'
+    exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "ls" ]; then
+    printf 'agentenv_demo:latest\nother:latest\n'
+    exit 0
+fi
+exit 0
+STUB
+    chmod +x "${tmp_root}/bin/docker"
+    docker_calls="${tmp_root}/docker.log"
+
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}" AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        DOCKER_CALLS="${docker_calls}" sh "${REPO_ROOT}/uninstall.sh" --dry-run --delete-models > "${tmp_root}/dry-run.out"
+    assert_contains "agentenv_demo" "${tmp_root}/dry-run.out" "dry-run should enumerate agentenv docker resources"
+
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}" AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        DOCKER_CALLS="${docker_calls}" sh "${REPO_ROOT}/uninstall.sh" --yes --delete-models > "${tmp_root}/uninstall.out"
+    PATH=${ORIGINAL_PATH}
+
+    assert_contains "volume rm agentenv_demo" "${docker_calls}" "uninstall should remove agentenv docker volume"
+    assert_contains "image rm agentenv_demo:latest" "${docker_calls}" "uninstall should remove agentenv docker image"
+    assert_not_contains "other_volume" "${docker_calls}" "uninstall should not remove unrelated volume"
+    assert_not_exists "${AGENTENV_HOME}/models" "--delete-models should remove agentenv model cache"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/envs/bad" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AGENTENV_STUB_CALLS"
+if [ "$1" = "destroy" ] && [ "$2" = "bad" ]; then
+    printf 'destroy failed for bad\n' >&2
+    exit 7
+fi
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+    printf '{"name":"bad"}\n' > "${AGENTENV_HOME}/envs/bad/state.json"
+    calls_file="${tmp_root}/calls.log"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_STUB_CALLS="${calls_file}" AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "partial destroy failure should make uninstall exit non-zero"
+    assert_contains "destroy demo --yes" "${calls_file}" "uninstall should destroy demo through CLI"
+    assert_contains "destroy bad --yes" "${calls_file}" "uninstall should continue to bad env"
+    assert_contains "destroy failed for bad" "${diagnostics_dir}/errors.log" "diagnostics should contain destroy failure"
+    assert_contains "Uninstall plan" "${diagnostics_dir}/plan.txt" "diagnostics should include plan"
+    assert_contains "Diagnostics:" "${tmp_root}/uninstall.err" "stderr should print diagnostic path"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_resets_keyring_indexed_credentials() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    resets_file="${tmp_root}/credential-resets.log"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+if [ "$1" = "credentials" ] && [ "$2" = "list" ]; then
+    printf 'OPENAI_API_KEY\nANTHROPIC_API_KEY\n'
+    exit 0
+fi
+if [ "$1" = "credentials" ] && [ "$2" = "reset" ]; then
+    printf '%s\n' "$3" >> "$AGENTENV_RESET_LOG"
+    exit 0
+fi
+printf 'unexpected agentenv invocation: %s\n' "$*" >&2
+exit 1
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"locations":{"OPENAI_API_KEY":"keyring","ANTHROPIC_API_KEY":"keyring"}}\n' > "${AGENTENV_HOME}/credentials-index.json"
+    printf '{"values":{"FILE_TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    : > "${resets_file}"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_RESET_LOG="${resets_file}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_contains "OPENAI_API_KEY" "${resets_file}" "uninstall should reset keyring-indexed OpenAI credential"
+    assert_contains "ANTHROPIC_API_KEY" "${resets_file}" "uninstall should reset keyring-indexed Anthropic credential"
+    assert_not_exists "${AGENTENV_HOME}/credentials-index.json" "uninstall should remove credential index"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "uninstall should remove file credentials"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_preserves_keyring_index_when_credential_reset_fails() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    resets_file="${tmp_root}/credential-resets.log"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+if [ "$1" = "credentials" ] && [ "$2" = "list" ]; then
+    printf 'OPENAI_API_KEY\nANTHROPIC_API_KEY\n'
+    exit 0
+fi
+if [ "$1" = "credentials" ] && [ "$2" = "reset" ]; then
+    printf '%s\n' "$3" >> "$AGENTENV_RESET_LOG"
+    if [ "$3" = "ANTHROPIC_API_KEY" ]; then
+        printf 'reset failed\n' >&2
+        exit 7
+    fi
+    exit 0
+fi
+printf 'unexpected agentenv invocation: %s\n' "$*" >&2
+exit 1
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"locations":{"OPENAI_API_KEY":"keyring","ANTHROPIC_API_KEY":"keyring"}}\n' > "${AGENTENV_HOME}/credentials-index.json"
+    printf '{"values":{"FILE_TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    : > "${resets_file}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_RESET_LOG="${resets_file}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "credential reset failure should make uninstall exit non-zero"
+    assert_contains "OPENAI_API_KEY" "${resets_file}" "uninstall should still reset earlier credentials"
+    assert_contains "ANTHROPIC_API_KEY" "${resets_file}" "uninstall should attempt the failing credential reset"
+    assert_exists "${AGENTENV_HOME}/credentials-index.json" "failed credential reset should preserve credential index"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "failed keyring reset should not preserve file credentials"
+    assert_contains "failed to reset credential ANTHROPIC_API_KEY" "${tmp_root}/uninstall.err" "stderr should report the credential reset failure"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_env_registry_before_destroy() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    project_envs="${tmp_root}/project-envs"
+    calls_file="${tmp_root}/destroy-calls.log"
+    mkdir -p "${INSTALL_DIR}" "${project_envs}/demo"
+    ln -s "${project_envs}" "${AGENTENV_HOME}/envs"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AGENTENV_DESTROY_CALLS"
+if [ "$1" = "destroy" ]; then
+    rm -rf "$AGENTENV_HOME/envs/$2"
+fi
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo","preserve":true}\n' > "${project_envs}/demo/state.json"
+    : > "${calls_file}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_DESTROY_CALLS="${calls_file}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink env registry should make uninstall report partial failure"
+    assert_not_contains "destroy demo --yes" "${calls_file}" "uninstall should not destroy through a symlinked env registry"
+    assert_exists "${project_envs}/demo/state.json" "symlink env registry should not delete target project env data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_diagnostics_override_under_removed_envs() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${AGENTENV_HOME}/envs/diagnostics"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe diagnostics override should make uninstall exit non-zero"
+    assert_exists "${diagnostics_dir}" "unsafe diagnostics override directory should remain"
+    assert_contains "errors.log" "${tmp_root}/uninstall.err" "stderr should reference diagnostics errors"
+    assert_not_exists "${diagnostics_dir}/errors.log" "unsafe diagnostics override should not be mutated"
+    assert_exists "${AGENTENV_HOME}/envs/demo/state.json" "uninstall should not remove env data after unsafe diagnostics override"
+    assert_exists "${INSTALL_DIR}/agentenv" "uninstall should not remove binary after unsafe diagnostics override"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_approval_config_by_default() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}"
+    printf '#!/bin/sh\nexit 0\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    cat > "${AGENTENV_HOME}/config.yaml" <<'YAML'
+approvals:
+  webhooks:
+    - url: https://approvals.example.test/agentenv
+      secret: webhook-secret
+YAML
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_not_exists "${AGENTENV_HOME}/config.yaml" "uninstall should remove approval config by default"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_relative_diagnostics_override_under_removed_envs() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+
+    set +e
+    (
+        cd "${AGENTENV_HOME}/envs"
+        AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+            AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="diagnostics" \
+            sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    )
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "relative diagnostics override should make uninstall exit non-zero"
+    assert_exists "${AGENTENV_HOME}/envs/demo/state.json" "uninstall should not remove env data after relative diagnostics override"
+    assert_exists "${INSTALL_DIR}/agentenv" "uninstall should not remove binary after relative diagnostics override"
+    assert_not_exists "${AGENTENV_HOME}/envs/diagnostics" "relative diagnostics override should not be created"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_diagnostics_override_into_removed_envs() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_target="${AGENTENV_HOME}/envs/diagnostics"
+    diagnostics_link="${tmp_root}/diagnostics-link"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_target}"
+    ln -s "${diagnostics_target}" "${diagnostics_link}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_link}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink diagnostics override should make uninstall exit non-zero"
+    assert_exists "${AGENTENV_HOME}/envs/demo/state.json" "uninstall should not remove env data after symlink diagnostics override"
+    assert_exists "${INSTALL_DIR}/agentenv" "uninstall should not remove binary after symlink diagnostics override"
+    assert_exists "${diagnostics_target}" "symlink diagnostics target should remain"
+    assert_not_exists "${diagnostics_target}/errors.log" "symlink diagnostics target should not be mutated"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_safe_absolute_diagnostics_override_survives_success() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+
+    assert_exists "${diagnostics_dir}/plan.txt" "safe diagnostics override should keep plan after success"
+    assert_exists "${diagnostics_dir}/actions.log" "safe diagnostics override should keep actions after success"
+    assert_exists "${diagnostics_dir}/errors.log" "safe diagnostics override should keep errors log after success"
+    assert_contains "Uninstall plan" "${diagnostics_dir}/plan.txt" "safe diagnostics plan should be written"
+    assert_contains "removed ${INSTALL_DIR}/agentenv" "${diagnostics_dir}/actions.log" "safe diagnostics actions should be written"
+    assert_not_exists "${AGENTENV_HOME}/envs/demo/state.json" "clean uninstall should remove env data"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "clean uninstall should remove binary"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_diagnostics_actions_log_symlink_target() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    state_file="${AGENTENV_HOME}/envs/demo/state.json"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo","preserve":true}\n' > "${state_file}"
+    ln -s "${state_file}" "${diagnostics_dir}/actions.log"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "actions.log symlink should make dry-run exit non-zero"
+    assert_contains '"preserve":true' "${state_file}" "actions.log symlink target should not be truncated"
+    assert_exists "${INSTALL_DIR}/agentenv" "dry-run should not remove binary after unsafe diagnostics file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_diagnostics_plan_symlink_target() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    state_file="${AGENTENV_HOME}/envs/demo/state.json"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo","preserve":true}\n' > "${state_file}"
+    ln -s "${state_file}" "${diagnostics_dir}/plan.txt"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "plan.txt symlink should make dry-run exit non-zero"
+    assert_contains '"preserve":true' "${state_file}" "plan.txt symlink target should not be truncated"
+    assert_exists "${INSTALL_DIR}/agentenv" "dry-run should not remove binary after unsafe diagnostics file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_owned_files_and_shell_block() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'global events\n' > "${AGENTENV_HOME}/events.db"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    printf 'before\n# agentenv installer\nexport PATH="%s:$PATH"\nafter\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${project_dir}"
+    printf 'user work\n' > "${project_dir}/README.md"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_not_exists "${INSTALL_DIR}/agentenv" "uninstall should remove binary"
+    assert_not_exists "${AGENTENV_HOME}/drivers" "uninstall should remove drivers by default"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "uninstall should remove credentials json by default"
+    assert_not_contains "# agentenv installer" "${HOME}/.zshrc" "uninstall should remove installer sentinel"
+    assert_contains "before" "${HOME}/.zshrc" "uninstall should keep preexisting rc content"
+    assert_contains "after" "${HOME}/.zshrc" "uninstall should keep trailing rc content"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "1" "${backup_count}" "uninstall should back up changed rc file"
+    assert_exists "${project_dir}/README.md" "uninstall should not touch project directories"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_keep_flags_preserve_selected_state() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes --keep-data --keep-drivers --keep-credentials > "${tmp_root}/uninstall.out"
+
+    assert_not_exists "${INSTALL_DIR}/agentenv" "keep flags should not preserve agentenv binary"
+    assert_exists "${AGENTENV_HOME}/envs/demo" "--keep-data should preserve env registry"
+    assert_exists "${AGENTENV_HOME}/drivers/context-nexus" "--keep-drivers should preserve drivers"
+    assert_exists "${AGENTENV_HOME}/credentials.json" "--keep-credentials should preserve credentials json"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_binary_from_custom_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${HOME}/.local/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'global events\n' > "${AGENTENV_HOME}/events.db"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+
+    assert_not_contains "unsafe path" "${tmp_root}/uninstall.out" "custom install dir should not be rejected"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "custom install dir binary should be removed"
+    assert_exists "${INSTALL_DIR}" "custom install dir should not be removed when empty"
+    assert_not_exists "${AGENTENV_HOME}/envs" "custom install dir should still remove env registry by default"
+    assert_not_exists "${AGENTENV_HOME}/drivers" "custom install dir should still remove drivers by default"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "custom install dir should still remove credentials by default"
+    assert_not_exists "${AGENTENV_HOME}/events.db" "custom install dir should still remove events db"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_symlinked_agentenv_binary_only() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    target_file="${tmp_root}/target-agentenv"
+    mkdir -p "${INSTALL_DIR}"
+    printf 'target\n' > "${target_file}"
+    ln -s "${target_file}" "${INSTALL_DIR}/agentenv"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+
+    assert_not_contains "unsafe path" "${tmp_root}/uninstall.out" "symlinked agentenv binary should not be rejected"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "uninstall should remove symlinked agentenv binary"
+    assert_exists "${target_file}" "uninstall should not remove symlink target"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_second_run_is_noop() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/first.out"
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/second.out"
+
+    assert_contains "already absent" "${tmp_root}/second.out" "second uninstall should report absent files"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "second uninstall should leave binary absent"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_preserves_unconfirmed_shell_sentinel_lines() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'before\n# agentenv installer\nafter\n' > "${HOME}/.zshrc"
+    printf '# agentenv installer\nexport PATH="/other/bin:$PATH"\n' > "${HOME}/.bashrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "standalone sentinel should be preserved"
+    assert_contains "after" "${HOME}/.zshrc" "line after standalone sentinel should be preserved"
+    assert_contains "# agentenv installer" "${HOME}/.bashrc" "sentinel before unrelated export should be preserved"
+    assert_contains 'export PATH="/other/bin:$PATH"' "${HOME}/.bashrc" "unrelated PATH export should be preserved"
+
+    zsh_backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    bash_backup_count=$(find "${HOME}" -name '.bashrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${zsh_backup_count}" "unchanged standalone sentinel rc should not be backed up"
+    assert_eq "0" "${bash_backup_count}" "unchanged unrelated export rc should not be backed up"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_only_confirmed_shell_path_block() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'before\n# agentenv installer\nexport PATH="%s:$PATH"\nafter\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_not_contains "# agentenv installer" "${HOME}/.zshrc" "confirmed installer sentinel should be removed"
+    assert_not_contains "${INSTALL_DIR}" "${HOME}/.zshrc" "confirmed installer PATH export should be removed"
+    assert_contains "before" "${HOME}/.zshrc" "confirmed block cleanup should keep preexisting rc content"
+    assert_contains "after" "${HOME}/.zshrc" "confirmed block cleanup should keep trailing rc content"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "1" "${backup_count}" "confirmed block cleanup should back up changed rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_preserves_rc_file_mode() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'before\n# agentenv installer\nexport PATH="%s:$PATH"\nafter\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+    chmod 600 "${HOME}/.zshrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh -c 'umask 022; sh "$1" --yes' sh "${REPO_ROOT}/uninstall.sh" > "${tmp_root}/uninstall.out"
+
+    assert_eq "600" "$(file_mode "${HOME}/.zshrc")" "uninstall should preserve rc file mode"
+    assert_not_contains "# agentenv installer" "${HOME}/.zshrc" "mode-preserving cleanup should remove installer sentinel"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_home_as_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${HOME}/envs/demo" "${HOME}/drivers/context-nexus" "${HOME}/work"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'user work\n' > "${HOME}/work/README.md"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_HOME should report unsafe path"
+    assert_exists "${HOME}" "unsafe AGENTENV_HOME should not delete HOME"
+    assert_exists "${HOME}/work/README.md" "unsafe AGENTENV_HOME should not delete unrelated home files"
+    assert_exists "${HOME}/envs/demo" "unsafe AGENTENV_HOME should not delete home envs directory"
+    assert_exists "${INSTALL_DIR}/agentenv" "unsafe AGENTENV_HOME should not delete derived binary"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_agentenv_bin_outside_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    unsafe_bin="${tmp_root}/outside/agentenv"
+    mkdir -p "${INSTALL_DIR}" "$(dirname "${unsafe_bin}")"
+    printf '#!/bin/sh\n' > "${unsafe_bin}"
+    chmod +x "${unsafe_bin}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" AGENTENV_BIN="${unsafe_bin}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_BIN should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_BIN should report unsafe path"
+    assert_exists "${unsafe_bin}" "unsafe AGENTENV_BIN should not be deleted"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_agentenv_bin_under_home_outside_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    unsafe_bin="${AGENTENV_HOME}/not-bin/agentenv"
+    mkdir -p "${INSTALL_DIR}" "$(dirname "${unsafe_bin}")"
+    printf '#!/bin/sh\n' > "${unsafe_bin}"
+    chmod +x "${unsafe_bin}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" AGENTENV_BIN="${unsafe_bin}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "AGENTENV_BIN outside install dir should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "AGENTENV_BIN outside install dir should report unsafe path"
+    assert_exists "${unsafe_bin}" "AGENTENV_BIN outside install dir should not be deleted"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_parent_directory_components() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv/.."
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${HOME}/envs" "${HOME}/.agentenv" "${HOME}/bin"
+    printf 'keep\n' > "${HOME}/envs/keep.txt"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "parent directory component in AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "parent directory component should report unsafe path"
+    assert_exists "${HOME}/envs/keep.txt" "parent directory component should not delete files outside agentenv home"
+    assert_exists "${HOME}/bin" "parent directory component should not remove unrelated empty bin directory"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_root_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    mkdir -p "${AGENTENV_HOME}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="/" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "root install dir should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "root install dir should report unsafe path"
+    assert_contains "AGENTENV_INSTALL_DIR" "${tmp_root}/uninstall.out" "root install dir should be rejected as configured root"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_home_as_agentenv_home_before_shell_cleanup() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_HOME should fail before shell cleanup"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_HOME should report unsafe path"
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "unsafe AGENTENV_HOME should preserve shell sentinel"
+    assert_contains "export PATH=\"${INSTALL_DIR}:\$PATH\"" "${HOME}/.zshrc" "unsafe AGENTENV_HOME should preserve shell PATH export"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${backup_count}" "unsafe AGENTENV_HOME should not back up rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_root_install_dir_before_shell_cleanup() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="/"
+    mkdir -p "${HOME}" "${AGENTENV_HOME}"
+    printf '# agentenv installer\nexport PATH="/:$PATH"\n' > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_INSTALL_DIR should fail before shell cleanup"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_INSTALL_DIR should report unsafe path"
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "unsafe AGENTENV_INSTALL_DIR should preserve shell sentinel"
+    assert_contains 'export PATH="/:$PATH"' "${HOME}/.zshrc" "unsafe AGENTENV_INSTALL_DIR should preserve shell PATH export"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${backup_count}" "unsafe AGENTENV_INSTALL_DIR should not back up rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_agentenv_bin_relationship_before_shell_cleanup() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    unsafe_bin="${AGENTENV_HOME}/not-bin/agentenv"
+    mkdir -p "${INSTALL_DIR}" "$(dirname "${unsafe_bin}")"
+    printf '#!/bin/sh\n' > "${unsafe_bin}"
+    chmod +x "${unsafe_bin}"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" AGENTENV_BIN="${unsafe_bin}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_BIN relationship should fail before shell cleanup"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_BIN relationship should report unsafe path"
+    assert_exists "${unsafe_bin}" "unsafe AGENTENV_BIN relationship should not delete binary"
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "unsafe AGENTENV_BIN relationship should preserve shell sentinel"
+    assert_contains "export PATH=\"${INSTALL_DIR}:\$PATH\"" "${HOME}/.zshrc" "unsafe AGENTENV_BIN relationship should preserve shell PATH export"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${backup_count}" "unsafe AGENTENV_BIN relationship should not back up rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_relative_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    work_dir="${tmp_root}/work"
+    mkdir -p "${work_dir}/agentenv-rel/envs"
+    printf 'keep\n' > "${work_dir}/agentenv-rel/envs/keep.txt"
+
+    set +e
+    (cd "${work_dir}" && AGENTENV_HOME="agentenv-rel" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1)
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "relative AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "relative AGENTENV_HOME should report unsafe path"
+    assert_exists "${work_dir}/agentenv-rel/envs/keep.txt" "relative AGENTENV_HOME should not delete cwd files"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_relative_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    work_dir="${tmp_root}/work"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    mkdir -p "${work_dir}/relative-bin" "${AGENTENV_HOME}"
+    printf '#!/bin/sh\n' > "${work_dir}/relative-bin/agentenv"
+    chmod +x "${work_dir}/relative-bin/agentenv"
+
+    set +e
+    (cd "${work_dir}" && AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="relative-bin" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1)
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "relative AGENTENV_INSTALL_DIR should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "relative AGENTENV_INSTALL_DIR should report unsafe path"
+    assert_exists "${work_dir}/relative-bin/agentenv" "relative AGENTENV_INSTALL_DIR should not delete cwd files"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${HOME}" "${project_dir}/envs"
+    printf 'keep\n' > "${project_dir}/envs/keep.txt"
+    ln -s "${project_dir}" "${HOME}/.agentenv"
+
+    set +e
+    HOME="${HOME}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "symlink AGENTENV_HOME should report unsafe path"
+    assert_exists "${project_dir}/envs/keep.txt" "symlink AGENTENV_HOME should not delete project data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_ancestor_in_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${HOME}" "${project_dir}/.agentenv/envs"
+    printf 'keep\n' > "${project_dir}/.agentenv/envs/keep.txt"
+    ln -s "${project_dir}" "${HOME}/link"
+
+    set +e
+    AGENTENV_HOME="${HOME}/link/.agentenv" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink ancestor in AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "symlink ancestor in AGENTENV_HOME should report unsafe path"
+    assert_exists "${project_dir}/.agentenv/envs/keep.txt" "symlink ancestor in AGENTENV_HOME should not delete project data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_home_prefix() {
+    tmp_root=$(mktemp -d)
+
+    real_home="${tmp_root}/real-home"
+    link_home="${tmp_root}/home-link"
+    mkdir -p "${real_home}/.agentenv/envs"
+    printf 'keep\n' > "${real_home}/.agentenv/envs/keep.txt"
+    ln -s "${real_home}" "${link_home}"
+
+    set +e
+    HOME="${link_home}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink HOME prefix should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "symlink HOME prefix should report unsafe path"
+    assert_exists "${real_home}/.agentenv/envs/keep.txt" "symlink HOME prefix should not delete real home data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_dry_run_rejects_symlink_home_ancestor_before_plan() {
+    tmp_root=$(mktemp -d)
+
+    real_parent="${tmp_root}/real-parent"
+    link_parent="${tmp_root}/link-parent"
+    HOME="${link_parent}/home"
+    mkdir -p "${real_parent}/home/.agentenv/envs"
+    printf 'keep\n' > "${real_parent}/home/.agentenv/envs/keep.txt"
+    ln -s "${real_parent}" "${link_parent}"
+
+    set +e
+    HOME="${HOME}" sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink HOME ancestor should make dry-run fail"
+    assert_contains "unsafe path" "${tmp_root}/dry-run.out" "symlink HOME ancestor should report unsafe path"
+    assert_not_contains "Uninstall plan" "${tmp_root}/dry-run.out" "symlink HOME ancestor should not print dry-run plan"
+    assert_exists "${real_parent}/home/.agentenv/envs/keep.txt" "symlink HOME ancestor should not delete real data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_dot_path_components() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/."
+    mkdir -p "${HOME}/envs"
+    printf 'keep\n' > "${HOME}/envs/keep.txt"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "dot component in AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "dot component in AGENTENV_HOME should report unsafe path"
+    assert_exists "${HOME}/envs/keep.txt" "dot component in AGENTENV_HOME should not delete home envs"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf 'before\n# agentenv installer\nafter\n' > "${HOME}/.zshrc"
+    printf '# agentenv installer\nexport PATH="/other/bin:$PATH"\n' > "${HOME}/.bashrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out"
+
+    assert_not_contains "remove installer PATH block" "${tmp_root}/dry-run.out" "dry-run should not plan unconfirmed shell cleanup"
+    assert_contains "no installer PATH blocks found" "${tmp_root}/dry-run.out" "dry-run should report no confirmed shell blocks"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_dry_run_rejects_unsafe_roots_before_plan() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "dry-run with unsafe AGENTENV_HOME should fail"
+    assert_contains "unsafe path" "${tmp_root}/dry-run.out" "dry-run with unsafe AGENTENV_HOME should report unsafe path"
+    assert_not_contains "Uninstall plan" "${tmp_root}/dry-run.out" "dry-run with unsafe AGENTENV_HOME should not print plan"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_dry_run_plans_broken_symlink_removal() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    ln -s "${AGENTENV_HOME}/missing-target" "${AGENTENV_HOME}/drivers"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out"
+
+    assert_contains "remove ${AGENTENV_HOME}/drivers" "${tmp_root}/dry-run.out" "dry-run should plan broken symlink removal"
+    assert_not_contains "already absent ${AGENTENV_HOME}/drivers" "${tmp_root}/dry-run.out" "dry-run should not treat broken symlink as absent"
+    if [ ! -L "${AGENTENV_HOME}/drivers" ]; then
+        fail "dry-run should not remove broken symlink"
+    fi
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+    assert_not_exists "${AGENTENV_HOME}/drivers" "real uninstall should remove broken symlink"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_dry_run_prints_plan_without_removing() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${project_dir}"
+    printf 'user work\n' > "${project_dir}/README.md"
+
+    output_file="${tmp_root}/dry-run.out"
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${output_file}"
+
+    assert_contains "Uninstall plan" "${output_file}" "dry-run should print a plan"
+    assert_contains "${INSTALL_DIR}/agentenv" "${output_file}" "plan should include binary"
+    assert_contains "${AGENTENV_HOME}/drivers" "${output_file}" "plan should include drivers"
+    assert_exists "${INSTALL_DIR}/agentenv" "dry-run should not remove binary"
+    assert_exists "${AGENTENV_HOME}/credentials.json" "dry-run should not remove credentials"
+    assert_exists "${project_dir}/README.md" "dry-run should not touch project directories"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_choose_rc_targets_creates_profile_when_missing() {
     tmp_root=$(mktemp -d)
 
@@ -444,6 +1605,45 @@ main() {
     test_detect_target_macos
     test_verify_sha256_value
     test_archive_name_candidates_cover_legacy_and_dist_formats
+    test_uninstall_cleans_agentenv_docker_resources_and_optional_models
+    test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure
+    test_uninstall_resets_keyring_indexed_credentials
+    test_uninstall_preserves_keyring_index_when_credential_reset_fails
+    test_uninstall_rejects_symlink_env_registry_before_destroy
+    test_uninstall_rejects_diagnostics_override_under_removed_envs
+    test_uninstall_removes_approval_config_by_default
+    test_uninstall_rejects_relative_diagnostics_override_under_removed_envs
+    test_uninstall_rejects_symlink_diagnostics_override_into_removed_envs
+    test_uninstall_safe_absolute_diagnostics_override_survives_success
+    test_uninstall_rejects_diagnostics_actions_log_symlink_target
+    test_uninstall_rejects_diagnostics_plan_symlink_target
+    test_uninstall_removes_owned_files_and_shell_block
+    test_uninstall_keep_flags_preserve_selected_state
+    test_uninstall_removes_binary_from_custom_install_dir
+    test_uninstall_removes_symlinked_agentenv_binary_only
+    test_uninstall_second_run_is_noop
+    test_uninstall_preserves_unconfirmed_shell_sentinel_lines
+    test_uninstall_removes_only_confirmed_shell_path_block
+    test_uninstall_preserves_rc_file_mode
+    test_uninstall_rejects_home_as_agentenv_home
+    test_uninstall_rejects_agentenv_bin_outside_install_dir
+    test_uninstall_rejects_agentenv_bin_under_home_outside_install_dir
+    test_uninstall_rejects_parent_directory_components
+    test_uninstall_rejects_root_install_dir
+    test_uninstall_rejects_home_as_agentenv_home_before_shell_cleanup
+    test_uninstall_rejects_root_install_dir_before_shell_cleanup
+    test_uninstall_rejects_agentenv_bin_relationship_before_shell_cleanup
+    test_uninstall_rejects_relative_agentenv_home
+    test_uninstall_rejects_relative_install_dir
+    test_uninstall_rejects_symlink_agentenv_home
+    test_uninstall_rejects_symlink_ancestor_in_agentenv_home
+    test_uninstall_rejects_symlink_home_prefix
+    test_uninstall_dry_run_rejects_symlink_home_ancestor_before_plan
+    test_uninstall_rejects_dot_path_components
+    test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
+    test_uninstall_dry_run_rejects_unsafe_roots_before_plan
+    test_uninstall_dry_run_plans_broken_symlink_removal
+    test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
     test_install_python_drivers_preserves_existing_driver_on_extract_failure
