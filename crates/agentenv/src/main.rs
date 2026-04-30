@@ -2500,6 +2500,7 @@ mod tests {
                 "sessions".to_string(),
                 "list".to_string(),
                 "destroy".to_string(),
+                "uninstall".to_string(),
                 "describe".to_string(),
                 "status".to_string(),
                 "logs".to_string(),
