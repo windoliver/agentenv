@@ -636,6 +636,29 @@ test_uninstall_rejects_agentenv_bin_outside_install_dir() {
     pass
 }
 
+test_uninstall_rejects_parent_directory_components() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv/.."
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${HOME}/envs" "${HOME}/.agentenv"
+    printf 'keep\n' > "${HOME}/envs/keep.txt"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "parent directory component in AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "parent directory component should report unsafe path"
+    assert_exists "${HOME}/envs/keep.txt" "parent directory component should not delete files outside agentenv home"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_prints_plan_without_removing() {
     tmp_root=$(mktemp -d)
 
@@ -693,6 +716,7 @@ main() {
     test_uninstall_removes_only_confirmed_shell_path_block
     test_uninstall_rejects_home_as_agentenv_home
     test_uninstall_rejects_agentenv_bin_outside_install_dir
+    test_uninstall_rejects_parent_directory_components
     test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path

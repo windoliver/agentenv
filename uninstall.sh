@@ -274,10 +274,18 @@ path_is_under_dir() {
 }
 
 path_is_agentenv_bin() {
-    path=$1
-    [ "${path}" = "${AGENTENV_BIN}" ] || return 1
-    [ "${path}" = "${INSTALL_DIR}/${APP_NAME}" ] || return 1
-    path_is_under_dir "${path}" "${INSTALL_DIR}"
+    agentenv_bin_path=$1
+    [ "${agentenv_bin_path}" = "${AGENTENV_BIN}" ] || return 1
+    [ "${agentenv_bin_path}" = "${INSTALL_DIR}/${APP_NAME}" ] || return 1
+    path_is_under_dir "${agentenv_bin_path}" "${INSTALL_DIR}"
+}
+
+path_has_parent_component() {
+    component_path=$1
+    case "${component_path}" in
+        ".."|../*|*/..|*/../*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 validate_remove_path() {
@@ -288,6 +296,18 @@ validate_remove_path() {
             return 1
             ;;
     esac
+    if path_has_parent_component "${AGENTENV_HOME}"; then
+        record_error "unsafe path ${path}: AGENTENV_HOME contains parent directory component (${AGENTENV_HOME})"
+        return 1
+    fi
+    if path_has_parent_component "${INSTALL_DIR}"; then
+        record_error "unsafe path ${path}: AGENTENV_INSTALL_DIR contains parent directory component (${INSTALL_DIR})"
+        return 1
+    fi
+    if path_has_parent_component "${AGENTENV_BIN}"; then
+        record_error "unsafe path ${path}: AGENTENV_BIN contains parent directory component (${AGENTENV_BIN})"
+        return 1
+    fi
     if [ "${AGENTENV_HOME}" = "${HOME}" ]; then
         record_error "unsafe path ${path}: AGENTENV_HOME must not be HOME"
         return 1
@@ -299,6 +319,10 @@ validate_remove_path() {
             return 1
             ;;
     esac
+    if path_has_parent_component "${path}"; then
+        record_error "unsafe path ${path}: contains parent directory component"
+        return 1
+    fi
     if [ "${path}" = "${HOME}" ]; then
         record_error "unsafe path ${path}: refusing to remove HOME"
         return 1
