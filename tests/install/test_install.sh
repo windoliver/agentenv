@@ -606,6 +606,54 @@ STUB
     pass
 }
 
+test_uninstall_preserves_keyring_index_when_credential_reset_fails() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    resets_file="${tmp_root}/credential-resets.log"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+if [ "$1" = "credentials" ] && [ "$2" = "list" ]; then
+    printf 'OPENAI_API_KEY\nANTHROPIC_API_KEY\n'
+    exit 0
+fi
+if [ "$1" = "credentials" ] && [ "$2" = "reset" ]; then
+    printf '%s\n' "$3" >> "$AGENTENV_RESET_LOG"
+    if [ "$3" = "ANTHROPIC_API_KEY" ]; then
+        printf 'reset failed\n' >&2
+        exit 7
+    fi
+    exit 0
+fi
+printf 'unexpected agentenv invocation: %s\n' "$*" >&2
+exit 1
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"locations":{"OPENAI_API_KEY":"keyring","ANTHROPIC_API_KEY":"keyring"}}\n' > "${AGENTENV_HOME}/credentials-index.json"
+    printf '{"values":{"FILE_TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    : > "${resets_file}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_RESET_LOG="${resets_file}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "credential reset failure should make uninstall exit non-zero"
+    assert_contains "OPENAI_API_KEY" "${resets_file}" "uninstall should still reset earlier credentials"
+    assert_contains "ANTHROPIC_API_KEY" "${resets_file}" "uninstall should attempt the failing credential reset"
+    assert_exists "${AGENTENV_HOME}/credentials-index.json" "failed credential reset should preserve credential index"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "failed keyring reset should not preserve file credentials"
+    assert_contains "failed to reset credential ANTHROPIC_API_KEY" "${tmp_root}/uninstall.err" "stderr should report the credential reset failure"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_rejects_symlink_env_registry_before_destroy() {
     tmp_root=$(mktemp -d)
 
@@ -1560,6 +1608,7 @@ main() {
     test_uninstall_cleans_agentenv_docker_resources_and_optional_models
     test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure
     test_uninstall_resets_keyring_indexed_credentials
+    test_uninstall_preserves_keyring_index_when_credential_reset_fails
     test_uninstall_rejects_symlink_env_registry_before_destroy
     test_uninstall_rejects_diagnostics_override_under_removed_envs
     test_uninstall_removes_approval_config_by_default

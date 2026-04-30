@@ -27,6 +27,7 @@ PLAN_FILE=""
 ACTIONS_LOG=""
 ERRORS_LOG=""
 FAILURE_COUNT=0
+PRESERVE_CREDENTIAL_INDEX=0
 
 usage() {
     cat <<EOF
@@ -690,6 +691,7 @@ reset_stored_credentials() {
 
     if [ ! -x "${AGENTENV_BIN}" ]; then
         if [ -e "${AGENTENV_HOME}/credentials-index.json" ]; then
+            PRESERVE_CREDENTIAL_INDEX=1
             record_error "agentenv binary unavailable; cannot reset keyring credentials: ${AGENTENV_BIN}"
         else
             log_action "agentenv binary unavailable; credential file will be removed without CLI reset"
@@ -704,10 +706,16 @@ reset_stored_credentials() {
             if "${AGENTENV_BIN}" credentials reset "${credential_name}" >> "${ACTIONS_LOG}" 2>> "${ERRORS_LOG}"; then
                 log_action "reset credential ${credential_name}"
             else
+                if [ -e "${AGENTENV_HOME}/credentials-index.json" ]; then
+                    PRESERVE_CREDENTIAL_INDEX=1
+                fi
                 record_error "failed to reset credential ${credential_name}"
             fi
         done < "${credentials_file}"
     else
+        if [ -e "${AGENTENV_HOME}/credentials-index.json" ]; then
+            PRESERVE_CREDENTIAL_INDEX=1
+        fi
         record_error "failed to list credentials for reset"
     fi
     rm -f "${credentials_file}"
@@ -767,7 +775,11 @@ remove_selected_paths() {
     fi
     if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
         remove_path_if_present "${AGENTENV_HOME}/credentials.json" || true
-        remove_path_if_present "${AGENTENV_HOME}/credentials-index.json" || true
+        if [ "${PRESERVE_CREDENTIAL_INDEX}" -eq 1 ] && [ -e "${AGENTENV_HOME}/credentials-index.json" ]; then
+            log_action "preserved ${AGENTENV_HOME}/credentials-index.json after credential reset failure"
+        else
+            remove_path_if_present "${AGENTENV_HOME}/credentials-index.json" || true
+        fi
     fi
     remove_path_if_present "${AGENTENV_HOME}/config.yaml" || true
     remove_path_if_present "${AGENTENV_HOME}/events.db" || true
