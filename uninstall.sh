@@ -313,38 +313,6 @@ path_has_symlink_component() {
     return 1
 }
 
-path_has_symlink_component_under_base() {
-    checked_path=$1
-    base_path=$2
-    if [ -L "${base_path}" ]; then
-        return 0
-    fi
-
-    case "${checked_path}" in
-        "${base_path}"/*)
-            ;;
-        *)
-            path_has_symlink_component "${checked_path}"
-            return $?
-            ;;
-    esac
-
-    relative_path=${checked_path#"${base_path}/"}
-    current_path=${base_path}
-    old_ifs=$IFS
-    IFS=/
-    for component in ${relative_path}; do
-        [ -n "${component}" ] || continue
-        current_path="${current_path}/${component}"
-        if [ -L "${current_path}" ]; then
-            IFS=${old_ifs}
-            return 0
-        fi
-    done
-    IFS=${old_ifs}
-    return 1
-}
-
 validate_configured_path() {
     label=$1
     configured_path=$2
@@ -378,7 +346,7 @@ validate_configured_path() {
         record_error "unsafe path ${configured_path}: ${label} must not be a symlink"
         return 1
     fi
-    if path_has_symlink_component_under_base "${configured_path}" "${HOME}"; then
+    if path_has_symlink_component "${configured_path}"; then
         record_error "unsafe path ${configured_path}: ${label} must not contain symlink components"
         return 1
     fi

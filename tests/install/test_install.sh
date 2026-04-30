@@ -10,7 +10,29 @@ AGENTENV_UNINSTALLER_SOURCE_ONLY=1 . "${REPO_ROOT}/uninstall.sh"
 unset AGENTENV_UNINSTALLER_SOURCE_ONLY
 
 ORIGINAL_PATH=${PATH}
+TEST_TMPDIR="${REPO_ROOT}/target/install-test-tmp"
+mkdir -p "${TEST_TMPDIR}"
+TMPDIR="${TEST_TMPDIR}"
+export TMPDIR
 TEST_COUNT=0
+
+mktemp() {
+    case "$#" in
+        0)
+            command mktemp "${TMPDIR}/tmp.XXXXXX"
+            ;;
+        1)
+            if [ "$1" = "-d" ]; then
+                command mktemp -d "${TMPDIR}/tmp.XXXXXX"
+            else
+                command mktemp "$@"
+            fi
+            ;;
+        *)
+            command mktemp "$@"
+            ;;
+    esac
+}
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -928,6 +950,30 @@ test_uninstall_rejects_symlink_home_prefix() {
     pass
 }
 
+test_uninstall_dry_run_rejects_symlink_home_ancestor_before_plan() {
+    tmp_root=$(mktemp -d)
+
+    real_parent="${tmp_root}/real-parent"
+    link_parent="${tmp_root}/link-parent"
+    HOME="${link_parent}/home"
+    mkdir -p "${real_parent}/home/.agentenv/envs"
+    printf 'keep\n' > "${real_parent}/home/.agentenv/envs/keep.txt"
+    ln -s "${real_parent}" "${link_parent}"
+
+    set +e
+    HOME="${HOME}" sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink HOME ancestor should make dry-run fail"
+    assert_contains "unsafe path" "${tmp_root}/dry-run.out" "symlink HOME ancestor should report unsafe path"
+    assert_not_contains "Uninstall plan" "${tmp_root}/dry-run.out" "symlink HOME ancestor should not print dry-run plan"
+    assert_exists "${real_parent}/home/.agentenv/envs/keep.txt" "symlink HOME ancestor should not delete real data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_rejects_dot_path_components() {
     tmp_root=$(mktemp -d)
 
@@ -1062,6 +1108,7 @@ main() {
     test_uninstall_rejects_symlink_agentenv_home
     test_uninstall_rejects_symlink_ancestor_in_agentenv_home
     test_uninstall_rejects_symlink_home_prefix
+    test_uninstall_dry_run_rejects_symlink_home_ancestor_before_plan
     test_uninstall_rejects_dot_path_components
     test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
     test_uninstall_dry_run_rejects_unsafe_roots_before_plan
