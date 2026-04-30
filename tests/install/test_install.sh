@@ -706,6 +706,94 @@ test_uninstall_rejects_root_install_dir() {
     pass
 }
 
+test_uninstall_rejects_relative_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    work_dir="${tmp_root}/work"
+    mkdir -p "${work_dir}/agentenv-rel/envs"
+    printf 'keep\n' > "${work_dir}/agentenv-rel/envs/keep.txt"
+
+    set +e
+    (cd "${work_dir}" && AGENTENV_HOME="agentenv-rel" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1)
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "relative AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "relative AGENTENV_HOME should report unsafe path"
+    assert_exists "${work_dir}/agentenv-rel/envs/keep.txt" "relative AGENTENV_HOME should not delete cwd files"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_relative_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    work_dir="${tmp_root}/work"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    mkdir -p "${work_dir}/relative-bin" "${AGENTENV_HOME}"
+    printf '#!/bin/sh\n' > "${work_dir}/relative-bin/agentenv"
+    chmod +x "${work_dir}/relative-bin/agentenv"
+
+    set +e
+    (cd "${work_dir}" && AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="relative-bin" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1)
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "relative AGENTENV_INSTALL_DIR should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "relative AGENTENV_INSTALL_DIR should report unsafe path"
+    assert_exists "${work_dir}/relative-bin/agentenv" "relative AGENTENV_INSTALL_DIR should not delete cwd files"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${HOME}" "${project_dir}/envs"
+    printf 'keep\n' > "${project_dir}/envs/keep.txt"
+    ln -s "${project_dir}" "${HOME}/.agentenv"
+
+    set +e
+    HOME="${HOME}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "symlink AGENTENV_HOME should report unsafe path"
+    assert_exists "${project_dir}/envs/keep.txt" "symlink AGENTENV_HOME should not delete project data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf 'before\n# agentenv installer\nafter\n' > "${HOME}/.zshrc"
+    printf '# agentenv installer\nexport PATH="/other/bin:$PATH"\n' > "${HOME}/.bashrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out"
+
+    assert_not_contains "remove installer PATH block" "${tmp_root}/dry-run.out" "dry-run should not plan unconfirmed shell cleanup"
+    assert_contains "no installer PATH blocks found" "${tmp_root}/dry-run.out" "dry-run should report no confirmed shell blocks"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_prints_plan_without_removing() {
     tmp_root=$(mktemp -d)
 
@@ -766,6 +854,10 @@ main() {
     test_uninstall_rejects_agentenv_bin_under_home_outside_install_dir
     test_uninstall_rejects_parent_directory_components
     test_uninstall_rejects_root_install_dir
+    test_uninstall_rejects_relative_agentenv_home
+    test_uninstall_rejects_relative_install_dir
+    test_uninstall_rejects_symlink_agentenv_home
+    test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
     test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path

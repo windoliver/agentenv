@@ -119,7 +119,7 @@ plan_preserve_path() {
 append_shell_plan() {
     found=0
     for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
-        if [ -f "${rc_file}" ] && grep -F "${INSTALLER_SENTINEL}" "${rc_file}" >/dev/null 2>&1; then
+        if [ -f "${rc_file}" ] && has_installer_block "${rc_file}"; then
             printf '  remove installer PATH block from %s (backup first)\n' "${rc_file}" >> "${PLAN_FILE}"
             found=1
         fi
@@ -297,12 +297,24 @@ validate_configured_path() {
             return 1
             ;;
     esac
+    case "${configured_path}" in
+        /*)
+            ;;
+        *)
+            record_error "unsafe path ${configured_path}: ${label} must be absolute"
+            return 1
+            ;;
+    esac
     if [ "${configured_path}" = "${HOME}" ]; then
         record_error "unsafe path ${configured_path}: ${label} must not be HOME"
         return 1
     fi
     if path_has_parent_component "${configured_path}"; then
         record_error "unsafe path ${configured_path}: ${label} contains parent directory component"
+        return 1
+    fi
+    if [ -L "${configured_path}" ]; then
+        record_error "unsafe path ${configured_path}: ${label} must not be a symlink"
         return 1
     fi
     return 0
