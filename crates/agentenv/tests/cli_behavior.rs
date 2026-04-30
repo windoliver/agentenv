@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -1794,6 +1795,8 @@ dirname "$0" > "$AGENTENV_UNINSTALL_DIR_OUT"
 
     let work_dir = temp_dir.join("work");
     fs::create_dir_all(&work_dir).unwrap();
+    let download_parent = temp_dir.join("tmp");
+    fs::create_dir_all(&download_parent).unwrap();
     let download_dir_file = temp_dir.join("download-dir.txt");
 
     let output = Command::new(agentenv_bin())
@@ -1807,8 +1810,9 @@ dirname "$0" > "$AGENTENV_UNINSTALL_DIR_OUT"
                 temp_dir.join("releases").join("download").display()
             ),
         )
-        .env("AGENTENV_VERSION", version)
+        .env("AGENTENV_VERSION", format!("refs/tags/{version}"))
         .env("AGENTENV_UNINSTALL_DIR_OUT", &download_dir_file)
+        .env("TMPDIR", &download_parent)
         .env_remove("AGENTENV_UNINSTALL_SCRIPT")
         .output()
         .unwrap();
@@ -1824,6 +1828,111 @@ dirname "$0" > "$AGENTENV_UNINSTALL_DIR_OUT"
         "download directory was not cleaned up: {}",
         download_dir.display()
     );
+}
+
+#[test]
+fn uninstall_rejects_checksum_mismatch_and_cleans_up_download_dir() {
+    let temp_dir = make_temp_dir("uninstall-checksum-mismatch");
+    let version = "v-bad-checksum";
+    let hosted_dir = temp_dir.join("releases").join("download").join(version);
+    fs::create_dir_all(&hosted_dir).unwrap();
+    let hosted_script = hosted_dir.join("uninstall.sh");
+    fs::write(
+        &hosted_script,
+        r#"#!/bin/sh
+set -eu
+printf executed > "$AGENTENV_UNINSTALL_MARKER"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        hosted_dir.join("uninstall.sh.sha256"),
+        "0000000000000000000000000000000000000000000000000000000000000000  uninstall.sh\n",
+    )
+    .unwrap();
+
+    let work_dir = temp_dir.join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let download_parent = temp_dir.join("tmp");
+    fs::create_dir_all(&download_parent).unwrap();
+    let marker = temp_dir.join("executed.txt");
+    let before = agentenv_uninstall_temp_dirs(&download_parent);
+
+    let output = Command::new(agentenv_bin())
+        .arg("uninstall")
+        .arg("--dry-run")
+        .current_dir(&work_dir)
+        .env(
+            "AGENTENV_RELEASE_BASE_URL",
+            format!(
+                "file://{}",
+                temp_dir.join("releases").join("download").display()
+            ),
+        )
+        .env("AGENTENV_VERSION", version)
+        .env("AGENTENV_UNINSTALL_MARKER", &marker)
+        .env("TMPDIR", &download_parent)
+        .env_remove("AGENTENV_UNINSTALL_SCRIPT")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        !marker.exists(),
+        "checksum-mismatched uninstall script was executed: {}",
+        output_summary(&output)
+    );
+    let after = agentenv_uninstall_temp_dirs(&download_parent);
+    let leaked: Vec<_> = after.difference(&before).collect();
+    assert!(
+        leaked.is_empty(),
+        "download temp dirs leaked after checksum failure: {leaked:?}\n{}",
+        output_summary(&output)
+    );
+}
+
+#[test]
+fn uninstall_discovers_sibling_script_next_to_current_exe() {
+    let temp_dir = make_temp_dir("uninstall-sibling-script");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let copied_bin = bin_dir.join("agentenv");
+    fs::copy(agentenv_bin(), &copied_bin).unwrap();
+    make_executable(&copied_bin);
+
+    let script = bin_dir.join("uninstall.sh");
+    let args_file = temp_dir.join("args.txt");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+    printf '%s\n' "$arg"
+done > "$AGENTENV_UNINSTALL_ARGS_OUT"
+"#,
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let output = Command::new(&copied_bin)
+        .arg("uninstall")
+        .arg("--dry-run")
+        .env("AGENTENV_UNINSTALL_ARGS_OUT", &args_file)
+        .env_remove("AGENTENV_UNINSTALL_SCRIPT")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args: Vec<_> = fs::read_to_string(args_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(args, ["--dry-run"]);
 }
 
 #[test]
@@ -2339,6 +2448,17 @@ fn make_executable(path: &Path) {
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
     }
+}
+
+fn agentenv_uninstall_temp_dirs(root: &Path) -> BTreeSet<PathBuf> {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name()?.to_str()?;
+            name.starts_with("agentenv-uninstall-").then_some(path)
+        })
+        .collect()
 }
 
 fn unique_suffix() -> String {

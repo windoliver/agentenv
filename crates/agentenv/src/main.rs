@@ -516,13 +516,13 @@ fn download_hosted_uninstall_script() -> Result<ResolvedUninstallScript> {
     let repo = std::env::var("AGENTENV_REPO").unwrap_or_else(|_| "windoliver/agentenv".to_owned());
     let base_url = std::env::var("AGENTENV_RELEASE_BASE_URL")
         .unwrap_or_else(|_| format!("https://github.com/{repo}/releases/download"));
-    let version = std::env::var("AGENTENV_VERSION")
-        .unwrap_or_else(|_| format!("v{}", env!("CARGO_PKG_VERSION")));
+    let version = hosted_uninstall_version();
     let base_url = base_url.trim_end_matches('/');
     let script_url = format!("{base_url}/{version}/uninstall.sh");
     let checksum_url = format!("{base_url}/{version}/uninstall.sh.sha256");
 
     let download_dir = make_uninstall_download_dir()?;
+    let download_guard = UninstallDownloadGuard::new(download_dir.clone());
     let script_path = download_dir.join("uninstall.sh");
     let checksum_path = download_dir.join("uninstall.sh.sha256");
 
@@ -532,10 +532,50 @@ fn download_hosted_uninstall_script() -> Result<ResolvedUninstallScript> {
         .with_context(|| format!("download uninstall checksum from `{checksum_url}`"))?;
     verify_file_sha256(&script_path, &checksum_path)?;
 
+    let cleanup_dir = download_guard.keep();
     Ok(ResolvedUninstallScript::downloaded(
         script_path,
-        download_dir,
+        cleanup_dir,
     ))
+}
+
+fn hosted_uninstall_version() -> String {
+    let default = || format!("v{}", env!("CARGO_PKG_VERSION"));
+    let Ok(version) = std::env::var("AGENTENV_VERSION") else {
+        return default();
+    };
+    let version = version.trim();
+    if version.is_empty() {
+        return default();
+    }
+    version
+        .strip_prefix("refs/tags/")
+        .unwrap_or(version)
+        .to_owned()
+}
+
+struct UninstallDownloadGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl UninstallDownloadGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn keep(mut self) -> PathBuf {
+        self.keep = true;
+        self.path.clone()
+    }
+}
+
+impl Drop for UninstallDownloadGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn make_uninstall_download_dir() -> Result<PathBuf> {
