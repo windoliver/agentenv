@@ -288,6 +288,14 @@ path_has_parent_component() {
     esac
 }
 
+path_has_current_component() {
+    component_path=$1
+    case "${component_path}" in
+        "."|./*|*/.|*/./*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 path_has_symlink_component() {
     checked_path=$1
     current_path=""
@@ -308,6 +316,10 @@ path_has_symlink_component() {
 path_has_symlink_component_under_base() {
     checked_path=$1
     base_path=$2
+    if [ -L "${base_path}" ]; then
+        return 0
+    fi
+
     case "${checked_path}" in
         "${base_path}"/*)
             ;;
@@ -358,6 +370,10 @@ validate_configured_path() {
         record_error "unsafe path ${configured_path}: ${label} contains parent directory component"
         return 1
     fi
+    if path_has_current_component "${configured_path}"; then
+        record_error "unsafe path ${configured_path}: ${label} contains current directory component"
+        return 1
+    fi
     if [ -L "${configured_path}" ]; then
         record_error "unsafe path ${configured_path}: ${label} must not be a symlink"
         return 1
@@ -392,6 +408,10 @@ validate_remove_path() {
     esac
     if path_has_parent_component "${path}"; then
         record_error "unsafe path ${path}: contains parent directory component"
+        return 1
+    fi
+    if path_has_current_component "${path}"; then
+        record_error "unsafe path ${path}: contains current directory component"
         return 1
     fi
     if [ "${path}" = "${HOME}" ]; then

@@ -906,6 +906,50 @@ test_uninstall_rejects_symlink_ancestor_in_agentenv_home() {
     pass
 }
 
+test_uninstall_rejects_symlink_home_prefix() {
+    tmp_root=$(mktemp -d)
+
+    real_home="${tmp_root}/real-home"
+    link_home="${tmp_root}/home-link"
+    mkdir -p "${real_home}/.agentenv/envs"
+    printf 'keep\n' > "${real_home}/.agentenv/envs/keep.txt"
+    ln -s "${real_home}" "${link_home}"
+
+    set +e
+    HOME="${link_home}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink HOME prefix should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "symlink HOME prefix should report unsafe path"
+    assert_exists "${real_home}/.agentenv/envs/keep.txt" "symlink HOME prefix should not delete real home data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_dot_path_components() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/."
+    mkdir -p "${HOME}/envs"
+    printf 'keep\n' > "${HOME}/envs/keep.txt"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "dot component in AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "dot component in AGENTENV_HOME should report unsafe path"
+    assert_exists "${HOME}/envs/keep.txt" "dot component in AGENTENV_HOME should not delete home envs"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan() {
     tmp_root=$(mktemp -d)
 
@@ -1017,6 +1061,8 @@ main() {
     test_uninstall_rejects_relative_install_dir
     test_uninstall_rejects_symlink_agentenv_home
     test_uninstall_rejects_symlink_ancestor_in_agentenv_home
+    test_uninstall_rejects_symlink_home_prefix
+    test_uninstall_rejects_dot_path_components
     test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
     test_uninstall_dry_run_rejects_unsafe_roots_before_plan
     test_uninstall_dry_run_prints_plan_without_removing
