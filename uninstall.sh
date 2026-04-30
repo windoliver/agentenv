@@ -324,7 +324,7 @@ validate_configured_roots() {
     validate_configured_path "AGENTENV_HOME" "${AGENTENV_HOME}" || return 1
     validate_configured_path "AGENTENV_INSTALL_DIR" "${INSTALL_DIR}" || return 1
     validate_configured_path "AGENTENV_BIN" "${AGENTENV_BIN}" || return 1
-    if ! path_is_agentenv_bin "${AGENTENV_BIN}" || ! path_is_under_dir "${AGENTENV_BIN}" "${AGENTENV_HOME}"; then
+    if ! path_is_agentenv_bin "${AGENTENV_BIN}"; then
         record_error "unsafe path ${AGENTENV_BIN}: AGENTENV_BIN must be under ${INSTALL_DIR}"
         return 1
     fi
@@ -353,8 +353,11 @@ validate_remove_path() {
     if [ "${path}" = "${AGENTENV_HOME}" ]; then
         return 0
     fi
+    if [ "${path}" = "${INSTALL_DIR}" ]; then
+        return 0
+    fi
     if [ "${path}" = "${AGENTENV_BIN}" ]; then
-        if path_is_agentenv_bin "${path}" && path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
+        if path_is_agentenv_bin "${path}"; then
             return 0
         fi
         record_error "unsafe path ${path}: AGENTENV_BIN must be under ${INSTALL_DIR}"
@@ -439,6 +442,11 @@ cleanup_uninstall_tmp() {
     fi
 }
 
+report_uninstall_failures() {
+    cat "${ERRORS_LOG}" >&2
+    printf 'Uninstall completed with %s failure(s). Diagnostics: %s\n' "${FAILURE_COUNT}" "${TMP_ROOT}" >&2
+}
+
 main() {
     parse_uninstall_args "$@"
     TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-uninstall.XXXXXX")
@@ -449,6 +457,10 @@ main() {
     : > "${ERRORS_LOG}"
     trap cleanup_uninstall_tmp EXIT INT TERM
 
+    if ! validate_configured_roots; then
+        report_uninstall_failures
+        return 1
+    fi
     build_uninstall_plan
     cat "${PLAN_FILE}"
     if [ "${DRY_RUN}" -eq 1 ]; then
@@ -457,8 +469,7 @@ main() {
     confirm_uninstall || return 1
     execute_uninstall || true
     if [ "${FAILURE_COUNT}" -gt 0 ]; then
-        cat "${ERRORS_LOG}" >&2
-        printf 'Uninstall completed with %s failure(s). Diagnostics: %s\n' "${FAILURE_COUNT}" "${TMP_ROOT}" >&2
+        report_uninstall_failures
         return 1
     fi
     printf 'Uninstall complete\n'

@@ -507,6 +507,32 @@ test_uninstall_keep_flags_preserve_selected_state() {
     pass
 }
 
+test_uninstall_removes_binary_from_custom_install_dir() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${HOME}/.local/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'global events\n' > "${AGENTENV_HOME}/events.db"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+
+    assert_not_contains "unsafe path" "${tmp_root}/uninstall.out" "custom install dir should not be rejected"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "custom install dir binary should be removed"
+    assert_not_exists "${AGENTENV_HOME}/envs" "custom install dir should still remove env registry by default"
+    assert_not_exists "${AGENTENV_HOME}/drivers" "custom install dir should still remove drivers by default"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "custom install dir should still remove credentials by default"
+    assert_not_exists "${AGENTENV_HOME}/events.db" "custom install dir should still remove events db"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_second_run_is_noop() {
     tmp_root=$(mktemp -d)
 
@@ -876,6 +902,29 @@ test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan() {
     pass
 }
 
+test_uninstall_dry_run_rejects_unsafe_roots_before_plan() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "dry-run with unsafe AGENTENV_HOME should fail"
+    assert_contains "unsafe path" "${tmp_root}/dry-run.out" "dry-run with unsafe AGENTENV_HOME should report unsafe path"
+    assert_not_contains "Uninstall plan" "${tmp_root}/dry-run.out" "dry-run with unsafe AGENTENV_HOME should not print plan"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_prints_plan_without_removing() {
     tmp_root=$(mktemp -d)
 
@@ -928,6 +977,7 @@ main() {
     test_archive_name_candidates_cover_legacy_and_dist_formats
     test_uninstall_removes_owned_files_and_shell_block
     test_uninstall_keep_flags_preserve_selected_state
+    test_uninstall_removes_binary_from_custom_install_dir
     test_uninstall_second_run_is_noop
     test_uninstall_preserves_unconfirmed_shell_sentinel_lines
     test_uninstall_removes_only_confirmed_shell_path_block
@@ -943,6 +993,7 @@ main() {
     test_uninstall_rejects_relative_install_dir
     test_uninstall_rejects_symlink_agentenv_home
     test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
+    test_uninstall_dry_run_rejects_unsafe_roots_before_plan
     test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
