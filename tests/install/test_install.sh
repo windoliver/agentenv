@@ -492,6 +492,7 @@ main() {
     test_detect_target_macos
     test_verify_sha256_value
     test_archive_name_candidates_cover_legacy_and_dist_formats
+    test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
     test_install_python_drivers_preserves_existing_driver_on_extract_failure
@@ -501,7 +502,6 @@ main() {
     test_install_python_drivers_installs_source_context_nexus_bundle_with_venv
     test_install_python_drivers_upgrades_directory_context_nexus_to_source_bundle
     test_install_driver_launcher_prepends_venv_bin_to_path
-    test_uninstall_dry_run_prints_plan_without_removing
     test_choose_rc_targets_creates_profile_when_missing
     printf 'PASS: %s installer tests\n' "${TEST_COUNT}"
 }
