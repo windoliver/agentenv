@@ -64,6 +64,7 @@ parse_uninstall_args() {
                 DRY_RUN=1
                 ;;
             --keep-openshell)
+                # OpenShell is preserved by default; accept the flag for explicit callers.
                 KEEP_OPENSHELL=1
                 ;;
             --keep-drivers)
@@ -193,6 +194,15 @@ backup_uninstall_file() {
     fi
 }
 
+file_mode() {
+    file_path=$1
+    if stat -f %Lp "${file_path}" >/dev/null 2>&1; then
+        stat -f %Lp "${file_path}"
+        return 0
+    fi
+    stat -c %a "${file_path}"
+}
+
 installer_path_export_line() {
     printf 'export PATH="%s:$PATH"' "${INSTALL_DIR}"
 }
@@ -229,6 +239,10 @@ remove_installer_block() {
 
     backup_uninstall_file "${rc_file}" || return 1
     tmp_file="${TMP_ROOT}/$(basename "${rc_file}").uninstall.$$"
+    rc_mode=$(file_mode "${rc_file}") || {
+        record_error "failed to read mode for ${rc_file}"
+        return 1
+    }
     expected_export=$(installer_path_export_line)
     awk -v sentinel="${INSTALLER_SENTINEL}" -v expected_export="${expected_export}" '
         pending == 1 {
@@ -256,6 +270,10 @@ remove_installer_block() {
     }
 
     if mv "${tmp_file}" "${rc_file}"; then
+        if ! chmod "${rc_mode}" "${rc_file}"; then
+            record_error "failed to restore mode for ${rc_file}"
+            return 1
+        fi
         log_action "removed installer PATH block from ${rc_file}"
     else
         record_error "failed to update ${rc_file}"

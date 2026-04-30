@@ -86,6 +86,15 @@ assert_exists() {
     fi
 }
 
+file_mode() {
+    path=$1
+    if stat -f %Lp "${path}" >/dev/null 2>&1; then
+        stat -f %Lp "${path}"
+        return 0
+    fi
+    stat -c %a "${path}"
+}
+
 make_stub_cmd() {
     command_dir=$1
     name=$2
@@ -654,6 +663,28 @@ test_uninstall_removes_only_confirmed_shell_path_block() {
     pass
 }
 
+test_uninstall_preserves_rc_file_mode() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'before\n# agentenv installer\nexport PATH="%s:$PATH"\nafter\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+    chmod 600 "${HOME}/.zshrc"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh -c 'umask 022; sh "$1" --yes' sh "${REPO_ROOT}/uninstall.sh" > "${tmp_root}/uninstall.out"
+
+    assert_eq "600" "$(file_mode "${HOME}/.zshrc")" "uninstall should preserve rc file mode"
+    assert_not_contains "# agentenv installer" "${HOME}/.zshrc" "mode-preserving cleanup should remove installer sentinel"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_rejects_home_as_agentenv_home() {
     tmp_root=$(mktemp -d)
 
@@ -1146,6 +1177,7 @@ main() {
     test_uninstall_second_run_is_noop
     test_uninstall_preserves_unconfirmed_shell_sentinel_lines
     test_uninstall_removes_only_confirmed_shell_path_block
+    test_uninstall_preserves_rc_file_mode
     test_uninstall_rejects_home_as_agentenv_home
     test_uninstall_rejects_agentenv_bin_outside_install_dir
     test_uninstall_rejects_agentenv_bin_under_home_outside_install_dir
