@@ -444,26 +444,55 @@ async fn run() -> Result<()> {
 fn run_uninstall(args: UninstallArgs) -> Result<()> {
     let script = resolve_uninstall_script()?;
     let status = process::Command::new("sh")
-        .arg(&script)
+        .arg(&script.path)
         .args(args.to_script_args())
-        .status()
-        .with_context(|| format!("failed to run uninstall script `{}`", script.display()))?;
+        .status();
+    script.cleanup_best_effort();
+    let status = status
+        .with_context(|| format!("failed to run uninstall script `{}`", script.path.display()))?;
 
     match status.code() {
         Some(0) => Ok(()),
         Some(code) => exit_process(code),
         None => bail!(
             "uninstall script `{}` terminated by signal",
-            script.display()
+            script.path.display()
         ),
     }
 }
 
-fn resolve_uninstall_script() -> Result<PathBuf> {
+struct ResolvedUninstallScript {
+    path: PathBuf,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl ResolvedUninstallScript {
+    fn local(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup_dir: None,
+        }
+    }
+
+    fn downloaded(path: PathBuf, cleanup_dir: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup_dir: Some(cleanup_dir),
+        }
+    }
+
+    fn cleanup_best_effort(&self) {
+        if let Some(dir) = &self.cleanup_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn resolve_uninstall_script() -> Result<ResolvedUninstallScript> {
     if let Some(script) = std::env::var_os("AGENTENV_UNINSTALL_SCRIPT") {
         let script = PathBuf::from(script);
         if script.is_file() {
-            return Ok(script);
+            return Ok(ResolvedUninstallScript::local(script));
         }
         bail!(
             "AGENTENV_UNINSTALL_SCRIPT points to `{}`, which is not a file",
@@ -475,27 +504,15 @@ fn resolve_uninstall_script() -> Result<PathBuf> {
         if let Some(exe_dir) = current_exe.parent() {
             let script = exe_dir.join("uninstall.sh");
             if script.is_file() {
-                return Ok(script);
+                return Ok(ResolvedUninstallScript::local(script));
             }
         }
-    }
-
-    let cwd = std::env::current_dir().context("failed to determine current working directory")?;
-    if let Some(script) = find_uninstall_script_in_ancestors(&cwd) {
-        return Ok(script);
     }
 
     download_hosted_uninstall_script()
 }
 
-fn find_uninstall_script_in_ancestors(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .map(|ancestor| ancestor.join("uninstall.sh"))
-        .find(|script| script.is_file())
-}
-
-fn download_hosted_uninstall_script() -> Result<PathBuf> {
+fn download_hosted_uninstall_script() -> Result<ResolvedUninstallScript> {
     let repo = std::env::var("AGENTENV_REPO").unwrap_or_else(|_| "windoliver/agentenv".to_owned());
     let base_url = std::env::var("AGENTENV_RELEASE_BASE_URL")
         .unwrap_or_else(|_| format!("https://github.com/{repo}/releases/download"));
@@ -515,7 +532,10 @@ fn download_hosted_uninstall_script() -> Result<PathBuf> {
         .with_context(|| format!("download uninstall checksum from `{checksum_url}`"))?;
     verify_file_sha256(&script_path, &checksum_path)?;
 
-    Ok(script_path)
+    Ok(ResolvedUninstallScript::downloaded(
+        script_path,
+        download_dir,
+    ))
 }
 
 fn make_uninstall_download_dir() -> Result<PathBuf> {
@@ -524,7 +544,7 @@ fn make_uninstall_download_dir() -> Result<PathBuf> {
         .context("system time is before UNIX_EPOCH")?
         .as_nanos();
     let path = std::env::temp_dir().join(format!("agentenv-uninstall-{}-{now}", process::id()));
-    fs::create_dir_all(&path).with_context(|| {
+    fs::create_dir(&path).with_context(|| {
         format!(
             "failed to create uninstall download directory `{}`",
             path.display()

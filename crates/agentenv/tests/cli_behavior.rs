@@ -13,6 +13,7 @@ use agentenv_events::{
     ActivityEvent, ActivityKind, ActivityResult,
 };
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use sha2::{Digest, Sha256};
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
@@ -1691,14 +1692,23 @@ done > "$AGENTENV_UNINSTALL_ARGS_OUT"
         "stderr was: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let args = fs::read_to_string(args_file).unwrap();
-    assert!(args.contains("--yes"), "args were: {args}");
-    assert!(args.contains("--dry-run"), "args were: {args}");
-    assert!(args.contains("--keep-openshell"), "args were: {args}");
-    assert!(args.contains("--keep-drivers"), "args were: {args}");
-    assert!(args.contains("--keep-credentials"), "args were: {args}");
-    assert!(args.contains("--keep-data"), "args were: {args}");
-    assert!(args.contains("--delete-models"), "args were: {args}");
+    let args: Vec<_> = fs::read_to_string(args_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "--yes",
+            "--keep-openshell",
+            "--keep-drivers",
+            "--keep-credentials",
+            "--keep-data",
+            "--delete-models",
+            "--dry-run",
+        ]
+    );
 }
 
 #[test]
@@ -1722,6 +1732,98 @@ exit 7
         .unwrap();
 
     assert_eq!(output.status.code(), Some(7));
+}
+
+#[test]
+fn uninstall_does_not_discover_script_from_current_dir() {
+    let temp_dir = make_temp_dir("uninstall-ignore-cwd-script");
+    let script = temp_dir.join("uninstall.sh");
+    let marker = temp_dir.join("executed.txt");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+printf executed > "$AGENTENV_UNINSTALL_MARKER"
+"#,
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let output = Command::new(agentenv_bin())
+        .arg("uninstall")
+        .arg("--dry-run")
+        .current_dir(&temp_dir)
+        .env(
+            "AGENTENV_RELEASE_BASE_URL",
+            "file:///agentenv-missing-release",
+        )
+        .env("AGENTENV_VERSION", "v-missing")
+        .env("AGENTENV_UNINSTALL_MARKER", &marker)
+        .env_remove("AGENTENV_UNINSTALL_SCRIPT")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        !marker.exists(),
+        "cwd uninstall.sh was executed: {}",
+        output_summary(&output)
+    );
+}
+
+#[test]
+fn uninstall_cleans_up_hosted_fallback_temp_dir() {
+    let temp_dir = make_temp_dir("uninstall-cleanup-hosted");
+    let version = "v-cleanup";
+    let hosted_dir = temp_dir.join("releases").join("download").join(version);
+    fs::create_dir_all(&hosted_dir).unwrap();
+    let hosted_script = hosted_dir.join("uninstall.sh");
+    let hosted_script_body = r#"#!/bin/sh
+set -eu
+dirname "$0" > "$AGENTENV_UNINSTALL_DIR_OUT"
+"#;
+    fs::write(&hosted_script, hosted_script_body).unwrap();
+    fs::write(
+        hosted_dir.join("uninstall.sh.sha256"),
+        format!(
+            "{}  uninstall.sh\n",
+            hex::encode(Sha256::digest(hosted_script_body.as_bytes()))
+        ),
+    )
+    .unwrap();
+
+    let work_dir = temp_dir.join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let download_dir_file = temp_dir.join("download-dir.txt");
+
+    let output = Command::new(agentenv_bin())
+        .arg("uninstall")
+        .arg("--dry-run")
+        .current_dir(&work_dir)
+        .env(
+            "AGENTENV_RELEASE_BASE_URL",
+            format!(
+                "file://{}",
+                temp_dir.join("releases").join("download").display()
+            ),
+        )
+        .env("AGENTENV_VERSION", version)
+        .env("AGENTENV_UNINSTALL_DIR_OUT", &download_dir_file)
+        .env_remove("AGENTENV_UNINSTALL_SCRIPT")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let download_dir = PathBuf::from(fs::read_to_string(download_dir_file).unwrap().trim());
+    assert!(
+        !download_dir.exists(),
+        "download directory was not cleaned up: {}",
+        download_dir.display()
+    );
 }
 
 #[test]
