@@ -6,6 +6,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)
 
 AGENTENV_INSTALLER_SOURCE_ONLY=1 . "${REPO_ROOT}/install.sh"
+AGENTENV_UNINSTALLER_SOURCE_ONLY=1 . "${REPO_ROOT}/uninstall.sh"
+unset AGENTENV_UNINSTALLER_SOURCE_ONLY
 
 ORIGINAL_PATH=${PATH}
 TEST_COUNT=0
@@ -34,6 +36,22 @@ assert_contains() {
     context=$3
     if ! grep -F "${needle}" "${haystack_file}" >/dev/null 2>&1; then
         fail "${context}: did not find '${needle}' in ${haystack_file}"
+    fi
+}
+
+assert_not_exists() {
+    path=$1
+    context=$2
+    if [ -e "${path}" ]; then
+        fail "${context}: ${path} should not exist"
+    fi
+}
+
+assert_exists() {
+    path=$1
+    context=$2
+    if [ ! -e "${path}" ]; then
+        fail "${context}: ${path} should exist"
     fi
 }
 
@@ -424,6 +442,36 @@ test_install_driver_launcher_prepends_venv_bin_to_path() {
     pass
 }
 
+test_uninstall_dry_run_prints_plan_without_removing() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${project_dir}"
+    printf 'user work\n' > "${project_dir}/README.md"
+
+    output_file="${tmp_root}/dry-run.out"
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${output_file}"
+
+    assert_contains "Uninstall plan" "${output_file}" "dry-run should print a plan"
+    assert_contains "${INSTALL_DIR}/agentenv" "${output_file}" "plan should include binary"
+    assert_contains "${AGENTENV_HOME}/drivers" "${output_file}" "plan should include drivers"
+    assert_exists "${INSTALL_DIR}/agentenv" "dry-run should not remove binary"
+    assert_exists "${AGENTENV_HOME}/credentials.json" "dry-run should not remove credentials"
+    assert_exists "${project_dir}/README.md" "dry-run should not touch project directories"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_choose_rc_targets_creates_profile_when_missing() {
     tmp_root=$(mktemp -d)
 
@@ -453,6 +501,7 @@ main() {
     test_install_python_drivers_installs_source_context_nexus_bundle_with_venv
     test_install_python_drivers_upgrades_directory_context_nexus_to_source_bundle
     test_install_driver_launcher_prepends_venv_bin_to_path
+    test_uninstall_dry_run_prints_plan_without_removing
     test_choose_rc_targets_creates_profile_when_missing
     printf 'PASS: %s installer tests\n' "${TEST_COUNT}"
 }
