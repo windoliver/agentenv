@@ -288,6 +288,51 @@ path_has_parent_component() {
     esac
 }
 
+path_has_symlink_component() {
+    checked_path=$1
+    current_path=""
+    old_ifs=$IFS
+    IFS=/
+    for component in ${checked_path}; do
+        [ -n "${component}" ] || continue
+        current_path="${current_path}/${component}"
+        if [ -L "${current_path}" ]; then
+            IFS=${old_ifs}
+            return 0
+        fi
+    done
+    IFS=${old_ifs}
+    return 1
+}
+
+path_has_symlink_component_under_base() {
+    checked_path=$1
+    base_path=$2
+    case "${checked_path}" in
+        "${base_path}"/*)
+            ;;
+        *)
+            path_has_symlink_component "${checked_path}"
+            return $?
+            ;;
+    esac
+
+    relative_path=${checked_path#"${base_path}/"}
+    current_path=${base_path}
+    old_ifs=$IFS
+    IFS=/
+    for component in ${relative_path}; do
+        [ -n "${component}" ] || continue
+        current_path="${current_path}/${component}"
+        if [ -L "${current_path}" ]; then
+            IFS=${old_ifs}
+            return 0
+        fi
+    done
+    IFS=${old_ifs}
+    return 1
+}
+
 validate_configured_path() {
     label=$1
     configured_path=$2
@@ -315,6 +360,10 @@ validate_configured_path() {
     fi
     if [ -L "${configured_path}" ]; then
         record_error "unsafe path ${configured_path}: ${label} must not be a symlink"
+        return 1
+    fi
+    if path_has_symlink_component_under_base "${configured_path}" "${HOME}"; then
+        record_error "unsafe path ${configured_path}: ${label} must not contain symlink components"
         return 1
     fi
     return 0
@@ -425,9 +474,10 @@ remove_selected_paths() {
         remove_path_if_present "${AGENTENV_HOME}/models" || true
     fi
 
-    for directory in "${INSTALL_DIR}" "${AGENTENV_HOME}"; do
-        remove_empty_dir_if_safe "${directory}" || true
-    done
+    if path_is_under_dir "${INSTALL_DIR}" "${AGENTENV_HOME}"; then
+        remove_empty_dir_if_safe "${INSTALL_DIR}" || true
+    fi
+    remove_empty_dir_if_safe "${AGENTENV_HOME}" || true
 }
 
 execute_uninstall() {

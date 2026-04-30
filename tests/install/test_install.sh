@@ -524,6 +524,7 @@ test_uninstall_removes_binary_from_custom_install_dir() {
 
     assert_not_contains "unsafe path" "${tmp_root}/uninstall.out" "custom install dir should not be rejected"
     assert_not_exists "${INSTALL_DIR}/agentenv" "custom install dir binary should be removed"
+    assert_exists "${INSTALL_DIR}" "custom install dir should not be removed when empty"
     assert_not_exists "${AGENTENV_HOME}/envs" "custom install dir should still remove env registry by default"
     assert_not_exists "${AGENTENV_HOME}/drivers" "custom install dir should still remove drivers by default"
     assert_not_exists "${AGENTENV_HOME}/credentials.json" "custom install dir should still remove credentials by default"
@@ -882,6 +883,29 @@ test_uninstall_rejects_symlink_agentenv_home() {
     pass
 }
 
+test_uninstall_rejects_symlink_ancestor_in_agentenv_home() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${HOME}" "${project_dir}/.agentenv/envs"
+    printf 'keep\n' > "${project_dir}/.agentenv/envs/keep.txt"
+    ln -s "${project_dir}" "${HOME}/link"
+
+    set +e
+    AGENTENV_HOME="${HOME}/link/.agentenv" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink ancestor in AGENTENV_HOME should make uninstall fail"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "symlink ancestor in AGENTENV_HOME should report unsafe path"
+    assert_exists "${project_dir}/.agentenv/envs/keep.txt" "symlink ancestor in AGENTENV_HOME should not delete project data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan() {
     tmp_root=$(mktemp -d)
 
@@ -992,6 +1016,7 @@ main() {
     test_uninstall_rejects_relative_agentenv_home
     test_uninstall_rejects_relative_install_dir
     test_uninstall_rejects_symlink_agentenv_home
+    test_uninstall_rejects_symlink_ancestor_in_agentenv_home
     test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
     test_uninstall_dry_run_rejects_unsafe_roots_before_plan
     test_uninstall_dry_run_prints_plan_without_removing
