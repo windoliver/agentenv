@@ -642,7 +642,7 @@ test_uninstall_rejects_parent_directory_components() {
     HOME="${tmp_root}/home"
     AGENTENV_HOME="${HOME}/.agentenv/.."
     INSTALL_DIR="${AGENTENV_HOME}/bin"
-    mkdir -p "${HOME}/envs" "${HOME}/.agentenv"
+    mkdir -p "${HOME}/envs" "${HOME}/.agentenv" "${HOME}/bin"
     printf 'keep\n' > "${HOME}/envs/keep.txt"
 
     set +e
@@ -654,6 +654,7 @@ test_uninstall_rejects_parent_directory_components() {
     assert_eq "1" "${rc}" "parent directory component in AGENTENV_HOME should make uninstall fail"
     assert_contains "unsafe path" "${tmp_root}/uninstall.out" "parent directory component should report unsafe path"
     assert_exists "${HOME}/envs/keep.txt" "parent directory component should not delete files outside agentenv home"
+    assert_exists "${HOME}/bin" "parent directory component should not remove unrelated empty bin directory"
 
     rm -rf "${tmp_root}"
     pass

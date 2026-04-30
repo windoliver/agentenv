@@ -328,6 +328,9 @@ validate_remove_path() {
         return 1
     fi
 
+    if [ "${path}" = "${AGENTENV_HOME}" ]; then
+        return 0
+    fi
     if path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
         return 0
     fi
@@ -357,6 +360,18 @@ remove_path_if_present() {
     fi
 }
 
+remove_empty_dir_if_safe() {
+    directory=$1
+    if ! validate_remove_path "${directory}"; then
+        return 1
+    fi
+    if [ -d "${directory}" ]; then
+        if rmdir "${directory}" 2>/dev/null; then
+            log_action "removed empty directory ${directory}"
+        fi
+    fi
+}
+
 remove_shell_path_blocks() {
     for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
         remove_installer_block "${rc_file}" || true
@@ -382,11 +397,7 @@ remove_selected_paths() {
     fi
 
     for directory in "${INSTALL_DIR}" "${AGENTENV_HOME}"; do
-        if [ -d "${directory}" ]; then
-            if rmdir "${directory}" 2>/dev/null; then
-                log_action "removed empty directory ${directory}"
-            fi
-        fi
+        remove_empty_dir_if_safe "${directory}" || true
     done
 }
 
