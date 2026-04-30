@@ -1656,6 +1656,75 @@ fn destroy_purge_credentials_removes_state_credentials() {
 }
 
 #[test]
+fn uninstall_delegates_all_flags_to_configured_script() {
+    let temp_dir = make_temp_dir("uninstall-delegates-flags");
+    let script = temp_dir.join("uninstall.sh");
+    let args_file = temp_dir.join("args.txt");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+    printf '%s\n' "$arg"
+done > "$AGENTENV_UNINSTALL_ARGS_OUT"
+"#,
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let output = Command::new(agentenv_bin())
+        .arg("uninstall")
+        .arg("-y")
+        .arg("--dry-run")
+        .arg("--keep-openshell")
+        .arg("--keep-drivers")
+        .arg("--keep-credentials")
+        .arg("--keep-data")
+        .arg("--delete-models")
+        .env("AGENTENV_UNINSTALL_SCRIPT", &script)
+        .env("AGENTENV_UNINSTALL_ARGS_OUT", &args_file)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = fs::read_to_string(args_file).unwrap();
+    assert!(args.contains("--yes"), "args were: {args}");
+    assert!(args.contains("--dry-run"), "args were: {args}");
+    assert!(args.contains("--keep-openshell"), "args were: {args}");
+    assert!(args.contains("--keep-drivers"), "args were: {args}");
+    assert!(args.contains("--keep-credentials"), "args were: {args}");
+    assert!(args.contains("--keep-data"), "args were: {args}");
+    assert!(args.contains("--delete-models"), "args were: {args}");
+}
+
+#[test]
+fn uninstall_propagates_script_exit_status() {
+    let temp_dir = make_temp_dir("uninstall-propagates-status");
+    let script = temp_dir.join("uninstall.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+exit 7
+"#,
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let output = Command::new(agentenv_bin())
+        .arg("uninstall")
+        .arg("--yes")
+        .env("AGENTENV_UNINSTALL_SCRIPT", &script)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+}
+
+#[test]
 fn drivers_list_reports_malformed_manifest_path() {
     let temp_dir = make_temp_dir("drivers-list-bad-manifest");
     let driver_root = temp_dir.join("bad-driver");
@@ -2157,6 +2226,17 @@ fn make_temp_dir(prefix: &str) -> PathBuf {
     let path = std::env::temp_dir().join(unique);
     fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 }
 
 fn unique_suffix() -> String {
