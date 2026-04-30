@@ -288,30 +288,36 @@ path_has_parent_component() {
     esac
 }
 
-validate_remove_path() {
-    path=$1
-    case "${AGENTENV_HOME}" in
+validate_configured_path() {
+    label=$1
+    configured_path=$2
+    case "${configured_path}" in
         ""|"/"|".")
-            record_error "unsafe path ${path}: AGENTENV_HOME is unsafe (${AGENTENV_HOME})"
+            record_error "unsafe path ${configured_path}: ${label} is unsafe (${configured_path})"
             return 1
             ;;
     esac
-    if path_has_parent_component "${AGENTENV_HOME}"; then
-        record_error "unsafe path ${path}: AGENTENV_HOME contains parent directory component (${AGENTENV_HOME})"
+    if [ "${configured_path}" = "${HOME}" ]; then
+        record_error "unsafe path ${configured_path}: ${label} must not be HOME"
         return 1
     fi
-    if path_has_parent_component "${INSTALL_DIR}"; then
-        record_error "unsafe path ${path}: AGENTENV_INSTALL_DIR contains parent directory component (${INSTALL_DIR})"
+    if path_has_parent_component "${configured_path}"; then
+        record_error "unsafe path ${configured_path}: ${label} contains parent directory component"
         return 1
     fi
-    if path_has_parent_component "${AGENTENV_BIN}"; then
-        record_error "unsafe path ${path}: AGENTENV_BIN contains parent directory component (${AGENTENV_BIN})"
-        return 1
-    fi
-    if [ "${AGENTENV_HOME}" = "${HOME}" ]; then
-        record_error "unsafe path ${path}: AGENTENV_HOME must not be HOME"
-        return 1
-    fi
+    return 0
+}
+
+validate_configured_roots() {
+    validate_configured_path "AGENTENV_HOME" "${AGENTENV_HOME}" || return 1
+    validate_configured_path "AGENTENV_INSTALL_DIR" "${INSTALL_DIR}" || return 1
+    validate_configured_path "AGENTENV_BIN" "${AGENTENV_BIN}" || return 1
+    return 0
+}
+
+validate_remove_path() {
+    path=$1
+    validate_configured_roots || return 1
 
     case "${path}" in
         ""|"/"|".")
@@ -334,7 +340,7 @@ validate_remove_path() {
     if path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
         return 0
     fi
-    if path_is_agentenv_bin "${path}"; then
+    if path_is_agentenv_bin "${path}" && path_is_under_dir "${path}" "${AGENTENV_HOME}"; then
         return 0
     fi
 
