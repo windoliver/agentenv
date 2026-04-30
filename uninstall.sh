@@ -46,6 +46,7 @@ EOF
 
 log_action() {
     printf '%s\n' "$*" >> "${ACTIONS_LOG}"
+    printf '%s\n' "$*"
 }
 
 record_error() {
@@ -179,6 +180,108 @@ confirm_uninstall() {
     esac
 }
 
+backup_uninstall_file() {
+    file_path=$1
+    [ -f "${file_path}" ] || return 0
+    timestamp=$(date -u '+%Y%m%d%H%M%S')
+    backup_path="${file_path}.agentenv.bak.${timestamp}"
+    if cp "${file_path}" "${backup_path}"; then
+        log_action "backed up ${file_path} to ${backup_path}"
+    else
+        record_error "failed to back up ${file_path}"
+        return 1
+    fi
+}
+
+remove_installer_block() {
+    rc_file=$1
+    [ -f "${rc_file}" ] || return 0
+    if ! grep -F "${INSTALLER_SENTINEL}" "${rc_file}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    backup_uninstall_file "${rc_file}" || return 1
+    tmp_file="${TMP_ROOT}/$(basename "${rc_file}").uninstall.$$"
+    awk -v sentinel="${INSTALLER_SENTINEL}" -v install_dir="${INSTALL_DIR}" '
+        $0 == sentinel {
+            skip_path = 1
+            next
+        }
+        skip_path == 1 {
+            skip_path = 0
+            if (index($0, "export PATH=") == 1 && index($0, install_dir) > 0) {
+                next
+            }
+        }
+        { print }
+    ' "${rc_file}" > "${tmp_file}" || {
+        record_error "failed to rewrite ${rc_file}"
+        rm -f "${tmp_file}"
+        return 1
+    }
+
+    if mv "${tmp_file}" "${rc_file}"; then
+        log_action "removed installer PATH block from ${rc_file}"
+    else
+        record_error "failed to update ${rc_file}"
+        rm -f "${tmp_file}"
+        return 1
+    fi
+}
+
+remove_path_if_present() {
+    path=$1
+    if [ ! -e "${path}" ] && [ ! -L "${path}" ]; then
+        log_action "already absent ${path}"
+        return 0
+    fi
+
+    if rm -rf "${path}"; then
+        log_action "removed ${path}"
+    else
+        record_error "failed to remove ${path}"
+        return 1
+    fi
+}
+
+remove_shell_path_blocks() {
+    for rc_file in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        remove_installer_block "${rc_file}" || true
+    done
+}
+
+remove_selected_paths() {
+    remove_path_if_present "${AGENTENV_BIN}" || true
+    if [ "${KEEP_DATA}" -eq 0 ]; then
+        remove_path_if_present "${AGENTENV_HOME}/envs" || true
+    fi
+    if [ "${KEEP_DRIVERS}" -eq 0 ]; then
+        remove_path_if_present "${AGENTENV_HOME}/drivers" || true
+    fi
+    if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
+        remove_path_if_present "${AGENTENV_HOME}/credentials.json" || true
+    fi
+    remove_path_if_present "${AGENTENV_HOME}/events.db" || true
+    remove_path_if_present "${AGENTENV_HOME}/audit.key" || true
+    remove_path_if_present "${AGENTENV_HOME}/audit-signing-key" || true
+    if [ "${DELETE_MODELS}" -eq 1 ]; then
+        remove_path_if_present "${AGENTENV_HOME}/models" || true
+    fi
+
+    for directory in "${INSTALL_DIR}" "${AGENTENV_HOME}"; do
+        if [ -d "${directory}" ]; then
+            if rmdir "${directory}" 2>/dev/null; then
+                log_action "removed empty directory ${directory}"
+            fi
+        fi
+    done
+}
+
+execute_uninstall() {
+    remove_shell_path_blocks
+    remove_selected_paths
+}
+
 cleanup_uninstall_tmp() {
     if [ -n "${TMP_ROOT}" ] && [ -d "${TMP_ROOT}" ] && [ "${FAILURE_COUNT}" -eq 0 ]; then
         rm -rf "${TMP_ROOT}"
@@ -201,6 +304,13 @@ main() {
         return 0
     fi
     confirm_uninstall
+    execute_uninstall
+    if [ "${FAILURE_COUNT}" -gt 0 ]; then
+        cat "${ERRORS_LOG}" >&2
+        printf 'Uninstall completed with %s failure(s). Diagnostics: %s\n' "${FAILURE_COUNT}" "${TMP_ROOT}" >&2
+        return 1
+    fi
+    printf 'Uninstall complete\n'
 }
 
 if [ "${AGENTENV_UNINSTALLER_SOURCE_ONLY:-0}" != "1" ]; then

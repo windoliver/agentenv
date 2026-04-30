@@ -39,6 +39,15 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    needle=$1
+    haystack_file=$2
+    context=$3
+    if grep -F "${needle}" "${haystack_file}" >/dev/null 2>&1; then
+        fail "${context}: found '${needle}' in ${haystack_file}"
+    fi
+}
+
 assert_not_exists() {
     path=$1
     context=$2
@@ -442,6 +451,84 @@ test_install_driver_launcher_prepends_venv_bin_to_path() {
     pass
 }
 
+test_uninstall_removes_owned_files_and_shell_block() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'global events\n' > "${AGENTENV_HOME}/events.db"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    printf 'before\n# agentenv installer\nexport PATH="%s:$PATH"\nafter\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+    project_dir="${tmp_root}/project"
+    mkdir -p "${project_dir}"
+    printf 'user work\n' > "${project_dir}/README.md"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_not_exists "${INSTALL_DIR}/agentenv" "uninstall should remove binary"
+    assert_not_exists "${AGENTENV_HOME}/drivers" "uninstall should remove drivers by default"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "uninstall should remove credentials json by default"
+    assert_not_contains "# agentenv installer" "${HOME}/.zshrc" "uninstall should remove installer sentinel"
+    assert_contains "before" "${HOME}/.zshrc" "uninstall should keep preexisting rc content"
+    assert_contains "after" "${HOME}/.zshrc" "uninstall should keep trailing rc content"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "1" "${backup_count}" "uninstall should back up changed rc file"
+    assert_exists "${project_dir}/README.md" "uninstall should not touch project directories"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_keep_flags_preserve_selected_state() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${AGENTENV_HOME}/drivers/context-nexus"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"values":{"TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes --keep-data --keep-drivers --keep-credentials > "${tmp_root}/uninstall.out"
+
+    assert_not_exists "${INSTALL_DIR}/agentenv" "keep flags should not preserve agentenv binary"
+    assert_exists "${AGENTENV_HOME}/envs/demo" "--keep-data should preserve env registry"
+    assert_exists "${AGENTENV_HOME}/drivers/context-nexus" "--keep-drivers should preserve drivers"
+    assert_exists "${AGENTENV_HOME}/credentials.json" "--keep-credentials should preserve credentials json"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_second_run_is_noop() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/first.out"
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/second.out"
+
+    assert_contains "already absent" "${tmp_root}/second.out" "second uninstall should report absent files"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "second uninstall should leave binary absent"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_prints_plan_without_removing() {
     tmp_root=$(mktemp -d)
 
@@ -492,6 +579,9 @@ main() {
     test_detect_target_macos
     test_verify_sha256_value
     test_archive_name_candidates_cover_legacy_and_dist_formats
+    test_uninstall_removes_owned_files_and_shell_block
+    test_uninstall_keep_flags_preserve_selected_state
+    test_uninstall_second_run_is_noop
     test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path
