@@ -38,7 +38,8 @@
       "enum": [
         "egress_host",
         "mcp_tool",
-        "zone_access"
+        "zone_access",
+        "package_install"
       ]
     }
   }

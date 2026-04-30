@@ -7,12 +7,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use agentenv_approvals::{
+    sign_payload, ApprovalKind, ApprovalRequest, ApprovalScope, ApprovalStore,
+};
 use agentenv_events::{
     audit::{AuditSigningKey, AuditStore},
     store::{EventQuery, SqliteEventStore},
     ActivityEvent, ActivityKind, ActivityResult,
 };
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde_json::json;
+use time::OffsetDateTime;
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
@@ -1054,6 +1059,295 @@ fn stats_without_env_reads_global_activity_summary() {
     assert!(stdout.contains("global"), "stdout was: {stdout}");
     assert!(stdout.contains("egress_denied"), "stdout was: {stdout}");
     assert!(stdout.contains("denied"), "stdout was: {stdout}");
+}
+
+#[test]
+fn approvals_list_json_prints_pending_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    let mut cmd = assert_cmd::Command::cargo_bin("agentenv").unwrap();
+    cmd.env("HOME", temp.path())
+        .args(["approvals", "list", "--env", "demo", "--json"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"request_id\": \"req-1\""));
+}
+
+#[test]
+fn approvals_approve_records_decision() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "approve",
+            "req-1",
+            "--env",
+            "demo",
+            "--scope",
+            "session",
+            "--reason",
+            "ok",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("approved: req-1"));
+}
+
+#[test]
+fn approvals_approve_writes_decision_event_to_explicit_sink() {
+    let temp = tempfile::tempdir().unwrap();
+    let events_path = temp.path().join("approval-events.jsonl");
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .arg("--events-sink")
+        .arg(format!("file:{}", events_path.display()))
+        .args([
+            "approvals",
+            "approve",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "ok",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("approved: req-1"));
+
+    let events = fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("approval_decided"), "events were: {events}");
+    assert!(events.contains("req-1"), "events were: {events}");
+}
+
+#[test]
+fn approvals_deny_records_reason() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "deny",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "no",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("denied: req-1"));
+}
+
+#[test]
+fn approvals_approve_fails_when_request_was_already_denied() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "deny",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "no",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("denied: req-1"));
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args([
+            "approvals",
+            "approve",
+            "req-1",
+            "--env",
+            "demo",
+            "--reason",
+            "ok",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already decided as deny"));
+}
+
+#[test]
+fn approvals_watch_once_json_prints_pending_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    seed_pending_approval(temp.path(), "demo", "req-1");
+
+    assert_cmd::Command::cargo_bin("agentenv")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args(["approvals", "watch", "--env", "demo", "--json", "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"request_id\": \"req-1\""));
+}
+
+#[test]
+fn term_once_prints_pending_approvals_across_envs() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_env_state(temp.path(), "demo");
+    write_minimal_env_state(temp.path(), "tools");
+    seed_pending_approval(temp.path(), "demo", "req-1");
+    seed_pending_approval(temp.path(), "tools", "req-2");
+
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--once")
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("req-1"), "stdout was: {stdout}");
+    assert!(stdout.contains("req-2"), "stdout was: {stdout}");
+    assert!(stdout.contains("demo"), "stdout was: {stdout}");
+    assert!(stdout.contains("tools"), "stdout was: {stdout}");
+    assert!(stdout.contains("egress_host"), "stdout was: {stdout}");
+    assert!(stdout.contains("network access"), "stdout was: {stdout}");
+    assert!(stdout.contains("session"), "stdout was: {stdout}");
+}
+
+#[test]
+fn term_once_does_not_create_missing_approval_database() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_env_state(temp.path(), "demo");
+    let db_path = env_activity_db_path(temp.path(), "demo");
+    assert!(!db_path.exists());
+
+    let output = Command::new(agentenv_bin())
+        .arg("term")
+        .arg("--once")
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !db_path.exists(),
+        "read-only term --once created {}",
+        db_path.display()
+    );
+}
+
+#[test]
+fn approvals_serve_healthz_responds_ok() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = reserve_tcp_port();
+    let _server = spawn_approvals_server(temp.path(), port);
+
+    wait_for_http_ok(port, "/healthz");
+}
+
+#[test]
+fn approvals_serve_unsigned_decision_callback_returns_401_without_deciding() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = reserve_tcp_port();
+    write_approval_callback_config(temp.path(), "callback-test-secret");
+    write_minimal_env_state(temp.path(), "demo");
+    seed_pending_approval(temp.path(), "demo", "req-unsigned");
+    let _server = spawn_approvals_server(temp.path(), port);
+    wait_for_http_ok(port, "/healthz");
+    let body = decision_callback_body("req-unsigned");
+
+    let response = post_decision_callback(port, "req-unsigned", body, None);
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_no_approval_decision(temp.path(), "demo", "req-unsigned");
+}
+
+#[test]
+fn approvals_serve_mismatched_signed_request_id_rejects_without_deciding_url_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = reserve_tcp_port();
+    let secret = "callback-test-secret";
+    write_approval_callback_config(temp.path(), secret);
+    write_minimal_env_state(temp.path(), "demo");
+    seed_pending_approval(temp.path(), "demo", "req-url");
+    seed_pending_approval(temp.path(), "demo", "req-body");
+    let _server = spawn_approvals_server(temp.path(), port);
+    wait_for_http_ok(port, "/healthz");
+    let body = decision_callback_body("req-body");
+    let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+    let headers = signed_callback_headers(secret, timestamp, "delivery-mismatch", body.as_bytes());
+
+    let response = post_decision_callback(port, "req-url", body, Some(headers));
+
+    assert!(!response.status().is_success());
+    assert_no_approval_decision(temp.path(), "demo", "req-url");
+    assert_no_approval_decision(temp.path(), "demo", "req-body");
+}
+
+#[test]
+fn approvals_serve_stale_signed_decision_callback_returns_401_without_deciding() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = reserve_tcp_port();
+    let secret = "callback-test-secret";
+    write_approval_callback_config(temp.path(), secret);
+    write_minimal_env_state(temp.path(), "demo");
+    seed_pending_approval(temp.path(), "demo", "req-stale");
+    let _server = spawn_approvals_server(temp.path(), port);
+    wait_for_http_ok(port, "/healthz");
+    let body = decision_callback_body("req-stale");
+    let timestamp = OffsetDateTime::now_utc().unix_timestamp() - 600;
+    let headers = signed_callback_headers(secret, timestamp, "delivery-stale", body.as_bytes());
+
+    let response = post_decision_callback(port, "req-stale", body, Some(headers));
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_no_approval_decision(temp.path(), "demo", "req-stale");
+}
+
+#[test]
+fn approvals_serve_valid_signed_decision_callback_records_decision() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = reserve_tcp_port();
+    let secret = "callback-test-secret";
+    write_approval_callback_config(temp.path(), secret);
+    write_minimal_env_state(temp.path(), "demo");
+    seed_pending_approval(temp.path(), "demo", "req-valid");
+    let _server = spawn_approvals_server(temp.path(), port);
+    wait_for_http_ok(port, "/healthz");
+    let body = decision_callback_body("req-valid");
+    let timestamp = OffsetDateTime::now_utc().unix_timestamp();
+    let headers = signed_callback_headers(secret, timestamp, "delivery-valid", body.as_bytes());
+
+    let response = post_decision_callback(port, "req-valid", body, Some(headers));
+
+    assert!(response.status().is_success(), "HTTP {}", response.status());
+    let store = ApprovalStore::open(env_activity_db_path(temp.path(), "demo")).unwrap();
+    let decision = store.get_decision("req-valid").unwrap().unwrap();
+    assert_eq!(
+        decision.decision,
+        agentenv_approvals::ApprovalDecisionValue::Allow
+    );
 }
 
 #[test]
@@ -2187,6 +2481,150 @@ fn seed_activity_db(home: &Path, env: &str, events: &[ActivityEvent]) {
     let db_path = env_activity_db_path(home, env);
     let store = SqliteEventStore::open(db_path).unwrap();
     store.append_many(events).unwrap();
+}
+
+fn seed_pending_approval(home: &Path, env: &str, request_id: &str) {
+    let db_path = env_activity_db_path(home, env);
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let store = ApprovalStore::open(db_path).unwrap();
+    let requested_at = OffsetDateTime::from_unix_timestamp(1_777_000_000).unwrap();
+    let request = ApprovalRequest::new(
+        request_id,
+        env,
+        ApprovalKind::EgressHost,
+        "api.example.test:443",
+        "network access",
+        json!({"url": "https://api.example.test/v1"}),
+        requested_at,
+        ApprovalScope::Session,
+        Duration::from_secs(300),
+        "trace-approval-1",
+    );
+    store.insert_request(&request).unwrap();
+}
+
+fn reserve_tcp_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+struct ApprovalsServerChild {
+    child: process::Child,
+}
+
+impl Drop for ApprovalsServerChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
+    let child = Command::new(agentenv_bin())
+        .env("HOME", home)
+        .args(["approvals", "serve", "--addr", &format!("127.0.0.1:{port}")])
+        .spawn()
+        .unwrap();
+    ApprovalsServerChild { child }
+}
+
+fn wait_for_http_ok(port: u16, path: &str) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_error = None;
+
+    while std::time::Instant::now() < deadline {
+        match client.get(&url).send() {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "timed out waiting for {url}: {}",
+        last_error.unwrap_or_else(|| "no attempts were made".to_owned())
+    );
+}
+
+fn write_approval_callback_config(home: &Path, secret: &str) {
+    let config_dir = home.join(".agentenv");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.yaml"),
+        format!(
+            r#"
+approvals:
+  webhooks:
+    - url: https://approvals.example.test/agentenv
+      secret: {secret}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn decision_callback_body(request_id: &str) -> String {
+    serde_json::json!({
+        "request_id": request_id,
+        "decision": "allow",
+        "scope": "session",
+        "decided_by": "review-test",
+        "reason": "approved"
+    })
+    .to_string()
+}
+
+fn signed_callback_headers(
+    secret: &str,
+    timestamp: i64,
+    delivery_id: &str,
+    body: &[u8],
+) -> Vec<(&'static str, String)> {
+    let signature = sign_payload(secret, timestamp, delivery_id, body);
+    vec![
+        ("x-agentenv-signature", signature.header_value().to_owned()),
+        ("x-agentenv-timestamp", timestamp.to_string()),
+        ("x-agentenv-delivery", delivery_id.to_owned()),
+    ]
+}
+
+fn post_decision_callback(
+    port: u16,
+    request_id: &str,
+    body: String,
+    headers: Option<Vec<(&'static str, String)>>,
+) -> reqwest::blocking::Response {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let mut request = client
+        .post(format!(
+            "http://127.0.0.1:{port}/approvals/{request_id}/decision"
+        ))
+        .header("content-type", "application/json")
+        .body(body);
+    for (name, value) in headers.unwrap_or_default() {
+        request = request.header(name, value);
+    }
+    request.send().unwrap()
+}
+
+fn assert_no_approval_decision(home: &Path, env: &str, request_id: &str) {
+    let store = ApprovalStore::open(env_activity_db_path(home, env)).unwrap();
+    assert!(
+        store.get_decision(request_id).unwrap().is_none(),
+        "approval request `{request_id}` unexpectedly has a decision"
+    );
 }
 
 fn env_activity_db_path(home: &Path, env: &str) -> PathBuf {

@@ -260,8 +260,12 @@ actor, subject, and extras maps:
 
 ### `event/approval_requested`
 
+Approval `kind` values include `egress_host`, `mcp_tool`, `zone_access`, and
+`package_install`.
+
 ```json
 {
+  "jsonrpc": "2.0",
   "method": "event/approval_requested",
   "params": {
     "request_id": "req_01HXYZ",
@@ -278,8 +282,15 @@ Core resolves the request (via TUI, webhook, or CLI) and replies via:
 
 ### `approval/decision` (core → driver)
 
+The core sends `approval/decision` as a JSON-RPC notification, not a request.
+It has no `id`, and drivers must not send a JSON-RPC response for it. The
+original driver request that caused the approval remains pending: the driver
+emits `event/approval_requested`, waits for this decision notification, then
+continues or fails the original request and sends that original response.
+
 ```json
 {
+  "jsonrpc": "2.0",
   "method": "approval/decision",
   "params": {
     "request_id": "req_01HXYZ",

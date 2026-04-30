@@ -437,6 +437,33 @@ mod tests {
         ActivityEvent::new(ts, kind, result, format!("trace-{ts}"))
     }
 
+    fn create_approval_tables_with_requests(store: &SqliteEventStore, rows: &[(&str, &str, &str)]) {
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE approval_requests (
+              id TEXT PRIMARY KEY,
+              env TEXT NOT NULL,
+              status TEXT NOT NULL
+            );
+
+            CREATE TABLE approval_decisions (
+              request_id TEXT PRIMARY KEY,
+              decision TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+
+        for (id, env, status) in rows {
+            conn.execute(
+                "INSERT INTO approval_requests (id, env, status) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, env, status],
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn prometheus_render_includes_required_series() {
         let temp = tempfile::tempdir().unwrap();
@@ -593,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn approvals_pending_correlates_requests_and_decisions_by_request_id() {
+    fn approvals_pending_falls_back_to_derived_events_without_approval_tables() {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
         store
@@ -639,6 +666,40 @@ mod tests {
         let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
 
         assert_eq!(snapshot.approvals_pending_total, 1);
+    }
+
+    #[test]
+    fn approvals_pending_prefers_durable_approval_requests_when_tables_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        create_approval_tables_with_requests(
+            &store,
+            &[
+                ("req-pending-1", "demo", "pending"),
+                ("req-pending-2", "other", "pending"),
+                ("req-approved", "demo", "approved"),
+            ],
+        );
+        store
+            .append_many(&[
+                event(
+                    "2026-04-26T12:00:00Z",
+                    ActivityKind::ApprovalRequested,
+                    ActivityResult::PendingApproval,
+                )
+                .with_subject_value("request_id", serde_json::json!("event-req")),
+                event(
+                    "2026-04-26T12:00:01Z",
+                    ActivityKind::ApprovalDecided,
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("request_id", serde_json::json!("event-req")),
+            ])
+            .unwrap();
+
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+
+        assert_eq!(snapshot.approvals_pending_total, 2);
     }
 
     #[test]

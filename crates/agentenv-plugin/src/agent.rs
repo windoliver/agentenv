@@ -21,7 +21,14 @@ pub struct SubprocessAgentDriver {
     entry: DiscoveredDriver,
     timeout: Duration,
     event_emitter: Arc<dyn EventEmitter>,
+    approval_context: Option<ApprovalDriverContext>,
     client: Option<JsonRpcClient>,
+}
+
+#[derive(Clone)]
+struct ApprovalDriverContext {
+    env_name: String,
+    coordinator: agentenv_approvals::ApprovalCoordinator,
 }
 
 impl fmt::Debug for SubprocessAgentDriver {
@@ -56,12 +63,25 @@ impl SubprocessAgentDriver {
             entry,
             timeout,
             event_emitter: Arc::new(NoopEventEmitter),
+            approval_context: None,
             client: None,
         })
     }
 
     pub fn with_event_emitter(mut self, event_emitter: Arc<dyn EventEmitter>) -> Self {
         self.event_emitter = event_emitter;
+        self
+    }
+
+    pub fn with_approval_coordinator(
+        mut self,
+        env_name: impl Into<String>,
+        coordinator: agentenv_approvals::ApprovalCoordinator,
+    ) -> Self {
+        self.approval_context = Some(ApprovalDriverContext {
+            env_name: env_name.into(),
+            coordinator,
+        });
         self
     }
 
@@ -83,6 +103,12 @@ impl SubprocessAgentDriver {
         .await
         .map_err(|err| map_jsonrpc_error(&self.name, err))?;
         client.set_event_emitter_arc(Arc::clone(&self.event_emitter));
+        if let Some(approval_context) = &self.approval_context {
+            client.set_approval_coordinator(
+                approval_context.env_name.clone(),
+                approval_context.coordinator.clone(),
+            );
+        }
         Ok(client)
     }
 

@@ -6,9 +6,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use agentenv_approvals::{
+    ApprovalConfig, ApprovalCoordinator, ApprovalCoordinatorConfig, ApprovalNotifier,
+    ApprovalStore, UrlValidator,
+};
 use agentenv_events::{
     ActivityEvent, ActivityKind, ActivityResult, EventEmitter, NoopEventEmitter,
 };
@@ -182,6 +186,16 @@ pub trait DriverFactory {
         self.build(selection)
     }
 
+    fn build_for_env_observed(
+        &self,
+        selection: &DriverSelection,
+        _env: &str,
+        events: Arc<dyn EventEmitter>,
+        _approval_coordinator: Option<ApprovalCoordinator>,
+    ) -> RuntimeResult<DriverSet> {
+        self.build_observed(selection, events)
+    }
+
     fn build_pinned(
         &self,
         selection: &DriverSelection,
@@ -197,6 +211,17 @@ pub trait DriverFactory {
         _events: Arc<dyn EventEmitter>,
     ) -> RuntimeResult<DriverSet> {
         self.build_pinned(selection, pins)
+    }
+
+    fn build_pinned_for_env_observed(
+        &self,
+        selection: &DriverSelection,
+        pins: &DriverPinSet,
+        _env: &str,
+        events: Arc<dyn EventEmitter>,
+        _approval_coordinator: Option<ApprovalCoordinator>,
+    ) -> RuntimeResult<DriverSet> {
+        self.build_pinned_observed(selection, pins, events)
     }
 }
 
@@ -256,6 +281,10 @@ pub enum RuntimeError {
     Lockfile(#[from] crate::lockfile::LockfileError),
     #[error(transparent)]
     PortableLockfile(#[from] crate::portable_lockfile::PortableLockfileError),
+    #[error(transparent)]
+    ApprovalConfig(#[from] agentenv_approvals::ApprovalConfigError),
+    #[error(transparent)]
+    ApprovalNotification(#[from] agentenv_approvals::ApprovalNotificationError),
     #[error("unsupported driver `{name}` for {kind}")]
     UnsupportedDriver { kind: &'static str, name: String },
     #[error("unknown policy tier `{tier}`")]
@@ -506,6 +535,69 @@ pub async fn initialize_inference_driver(
         .map_err(RuntimeError::from)?;
     ensure_runtime_handshake(DriverKind::Inference, "inference", &result)?;
     Ok(result)
+}
+
+pub fn env_events_db_path(options: &RuntimeOptions, env: &str) -> RuntimeResult<PathBuf> {
+    Ok(env_paths(options, env)?.env_dir().join("events.db"))
+}
+
+pub fn env_approval_overlay_path(options: &RuntimeOptions, env: &str) -> RuntimeResult<PathBuf> {
+    Ok(env_paths(options, env)?
+        .env_dir()
+        .join("approval-policy-overlay.yaml"))
+}
+
+pub fn env_approval_proposals_path(options: &RuntimeOptions, env: &str) -> RuntimeResult<PathBuf> {
+    Ok(env_paths(options, env)?
+        .env_dir()
+        .join("approval-policy-proposals.yaml"))
+}
+
+pub fn approval_coordinator_for_env(
+    options: &RuntimeOptions,
+    env: &str,
+    events: Arc<dyn EventEmitter>,
+) -> RuntimeResult<ApprovalCoordinator> {
+    let store = ApprovalStore::open(env_events_db_path(options, env)?).map_err(|err| {
+        RuntimeError::Driver(DriverError::ApprovalUnavailable {
+            request_id: "<coordinator>".to_owned(),
+            message: err.to_string(),
+        })
+    })?;
+    Ok(ApprovalCoordinator::new(ApprovalCoordinatorConfig {
+        store,
+        events,
+        poll_interval: Duration::from_millis(250),
+        overlay_path: Some(env_approval_overlay_path(options, env)?),
+        proposal_path: Some(env_approval_proposals_path(options, env)?),
+        notifications: approval_notifications(options)?,
+    }))
+}
+
+fn approval_notifications(
+    options: &RuntimeOptions,
+) -> RuntimeResult<Option<Arc<ApprovalNotifier>>> {
+    let config = ApprovalConfig::load(&options.root.join("config.yaml"))?;
+    Ok(ApprovalNotifier::from_config(config, approval_url_validator())?.map(Arc::new))
+}
+
+fn approval_url_validator() -> UrlValidator {
+    Arc::new(|raw_url| {
+        let url = url::Url::parse(raw_url).map_err(|error| error.to_string())?;
+        crate::security::ssrf::validate_outbound(
+            &url,
+            crate::security::ssrf::SsrfOptions::default(),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    })
+}
+
+fn env_paths(options: &RuntimeOptions, env: &str) -> RuntimeResult<crate::env::EnvPaths> {
+    Ok(crate::env::EnvPaths::new(
+        options.root.clone(),
+        crate::env::validate_env_name(env)?,
+    ))
 }
 
 pub async fn run_preflight_only(
@@ -1649,7 +1741,16 @@ pub async fn exec_env_observed(
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
-    let mut set = factory.build_observed(&selection, Arc::clone(&events))?;
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        name,
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            name,
+            Arc::clone(&events),
+        )?),
+    )?;
     if let Err(err) = initialize_sandbox_driver(options, set.sandbox.as_mut()).await {
         emit_runtime_event(
             events.as_ref(),
@@ -1987,7 +2088,16 @@ pub async fn status_env_observed(
 ) -> RuntimeResult<EnvStatusSummary> {
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
-    let mut set = factory.build_observed(&selection, events)?;
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        name,
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            name,
+            Arc::clone(&events),
+        )?),
+    )?;
 
     let sandbox = match state.handles.sandbox.clone() {
         Some(handle) => {
@@ -2055,7 +2165,16 @@ pub async fn logs_env_observed(
     let state = describe_env(options, name)?.state;
     let selection = selection_from_state(&state);
     let handle = required_sandbox_handle(&state, name)?;
-    let mut set = factory.build_observed(&selection, events)?;
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        name,
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            name,
+            Arc::clone(&events),
+        )?),
+    )?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
     set.sandbox
@@ -2110,7 +2229,16 @@ pub async fn destroy_env_observed(
         .or_else(|| state.handles.context.clone())
         .or_else(|| state.handles.inference.clone());
     let selection = selection_from_state(&state);
-    let mut set = factory.build_observed(&selection, Arc::clone(&events))?;
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        name,
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            name,
+            Arc::clone(&events),
+        )?),
+    )?;
     let paths =
         crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(name)?);
     let mut destroy_error_emitted = false;
@@ -2878,6 +3006,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::Lifecycle(_)
         | RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
         | RuntimeError::ComponentConfigConversion { .. }
@@ -2896,6 +3025,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         }
         RuntimeError::Env(EnvError::Io { .. })
         | RuntimeError::Env(EnvError::Json { .. })
+        | RuntimeError::ApprovalNotification(_)
         | RuntimeError::Driver(_)
         | RuntimeError::DriverArtifact(_)
         | RuntimeError::CommandStatus { .. } => {
@@ -3181,8 +3311,10 @@ mod tests {
     use crate::driver::{ContextDriver, DriverResult, InferenceDriver, SandboxDriver};
 
     use super::{
-        component_spec, initialize_context_driver, initialize_sandbox_driver, DriverFactory,
-        DriverSet, RuntimeError, RuntimeOptions, RuntimeSecret,
+        approval_coordinator_for_env, component_spec, env_approval_overlay_path,
+        env_approval_proposals_path, env_events_db_path, initialize_context_driver,
+        initialize_sandbox_driver, DriverFactory, DriverSet, RuntimeError, RuntimeOptions,
+        RuntimeSecret,
     };
 
     fn unique_root(prefix: &str) -> std::path::PathBuf {
@@ -3219,6 +3351,88 @@ mod tests {
         fs::create_dir_all(env_dir).unwrap();
         let rendered = serde_json::to_string_pretty(&state).unwrap();
         fs::write(env_dir.join("state.json"), rendered).unwrap();
+    }
+
+    #[test]
+    fn approval_overlay_path_helpers_validate_env_and_stay_under_env_dir() {
+        let root = unique_root("agentenv-approval-paths");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: false,
+        };
+
+        assert_eq!(
+            env_events_db_path(&options, "demo").unwrap(),
+            root.join("envs").join("demo").join("events.db")
+        );
+        assert_eq!(
+            env_approval_overlay_path(&options, "demo").unwrap(),
+            root.join("envs")
+                .join("demo")
+                .join("approval-policy-overlay.yaml")
+        );
+        assert_eq!(
+            env_approval_proposals_path(&options, "demo").unwrap(),
+            root.join("envs")
+                .join("demo")
+                .join("approval-policy-proposals.yaml")
+        );
+        assert!(matches!(
+            env_approval_overlay_path(&options, "../demo"),
+            Err(RuntimeError::Env(crate::env::EnvError::InvalidName { .. }))
+        ));
+    }
+
+    #[test]
+    fn approval_runtime_paths_are_env_scoped() {
+        let root = unique_root("approval-runtime-paths");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: agentenv_proto::LogLevel::Info,
+            non_interactive: true,
+        };
+
+        assert_eq!(
+            env_approval_overlay_path(&options, "demo").unwrap(),
+            root.join("envs")
+                .join("demo")
+                .join("approval-policy-overlay.yaml")
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_coordinator_helper_writes_to_env_scoped_store() {
+        let root = unique_root("approval-coordinator");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let coordinator = approval_coordinator_for_env(
+            &options,
+            "demo",
+            Arc::new(RecordingEventEmitter::default()),
+        )
+        .unwrap();
+
+        coordinator
+            .submit_request(agentenv_approvals::ApprovalRequest::new(
+                "req-1",
+                "demo",
+                agentenv_approvals::ApprovalKind::EgressHost,
+                "example.com",
+                "network request",
+                serde_json::json!({}),
+                time::OffsetDateTime::UNIX_EPOCH,
+                agentenv_approvals::ApprovalScope::Once,
+                std::time::Duration::from_secs(60),
+                "trace-1",
+            ))
+            .await
+            .unwrap();
+
+        assert!(root.join("envs").join("demo").join("events.db").exists());
     }
 
     #[derive(Default)]

@@ -27,7 +27,21 @@ impl DriverFactory for BuiltInDriverFactory {
         selection: &DriverSelection,
         events: Arc<dyn EventEmitter>,
     ) -> RuntimeResult<DriverSet> {
-        build_driver_set_with_events(selection, events)
+        build_driver_set_with_context(selection, events, None)
+    }
+
+    fn build_for_env_observed(
+        &self,
+        selection: &DriverSelection,
+        env: &str,
+        events: Arc<dyn EventEmitter>,
+        approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+    ) -> RuntimeResult<DriverSet> {
+        let approval_context = approval_coordinator.map(|coordinator| SubprocessApprovalContext {
+            env_name: env.to_owned(),
+            coordinator,
+        });
+        build_driver_set_with_context(selection, events, approval_context.as_ref())
     }
 
     fn build_pinned(
@@ -44,13 +58,42 @@ impl DriverFactory for BuiltInDriverFactory {
         pins: &DriverPinSet,
         events: Arc<dyn EventEmitter>,
     ) -> RuntimeResult<DriverSet> {
-        build_pinned_driver_set_with_events(selection, pins, events)
+        build_pinned_driver_set_with_context(selection, pins, events, None)
+    }
+
+    fn build_pinned_for_env_observed(
+        &self,
+        selection: &DriverSelection,
+        pins: &DriverPinSet,
+        env: &str,
+        events: Arc<dyn EventEmitter>,
+        approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+    ) -> RuntimeResult<DriverSet> {
+        let approval_context = approval_coordinator.map(|coordinator| SubprocessApprovalContext {
+            env_name: env.to_owned(),
+            coordinator,
+        });
+        build_pinned_driver_set_with_context(selection, pins, events, approval_context.as_ref())
     }
 }
 
 fn build_driver_set_with_events(
     selection: &DriverSelection,
     events: Arc<dyn EventEmitter>,
+) -> RuntimeResult<DriverSet> {
+    build_driver_set_with_context(selection, events, None)
+}
+
+#[derive(Clone)]
+struct SubprocessApprovalContext {
+    env_name: String,
+    coordinator: agentenv_approvals::ApprovalCoordinator,
+}
+
+fn build_driver_set_with_context(
+    selection: &DriverSelection,
+    events: Arc<dyn EventEmitter>,
+    approval_context: Option<&SubprocessApprovalContext>,
 ) -> RuntimeResult<DriverSet> {
     let mut catalog = None;
     Ok(DriverSet {
@@ -70,13 +113,11 @@ fn build_driver_set_with_events(
             "codex" | "agent-codex" => Box::new(agent_codex::CodexDriver),
             "openclaw" | "agent-openclaw" => Box::new(agent_openclaw::OpenClawDriver),
             other => match subprocess_entry(&mut catalog, CatalogKind::Agent, other)? {
-                Some(entry) => Box::new(
-                    agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
-                        entry,
-                        SUBPROCESS_DRIVER_TIMEOUT,
-                    )?
-                    .with_event_emitter(Arc::clone(&events)),
-                ),
+                Some(entry) => Box::new(subprocess_agent_driver(
+                    entry,
+                    Arc::clone(&events),
+                    approval_context,
+                )?),
                 None => {
                     return Err(RuntimeError::UnsupportedDriver {
                         kind: "agent",
@@ -94,13 +135,11 @@ fn build_driver_set_with_events(
             }
             "none" | "context-none" => Box::new(context_none::NoneContextDriver),
             other => match subprocess_entry(&mut catalog, CatalogKind::Context, other)? {
-                Some(entry) => Box::new(
-                    agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
-                        entry,
-                        SUBPROCESS_DRIVER_TIMEOUT,
-                    )?
-                    .with_event_emitter(Arc::clone(&events)),
-                ),
+                Some(entry) => Box::new(subprocess_context_driver(
+                    entry,
+                    Arc::clone(&events),
+                    approval_context,
+                )?),
                 None => {
                     return Err(RuntimeError::UnsupportedDriver {
                         kind: "context",
@@ -140,10 +179,24 @@ fn build_pinned_driver_set_with_events(
     pins: &DriverPinSet,
     events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<DriverSet> {
+    build_pinned_driver_set_with_context(selection, pins, events, None)
+}
+
+fn build_pinned_driver_set_with_context(
+    selection: &DriverSelection,
+    pins: &DriverPinSet,
+    events: Arc<dyn EventEmitter>,
+    approval_context: Option<&SubprocessApprovalContext>,
+) -> RuntimeResult<DriverSet> {
     Ok(DriverSet {
         sandbox: build_pinned_sandbox(selection, pins.get("sandbox"))?,
-        agent: build_pinned_agent(selection, pins.get("agent"), Arc::clone(&events))?,
-        context: build_pinned_context(selection, pins.get("context"), events)?,
+        agent: build_pinned_agent(
+            selection,
+            pins.get("agent"),
+            Arc::clone(&events),
+            approval_context,
+        )?,
+        context: build_pinned_context(selection, pins.get("context"), events, approval_context)?,
         inference: build_pinned_inference(selection, pins.get("inference"))?,
     })
 }
@@ -173,17 +226,16 @@ fn build_pinned_agent(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
     events: Arc<dyn EventEmitter>,
+    approval_context: Option<&SubprocessApprovalContext>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::AgentDriver>> {
     match pin {
         Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
             let entry = verified_subprocess_entry(pin, CatalogKind::Agent, "agent")?;
-            Ok(Box::new(
-                agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
-                    entry,
-                    SUBPROCESS_DRIVER_TIMEOUT,
-                )?
-                .with_event_emitter(events),
-            ))
+            Ok(Box::new(subprocess_agent_driver(
+                entry,
+                events,
+                approval_context,
+            )?))
         }
         _ => match selection.agent.as_str() {
             "claude" | "agent-claude" => {
@@ -225,17 +277,16 @@ fn build_pinned_context(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
     events: Arc<dyn EventEmitter>,
+    approval_context: Option<&SubprocessApprovalContext>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::ContextDriver>> {
     match pin {
         Some(pin) if pin.source != agentenv_core::lockfile::DriverSourcePin::BuiltIn => {
             let entry = verified_subprocess_entry(pin, CatalogKind::Context, "context")?;
-            Ok(Box::new(
-                agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
-                    entry,
-                    SUBPROCESS_DRIVER_TIMEOUT,
-                )?
-                .with_event_emitter(events),
-            ))
+            Ok(Box::new(subprocess_context_driver(
+                entry,
+                events,
+                approval_context,
+            )?))
         }
         _ => match selection.context.as_str() {
             "filesystem" | "context-filesystem" => {
@@ -275,6 +326,42 @@ fn build_pinned_context(
             }),
         },
     }
+}
+
+fn subprocess_agent_driver(
+    entry: DiscoveredDriver,
+    events: Arc<dyn EventEmitter>,
+    approval_context: Option<&SubprocessApprovalContext>,
+) -> RuntimeResult<agentenv_plugin::SubprocessAgentDriver> {
+    let driver = agentenv_plugin::SubprocessAgentDriver::from_discovered_unstarted(
+        entry,
+        SUBPROCESS_DRIVER_TIMEOUT,
+    )?
+    .with_event_emitter(events);
+    Ok(match approval_context {
+        Some(context) => {
+            driver.with_approval_coordinator(context.env_name.clone(), context.coordinator.clone())
+        }
+        None => driver,
+    })
+}
+
+fn subprocess_context_driver(
+    entry: DiscoveredDriver,
+    events: Arc<dyn EventEmitter>,
+    approval_context: Option<&SubprocessApprovalContext>,
+) -> RuntimeResult<agentenv_plugin::SubprocessContextDriver> {
+    let driver = agentenv_plugin::SubprocessContextDriver::from_discovered_unstarted(
+        entry,
+        SUBPROCESS_DRIVER_TIMEOUT,
+    )?
+    .with_event_emitter(events);
+    Ok(match approval_context {
+        Some(context) => {
+            driver.with_approval_coordinator(context.env_name.clone(), context.coordinator.clone())
+        }
+        None => driver,
+    })
 }
 
 fn build_pinned_inference(
@@ -576,6 +663,119 @@ mod tests {
     }
 
     #[test]
+    fn subprocess_approval_context_helpers_preserve_driver_construction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hermes = temp.path().join("agent-hermes");
+        let nexus = temp.path().join("context-nexus");
+        write_manifest(&hermes, "agent", "hermes", "agentenv-driver-hermes");
+        write_manifest(&nexus, "context", "nexus", "agentenv-driver-nexus");
+        let agent_entry = agentenv_core::driver_catalog::DiscoveredDriver {
+            kind: CatalogKind::Agent,
+            name: "hermes".to_owned(),
+            version: "0.1.0".parse().expect("version"),
+            source: DriverSource::DevelopmentOverride,
+            description: None,
+            binary: Some(hermes.join("bin").join("agentenv-driver-hermes")),
+            manifest_path: Some(hermes.join("manifest.json")),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            capabilities_preview: serde_json::Value::Null,
+        };
+        let context_entry = agentenv_core::driver_catalog::DiscoveredDriver {
+            kind: CatalogKind::Context,
+            name: "nexus".to_owned(),
+            version: "0.1.0".parse().expect("version"),
+            source: DriverSource::DevelopmentOverride,
+            description: None,
+            binary: Some(nexus.join("bin").join("agentenv-driver-nexus")),
+            manifest_path: Some(nexus.join("manifest.json")),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            capabilities_preview: serde_json::Value::Null,
+        };
+        let store = agentenv_approvals::ApprovalStore::open(
+            temp.path().join("envs").join("demo").join("events.db"),
+        )
+        .expect("store");
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: std::time::Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let context = super::SubprocessApprovalContext {
+            env_name: "demo".to_owned(),
+            coordinator,
+        };
+
+        let agent = super::subprocess_agent_driver(
+            agent_entry,
+            std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+            Some(&context),
+        )
+        .expect("agent driver should build with approval context");
+        let context = super::subprocess_context_driver(
+            context_entry,
+            std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+            Some(&context),
+        )
+        .expect("context driver should build with approval context");
+        drop((agent, context));
+    }
+
+    #[test]
+    fn env_aware_factory_path_builds_subprocess_agent_and_context_with_approval_context() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let hermes = temp.path().join("agent-hermes");
+        let nexus = temp.path().join("context-nexus");
+        write_manifest(&hermes, "agent", "hermes", "agentenv-driver-hermes");
+        write_manifest(&nexus, "context", "nexus", "agentenv-driver-nexus");
+        let driver_path = std::env::join_paths([&hermes, &nexus]).expect("join driver path");
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            ("AGENTENV_DRIVER_PATH", driver_path),
+        ]);
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "hermes".to_owned(),
+            context: "nexus".to_owned(),
+            inference: None,
+        };
+        let store = agentenv_approvals::ApprovalStore::open(
+            temp.path().join("envs").join("demo").join("events.db"),
+        )
+        .expect("store");
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: std::time::Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+
+        let set = BuiltInDriverFactory
+            .build_for_env_observed(
+                &selection,
+                "demo",
+                std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                Some(coordinator),
+            )
+            .expect("env-aware factory path should build subprocess agent and context");
+
+        drop(set);
+    }
+
+    #[test]
     fn pinned_subprocess_selection_uses_exact_installed_source_when_override_shares_name_version() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
@@ -670,6 +870,101 @@ mod tests {
         let set = BuiltInDriverFactory
             .build_pinned(&selection, &pins)
             .expect("verified artifact should materialize without rediscovery");
+        drop(set);
+    }
+
+    #[test]
+    fn pinned_env_aware_factory_path_builds_subprocess_agent_and_context_with_approval_context() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let installed_parent = temp.path().join("verified-drivers");
+        let hermes_driver = installed_parent.join("agent-hermes");
+        let nexus_driver = installed_parent.join("context-nexus");
+        let built_in_binary = temp.path().join("agentenv-test-binary");
+        std::fs::write(&built_in_binary, "fake agentenv binary\n").expect("built-in binary");
+        write_manifest(&hermes_driver, "agent", "hermes", "agentenv-driver-hermes");
+        write_manifest(&nexus_driver, "context", "nexus", "agentenv-driver-nexus");
+        let artifacts = discover_driver_artifacts(
+            DriverDiscoveryConfig::new(installed_parent, Vec::new()),
+            Some(built_in_binary),
+        )
+        .expect("discover artifacts");
+        let hermes = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == CatalogKind::Agent
+                    && artifact.name == "hermes"
+                    && artifact.source == DriverSource::InstalledSubprocess
+            })
+            .expect("hermes artifact");
+        let nexus = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == CatalogKind::Context
+                    && artifact.name == "nexus"
+                    && artifact.source == DriverSource::InstalledSubprocess
+            })
+            .expect("nexus artifact");
+        let mut lockfile = lockfile_with_pin(
+            "agent",
+            ProtoDriverKind::Agent,
+            "hermes",
+            "0.1.0",
+            DriverSourcePin::Installed,
+            &hermes.digest,
+        );
+        lockfile.drivers.insert(
+            "context".to_owned(),
+            PortableDriverPin {
+                kind: proto_kind_label(ProtoDriverKind::Context).to_owned(),
+                name: "nexus".to_owned(),
+                version: "0.1.0".to_owned(),
+                source: DriverSourcePin::Installed,
+                digest: nexus.digest.clone(),
+            },
+        );
+        let pins = DriverPinSet::from_portable_lockfile_and_artifacts(&lockfile, &artifacts)
+            .expect("pin set");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _env_guard = EnvGuard::set([
+            ("HOME", home.into_os_string()),
+            (
+                "AGENTENV_DRIVER_PATH",
+                temp.path().join("missing-driver-path").into_os_string(),
+            ),
+        ]);
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "hermes".to_owned(),
+            context: "nexus".to_owned(),
+            inference: None,
+        };
+        let store = agentenv_approvals::ApprovalStore::open(
+            temp.path().join("envs").join("demo").join("events.db"),
+        )
+        .expect("store");
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: std::time::Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+
+        let set = BuiltInDriverFactory
+            .build_pinned_for_env_observed(
+                &selection,
+                &pins,
+                "demo",
+                std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                Some(coordinator),
+            )
+            .expect("pinned env-aware factory path should build subprocess agent and context");
+
         drop(set);
     }
 

@@ -1,3 +1,4 @@
+use agentenv_approvals::{format_rfc3339, ApprovalKind, ApprovalRequest, ApprovalScope};
 use agentenv_core::{
     admission::{AdmissionReport, ExitClass, ReasonCode},
     driver::DriverError,
@@ -49,12 +50,14 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         }
         RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
         | RuntimeError::FrozenLockfileDriverMismatch { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Driver(error) => reason_for_driver_error(error),
         RuntimeError::Env(EnvError::Io { .. })
         | RuntimeError::Env(EnvError::Json { .. })
+        | RuntimeError::ApprovalNotification(_)
         | RuntimeError::DriverArtifact(_)
         | RuntimeError::CommandStatus { .. }
         | RuntimeError::MissingSandboxHandle { .. }
@@ -78,6 +81,7 @@ fn reason_for_driver_error(error: &DriverError) -> ReasonCode {
         | DriverError::CommandSpawn { .. }
         | DriverError::CommandFailed { .. }
         | DriverError::Subprocess { .. }
+        | DriverError::ApprovalUnavailable { .. }
         | DriverError::PolicyTranslation { .. }
         | DriverError::PolicyRequiresRecreate { .. } => ReasonCode::DriverCommandFailed,
     }
@@ -110,6 +114,38 @@ pub struct ListJson {
 #[derive(Debug, Serialize)]
 pub struct SessionsJson {
     pub sessions: Vec<SessionListRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApprovalsListJson {
+    pub approvals: Vec<ApprovalRowJson>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalRowJson {
+    pub env: String,
+    pub request_id: String,
+    pub kind: ApprovalKind,
+    pub subject: String,
+    pub reason: String,
+    pub requested_at: String,
+    pub expires_at: String,
+    pub default_scope: ApprovalScope,
+}
+
+impl ApprovalRowJson {
+    pub fn from_request(request: &ApprovalRequest) -> Self {
+        Self {
+            env: request.env.clone(),
+            request_id: request.id.clone(),
+            kind: request.kind,
+            subject: request.subject.clone(),
+            reason: request.reason.clone(),
+            requested_at: format_rfc3339(request.requested_at),
+            expires_at: format_rfc3339(request.expires_at),
+            default_scope: request.default_scope,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +192,25 @@ pub fn print_sessions_text(rows: &[SessionListRow]) {
     }
 }
 
+pub fn print_approval_rows_text(rows: &[ApprovalRowJson]) {
+    println!(
+        "{:<20} {:<26} {:<16} {:<24} {:<24} {:<22} REQUESTED",
+        "ENV", "REQUEST", "KIND", "SUBJECT", "REASON", "DEFAULT_SCOPE"
+    );
+    for row in rows {
+        println!(
+            "{:<20} {:<26} {:<16} {:<24} {:<24} {:<22} {}",
+            row.env,
+            row.request_id,
+            approval_kind_label(row.kind),
+            truncate_table_cell(&row.subject, 24),
+            truncate_table_cell(&row.reason, 24),
+            approval_scope_label(row.default_scope),
+            row.requested_at
+        );
+    }
+}
+
 pub fn print_describe_text(description: &EnvDescription) {
     println!("Name: {}", description.state.name);
     println!("Phase: {:?}", description.state.phase);
@@ -174,6 +229,34 @@ pub fn print_describe_text(description: &EnvDescription) {
 #[allow(dead_code)]
 pub fn print_admission_text(report: &AdmissionReport) {
     println!("{}: {}", report.env, report.reason_code.as_str());
+}
+
+fn approval_kind_label(kind: ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::EgressHost => "egress_host",
+        ApprovalKind::McpTool => "mcp_tool",
+        ApprovalKind::ZoneAccess => "zone_access",
+        ApprovalKind::PackageInstall => "package_install",
+    }
+}
+
+fn approval_scope_label(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Session => "session",
+        ApprovalScope::PersistSandbox => "persist-sandbox",
+        ApprovalScope::ProposeForBaseline => "propose-for-baseline",
+    }
+}
+
+fn truncate_table_cell(value: &str, width: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(width).collect();
+    if chars.next().is_some() {
+        truncated
+    } else {
+        value.to_owned()
+    }
 }
 
 #[cfg(test)]
