@@ -21,6 +21,7 @@ INSTALL_DIR="${AGENTENV_INSTALL_DIR:-$HOME/.agentenv/bin}"
 AGENTENV_HOME="${AGENTENV_HOME:-$HOME/.agentenv}"
 AGENTENV_BIN="${AGENTENV_BIN:-$INSTALL_DIR/$APP_NAME}"
 TMP_ROOT=""
+FALLBACK_TMP_ROOT=""
 TMP_ROOT_IS_OVERRIDE=0
 PLAN_FILE=""
 ACTIONS_LOG=""
@@ -48,6 +49,14 @@ EOF
 log_action() {
     printf '%s\n' "$*" >> "${ACTIONS_LOG}"
     printf '%s\n' "$*"
+}
+
+init_diagnostics_files() {
+    PLAN_FILE="${TMP_ROOT}/plan.txt"
+    ACTIONS_LOG="${TMP_ROOT}/actions.log"
+    ERRORS_LOG="${TMP_ROOT}/errors.log"
+    : > "${ACTIONS_LOG}"
+    : > "${ERRORS_LOG}"
 }
 
 record_error() {
@@ -450,35 +459,88 @@ validate_remove_path() {
 }
 
 diagnostics_conflicts_with_removed_path() {
-    removed_path=$1
-    if path_is_same_or_under_dir "${TMP_ROOT}" "${removed_path}"; then
-        record_error "unsafe diagnostics directory ${TMP_ROOT}: inside path selected for removal ${removed_path}; errors.log would be removed"
+    diagnostics_path=$1
+    removed_path=$2
+    if path_is_same_or_under_dir "${diagnostics_path}" "${removed_path}"; then
+        record_error "unsafe diagnostics directory ${diagnostics_path}: inside path selected for removal ${removed_path}; errors.log would be removed"
         return 0
     fi
     return 1
 }
 
-validate_diagnostics_root() {
-    diagnostics_conflicts_with_removed_path "${AGENTENV_BIN}" && return 1
-    if [ "${KEEP_DATA}" -eq 0 ]; then
-        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/envs" && return 1
+validate_diagnostics_override_path() {
+    diagnostics_path=$1
+    case "${diagnostics_path}" in
+        ""|"/"|".")
+            record_error "unsafe diagnostics directory ${diagnostics_path}: AGENTENV_UNINSTALL_DIAGNOSTICS_DIR is unsafe (${diagnostics_path})"
+            return 1
+            ;;
+    esac
+    case "${diagnostics_path}" in
+        /*)
+            ;;
+        *)
+            record_error "unsafe diagnostics directory ${diagnostics_path}: AGENTENV_UNINSTALL_DIAGNOSTICS_DIR must be absolute"
+            return 1
+            ;;
+    esac
+    if path_has_parent_component "${diagnostics_path}"; then
+        record_error "unsafe diagnostics directory ${diagnostics_path}: AGENTENV_UNINSTALL_DIAGNOSTICS_DIR contains parent directory component"
+        return 1
     fi
-    if [ "${KEEP_DRIVERS}" -eq 0 ]; then
-        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/drivers" && return 1
+    if path_has_current_component "${diagnostics_path}"; then
+        record_error "unsafe diagnostics directory ${diagnostics_path}: AGENTENV_UNINSTALL_DIAGNOSTICS_DIR contains current directory component"
+        return 1
     fi
-    if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
-        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/credentials.json" && return 1
-    fi
-    diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/events.db" && return 1
-    diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/audit.key" && return 1
-    diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/audit-signing-key" && return 1
-    if [ "${DELETE_MODELS}" -eq 1 ]; then
-        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/models" && return 1
-    fi
-    if path_is_under_dir "${INSTALL_DIR}" "${AGENTENV_HOME}"; then
-        diagnostics_conflicts_with_removed_path "${INSTALL_DIR}" && return 1
+    if path_has_symlink_component "${diagnostics_path}"; then
+        record_error "unsafe diagnostics directory ${diagnostics_path}: AGENTENV_UNINSTALL_DIAGNOSTICS_DIR must not contain symlink components"
+        return 1
     fi
     return 0
+}
+
+validate_diagnostics_root_path() {
+    diagnostics_path=$1
+    diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_BIN}" && return 1
+    if [ "${KEEP_DATA}" -eq 0 ]; then
+        diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/envs" && return 1
+    fi
+    if [ "${KEEP_DRIVERS}" -eq 0 ]; then
+        diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/drivers" && return 1
+    fi
+    if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
+        diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/credentials.json" && return 1
+    fi
+    diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/events.db" && return 1
+    diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/audit.key" && return 1
+    diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/audit-signing-key" && return 1
+    if [ "${DELETE_MODELS}" -eq 1 ]; then
+        diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/models" && return 1
+    fi
+    if path_is_under_dir "${INSTALL_DIR}" "${AGENTENV_HOME}"; then
+        diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${INSTALL_DIR}" && return 1
+    fi
+    return 0
+}
+
+select_diagnostics_root() {
+    if [ -z "${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR:-}" ]; then
+        return 0
+    fi
+
+    diagnostics_override=${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR}
+    validate_diagnostics_override_path "${diagnostics_override}" || return 1
+    validate_diagnostics_root_path "${diagnostics_override}" || return 1
+    if ! mkdir -p "${diagnostics_override}"; then
+        record_error "failed to create diagnostics directory ${diagnostics_override}"
+        return 1
+    fi
+    validate_diagnostics_override_path "${diagnostics_override}" || return 1
+    validate_diagnostics_root_path "${diagnostics_override}" || return 1
+
+    TMP_ROOT=${diagnostics_override}
+    TMP_ROOT_IS_OVERRIDE=1
+    init_diagnostics_files
 }
 
 remove_path_if_present() {
@@ -578,6 +640,9 @@ execute_uninstall() {
 }
 
 cleanup_uninstall_tmp() {
+    if [ -n "${FALLBACK_TMP_ROOT}" ] && [ "${FALLBACK_TMP_ROOT}" != "${TMP_ROOT}" ] && [ -d "${FALLBACK_TMP_ROOT}" ]; then
+        rm -rf "${FALLBACK_TMP_ROOT}"
+    fi
     if [ -n "${TMP_ROOT}" ] && [ -d "${TMP_ROOT}" ] && [ "${TMP_ROOT_IS_OVERRIDE}" -eq 0 ] && [ "${FAILURE_COUNT}" -eq 0 ]; then
         rm -rf "${TMP_ROOT}"
     fi
@@ -590,26 +655,17 @@ report_uninstall_failures() {
 
 main() {
     parse_uninstall_args "$@"
-    if [ -n "${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR:-}" ]; then
-        TMP_ROOT=${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR}
-        TMP_ROOT_IS_OVERRIDE=1
-        mkdir -p "${TMP_ROOT}"
-    else
-        TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-uninstall.XXXXXX")
-        TMP_ROOT_IS_OVERRIDE=0
-    fi
-    PLAN_FILE="${TMP_ROOT}/plan.txt"
-    ACTIONS_LOG="${TMP_ROOT}/actions.log"
-    ERRORS_LOG="${TMP_ROOT}/errors.log"
-    : > "${ACTIONS_LOG}"
-    : > "${ERRORS_LOG}"
+    TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}-uninstall.XXXXXX")
+    FALLBACK_TMP_ROOT=${TMP_ROOT}
+    TMP_ROOT_IS_OVERRIDE=0
+    init_diagnostics_files
     trap cleanup_uninstall_tmp EXIT INT TERM
 
     if ! validate_configured_roots; then
         report_uninstall_failures
         return 1
     fi
-    if ! validate_diagnostics_root; then
+    if ! select_diagnostics_root; then
         report_uninstall_failures
         return 1
     fi
