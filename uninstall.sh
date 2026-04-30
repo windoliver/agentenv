@@ -140,6 +140,48 @@ append_shell_plan() {
     fi
 }
 
+append_docker_plan() {
+    if ! command -v docker >/dev/null 2>&1; then
+        printf '  docker not found; skipped\n' >> "${PLAN_FILE}"
+        return 0
+    fi
+
+    found=0
+    volumes_file="${TMP_ROOT}/docker-volumes.$$"
+    images_file="${TMP_ROOT}/docker-images.$$"
+
+    if docker volume ls --format '{{.Name}}' > "${volumes_file}" 2>> "${ERRORS_LOG}"; then
+        while IFS= read -r volume_name; do
+            case "${volume_name}" in
+                agentenv_*)
+                    printf '  remove docker volume %s\n' "${volume_name}" >> "${PLAN_FILE}"
+                    found=1
+                    ;;
+            esac
+        done < "${volumes_file}"
+    else
+        printf '  failed to list docker volumes\n' >> "${PLAN_FILE}"
+    fi
+
+    if docker image ls --format '{{.Repository}}:{{.Tag}}' > "${images_file}" 2>> "${ERRORS_LOG}"; then
+        while IFS= read -r image_name; do
+            case "${image_name}" in
+                agentenv_*)
+                    printf '  remove docker image %s\n' "${image_name}" >> "${PLAN_FILE}"
+                    found=1
+                    ;;
+            esac
+        done < "${images_file}"
+    else
+        printf '  failed to list docker images\n' >> "${PLAN_FILE}"
+    fi
+
+    rm -f "${volumes_file}" "${images_file}"
+    if [ "${found}" -eq 0 ]; then
+        printf '  no agentenv_ docker resources found\n' >> "${PLAN_FILE}"
+    fi
+}
+
 build_uninstall_plan() {
     : > "${PLAN_FILE}"
     printf 'Uninstall plan\n' >> "${PLAN_FILE}"
@@ -162,6 +204,8 @@ build_uninstall_plan() {
     fi
     printf '\nShell startup files:\n' >> "${PLAN_FILE}"
     append_shell_plan
+    printf '\nDocker resources:\n' >> "${PLAN_FILE}"
+    append_docker_plan
     printf '\nPreserve:\n' >> "${PLAN_FILE}"
     plan_preserve_path "openshell" "not owned by agentenv"
     if [ "${KEEP_DATA}" -eq 1 ]; then
@@ -624,6 +668,50 @@ destroy_registered_envs() {
     done
 }
 
+cleanup_docker_resources() {
+    if ! command -v docker >/dev/null 2>&1; then
+        log_action "docker not found; skipped docker resource cleanup"
+        return 0
+    fi
+
+    volumes_file="${TMP_ROOT}/docker-volumes-cleanup.$$"
+    images_file="${TMP_ROOT}/docker-images-cleanup.$$"
+
+    if docker volume ls --format '{{.Name}}' > "${volumes_file}" 2>> "${ERRORS_LOG}"; then
+        while IFS= read -r volume_name; do
+            case "${volume_name}" in
+                agentenv_*)
+                    if docker volume rm "${volume_name}" >> "${ACTIONS_LOG}" 2>> "${ERRORS_LOG}"; then
+                        log_action "removed docker volume ${volume_name}"
+                    else
+                        record_error "failed to remove docker volume ${volume_name}"
+                    fi
+                    ;;
+            esac
+        done < "${volumes_file}"
+    else
+        record_error "failed to list docker volumes"
+    fi
+
+    if docker image ls --format '{{.Repository}}:{{.Tag}}' > "${images_file}" 2>> "${ERRORS_LOG}"; then
+        while IFS= read -r image_name; do
+            case "${image_name}" in
+                agentenv_*)
+                    if docker image rm "${image_name}" >> "${ACTIONS_LOG}" 2>> "${ERRORS_LOG}"; then
+                        log_action "removed docker image ${image_name}"
+                    else
+                        record_error "failed to remove docker image ${image_name}"
+                    fi
+                    ;;
+            esac
+        done < "${images_file}"
+    else
+        record_error "failed to list docker images"
+    fi
+
+    rm -f "${volumes_file}" "${images_file}"
+}
+
 remove_selected_paths() {
     remove_path_if_present "${AGENTENV_BIN}" || true
     if [ "${KEEP_DATA}" -eq 0 ]; then
@@ -652,6 +740,7 @@ execute_uninstall() {
     validate_configured_roots || return 1
     remove_shell_path_blocks
     destroy_registered_envs
+    cleanup_docker_resources
     remove_selected_paths
 }
 

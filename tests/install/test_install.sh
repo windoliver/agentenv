@@ -482,6 +482,50 @@ test_install_driver_launcher_prepends_venv_bin_to_path() {
     pass
 }
 
+test_uninstall_cleans_agentenv_docker_resources_and_optional_models() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/models" "${tmp_root}/bin"
+    printf '#!/bin/sh\nexit 0\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf 'model cache\n' > "${AGENTENV_HOME}/models/model.bin"
+    cat > "${tmp_root}/bin/docker" <<'STUB'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DOCKER_CALLS"
+if [ "$1" = "volume" ] && [ "$2" = "ls" ]; then
+    printf 'agentenv_demo\nother_volume\n'
+    exit 0
+fi
+if [ "$1" = "image" ] && [ "$2" = "ls" ]; then
+    printf 'agentenv_demo:latest\nother:latest\n'
+    exit 0
+fi
+exit 0
+STUB
+    chmod +x "${tmp_root}/bin/docker"
+    docker_calls="${tmp_root}/docker.log"
+
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}" AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        DOCKER_CALLS="${docker_calls}" sh "${REPO_ROOT}/uninstall.sh" --dry-run --delete-models > "${tmp_root}/dry-run.out"
+    assert_contains "agentenv_demo" "${tmp_root}/dry-run.out" "dry-run should enumerate agentenv docker resources"
+
+    PATH="${tmp_root}/bin:${ORIGINAL_PATH}" AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        DOCKER_CALLS="${docker_calls}" sh "${REPO_ROOT}/uninstall.sh" --yes --delete-models > "${tmp_root}/uninstall.out"
+    PATH=${ORIGINAL_PATH}
+
+    assert_contains "volume rm agentenv_demo" "${docker_calls}" "uninstall should remove agentenv docker volume"
+    assert_contains "image rm agentenv_demo:latest" "${docker_calls}" "uninstall should remove agentenv docker image"
+    assert_not_contains "other_volume" "${docker_calls}" "uninstall should not remove unrelated volume"
+    assert_not_exists "${AGENTENV_HOME}/models" "--delete-models should remove agentenv model cache"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure() {
     tmp_root=$(mktemp -d)
 
@@ -1412,6 +1456,7 @@ main() {
     test_detect_target_macos
     test_verify_sha256_value
     test_archive_name_candidates_cover_legacy_and_dist_formats
+    test_uninstall_cleans_agentenv_docker_resources_and_optional_models
     test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure
     test_uninstall_rejects_diagnostics_override_under_removed_envs
     test_uninstall_rejects_relative_diagnostics_override_under_removed_envs
