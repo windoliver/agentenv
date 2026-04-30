@@ -523,6 +523,40 @@ STUB
     pass
 }
 
+test_uninstall_rejects_diagnostics_override_under_removed_envs() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${AGENTENV_HOME}/envs/diagnostics"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo"}\n' > "${AGENTENV_HOME}/envs/demo/state.json"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe diagnostics override should make uninstall exit non-zero"
+    assert_exists "${diagnostics_dir}" "unsafe diagnostics override directory should remain"
+    assert_contains "errors.log" "${tmp_root}/uninstall.err" "stderr should reference diagnostics errors"
+    assert_contains "unsafe diagnostics directory" "${diagnostics_dir}/errors.log" "diagnostics should explain unsafe override"
+    assert_exists "${AGENTENV_HOME}/envs/demo/state.json" "uninstall should not remove env data after unsafe diagnostics override"
+    assert_exists "${INSTALL_DIR}/agentenv" "uninstall should not remove binary after unsafe diagnostics override"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_removes_owned_files_and_shell_block() {
     tmp_root=$(mktemp -d)
 
@@ -1212,6 +1246,7 @@ main() {
     test_verify_sha256_value
     test_archive_name_candidates_cover_legacy_and_dist_formats
     test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure
+    test_uninstall_rejects_diagnostics_override_under_removed_envs
     test_uninstall_removes_owned_files_and_shell_block
     test_uninstall_keep_flags_preserve_selected_state
     test_uninstall_removes_binary_from_custom_install_dir

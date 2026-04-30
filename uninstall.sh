@@ -292,6 +292,12 @@ path_is_under_dir() {
     esac
 }
 
+path_is_same_or_under_dir() {
+    child_path=$1
+    parent_dir=$2
+    [ "${child_path}" = "${parent_dir}" ] || path_is_under_dir "${child_path}" "${parent_dir}"
+}
+
 path_is_agentenv_bin() {
     agentenv_bin_path=$1
     [ "${agentenv_bin_path}" = "${AGENTENV_BIN}" ] || return 1
@@ -443,6 +449,38 @@ validate_remove_path() {
     return 1
 }
 
+diagnostics_conflicts_with_removed_path() {
+    removed_path=$1
+    if path_is_same_or_under_dir "${TMP_ROOT}" "${removed_path}"; then
+        record_error "unsafe diagnostics directory ${TMP_ROOT}: inside path selected for removal ${removed_path}; errors.log would be removed"
+        return 0
+    fi
+    return 1
+}
+
+validate_diagnostics_root() {
+    diagnostics_conflicts_with_removed_path "${AGENTENV_BIN}" && return 1
+    if [ "${KEEP_DATA}" -eq 0 ]; then
+        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/envs" && return 1
+    fi
+    if [ "${KEEP_DRIVERS}" -eq 0 ]; then
+        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/drivers" && return 1
+    fi
+    if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
+        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/credentials.json" && return 1
+    fi
+    diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/events.db" && return 1
+    diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/audit.key" && return 1
+    diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/audit-signing-key" && return 1
+    if [ "${DELETE_MODELS}" -eq 1 ]; then
+        diagnostics_conflicts_with_removed_path "${AGENTENV_HOME}/models" && return 1
+    fi
+    if path_is_under_dir "${INSTALL_DIR}" "${AGENTENV_HOME}"; then
+        diagnostics_conflicts_with_removed_path "${INSTALL_DIR}" && return 1
+    fi
+    return 0
+}
+
 remove_path_if_present() {
     path=$1
     if ! validate_remove_path "${path}"; then
@@ -568,6 +606,10 @@ main() {
     trap cleanup_uninstall_tmp EXIT INT TERM
 
     if ! validate_configured_roots; then
+        report_uninstall_failures
+        return 1
+    fi
+    if ! validate_diagnostics_root; then
         report_uninstall_failures
         return 1
     fi
