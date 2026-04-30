@@ -1039,6 +1039,34 @@ test_uninstall_dry_run_rejects_unsafe_roots_before_plan() {
     pass
 }
 
+test_uninstall_dry_run_plans_broken_symlink_removal() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '#!/bin/sh\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    ln -s "${AGENTENV_HOME}/missing-target" "${AGENTENV_HOME}/drivers"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run > "${tmp_root}/dry-run.out"
+
+    assert_contains "remove ${AGENTENV_HOME}/drivers" "${tmp_root}/dry-run.out" "dry-run should plan broken symlink removal"
+    assert_not_contains "already absent ${AGENTENV_HOME}/drivers" "${tmp_root}/dry-run.out" "dry-run should not treat broken symlink as absent"
+    if [ ! -L "${AGENTENV_HOME}/drivers" ]; then
+        fail "dry-run should not remove broken symlink"
+    fi
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+    assert_not_exists "${AGENTENV_HOME}/drivers" "real uninstall should remove broken symlink"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_dry_run_prints_plan_without_removing() {
     tmp_root=$(mktemp -d)
 
@@ -1112,6 +1140,7 @@ main() {
     test_uninstall_rejects_dot_path_components
     test_uninstall_dry_run_preserves_unconfirmed_shell_sentinel_plan
     test_uninstall_dry_run_rejects_unsafe_roots_before_plan
+    test_uninstall_dry_run_plans_broken_symlink_removal
     test_uninstall_dry_run_prints_plan_without_removing
     test_write_path_exports_is_idempotent
     test_configure_shell_path_persists_when_current_shell_has_path

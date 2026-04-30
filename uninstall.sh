@@ -93,7 +93,7 @@ parse_uninstall_args() {
 
 path_size_kib() {
     path=$1
-    if [ ! -e "${path}" ]; then
+    if [ ! -e "${path}" ] && [ ! -L "${path}" ]; then
         printf '0'
         return 0
     fi
@@ -102,7 +102,7 @@ path_size_kib() {
 
 plan_remove_path() {
     path=$1
-    if [ -e "${path}" ]; then
+    if [ -e "${path}" ] || [ -L "${path}" ]; then
         size=$(path_size_kib "${path}")
         printf '  remove %s (%s KiB)\n' "${path}" "${size}" >> "${PLAN_FILE}"
     else
