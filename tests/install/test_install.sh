@@ -658,6 +658,72 @@ STUB
     pass
 }
 
+test_uninstall_rejects_diagnostics_actions_log_symlink_target() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    state_file="${AGENTENV_HOME}/envs/demo/state.json"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo","preserve":true}\n' > "${state_file}"
+    ln -s "${state_file}" "${diagnostics_dir}/actions.log"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "actions.log symlink should make dry-run exit non-zero"
+    assert_contains '"preserve":true' "${state_file}" "actions.log symlink target should not be truncated"
+    assert_exists "${INSTALL_DIR}/agentenv" "dry-run should not remove binary after unsafe diagnostics file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_diagnostics_plan_symlink_target() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    diagnostics_dir="${tmp_root}/diagnostics"
+    state_file="${AGENTENV_HOME}/envs/demo/state.json"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}/envs/demo" "${diagnostics_dir}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo","preserve":true}\n' > "${state_file}"
+    ln -s "${state_file}" "${diagnostics_dir}/plan.txt"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_UNINSTALL_DIAGNOSTICS_DIR="${diagnostics_dir}" \
+        sh "${REPO_ROOT}/uninstall.sh" --dry-run --yes > "${tmp_root}/uninstall.out" 2> "${tmp_root}/uninstall.err"
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "plan.txt symlink should make dry-run exit non-zero"
+    assert_contains '"preserve":true' "${state_file}" "plan.txt symlink target should not be truncated"
+    assert_exists "${INSTALL_DIR}/agentenv" "dry-run should not remove binary after unsafe diagnostics file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_removes_owned_files_and_shell_block() {
     tmp_root=$(mktemp -d)
 
@@ -1351,6 +1417,8 @@ main() {
     test_uninstall_rejects_relative_diagnostics_override_under_removed_envs
     test_uninstall_rejects_symlink_diagnostics_override_into_removed_envs
     test_uninstall_safe_absolute_diagnostics_override_survives_success
+    test_uninstall_rejects_diagnostics_actions_log_symlink_target
+    test_uninstall_rejects_diagnostics_plan_symlink_target
     test_uninstall_removes_owned_files_and_shell_block
     test_uninstall_keep_flags_preserve_selected_state
     test_uninstall_removes_binary_from_custom_install_dir

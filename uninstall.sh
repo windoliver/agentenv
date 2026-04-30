@@ -523,6 +523,21 @@ validate_diagnostics_root_path() {
     return 0
 }
 
+validate_diagnostics_file_targets() {
+    diagnostics_path=$1
+    for diagnostics_file in "${diagnostics_path}/plan.txt" "${diagnostics_path}/actions.log" "${diagnostics_path}/errors.log"; do
+        if [ -L "${diagnostics_file}" ]; then
+            record_error "unsafe diagnostics file ${diagnostics_file}: must not be a symlink"
+            return 1
+        fi
+        if [ -e "${diagnostics_file}" ] && [ ! -f "${diagnostics_file}" ]; then
+            record_error "unsafe diagnostics file ${diagnostics_file}: must be a regular file when present"
+            return 1
+        fi
+    done
+    return 0
+}
+
 select_diagnostics_root() {
     if [ -z "${AGENTENV_UNINSTALL_DIAGNOSTICS_DIR:-}" ]; then
         return 0
@@ -537,6 +552,7 @@ select_diagnostics_root() {
     fi
     validate_diagnostics_override_path "${diagnostics_override}" || return 1
     validate_diagnostics_root_path "${diagnostics_override}" || return 1
+    validate_diagnostics_file_targets "${diagnostics_override}" || return 1
 
     TMP_ROOT=${diagnostics_override}
     TMP_ROOT_IS_OVERRIDE=1
