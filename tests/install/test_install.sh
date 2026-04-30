@@ -73,7 +73,7 @@ assert_not_contains() {
 assert_not_exists() {
     path=$1
     context=$2
-    if [ -e "${path}" ]; then
+    if [ -e "${path}" ] || [ -L "${path}" ]; then
         fail "${context}: ${path} should not exist"
     fi
 }
@@ -551,6 +551,28 @@ test_uninstall_removes_binary_from_custom_install_dir() {
     assert_not_exists "${AGENTENV_HOME}/drivers" "custom install dir should still remove drivers by default"
     assert_not_exists "${AGENTENV_HOME}/credentials.json" "custom install dir should still remove credentials by default"
     assert_not_exists "${AGENTENV_HOME}/events.db" "custom install dir should still remove events db"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_symlinked_agentenv_binary_only() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    target_file="${tmp_root}/target-agentenv"
+    mkdir -p "${INSTALL_DIR}"
+    printf 'target\n' > "${target_file}"
+    ln -s "${target_file}" "${INSTALL_DIR}/agentenv"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+
+    assert_not_contains "unsafe path" "${tmp_root}/uninstall.out" "symlinked agentenv binary should not be rejected"
+    assert_not_exists "${INSTALL_DIR}/agentenv" "uninstall should remove symlinked agentenv binary"
+    assert_exists "${target_file}" "uninstall should not remove symlink target"
 
     rm -rf "${tmp_root}"
     pass
@@ -1120,6 +1142,7 @@ main() {
     test_uninstall_removes_owned_files_and_shell_block
     test_uninstall_keep_flags_preserve_selected_state
     test_uninstall_removes_binary_from_custom_install_dir
+    test_uninstall_removes_symlinked_agentenv_binary_only
     test_uninstall_second_run_is_noop
     test_uninstall_preserves_unconfirmed_shell_sentinel_lines
     test_uninstall_removes_only_confirmed_shell_path_block

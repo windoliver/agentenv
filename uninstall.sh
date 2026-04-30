@@ -313,6 +313,15 @@ path_has_symlink_component() {
     return 1
 }
 
+path_has_symlink_ancestor_component() {
+    checked_path=$1
+    ancestor_path=${checked_path%/*}
+    if [ "${ancestor_path}" = "${checked_path}" ] || [ -z "${ancestor_path}" ]; then
+        ancestor_path="/"
+    fi
+    path_has_symlink_component "${ancestor_path}"
+}
+
 validate_configured_path() {
     label=$1
     configured_path=$2
@@ -341,6 +350,13 @@ validate_configured_path() {
     if path_has_current_component "${configured_path}"; then
         record_error "unsafe path ${configured_path}: ${label} contains current directory component"
         return 1
+    fi
+    if [ "${label}" = "AGENTENV_BIN" ]; then
+        if path_has_symlink_ancestor_component "${configured_path}"; then
+            record_error "unsafe path ${configured_path}: ${label} must not contain symlink ancestor components"
+            return 1
+        fi
+        return 0
     fi
     if [ -L "${configured_path}" ]; then
         record_error "unsafe path ${configured_path}: ${label} must not be a symlink"
