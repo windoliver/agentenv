@@ -11,7 +11,8 @@ use agentenv_proto::{
     SchemaVersionError, SessionHandle, ShellHandle, ShutdownParams, StopParams,
 };
 use async_trait::async_trait;
-use std::fmt;
+use std::{fmt, time::Duration};
+use time::OffsetDateTime;
 
 pub type DriverResult<T> = Result<T, DriverError>;
 
@@ -51,6 +52,10 @@ pub enum DriverError {
     },
     PolicyRequiresRecreate {
         domains: String,
+    },
+    ApprovalUnavailable {
+        request_id: String,
+        message: String,
     },
     CleanupFailed {
         message: String,
@@ -159,6 +164,12 @@ impl fmt::Display for DriverError {
             DriverError::PolicyRequiresRecreate { domains } => {
                 write!(f, "policy update requires recreate for domains: {domains}")
             }
+            DriverError::ApprovalUnavailable {
+                request_id,
+                message,
+            } => {
+                write!(f, "approval request `{request_id}` unavailable: {message}")
+            }
             DriverError::CleanupFailed { message } => {
                 write!(f, "driver cleanup failed: {message}")
             }
@@ -207,6 +218,80 @@ pub trait SandboxDriver: Send + Sync {
     async fn stop(&self, params: StopParams) -> DriverResult<EmptyResult>;
     async fn destroy(&self, params: DestroyParams) -> DriverResult<EmptyResult>;
     async fn shutdown(&mut self, params: ShutdownParams) -> DriverResult<EmptyResult>;
+}
+
+#[async_trait]
+pub trait ApprovalRequester: Send + Sync {
+    async fn request_approval(
+        &self,
+        request: agentenv_approvals::ApprovalRequest,
+    ) -> DriverResult<agentenv_approvals::ApprovalDecisionRecord>;
+}
+
+#[async_trait]
+impl ApprovalRequester for agentenv_approvals::ApprovalCoordinator {
+    async fn request_approval(
+        &self,
+        request: agentenv_approvals::ApprovalRequest,
+    ) -> DriverResult<agentenv_approvals::ApprovalDecisionRecord> {
+        let request_id = request.id.clone();
+        let expires_at = request.expires_at;
+        self.submit_request(request)
+            .await
+            .map_err(|err| DriverError::ApprovalUnavailable {
+                request_id: request_id.clone(),
+                message: err.to_string(),
+            })?;
+        wait_for_approval_decision_or_expire(self, &request_id, expires_at).await
+    }
+}
+
+async fn wait_for_approval_decision_or_expire(
+    coordinator: &agentenv_approvals::ApprovalCoordinator,
+    request_id: &str,
+    expires_at: OffsetDateTime,
+) -> DriverResult<agentenv_approvals::ApprovalDecisionRecord> {
+    match tokio::time::timeout(
+        duration_until_utc(expires_at),
+        coordinator.wait_for_decision(request_id),
+    )
+    .await
+    {
+        Ok(decision) => decision.map_err(|err| approval_unavailable(request_id, err)),
+        Err(_) => {
+            if OffsetDateTime::now_utc() < expires_at {
+                tokio::time::sleep(duration_until_utc(expires_at)).await;
+            }
+            coordinator
+                .expire_due(OffsetDateTime::now_utc())
+                .await
+                .map_err(|err| approval_unavailable(request_id, err))?;
+            coordinator
+                .store()
+                .get_decision(request_id)
+                .map_err(|err| approval_unavailable(request_id, err))?
+                .ok_or_else(|| DriverError::ApprovalUnavailable {
+                    request_id: request_id.to_owned(),
+                    message: "approval expired without a recorded decision".to_owned(),
+                })
+        }
+    }
+}
+
+fn duration_until_utc(deadline: OffsetDateTime) -> Duration {
+    let now = OffsetDateTime::now_utc();
+    if deadline <= now {
+        Duration::ZERO
+    } else {
+        (deadline - now).try_into().unwrap_or(Duration::MAX)
+    }
+}
+
+fn approval_unavailable(request_id: &str, err: impl std::error::Error) -> DriverError {
+    DriverError::ApprovalUnavailable {
+        request_id: request_id.to_owned(),
+        message: err.to_string(),
+    }
 }
 
 #[async_trait]
@@ -273,6 +358,8 @@ pub trait InferenceDriver: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
     use agentenv_proto::{
         schema_version_major, ApplyPolicyParams, ApplyPolicyResult, Capabilities, ConnectParams,
         CopyInParams, CopyOutParams, DestroyParams, DriverInfo, DriverKind, EmptyResult,
@@ -283,8 +370,17 @@ mod tests {
     };
 
     use super::{
-        ensure_protocol_compatible, require_capability, DriverError, DriverResult, SandboxDriver,
+        ensure_protocol_compatible, require_capability, ApprovalRequester, DriverError,
+        DriverResult, SandboxDriver,
     };
+
+    fn temp_db_path(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}.db", std::process::id()))
+    }
 
     struct MinimalSandboxDriver;
 
@@ -461,6 +557,55 @@ mod tests {
             .expect_err("unsupported capability should fail");
 
         assert!(matches!(err, DriverError::CapabilityMissing { .. }));
+    }
+
+    #[test]
+    fn approval_unavailable_error_mentions_request() {
+        let error = DriverError::ApprovalUnavailable {
+            request_id: "req-1".to_owned(),
+            message: "approval coordinator not configured".to_owned(),
+        };
+
+        assert!(error.to_string().contains("req-1"));
+        assert!(error
+            .to_string()
+            .contains("approval coordinator not configured"));
+    }
+
+    #[tokio::test]
+    async fn approval_requester_auto_denies_expired_request() {
+        let store =
+            agentenv_approvals::ApprovalStore::open(temp_db_path("approval-requester")).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: std::sync::Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(1),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let request = agentenv_approvals::ApprovalRequest::new(
+            "req-expired",
+            "demo",
+            agentenv_approvals::ApprovalKind::EgressHost,
+            "example.com",
+            "network request",
+            serde_json::json!({}),
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+            agentenv_approvals::ApprovalScope::Once,
+            Duration::ZERO,
+            "trace-expired",
+        );
+
+        let decision = coordinator.request_approval(request).await.unwrap();
+
+        assert_eq!(
+            decision.decision,
+            agentenv_approvals::ApprovalDecisionValue::Deny
+        );
+        assert_eq!(decision.decided_by, "agentenv:auto-deny");
     }
 
     #[test]

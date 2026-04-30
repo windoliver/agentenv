@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fs};
 
-use agentenv_approvals::{ApprovalStatus, LocalApprovalStore};
+use agentenv_approvals::{LocalApprovalStatus, LocalApprovalStore};
 use agentenv_core::env::EnvStateFile;
 use agentenv_core::runtime::{self, RuntimeOptions};
 use agentenv_events::{LocalEventStore, StoredEvent, StoredEventKind};
@@ -169,7 +169,7 @@ impl OpsBackend for LocalOpsBackend {
                 &now_rfc3339(),
             )
             .context("allow approval")?;
-        if record.status == ApprovalStatus::Stale {
+        if record.status == LocalApprovalStatus::Stale {
             anyhow::bail!("approval request {request_id} is no longer pending");
         }
         Ok(())
@@ -186,7 +186,7 @@ impl OpsBackend for LocalOpsBackend {
                 &now_rfc3339(),
             )
             .context("deny approval")?;
-        if record.status == ApprovalStatus::Stale {
+        if record.status == LocalApprovalStatus::Stale {
             anyhow::bail!("approval request {request_id} is no longer pending");
         }
         Ok(())
@@ -327,7 +327,7 @@ fn now_rfc3339() -> String {
 mod tests {
     use std::{fs, path::Path};
 
-    use agentenv_approvals::{ApprovalRequestRecord, ApprovalStatus, LocalApprovalStore};
+    use agentenv_approvals::{ApprovalRequestRecord, LocalApprovalStatus, LocalApprovalStore};
     use agentenv_proto::{ApprovalKind, LogLevel};
     use agentenv_tui::backend::OpsBackend;
 
@@ -402,7 +402,7 @@ mod tests {
                 kind: ApprovalKind::EgressHost,
                 subject: "api.stripe.com:443".to_owned(),
                 reason: "egress".to_owned(),
-                status: ApprovalStatus::Pending,
+                status: LocalApprovalStatus::Pending,
                 requested_at: "2026-04-27T12:00:00Z".to_owned(),
                 decided_at: None,
                 decided_by: None,

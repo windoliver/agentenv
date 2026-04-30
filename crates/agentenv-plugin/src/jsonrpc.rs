@@ -18,10 +18,14 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_HEADER_LINES: usize = 32;
+const DEFAULT_APPROVAL_AUTO_DENY_AFTER: Duration = Duration::from_secs(300);
+const APPROVAL_DECISION_WRITE_MARGIN: Duration = Duration::from_secs(1);
+const MIN_SHORT_APPROVAL_AUTO_DENY_AFTER: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum JsonRpcError {
@@ -45,6 +49,8 @@ pub enum JsonRpcError {
     TooManyHeaders { count: usize, max: usize },
     #[error("JSON-RPC protocol error: {0}")]
     Protocol(String),
+    #[error("approval coordinator error: {0}")]
+    Approval(#[from] agentenv_approvals::ApprovalCoordinatorError),
     #[error("JSON-RPC request `{0}` timed out")]
     Timeout(String),
     #[error("remote JSON-RPC error {code}: {message}")]
@@ -66,6 +72,8 @@ pub struct JsonRpcClient {
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
     event_emitter: Arc<dyn EventEmitter>,
+    approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+    env_name: Option<String>,
     next_id: AtomicU64,
     timeout: Duration,
 }
@@ -151,6 +159,13 @@ pub struct RpcNotificationEnvelope {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+#[derive(Serialize)]
+struct RpcNotificationWithParams<T> {
+    jsonrpc: &'static str,
+    method: &'static str,
+    params: T,
 }
 
 pub fn notification_to_activity_event(
@@ -325,6 +340,120 @@ fn approval_requested_params_to_activity_event(
     event
 }
 
+#[cfg(test)]
+pub(crate) fn approval_request_from_params(
+    env: impl Into<String>,
+    params: agentenv_proto::ApprovalRequestedParams,
+    trace_id: impl Into<String>,
+) -> Result<agentenv_approvals::ApprovalRequest, JsonRpcError> {
+    approval_request_from_params_with_auto_deny(
+        env,
+        params,
+        trace_id,
+        DEFAULT_APPROVAL_AUTO_DENY_AFTER,
+    )
+}
+
+fn approval_request_from_params_with_auto_deny(
+    env: impl Into<String>,
+    params: agentenv_proto::ApprovalRequestedParams,
+    trace_id: impl Into<String>,
+    auto_deny_after: Duration,
+) -> Result<agentenv_approvals::ApprovalRequest, JsonRpcError> {
+    let requested_at = time::OffsetDateTime::now_utc();
+    Ok(agentenv_approvals::ApprovalRequest::new(
+        params.request_id,
+        env,
+        agentenv_approvals::ApprovalKind::from(params.kind),
+        params.subject,
+        params.reason,
+        Value::Object(params.context.into_iter().collect()),
+        requested_at,
+        approval_scope_from_default_ttl(params.default_ttl.as_deref()),
+        auto_deny_after,
+        trace_id,
+    ))
+}
+
+pub(crate) fn approval_decision_notification(
+    params: agentenv_proto::ApprovalDecisionParams,
+) -> Result<String, JsonRpcError> {
+    Ok(serde_json::to_string(
+        &approval_decision_notification_envelope(params),
+    )?)
+}
+
+fn approval_decision_notification_envelope(
+    params: agentenv_proto::ApprovalDecisionParams,
+) -> RpcNotificationWithParams<agentenv_proto::ApprovalDecisionParams> {
+    RpcNotificationWithParams {
+        jsonrpc: "2.0",
+        method: "approval/decision",
+        params,
+    }
+}
+
+fn approval_decision_params_from_record(
+    decision: agentenv_approvals::ApprovalDecisionRecord,
+) -> agentenv_proto::ApprovalDecisionParams {
+    agentenv_proto::ApprovalDecisionParams {
+        request_id: decision.request_id,
+        decision: agentenv_proto::ApprovalDecision::from(decision.decision),
+        scope: approval_scope_to_proto(decision.scope),
+        decided_by: decision.decided_by,
+        decided_at: agentenv_approvals::format_rfc3339(decision.decided_at),
+    }
+}
+
+fn approval_scope_from_default_ttl(default_ttl: Option<&str>) -> agentenv_approvals::ApprovalScope {
+    match default_ttl {
+        Some("once") => agentenv_approvals::ApprovalScope::Once,
+        Some("persist-sandbox") => agentenv_approvals::ApprovalScope::PersistSandbox,
+        Some("propose-for-baseline") => agentenv_approvals::ApprovalScope::ProposeForBaseline,
+        Some("session") | None => agentenv_approvals::ApprovalScope::Session,
+        Some(_) => agentenv_approvals::ApprovalScope::Session,
+    }
+}
+
+fn approval_scope_to_proto(
+    scope: agentenv_approvals::ApprovalScope,
+) -> agentenv_proto::ApprovalScope {
+    match scope {
+        agentenv_approvals::ApprovalScope::Once => agentenv_proto::ApprovalScope::Once,
+        agentenv_approvals::ApprovalScope::Session => agentenv_proto::ApprovalScope::Session,
+        agentenv_approvals::ApprovalScope::PersistSandbox => {
+            agentenv_proto::ApprovalScope::PersistSandbox
+        }
+        agentenv_approvals::ApprovalScope::ProposeForBaseline => {
+            agentenv_proto::ApprovalScope::ProposeForBaseline
+        }
+    }
+}
+
+fn bounded_approval_auto_deny_after(timeout: Duration) -> Duration {
+    if timeout > APPROVAL_DECISION_WRITE_MARGIN + MIN_SHORT_APPROVAL_AUTO_DENY_AFTER {
+        DEFAULT_APPROVAL_AUTO_DENY_AFTER.min(timeout - APPROVAL_DECISION_WRITE_MARGIN)
+    } else if timeout > MIN_SHORT_APPROVAL_AUTO_DENY_AFTER {
+        timeout / 2
+    } else {
+        timeout
+    }
+}
+
+fn duration_until_utc(deadline: time::OffsetDateTime) -> Duration {
+    let remaining = deadline - time::OffsetDateTime::now_utc();
+    remaining.try_into().unwrap_or(Duration::ZERO)
+}
+
+fn duration_until_instant(deadline: Instant) -> Duration {
+    let now = Instant::now();
+    if deadline > now {
+        deadline - now
+    } else {
+        Duration::ZERO
+    }
+}
+
 fn invalid_notification_event(
     method: &str,
     params: Value,
@@ -366,6 +495,7 @@ fn approval_kind_name(kind: &agentenv_proto::ApprovalKind) -> &'static str {
         agentenv_proto::ApprovalKind::EgressHost => "egress_host",
         agentenv_proto::ApprovalKind::McpTool => "mcp_tool",
         agentenv_proto::ApprovalKind::ZoneAccess => "zone_access",
+        agentenv_proto::ApprovalKind::PackageInstall => "package_install",
     }
 }
 
@@ -558,6 +688,8 @@ impl JsonRpcClient {
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
             event_emitter: Arc::new(NoopEventEmitter),
+            approval_coordinator: None,
+            env_name: None,
             next_id: AtomicU64::new(1),
             timeout: config.timeout,
         })
@@ -572,6 +704,15 @@ impl JsonRpcClient {
 
     pub fn set_event_emitter_arc(&mut self, event_emitter: Arc<dyn EventEmitter>) {
         self.event_emitter = event_emitter;
+    }
+
+    pub fn set_approval_coordinator(
+        &mut self,
+        env_name: impl Into<String>,
+        coordinator: agentenv_approvals::ApprovalCoordinator,
+    ) {
+        self.env_name = Some(env_name.into());
+        self.approval_coordinator = Some(coordinator);
     }
 
     pub fn with_event_emitter<E>(mut self, event_emitter: E) -> Self
@@ -594,7 +735,8 @@ impl JsonRpcClient {
     {
         let _rpc_guard = self.rpc.lock().await;
         self.ensure_open().await?;
-        match tokio::time::timeout(self.timeout, self.call_inner(method, params)).await {
+        let deadline = Instant::now() + self.timeout;
+        match tokio::time::timeout_at(deadline, self.call_inner(method, params, deadline)).await {
             Ok(result) => result,
             Err(_) => {
                 self.poison_and_terminate(format!("request `{method}` timed out"))
@@ -607,9 +749,14 @@ impl JsonRpcClient {
     pub async fn shutdown(&mut self) -> Result<(), JsonRpcError> {
         let _rpc_guard = self.rpc.lock().await;
         self.ensure_open().await?;
-        let shutdown_result = tokio::time::timeout(
-            self.timeout,
-            self.call_inner::<_, agentenv_proto::EmptyResult>("shutdown", &ShutdownParams {}),
+        let deadline = Instant::now() + self.timeout;
+        let shutdown_result = tokio::time::timeout_at(
+            deadline,
+            self.call_inner::<_, agentenv_proto::EmptyResult>(
+                "shutdown",
+                &ShutdownParams {},
+                deadline,
+            ),
         )
         .await;
         match shutdown_result {
@@ -647,7 +794,12 @@ impl JsonRpcClient {
         Ok(())
     }
 
-    async fn call_inner<P, R>(&self, method: &str, params: &P) -> Result<R, JsonRpcError>
+    async fn call_inner<P, R>(
+        &self,
+        method: &str,
+        params: &P,
+        rpc_deadline: Instant,
+    ) -> Result<R, JsonRpcError>
     where
         P: Serialize + ?Sized,
         R: DeserializeOwned,
@@ -673,8 +825,8 @@ impl JsonRpcClient {
             };
             if raw.get("method").is_some() && raw.get("id").is_none() {
                 let notification: RpcNotificationEnvelope = serde_json::from_value(raw)?;
-                let event = notification_to_activity_event(notification, &fallback_trace_id)?;
-                self.event_emitter.emit(event.redacted());
+                self.handle_notification(notification, &fallback_trace_id, rpc_deadline)
+                    .await?;
                 continue;
             }
             let response: RpcResponseEnvelope = serde_json::from_value(raw)?;
@@ -694,6 +846,96 @@ impl JsonRpcClient {
                 .result
                 .ok_or_else(|| JsonRpcError::Protocol(format!("missing result for `{method}`")))?;
             return Ok(serde_json::from_value(result)?);
+        }
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: RpcNotificationEnvelope,
+        fallback_trace_id: &str,
+        rpc_deadline: Instant,
+    ) -> Result<(), JsonRpcError> {
+        if notification.method == "event/approval_requested" {
+            if let (Some(coordinator), Some(env_name)) =
+                (&self.approval_coordinator, &self.env_name)
+            {
+                return self
+                    .handle_approval_requested_notification(
+                        notification,
+                        fallback_trace_id,
+                        env_name,
+                        coordinator,
+                        rpc_deadline,
+                    )
+                    .await;
+            }
+        }
+
+        let event = notification_to_activity_event(notification, fallback_trace_id)?;
+        self.event_emitter.emit(event.redacted());
+        Ok(())
+    }
+
+    async fn handle_approval_requested_notification(
+        &self,
+        notification: RpcNotificationEnvelope,
+        fallback_trace_id: &str,
+        env_name: &str,
+        coordinator: &agentenv_approvals::ApprovalCoordinator,
+        rpc_deadline: Instant,
+    ) -> Result<(), JsonRpcError> {
+        let event = notification_to_activity_event(notification.clone(), fallback_trace_id)?;
+        let params: agentenv_proto::ApprovalRequestedParams =
+            match serde_json::from_value(notification.params) {
+                Ok(params) => params,
+                Err(_) => {
+                    self.event_emitter.emit(event.redacted());
+                    return Ok(());
+                }
+            };
+        let request_id = params.request_id.clone();
+        let request = approval_request_from_params_with_auto_deny(
+            env_name,
+            params,
+            fallback_trace_id,
+            bounded_approval_auto_deny_after(duration_until_instant(rpc_deadline)),
+        )?;
+        let expires_at = request.expires_at;
+
+        coordinator.submit_request(request).await?;
+        let decision =
+            Self::wait_for_approval_decision_or_expire(coordinator, &request_id, expires_at)
+                .await?;
+        let params = approval_decision_params_from_record(decision);
+        let notification = approval_decision_notification(params)?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            write_framed_json_bytes_async(&mut *stdin, notification.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
+    async fn wait_for_approval_decision_or_expire(
+        coordinator: &agentenv_approvals::ApprovalCoordinator,
+        request_id: &str,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<agentenv_approvals::ApprovalDecisionRecord, JsonRpcError> {
+        match tokio::time::timeout(
+            duration_until_utc(expires_at),
+            coordinator.wait_for_decision(request_id),
+        )
+        .await
+        {
+            Ok(decision) => Ok(decision?),
+            Err(_) => {
+                if time::OffsetDateTime::now_utc() < expires_at {
+                    tokio::time::sleep(duration_until_utc(expires_at)).await;
+                }
+                coordinator
+                    .expire_due(time::OffsetDateTime::now_utc())
+                    .await?;
+                Ok(coordinator.wait_for_decision(request_id).await?)
+            }
         }
     }
 
@@ -752,10 +994,20 @@ where
     T: Serialize + ?Sized,
 {
     let payload = serde_json::to_vec(message)?;
+    write_framed_json_bytes_async(writer, &payload).await
+}
+
+async fn write_framed_json_bytes_async<W>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<(), JsonRpcError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     writer
         .write_all(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes())
         .await?;
-    writer.write_all(&payload).await?;
+    writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -857,6 +1109,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        approval_decision_notification, approval_request_from_params,
         notification_to_activity_event, read_framed_json_blocking, write_framed_json_blocking,
         JsonRpcError, RpcNotificationEnvelope, RpcResponseEnvelope, DEFAULT_MAX_FRAME_BYTES,
         DEFAULT_MAX_HEADER_BYTES, DEFAULT_MAX_HEADER_LINES,
@@ -1102,6 +1355,65 @@ mod tests {
             json!("https://api.example.test/v1")
         );
         assert_eq!(event.extras["default_ttl"], json!("session"));
+    }
+
+    #[test]
+    fn approval_requested_notification_converts_to_domain_request() {
+        let params = agentenv_proto::ApprovalRequestedParams {
+            request_id: "req-1".to_owned(),
+            kind: agentenv_proto::ApprovalKind::EgressHost,
+            subject: "api.example.test:443".to_owned(),
+            reason: "network".to_owned(),
+            context: std::collections::BTreeMap::new(),
+            default_ttl: Some("session".to_owned()),
+        };
+
+        let request = approval_request_from_params("demo", params, "trace-1").unwrap();
+
+        assert_eq!(request.env, "demo");
+        assert_eq!(request.id, "req-1");
+        assert_eq!(request.kind, agentenv_approvals::ApprovalKind::EgressHost);
+        assert_eq!(
+            request.default_scope,
+            agentenv_approvals::ApprovalScope::Session
+        );
+        assert_eq!(request.created_trace_id, "trace-1");
+    }
+
+    #[test]
+    fn approval_decision_notification_serializes_as_jsonrpc_notification() {
+        let body = approval_decision_notification(agentenv_proto::ApprovalDecisionParams {
+            request_id: "req-1".to_owned(),
+            decision: agentenv_proto::ApprovalDecision::Allow,
+            scope: agentenv_proto::ApprovalScope::Session,
+            decided_by: "alice".to_owned(),
+            decided_at: "2026-04-29T12:00:00Z".to_owned(),
+        })
+        .unwrap();
+
+        assert!(body.contains("\"method\":\"approval/decision\""));
+        assert!(body.contains("\"request_id\":\"req-1\""));
+    }
+
+    #[test]
+    fn approval_requested_notification_preserves_package_install_kind() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/approval_requested",
+            "params": {
+                "request_id": "req-package",
+                "kind": "package_install",
+                "subject": "ripgrep",
+                "reason": "agent requested package install",
+                "context": {"package": "ripgrep"}
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::ApprovalRequested);
+        assert_eq!(event.subject["kind"], json!("package_install"));
     }
 
     #[test]
@@ -1360,6 +1672,228 @@ mod async_client_tests {
         client.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn approval_requested_notification_waits_and_sends_decision() {
+        let store_path = temp_fixture_artifact_path("approvals", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let emitter = agentenv_events::RecordingEventEmitter::default();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(emitter.clone()),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-decision");
+        let mut client = spawn_fixture_client(
+            "approval_before_preflight",
+            Duration::from_secs(5),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_event_emitter(emitter.clone());
+        client.set_approval_coordinator("demo", coordinator.clone());
+
+        let decider = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                wait_for_approval_request(&coordinator, "req-1").await;
+                coordinator
+                    .decide(agentenv_approvals::ApprovalDecisionRecord {
+                        request_id: "req-1".to_owned(),
+                        decision: agentenv_approvals::ApprovalDecisionValue::Allow,
+                        scope: agentenv_approvals::ApprovalScope::Session,
+                        decided_by: "alice".to_owned(),
+                        decided_at: time::OffsetDateTime::UNIX_EPOCH,
+                        reason: None,
+                        context: json!({}),
+                        trace_id: "trace-approval".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        decider.await.unwrap();
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decision["method"], json!("approval/decision"));
+        assert_eq!(decision["params"]["request_id"], json!("req-1"));
+        assert_eq!(decision["params"]["decision"], json!("allow"));
+        assert_eq!(decision["params"]["scope"], json!("session"));
+        assert_eq!(decision["params"]["decided_by"], json!("alice"));
+        let approval_requested_events = emitter
+            .recorded()
+            .into_iter()
+            .filter(|event| event.kind == agentenv_events::ActivityKind::ApprovalRequested)
+            .count();
+        assert_eq!(approval_requested_events, 1);
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_decision_round_trips_same_request_id_before_original_response() {
+        let store_path = temp_fixture_artifact_path("approvals-dynamic-request-id", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-dynamic-request-id");
+        let mut client = spawn_fixture_client(
+            "approval_with_dynamic_request_id",
+            Duration::from_secs(5),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator.clone());
+
+        let decider = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                wait_for_approval_request(&coordinator, "req-for-rpc-1").await;
+                coordinator
+                    .decide(agentenv_approvals::ApprovalDecisionRecord {
+                        request_id: "req-for-rpc-1".to_owned(),
+                        decision: agentenv_approvals::ApprovalDecisionValue::Allow,
+                        scope: agentenv_approvals::ApprovalScope::Session,
+                        decided_by: "alice".to_owned(),
+                        decided_at: time::OffsetDateTime::UNIX_EPOCH,
+                        reason: None,
+                        context: json!({}),
+                        trace_id: "trace-approval".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        decider.await.unwrap();
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(recorded["original_request_id"], json!(1));
+        assert_eq!(recorded["approval_request_id"], json!("req-for-rpc-1"));
+        assert_eq!(recorded["decision"]["method"], json!("approval/decision"));
+        assert!(recorded["decision"].get("id").is_none());
+        assert_eq!(
+            recorded["decision"]["params"]["request_id"],
+            recorded["approval_request_id"]
+        );
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_requested_notification_auto_denies_before_client_timeout() {
+        let store_path = temp_fixture_artifact_path("approvals-auto-deny", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-auto-deny");
+        let mut client = spawn_fixture_client(
+            "approval_before_preflight",
+            Duration::from_secs(2),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator);
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decision["method"], json!("approval/decision"));
+        assert_eq!(decision["params"]["request_id"], json!("req-1"));
+        assert_eq!(decision["params"]["decision"], json!("deny"));
+        assert_eq!(decision["params"]["scope"], json!("once"));
+        assert_eq!(
+            decision["params"]["decided_by"],
+            json!("agentenv:auto-deny")
+        );
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_approval_requested_notification_auto_denies_before_client_timeout() {
+        let store_path = temp_fixture_artifact_path("approvals-delayed-auto-deny", "db");
+        let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store,
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let decision_file = temp_fixture_path("approval-delayed-auto-deny");
+        let mut client = spawn_fixture_client(
+            "delayed_approval_before_preflight",
+            Duration::from_secs(2),
+            &[(
+                "JSONRPC_FIXTURE_DECISION_FILE",
+                decision_file.to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        client.set_approval_coordinator("demo", coordinator);
+
+        let result: agentenv_proto::PreflightResult = client
+            .call("preflight", &agentenv_proto::PreflightParams::default())
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        let recorded = fs::read_to_string(&decision_file).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decision["method"], json!("approval/decision"));
+        assert_eq!(decision["params"]["request_id"], json!("req-1"));
+        assert_eq!(decision["params"]["decision"], json!("deny"));
+        client.shutdown().await.unwrap();
+    }
+
     async fn spawn_fixture_client(
         mode: &str,
         timeout: Duration,
@@ -1438,6 +1972,49 @@ def response(request):
                     "extras": {},
                 },
             })
+        if MODE == "approval_before_preflight" or MODE == "delayed_approval_before_preflight":
+            if MODE == "delayed_approval_before_preflight":
+                time.sleep(1.1)
+            write_message({
+                "jsonrpc": "2.0",
+                "method": "event/approval_requested",
+                "params": {
+                    "request_id": "req-1",
+                    "kind": "egress_host",
+                    "subject": "api.example.test:443",
+                    "reason": "network",
+                    "context": {},
+                    "default_ttl": "session",
+                },
+            })
+            decision = read_message()
+            decision_file = os.environ["JSONRPC_FIXTURE_DECISION_FILE"]
+            with open(decision_file, "w", encoding="utf-8") as handle:
+                json.dump(decision, handle, separators=(",", ":"))
+                handle.flush()
+        if MODE == "approval_with_dynamic_request_id":
+            approval_request_id = f"req-for-rpc-{request['id']}"
+            write_message({
+                "jsonrpc": "2.0",
+                "method": "event/approval_requested",
+                "params": {
+                    "request_id": approval_request_id,
+                    "kind": "egress_host",
+                    "subject": "api.example.test:443",
+                    "reason": "network",
+                    "context": {},
+                    "default_ttl": "session",
+                },
+            })
+            decision = read_message()
+            decision_file = os.environ["JSONRPC_FIXTURE_DECISION_FILE"]
+            with open(decision_file, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "original_request_id": request["id"],
+                    "approval_request_id": approval_request_id,
+                    "decision": decision,
+                }, handle, separators=(",", ":"))
+                handle.flush()
         return {
             "jsonrpc": "2.0",
             "id": request["id"],
@@ -1522,6 +2099,27 @@ while True:
                 panic!("process {} did not exit in time", pid);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_approval_request(
+        coordinator: &agentenv_approvals::ApprovalCoordinator,
+        request_id: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if coordinator
+                .store()
+                .get_request(request_id)
+                .unwrap()
+                .is_some()
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("approval request {request_id} was not submitted");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
