@@ -567,6 +567,82 @@ STUB
     pass
 }
 
+test_uninstall_resets_keyring_indexed_credentials() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    resets_file="${tmp_root}/credential-resets.log"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+if [ "$1" = "credentials" ] && [ "$2" = "list" ]; then
+    printf 'OPENAI_API_KEY\nANTHROPIC_API_KEY\n'
+    exit 0
+fi
+if [ "$1" = "credentials" ] && [ "$2" = "reset" ]; then
+    printf '%s\n' "$3" >> "$AGENTENV_RESET_LOG"
+    exit 0
+fi
+printf 'unexpected agentenv invocation: %s\n' "$*" >&2
+exit 1
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"locations":{"OPENAI_API_KEY":"keyring","ANTHROPIC_API_KEY":"keyring"}}\n' > "${AGENTENV_HOME}/credentials-index.json"
+    printf '{"values":{"FILE_TOKEN":"secret"}}\n' > "${AGENTENV_HOME}/credentials.json"
+    : > "${resets_file}"
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_RESET_LOG="${resets_file}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_contains "OPENAI_API_KEY" "${resets_file}" "uninstall should reset keyring-indexed OpenAI credential"
+    assert_contains "ANTHROPIC_API_KEY" "${resets_file}" "uninstall should reset keyring-indexed Anthropic credential"
+    assert_not_exists "${AGENTENV_HOME}/credentials-index.json" "uninstall should remove credential index"
+    assert_not_exists "${AGENTENV_HOME}/credentials.json" "uninstall should remove file credentials"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_symlink_env_registry_before_destroy() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    project_envs="${tmp_root}/project-envs"
+    calls_file="${tmp_root}/destroy-calls.log"
+    mkdir -p "${INSTALL_DIR}" "${project_envs}/demo"
+    ln -s "${project_envs}" "${AGENTENV_HOME}/envs"
+    cat > "${INSTALL_DIR}/agentenv" <<'STUB'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AGENTENV_DESTROY_CALLS"
+if [ "$1" = "destroy" ]; then
+    rm -rf "$AGENTENV_HOME/envs/$2"
+fi
+exit 0
+STUB
+    chmod +x "${INSTALL_DIR}/agentenv"
+    printf '{"name":"demo","preserve":true}\n' > "${project_envs}/demo/state.json"
+    : > "${calls_file}"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        AGENTENV_DESTROY_CALLS="${calls_file}" sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "symlink env registry should make uninstall report partial failure"
+    assert_not_contains "destroy demo --yes" "${calls_file}" "uninstall should not destroy through a symlinked env registry"
+    assert_exists "${project_envs}/demo/state.json" "symlink env registry should not delete target project env data"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_rejects_diagnostics_override_under_removed_envs() {
     tmp_root=$(mktemp -d)
 
@@ -596,6 +672,31 @@ STUB
     assert_not_exists "${diagnostics_dir}/errors.log" "unsafe diagnostics override should not be mutated"
     assert_exists "${AGENTENV_HOME}/envs/demo/state.json" "uninstall should not remove env data after unsafe diagnostics override"
     assert_exists "${INSTALL_DIR}/agentenv" "uninstall should not remove binary after unsafe diagnostics override"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_removes_approval_config_by_default() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}" "${AGENTENV_HOME}"
+    printf '#!/bin/sh\nexit 0\n' > "${INSTALL_DIR}/agentenv"
+    chmod +x "${INSTALL_DIR}/agentenv"
+    cat > "${AGENTENV_HOME}/config.yaml" <<'YAML'
+approvals:
+  webhooks:
+    - url: https://approvals.example.test/agentenv
+      secret: webhook-secret
+YAML
+
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out"
+
+    assert_not_exists "${AGENTENV_HOME}/config.yaml" "uninstall should remove approval config by default"
 
     rm -rf "${tmp_root}"
     pass
@@ -1458,7 +1559,10 @@ main() {
     test_archive_name_candidates_cover_legacy_and_dist_formats
     test_uninstall_cleans_agentenv_docker_resources_and_optional_models
     test_uninstall_attempts_env_destroy_and_writes_diagnostics_on_failure
+    test_uninstall_resets_keyring_indexed_credentials
+    test_uninstall_rejects_symlink_env_registry_before_destroy
     test_uninstall_rejects_diagnostics_override_under_removed_envs
+    test_uninstall_removes_approval_config_by_default
     test_uninstall_rejects_relative_diagnostics_override_under_removed_envs
     test_uninstall_rejects_symlink_diagnostics_override_into_removed_envs
     test_uninstall_safe_absolute_diagnostics_override_survives_success

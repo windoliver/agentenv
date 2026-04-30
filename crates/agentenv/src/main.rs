@@ -532,10 +532,20 @@ async fn run() -> Result<()> {
 
 fn run_uninstall(args: UninstallArgs) -> Result<()> {
     let script = resolve_uninstall_script()?;
-    let status = process::Command::new("sh")
-        .arg(&script.path)
-        .args(args.to_script_args())
-        .status();
+    let current_exe = std::env::current_exe().ok();
+    let mut command = process::Command::new("sh");
+    command.arg(&script.path).args(args.to_script_args());
+    if std::env::var_os("AGENTENV_BIN").is_none() {
+        if let Some(path) = &current_exe {
+            command.env("AGENTENV_BIN", path);
+        }
+    }
+    if std::env::var_os("AGENTENV_INSTALL_DIR").is_none() {
+        if let Some(dir) = current_exe.as_ref().and_then(|path| path.parent()) {
+            command.env("AGENTENV_INSTALL_DIR", dir);
+        }
+    }
+    let status = command.status();
     script.cleanup_best_effort();
     let status = status
         .with_context(|| format!("failed to run uninstall script `{}`", script.path.display()))?;

@@ -2196,6 +2196,7 @@ fn uninstall_discovers_sibling_script_next_to_current_exe() {
 
     let script = bin_dir.join("uninstall.sh");
     let args_file = temp_dir.join("args.txt");
+    let env_file = temp_dir.join("env.txt");
     fs::write(
         &script,
         r#"#!/bin/sh
@@ -2203,6 +2204,10 @@ set -eu
 for arg in "$@"; do
     printf '%s\n' "$arg"
 done > "$AGENTENV_UNINSTALL_ARGS_OUT"
+{
+    printf 'AGENTENV_BIN=%s\n' "${AGENTENV_BIN-}"
+    printf 'AGENTENV_INSTALL_DIR=%s\n' "${AGENTENV_INSTALL_DIR-}"
+} > "$AGENTENV_UNINSTALL_ENV_OUT"
 "#,
     )
     .unwrap();
@@ -2212,7 +2217,10 @@ done > "$AGENTENV_UNINSTALL_ARGS_OUT"
         .arg("uninstall")
         .arg("--dry-run")
         .env("AGENTENV_UNINSTALL_ARGS_OUT", &args_file)
+        .env("AGENTENV_UNINSTALL_ENV_OUT", &env_file)
         .env_remove("AGENTENV_UNINSTALL_SCRIPT")
+        .env_remove("AGENTENV_BIN")
+        .env_remove("AGENTENV_INSTALL_DIR")
         .output()
         .unwrap();
 
@@ -2227,6 +2235,15 @@ done > "$AGENTENV_UNINSTALL_ARGS_OUT"
         .map(str::to_owned)
         .collect();
     assert_eq!(args, ["--dry-run"]);
+    let env = fs::read_to_string(env_file).unwrap();
+    assert!(
+        env.contains(&format!("AGENTENV_BIN={}", copied_bin.display())),
+        "env was: {env}"
+    );
+    assert!(
+        env.contains(&format!("AGENTENV_INSTALL_DIR={}", bin_dir.display())),
+        "env was: {env}"
+    );
 }
 
 #[test]

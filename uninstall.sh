@@ -195,7 +195,9 @@ build_uninstall_plan() {
     fi
     if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
         plan_remove_path "${AGENTENV_HOME}/credentials.json"
+        plan_remove_path "${AGENTENV_HOME}/credentials-index.json"
     fi
+    plan_remove_path "${AGENTENV_HOME}/config.yaml"
     plan_remove_path "${AGENTENV_HOME}/events.db"
     plan_remove_path "${AGENTENV_HOME}/audit.key"
     plan_remove_path "${AGENTENV_HOME}/audit-signing-key"
@@ -216,6 +218,7 @@ build_uninstall_plan() {
     fi
     if [ "${KEEP_CREDENTIALS}" -eq 1 ]; then
         plan_preserve_path "${AGENTENV_HOME}/credentials.json" "--keep-credentials"
+        plan_preserve_path "${AGENTENV_HOME}/credentials-index.json" "--keep-credentials"
     fi
 }
 
@@ -554,7 +557,9 @@ validate_diagnostics_root_path() {
     fi
     if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
         diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/credentials.json" && return 1
+        diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/credentials-index.json" && return 1
     fi
+    diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/config.yaml" && return 1
     diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/events.db" && return 1
     diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/audit.key" && return 1
     diagnostics_conflicts_with_removed_path "${diagnostics_path}" "${AGENTENV_HOME}/audit-signing-key" && return 1
@@ -646,6 +651,10 @@ destroy_registered_envs() {
     fi
 
     envs_dir="${AGENTENV_HOME}/envs"
+    if [ -L "${envs_dir}" ]; then
+        record_error "unsafe env registry ${envs_dir}: must not be a symlink; skipping driver destroy"
+        return 0
+    fi
     if [ ! -d "${envs_dir}" ]; then
         log_action "no env registry found ${envs_dir}"
         return 0
@@ -666,6 +675,42 @@ destroy_registered_envs() {
             record_error "failed to destroy env ${env_name}"
         fi
     done
+}
+
+reset_stored_credentials() {
+    if [ "${KEEP_CREDENTIALS}" -eq 1 ]; then
+        log_action "preserved credentials"
+        return 0
+    fi
+
+    if [ ! -e "${AGENTENV_HOME}/credentials.json" ] && [ ! -e "${AGENTENV_HOME}/credentials-index.json" ]; then
+        log_action "no stored credentials found"
+        return 0
+    fi
+
+    if [ ! -x "${AGENTENV_BIN}" ]; then
+        if [ -e "${AGENTENV_HOME}/credentials-index.json" ]; then
+            record_error "agentenv binary unavailable; cannot reset keyring credentials: ${AGENTENV_BIN}"
+        else
+            log_action "agentenv binary unavailable; credential file will be removed without CLI reset"
+        fi
+        return 0
+    fi
+
+    credentials_file="${TMP_ROOT}/credentials-list.$$"
+    if "${AGENTENV_BIN}" credentials list > "${credentials_file}" 2>> "${ERRORS_LOG}"; then
+        while IFS= read -r credential_name; do
+            [ -n "${credential_name}" ] || continue
+            if "${AGENTENV_BIN}" credentials reset "${credential_name}" >> "${ACTIONS_LOG}" 2>> "${ERRORS_LOG}"; then
+                log_action "reset credential ${credential_name}"
+            else
+                record_error "failed to reset credential ${credential_name}"
+            fi
+        done < "${credentials_file}"
+    else
+        record_error "failed to list credentials for reset"
+    fi
+    rm -f "${credentials_file}"
 }
 
 cleanup_docker_resources() {
@@ -722,7 +767,9 @@ remove_selected_paths() {
     fi
     if [ "${KEEP_CREDENTIALS}" -eq 0 ]; then
         remove_path_if_present "${AGENTENV_HOME}/credentials.json" || true
+        remove_path_if_present "${AGENTENV_HOME}/credentials-index.json" || true
     fi
+    remove_path_if_present "${AGENTENV_HOME}/config.yaml" || true
     remove_path_if_present "${AGENTENV_HOME}/events.db" || true
     remove_path_if_present "${AGENTENV_HOME}/audit.key" || true
     remove_path_if_present "${AGENTENV_HOME}/audit-signing-key" || true
@@ -740,6 +787,7 @@ execute_uninstall() {
     validate_configured_roots || return 1
     remove_shell_path_blocks
     destroy_registered_envs
+    reset_stored_credentials
     cleanup_docker_resources
     remove_selected_paths
 }
