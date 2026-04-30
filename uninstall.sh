@@ -424,6 +424,7 @@ remove_selected_paths() {
 }
 
 execute_uninstall() {
+    validate_configured_roots || return 1
     remove_shell_path_blocks
     remove_selected_paths
 }
@@ -450,7 +451,7 @@ main() {
         return 0
     fi
     confirm_uninstall || return 1
-    execute_uninstall
+    execute_uninstall || true
     if [ "${FAILURE_COUNT}" -gt 0 ]; then
         cat "${ERRORS_LOG}" >&2
         printf 'Uninstall completed with %s failure(s). Diagnostics: %s\n' "${FAILURE_COUNT}" "${TMP_ROOT}" >&2

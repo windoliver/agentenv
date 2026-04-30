@@ -706,6 +706,58 @@ test_uninstall_rejects_root_install_dir() {
     pass
 }
 
+test_uninstall_rejects_home_as_agentenv_home_before_shell_cleanup() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}"
+    INSTALL_DIR="${AGENTENV_HOME}/bin"
+    mkdir -p "${INSTALL_DIR}"
+    printf '# agentenv installer\nexport PATH="%s:$PATH"\n' "${INSTALL_DIR}" > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_HOME should fail before shell cleanup"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_HOME should report unsafe path"
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "unsafe AGENTENV_HOME should preserve shell sentinel"
+    assert_contains "export PATH=\"${INSTALL_DIR}:\$PATH\"" "${HOME}/.zshrc" "unsafe AGENTENV_HOME should preserve shell PATH export"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${backup_count}" "unsafe AGENTENV_HOME should not back up rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
+test_uninstall_rejects_root_install_dir_before_shell_cleanup() {
+    tmp_root=$(mktemp -d)
+
+    HOME="${tmp_root}/home"
+    AGENTENV_HOME="${HOME}/.agentenv"
+    INSTALL_DIR="/"
+    mkdir -p "${HOME}" "${AGENTENV_HOME}"
+    printf '# agentenv installer\nexport PATH="/:$PATH"\n' > "${HOME}/.zshrc"
+
+    set +e
+    AGENTENV_HOME="${AGENTENV_HOME}" AGENTENV_INSTALL_DIR="${INSTALL_DIR}" HOME="${HOME}" \
+        sh "${REPO_ROOT}/uninstall.sh" --yes > "${tmp_root}/uninstall.out" 2>&1
+    rc=$?
+    set -e
+
+    assert_eq "1" "${rc}" "unsafe AGENTENV_INSTALL_DIR should fail before shell cleanup"
+    assert_contains "unsafe path" "${tmp_root}/uninstall.out" "unsafe AGENTENV_INSTALL_DIR should report unsafe path"
+    assert_contains "# agentenv installer" "${HOME}/.zshrc" "unsafe AGENTENV_INSTALL_DIR should preserve shell sentinel"
+    assert_contains 'export PATH="/:$PATH"' "${HOME}/.zshrc" "unsafe AGENTENV_INSTALL_DIR should preserve shell PATH export"
+    backup_count=$(find "${HOME}" -name '.zshrc.agentenv.bak.*' | wc -l | awk '{print $1}')
+    assert_eq "0" "${backup_count}" "unsafe AGENTENV_INSTALL_DIR should not back up rc file"
+
+    rm -rf "${tmp_root}"
+    pass
+}
+
 test_uninstall_rejects_relative_agentenv_home() {
     tmp_root=$(mktemp -d)
 
@@ -854,6 +906,8 @@ main() {
     test_uninstall_rejects_agentenv_bin_under_home_outside_install_dir
     test_uninstall_rejects_parent_directory_components
     test_uninstall_rejects_root_install_dir
+    test_uninstall_rejects_home_as_agentenv_home_before_shell_cleanup
+    test_uninstall_rejects_root_install_dir_before_shell_cleanup
     test_uninstall_rejects_relative_agentenv_home
     test_uninstall_rejects_relative_install_dir
     test_uninstall_rejects_symlink_agentenv_home
