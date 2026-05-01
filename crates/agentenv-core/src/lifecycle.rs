@@ -552,48 +552,12 @@ fn portable_explicit_image_artifact(
     role: &str,
     component: &crate::lockfile::PortableComponent,
 ) -> Result<Option<(String, String)>, LifecycleError> {
-    if !component.extra.contains_key("image") {
-        return Ok(None);
-    }
-
-    let digest = component
-        .extra
-        .get("digest")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| LifecycleError::MissingDigest {
-            path: format!("{role}.digest"),
-        })?;
-
-    parse_sha256_digest(digest).map_err(|source| LifecycleError::InvalidDigest {
-        path: format!("{role}.digest"),
-        source,
-    })?;
-
-    Ok(Some((format!("{role}-image"), digest.to_string())))
+    explicit_image_digest(role, &component.extra)
+        .map(|digest| digest.map(|digest| (format!("{role}-image"), digest)))
 }
 
 fn verify_component_digest(path: &str, component: &ComponentSection) -> Result<(), LifecycleError> {
-    if component.extra.contains_key("image") {
-        let digest =
-            component
-                .extra
-                .get("digest")
-                .ok_or_else(|| LifecycleError::MissingDigest {
-                    path: format!("{path}.digest"),
-                })?;
-        let digest = digest
-            .as_str()
-            .ok_or_else(|| LifecycleError::MissingDigest {
-                path: format!("{path}.digest"),
-            })?;
-
-        parse_sha256_digest(digest).map_err(|source| LifecycleError::InvalidDigest {
-            path: format!("{path}.digest"),
-            source,
-        })?;
-    }
-
-    Ok(())
+    explicit_image_digest(path, &component.extra).map(|_| ())
 }
 
 fn driver_pins(resolved: &ResolvedBlueprint) -> BTreeMap<String, DriverPin> {
@@ -643,24 +607,43 @@ fn explicit_image_artifact(
     role: &str,
     component: &CanonicalComponent,
 ) -> Result<Option<(String, String)>, LifecycleError> {
-    if !component.extra.contains_key("image") {
+    explicit_image_digest(role, &component.extra)
+        .map(|digest| digest.map(|digest| (format!("{role}-image"), digest)))
+}
+
+fn explicit_image_digest(
+    role: &str,
+    extra: &BTreeMap<String, Value>,
+) -> Result<Option<String>, LifecycleError> {
+    let Some(image) = extra.get("image") else {
         return Ok(None);
+    };
+
+    if let Some(image) = image.as_mapping() {
+        if mapping_string(image, "source") == Some("byo") {
+            let Some(digest) = mapping_string(image, "expected_digest") else {
+                return Ok(None);
+            };
+            parse_sha256_digest(digest).map_err(|source| LifecycleError::InvalidDigest {
+                path: format!("{role}.image.expected_digest"),
+                source,
+            })?;
+            return Ok(Some(digest.to_owned()));
+        }
     }
 
-    let digest = component
-        .extra
-        .get("digest")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| LifecycleError::MissingDigest {
+    let digest = extra.get("digest").and_then(Value::as_str).ok_or_else(|| {
+        LifecycleError::MissingDigest {
             path: format!("{role}.digest"),
-        })?;
+        }
+    })?;
 
     parse_sha256_digest(digest).map_err(|source| LifecycleError::InvalidDigest {
         path: format!("{role}.digest"),
         source,
     })?;
 
-    Ok(Some((format!("{role}-image"), digest.to_string())))
+    Ok(Some(digest.to_owned()))
 }
 
 fn collect_credentials(

@@ -3,6 +3,26 @@
 `agentenv` is the CLI entry point for creating, entering, reproducing, observing,
 and auditing agent environments.
 
+Create with a custom sandbox Dockerfile:
+
+```bash
+agentenv create demo --from ./enterprise-sandbox/Containerfile
+```
+
+`--from` is equivalent to setting `AGENTENV_FROM_DOCKERFILE` and overlays the
+blueprint with:
+
+```yaml
+sandbox:
+  image:
+    source: byo
+    dockerfile: /absolute/path/to/Containerfile
+```
+
+The Dockerfile parent directory is the build context. The built image digest is
+verified against `sandbox.image.expected_digest` when present; otherwise the
+computed digest is recorded in the environment lockfile.
+
 Day-2 operations:
 
 - `agentenv logs --env <name> --kind <kind> [--follow] [--json]`

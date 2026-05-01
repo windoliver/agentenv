@@ -229,6 +229,28 @@ pub fn print_describe_text(description: &EnvDescription) {
 #[allow(dead_code)]
 pub fn print_admission_text(report: &AdmissionReport) {
     println!("{}: {}", report.env, report.reason_code.as_str());
+    for check in &report.checks {
+        for issue in &check.issues {
+            println!(
+                "{} {} {}: {}",
+                admission_issue_severity(&issue.severity),
+                check.driver,
+                issue.code,
+                issue.message
+            );
+            if let Some(remediation) = issue.remediation.as_deref() {
+                println!("  remediation: {remediation}");
+            }
+        }
+    }
+}
+
+fn admission_issue_severity(severity: &agentenv_proto::IssueSeverity) -> &'static str {
+    match severity {
+        agentenv_proto::IssueSeverity::Info => "info",
+        agentenv_proto::IssueSeverity::Warning => "warning",
+        agentenv_proto::IssueSeverity::Error => "error",
+    }
 }
 
 fn approval_kind_label(kind: ApprovalKind) -> &'static str {
