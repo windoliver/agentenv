@@ -5,6 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     io::Write,
+    path::Component,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{Arc, Mutex},
@@ -1698,19 +1699,246 @@ fn stage_build_context(
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
+    let dockerignore = DockerIgnore::load(src)?;
     fs::create_dir_all(dst)?;
+    let _ = copy_dir_contents_inner(src, dst, Path::new(""), &dockerignore, false, true)?;
+    Ok(())
+}
+
+fn copy_dir_contents_inner(
+    src: &Path,
+    dst: &Path,
+    relative: &Path,
+    dockerignore: &DockerIgnore,
+    parent_ignored: bool,
+    create_current: bool,
+) -> io::Result<bool> {
+    if create_current {
+        fs::create_dir_all(dst)?;
+    }
+    let mut copied_any = create_current;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let file_type = metadata.file_type();
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
+        let relative_path = if relative.as_os_str().is_empty() {
+            PathBuf::from(entry.file_name())
+        } else {
+            relative.join(entry.file_name())
+        };
+        let is_dir = file_type.is_dir();
+        let ignored = dockerignore.is_ignored(&relative_path, is_dir, parent_ignored);
         if file_type.is_dir() {
-            copy_dir_contents(&src_path, &dst_path)?;
+            if ignored && !dockerignore.may_reinclude_descendant(&relative_path) {
+                continue;
+            }
+            if copy_dir_contents_inner(
+                &src_path,
+                &dst_path,
+                &relative_path,
+                dockerignore,
+                ignored,
+                !ignored,
+            )? {
+                copied_any = true;
+            }
+        } else if ignored {
+            continue;
+        } else if file_type.is_symlink() {
+            fs::create_dir_all(dst)?;
+            copy_symlink(&src_path, &dst_path)?;
+            copied_any = true;
         } else if file_type.is_file() {
+            fs::create_dir_all(dst)?;
             fs::copy(&src_path, &dst_path)?;
+            copied_any = true;
         }
     }
-    Ok(())
+    Ok(copied_any)
+}
+
+#[derive(Debug, Clone, Default)]
+struct DockerIgnore {
+    rules: Vec<DockerIgnoreRule>,
+}
+
+#[derive(Debug, Clone)]
+struct DockerIgnoreRule {
+    pattern: String,
+    negated: bool,
+    has_slash: bool,
+}
+
+impl DockerIgnore {
+    fn load(context_dir: &Path) -> io::Result<Self> {
+        match fs::read_to_string(context_dir.join(".dockerignore")) {
+            Ok(contents) => Ok(Self::parse(&contents)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(source),
+        }
+    }
+
+    fn parse(contents: &str) -> Self {
+        let rules = contents
+            .lines()
+            .filter_map(DockerIgnoreRule::parse)
+            .collect();
+        Self { rules }
+    }
+
+    fn is_ignored(&self, relative_path: &Path, is_dir: bool, parent_ignored: bool) -> bool {
+        let Some(relative_path) = normalized_relative_path(relative_path) else {
+            return parent_ignored;
+        };
+        let mut ignored = parent_ignored;
+        for rule in &self.rules {
+            if rule.matches(&relative_path, is_dir) {
+                ignored = !rule.negated;
+            }
+        }
+        ignored
+    }
+
+    fn may_reinclude_descendant(&self, relative_dir: &Path) -> bool {
+        let Some(relative_dir) = normalized_relative_path(relative_dir) else {
+            return false;
+        };
+        self.rules
+            .iter()
+            .any(|rule| rule.negated && rule.may_match_descendant(&relative_dir))
+    }
+}
+
+impl DockerIgnoreRule {
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (negated, pattern) = line
+            .strip_prefix('!')
+            .map(|pattern| (true, pattern.trim()))
+            .unwrap_or((false, line));
+        let pattern = clean_dockerignore_pattern(pattern)?;
+        let has_slash = pattern.contains('/');
+        Some(Self {
+            pattern,
+            negated,
+            has_slash,
+        })
+    }
+
+    fn matches(&self, relative_path: &str, _is_dir: bool) -> bool {
+        dockerignore_pattern_matches(&self.pattern, self.has_slash, relative_path)
+    }
+
+    fn may_match_descendant(&self, relative_dir: &str) -> bool {
+        if !self.has_slash {
+            return true;
+        }
+        self.pattern.starts_with(&format!("{relative_dir}/"))
+            || self.pattern == relative_dir
+            || self.pattern.contains("**")
+    }
+}
+
+fn clean_dockerignore_pattern(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim().trim_matches('/');
+    if pattern.is_empty() || pattern == "." {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let normalized = pattern.replace('\\', "/");
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let pattern = parts.join("/");
+    (!pattern.is_empty() && pattern != ".").then_some(pattern)
+}
+
+fn normalized_relative_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn dockerignore_pattern_matches(pattern: &str, has_slash: bool, relative_path: &str) -> bool {
+    if !has_slash {
+        return relative_path
+            .split('/')
+            .any(|part| wildcard_matches(pattern, part));
+    }
+
+    let pattern_parts = pattern.split('/').collect::<Vec<_>>();
+    let path_parts = relative_path.split('/').collect::<Vec<_>>();
+    dockerignore_segments_match(&pattern_parts, &path_parts)
+}
+
+fn dockerignore_segments_match(pattern: &[&str], path: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return path.is_empty();
+    }
+    if pattern[0] == "**" {
+        return dockerignore_segments_match(&pattern[1..], path)
+            || (!path.is_empty() && dockerignore_segments_match(pattern, &path[1..]));
+    }
+    !path.is_empty()
+        && wildcard_matches(pattern[0], path[0])
+        && dockerignore_segments_match(&pattern[1..], &path[1..])
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let mut matches = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+    matches[0][0] = true;
+    for i in 1..=pattern.len() {
+        if pattern[i - 1] == '*' {
+            matches[i][0] = matches[i - 1][0];
+        }
+    }
+    for i in 1..=pattern.len() {
+        for j in 1..=text.len() {
+            matches[i][j] = match pattern[i - 1] {
+                '*' => matches[i - 1][j] || matches[i][j - 1],
+                '?' => matches[i - 1][j - 1],
+                ch => ch == text[j - 1] && matches[i - 1][j - 1],
+            };
+        }
+    }
+    matches[pattern.len()][text.len()]
+}
+
+#[cfg(unix)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(src)?, dst)
+}
+
+#[cfg(windows)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    let target = fs::read_link(src)?;
+    if fs::metadata(src)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        std::os::windows::fs::symlink_dir(target, dst)
+    } else {
+        std::os::windows::fs::symlink_file(target, dst)
+    }
 }
 
 fn install_openshell_command_request() -> CommandRequest {
@@ -4568,6 +4796,48 @@ mod driver_tests {
             .join("devbox")
             .join("image-digest")
             .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_build_context_honors_dockerignore_and_preserves_symlinks() {
+        let tempdir = unique_tempdir("sandbox-openshell-stage-context");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(context_dir.join("ignored-dir")).expect("create context");
+        let dockerfile = context_dir.join("Containerfile.agentenv");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+        std::fs::write(
+            context_dir.join(".dockerignore"),
+            "secret.txt\nignored-dir\n*.log\n!keep.log\n",
+        )
+        .expect("write dockerignore");
+        std::fs::write(context_dir.join("secret.txt"), "secret").expect("write secret");
+        std::fs::write(context_dir.join("ignored-dir").join("hidden.txt"), "hidden")
+            .expect("write ignored file");
+        std::fs::write(context_dir.join("app.log"), "ignored").expect("write ignored log");
+        std::fs::write(context_dir.join("keep.log"), "included").expect("write included log");
+        std::fs::write(context_dir.join("real.txt"), "real").expect("write symlink target");
+        std::os::unix::fs::symlink("real.txt", context_dir.join("linked-real"))
+            .expect("create symlink");
+        let stage_dir = tempdir.join(".agentenv").join("build").join("devbox");
+
+        super::stage_build_context(&context_dir, &dockerfile, &stage_dir).expect("stage context");
+
+        assert!(stage_dir.join("Dockerfile").is_file());
+        assert!(stage_dir.join("keep.log").is_file());
+        assert!(stage_dir.join("real.txt").is_file());
+        assert!(!stage_dir.join("secret.txt").exists());
+        assert!(!stage_dir.join("ignored-dir").join("hidden.txt").exists());
+        assert!(!stage_dir.join("app.log").exists());
+        assert!(std::fs::symlink_metadata(stage_dir.join("linked-real"))
+            .expect("staged symlink metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(stage_dir.join("linked-real")).expect("staged symlink target"),
+            PathBuf::from("real.txt")
+        );
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 

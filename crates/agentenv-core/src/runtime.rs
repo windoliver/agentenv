@@ -1779,19 +1779,27 @@ fn sandbox_spec_for_create(
     let image = match sandbox_extra.get("image") {
         Some(serde_yaml::Value::String(image)) => Some(image.clone()),
         Some(serde_yaml::Value::Mapping(image)) => {
-            let source = yaml_mapping_string(image, "source").unwrap_or_default();
+            let source = optional_yaml_mapping_string(image, "source", "sandbox.image.source")?
+                .unwrap_or_default();
             if source != "byo" {
                 return Err(RuntimeError::Driver(DriverError::InvalidInput {
                     message: format!("unsupported sandbox image source `{source}`"),
                 }));
             }
-            let dockerfile = yaml_mapping_string(image, "dockerfile").ok_or_else(|| {
-                RuntimeError::Driver(DriverError::InvalidInput {
-                    message: "sandbox.image.dockerfile is required when source is `byo`".to_owned(),
-                })
-            })?;
+            let dockerfile =
+                required_yaml_mapping_string(image, "dockerfile", "sandbox.image.dockerfile")?
+                    .ok_or_else(|| {
+                        RuntimeError::Driver(DriverError::InvalidInput {
+                            message: "sandbox.image.dockerfile is required when source is `byo`"
+                                .to_owned(),
+                        })
+                    })?;
             metadata.insert("byo_dockerfile".to_owned(), serde_json::json!(dockerfile));
-            if let Some(expected_digest) = yaml_mapping_string(image, "expected_digest") {
+            if let Some(expected_digest) = optional_yaml_mapping_string(
+                image,
+                "expected_digest",
+                "sandbox.image.expected_digest",
+            )? {
                 metadata.insert(
                     "byo_expected_digest".to_owned(),
                     serde_json::json!(expected_digest),
@@ -1985,9 +1993,36 @@ fn sanitize_byo_build_name(name: &str) -> String {
 }
 
 fn yaml_mapping_string<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
-    mapping
-        .get(serde_yaml::Value::String(key.to_owned()))
-        .and_then(serde_yaml::Value::as_str)
+    yaml_mapping_value(mapping, key).and_then(serde_yaml::Value::as_str)
+}
+
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.to_owned()))
+}
+
+fn required_yaml_mapping_string<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+    path: &str,
+) -> RuntimeResult<Option<&'a str>> {
+    optional_yaml_mapping_string(mapping, key, path)
+}
+
+fn optional_yaml_mapping_string<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+    path: &str,
+) -> RuntimeResult<Option<&'a str>> {
+    match yaml_mapping_value(mapping, key) {
+        Some(serde_yaml::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!("{path} must be a string when set"),
+        })),
+        None => Ok(None),
+    }
 }
 
 fn mcp_endpoint_port(endpoint: &agentenv_proto::McpEndpoint) -> Option<String> {
