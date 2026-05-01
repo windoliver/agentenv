@@ -31,6 +31,7 @@ context-mcp-generic = { path = "../drivers/context-mcp-generic" }
 context-none = { path = "../drivers/context-none" }
 crossterm.workspace = true
 dirs.workspace = true
+hex.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 inference-anthropic = { path = "../drivers/inference-anthropic" }
@@ -42,6 +43,7 @@ sandbox-openshell = { path = "../drivers/sandbox-openshell" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
 time = { workspace = true, features = ["formatting"] }
 tokio.workspace = true
 tracing.workspace = true

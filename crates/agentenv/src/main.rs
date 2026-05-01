@@ -7,7 +7,7 @@ use std::{
     process,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agentenv_approvals::{
@@ -31,6 +31,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use hyper::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
@@ -61,6 +62,7 @@ enum Commands {
     Sessions(SessionsArgs),
     List(ListArgs),
     Destroy(DestroyArgs),
+    Uninstall(UninstallArgs),
     Describe(DescribeArgs),
     Status(StatusArgs),
     Logs(LogsArgs),
@@ -185,6 +187,52 @@ struct DestroyArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     non_interactive: bool,
+}
+
+#[derive(Debug, Args)]
+struct UninstallArgs {
+    #[arg(short = 'y', long)]
+    yes: bool,
+    #[arg(long)]
+    keep_openshell: bool,
+    #[arg(long)]
+    keep_drivers: bool,
+    #[arg(long)]
+    keep_credentials: bool,
+    #[arg(long)]
+    keep_data: bool,
+    #[arg(long)]
+    delete_models: bool,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl UninstallArgs {
+    fn to_script_args(&self) -> Vec<&'static str> {
+        let mut args = Vec::new();
+        if self.yes {
+            args.push("--yes");
+        }
+        if self.keep_openshell {
+            args.push("--keep-openshell");
+        }
+        if self.keep_drivers {
+            args.push("--keep-drivers");
+        }
+        if self.keep_credentials {
+            args.push("--keep-credentials");
+        }
+        if self.keep_data {
+            args.push("--keep-data");
+        }
+        if self.delete_models {
+            args.push("--delete-models");
+        }
+        if self.dry_run {
+            args.push("--dry-run");
+        }
+        args
+    }
 }
 
 #[derive(Debug, Args)]
@@ -463,6 +511,7 @@ async fn run() -> Result<()> {
         Some(Commands::Sessions(args)) => run_sessions(args).await,
         Some(Commands::List(args)) => run_list(args),
         Some(Commands::Destroy(args)) => run_destroy(args, &cli.events_sink).await,
+        Some(Commands::Uninstall(args)) => run_uninstall(args),
         Some(Commands::Describe(args)) => run_describe(args),
         Some(Commands::Status(args)) => run_status(args).await,
         Some(Commands::Logs(args)) => run_logs(args).await,
@@ -485,6 +534,232 @@ async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_uninstall(args: UninstallArgs) -> Result<()> {
+    let script = resolve_uninstall_script()?;
+    let current_exe = std::env::current_exe().ok();
+    let mut command = process::Command::new("sh");
+    command.arg(&script.path).args(args.to_script_args());
+    if std::env::var_os("AGENTENV_BIN").is_none() {
+        if let Some(path) = &current_exe {
+            command.env("AGENTENV_BIN", path);
+        }
+    }
+    if std::env::var_os("AGENTENV_INSTALL_DIR").is_none() {
+        if let Some(dir) = current_exe.as_ref().and_then(|path| path.parent()) {
+            command.env("AGENTENV_INSTALL_DIR", dir);
+        }
+    }
+    let status = command.status();
+    script.cleanup_best_effort();
+    let status = status
+        .with_context(|| format!("failed to run uninstall script `{}`", script.path.display()))?;
+
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => exit_process(code),
+        None => bail!(
+            "uninstall script `{}` terminated by signal",
+            script.path.display()
+        ),
+    }
+}
+
+struct ResolvedUninstallScript {
+    path: PathBuf,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl ResolvedUninstallScript {
+    fn local(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup_dir: None,
+        }
+    }
+
+    fn downloaded(path: PathBuf, cleanup_dir: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup_dir: Some(cleanup_dir),
+        }
+    }
+
+    fn cleanup_best_effort(&self) {
+        if let Some(dir) = &self.cleanup_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn resolve_uninstall_script() -> Result<ResolvedUninstallScript> {
+    if let Some(script) = std::env::var_os("AGENTENV_UNINSTALL_SCRIPT") {
+        let script = PathBuf::from(script);
+        if script.is_file() {
+            return Ok(ResolvedUninstallScript::local(script));
+        }
+        bail!(
+            "AGENTENV_UNINSTALL_SCRIPT points to `{}`, which is not a file",
+            script.display()
+        );
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let script = exe_dir.join("uninstall.sh");
+            if script.is_file() {
+                return Ok(ResolvedUninstallScript::local(script));
+            }
+        }
+    }
+
+    download_hosted_uninstall_script()
+}
+
+fn download_hosted_uninstall_script() -> Result<ResolvedUninstallScript> {
+    let repo = std::env::var("AGENTENV_REPO").unwrap_or_else(|_| "windoliver/agentenv".to_owned());
+    let base_url = std::env::var("AGENTENV_RELEASE_BASE_URL")
+        .unwrap_or_else(|_| format!("https://github.com/{repo}/releases/download"));
+    let version = hosted_uninstall_version();
+    let base_url = base_url.trim_end_matches('/');
+    let script_url = format!("{base_url}/{version}/uninstall.sh");
+    let checksum_url = format!("{base_url}/{version}/uninstall.sh.sha256");
+
+    let download_dir = make_uninstall_download_dir()?;
+    let download_guard = UninstallDownloadGuard::new(download_dir.clone());
+    let script_path = download_dir.join("uninstall.sh");
+    let checksum_path = download_dir.join("uninstall.sh.sha256");
+
+    download_url_to_file(&script_url, &script_path)
+        .with_context(|| format!("download uninstall script from `{script_url}`"))?;
+    download_url_to_file(&checksum_url, &checksum_path)
+        .with_context(|| format!("download uninstall checksum from `{checksum_url}`"))?;
+    verify_file_sha256(&script_path, &checksum_path)?;
+
+    let cleanup_dir = download_guard.keep();
+    Ok(ResolvedUninstallScript::downloaded(
+        script_path,
+        cleanup_dir,
+    ))
+}
+
+fn hosted_uninstall_version() -> String {
+    let default = || format!("v{}", env!("CARGO_PKG_VERSION"));
+    let Ok(version) = std::env::var("AGENTENV_VERSION") else {
+        return default();
+    };
+    let version = version.trim();
+    if version.is_empty() {
+        return default();
+    }
+    version
+        .strip_prefix("refs/tags/")
+        .unwrap_or(version)
+        .to_owned()
+}
+
+struct UninstallDownloadGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl UninstallDownloadGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn keep(mut self) -> PathBuf {
+        self.keep = true;
+        self.path.clone()
+    }
+}
+
+impl Drop for UninstallDownloadGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn make_uninstall_download_dir() -> Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before UNIX_EPOCH")?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("agentenv-uninstall-{}-{now}", process::id()));
+    fs::create_dir(&path).with_context(|| {
+        format!(
+            "failed to create uninstall download directory `{}`",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn download_url_to_file(url: &str, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create download destination directory `{}`",
+                parent.display()
+            )
+        })?;
+    }
+
+    let curl_status = process::Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(path)
+        .arg(url)
+        .status();
+    if matches!(curl_status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    let wget_status = process::Command::new("wget")
+        .args(["-q", "-O"])
+        .arg(path)
+        .arg(url)
+        .status();
+    if matches!(wget_status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    bail!("failed to download `{url}` with curl or wget");
+}
+
+fn verify_file_sha256(file_path: &Path, checksum_path: &Path) -> Result<()> {
+    let checksum = fs::read_to_string(checksum_path)
+        .with_context(|| format!("failed to read checksum `{}`", checksum_path.display()))?;
+    let expected = checksum
+        .split_whitespace()
+        .next()
+        .context("checksum file is empty")?
+        .to_ascii_lowercase();
+
+    let mut file = fs::File::open(file_path)
+        .with_context(|| format!("failed to open downloaded file `{}`", file_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read `{}`", file_path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if actual != expected {
+        bail!(
+            "checksum mismatch for `{}`: expected {expected}, got {actual}",
+            file_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> {
@@ -3356,6 +3631,7 @@ mod tests {
                 "sessions".to_string(),
                 "list".to_string(),
                 "destroy".to_string(),
+                "uninstall".to_string(),
                 "describe".to_string(),
                 "status".to_string(),
                 "logs".to_string(),
