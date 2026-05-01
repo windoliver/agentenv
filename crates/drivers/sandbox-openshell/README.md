@@ -9,7 +9,7 @@ Behavior:
 - Supports BYO sandbox Dockerfiles through `sandbox.image.source: byo` or
   `agentenv create --from <path>`. The Dockerfile parent directory is copied to
   `~/.agentenv/build/<env>/`, the selected Dockerfile is staged as `Dockerfile`,
-  and the built image is passed to `openshell sandbox create --from`.
+  and that staged context is passed to `openshell sandbox create --from`.
 - Translates `agentenv` network policy into OpenShell policy documents and supports hot-reload for network and inference policy updates.
 - Passes credentials into the sandbox as environment variables only; they do not flow through argv, policy files, or image layers.
 
@@ -22,10 +22,11 @@ BYO Dockerfiles may declare these stable build arguments:
 | `AGENTENV_MCP_PORT` | MCP HTTP port when the context endpoint uses an HTTP transport. Empty otherwise. |
 | `AGENTENV_WORKSPACE_MOUNT` | Sandbox workspace path, currently `/sandbox`. |
 
-If `sandbox.image.expected_digest` is set, the driver compares it with the
-built image ID and fails before sandbox creation on mismatch. If omitted, the
-computed digest is written to `~/.agentenv/build/<env>/image-digest` for the
-core to record in `lock.yaml`.
+The driver also builds the staged context locally so it can inspect the image ID.
+If `sandbox.image.expected_digest` is set, the driver compares it with the built
+image ID and fails before sandbox creation on mismatch. If omitted, the computed
+digest is written to `~/.agentenv/build/<env>/image-digest` for the core to
+record in `lock.yaml`.
 
 Integration test command:
 

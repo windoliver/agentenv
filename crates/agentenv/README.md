@@ -21,7 +21,9 @@ sandbox:
 
 The Dockerfile parent directory is the build context. The built image digest is
 verified against `sandbox.image.expected_digest` when present; otherwise the
-computed digest is recorded in the environment lockfile.
+computed digest is recorded in the environment lockfile. After local digest
+verification, the staged context is handed to OpenShell so its gateway can build
+and materialize the sandbox image.
 
 Day-2 operations:
 

@@ -629,7 +629,7 @@ impl SandboxDriver for OpenShellDriver {
             }
         };
         let image = match byo_dockerfile_config(&spec.metadata)? {
-            Some(config) => self.build_byo_dockerfile_image(&name, &config)?,
+            Some(config) => self.prepare_byo_dockerfile_context(&name, &config)?,
             None => spec.image.unwrap_or_else(|| "openclaw".to_owned()),
         };
         let remote = match spec.metadata.get("remote") {
@@ -958,7 +958,7 @@ impl OpenShellDriver {
         }
     }
 
-    fn build_byo_dockerfile_image(
+    fn prepare_byo_dockerfile_context(
         &self,
         name: &str,
         config: &ByoDockerfileConfig,
@@ -1004,7 +1004,7 @@ impl OpenShellDriver {
             format!("AGENTENV_MCP_PORT={}", config.mcp_port),
             "--build-arg".to_owned(),
             format!("AGENTENV_WORKSPACE_MOUNT={}", config.workspace_mount),
-            stage_arg,
+            stage_arg.clone(),
         ];
         self.run_checked_host_command(
             "docker",
@@ -1044,7 +1044,7 @@ impl OpenShellDriver {
             }
         })?;
 
-        Ok(tag)
+        Ok(stage_arg)
     }
 
     fn run_command_request(&self, request: CommandRequest) -> io::Result<CommandOutput> {
@@ -4606,7 +4606,7 @@ mod driver_tests {
     }
 
     #[test]
-    fn create_builds_byo_dockerfile_and_uses_built_image() {
+    fn create_builds_byo_dockerfile_and_uses_staged_context() {
         let tempdir = unique_tempdir("sandbox-openshell-byo-build");
         let context_dir = tempdir.join("enterprise-sandbox");
         std::fs::create_dir_all(&context_dir).expect("create context");
@@ -4620,6 +4620,7 @@ mod driver_tests {
         let workdir = tempdir.join(".agentenv");
         let stage_dir = workdir.join("build").join("devbox");
         let stage_dockerfile = stage_dir.join("Dockerfile");
+        let stage_dir_arg = stage_dir.display().to_string();
         let tag = "agentenv-byo-devbox:latest";
         let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let expected_build_args = vec![
@@ -4636,7 +4637,7 @@ mod driver_tests {
             "AGENTENV_MCP_PORT=3333".to_owned(),
             "--build-arg".to_owned(),
             "AGENTENV_WORKSPACE_MOUNT=/sandbox".to_owned(),
-            stage_dir.display().to_string(),
+            stage_dir_arg.clone(),
         ];
         let runner = Arc::new(FlexibleCommandRunner::new(vec![
             FlexibleCommandExpectation::success(
@@ -4676,7 +4677,7 @@ mod driver_tests {
                             "devbox",
                             "--no-auto-providers",
                             "--from",
-                            tag,
+                            &stage_dir_arg,
                             "--",
                             "true",
                         ])
