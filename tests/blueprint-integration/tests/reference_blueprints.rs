@@ -90,11 +90,11 @@ fn reference_blueprints_create_exec_destroy() -> Result<(), Box<dyn std::error::
     let workspace = workspace_root();
     let driver_output = agentenv_output(&workspace, ["drivers", "list"])?;
     if !driver_output.status.success() {
-        println!(
-            "skipping blueprint integration tests: `agentenv drivers list` failed\n{}",
+        panic!(
+            "`agentenv drivers list` failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&driver_output.stdout),
             String::from_utf8_lossy(&driver_output.stderr)
         );
-        return Ok(());
     }
     let drivers = String::from_utf8_lossy(&driver_output.stdout);
 
