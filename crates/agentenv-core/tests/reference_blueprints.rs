@@ -226,6 +226,47 @@ fn all_reference_blueprints_parse() {
 }
 
 #[test]
+fn docs_catalog_mentions_every_reference_blueprint() {
+    let docs = std::fs::read_to_string(workspace_path("docs/BLUEPRINTS.md")).unwrap();
+
+    for case in reference_blueprints() {
+        let file_name = case.path.strip_prefix("blueprints/").unwrap();
+        assert!(
+            docs.contains(file_name),
+            "docs/BLUEPRINTS.md must mention {file_name}"
+        );
+    }
+}
+
+#[test]
+fn sample_project_blueprints_parse() {
+    {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("NEXUS_HUB_URL", "https://93.184.216.35");
+    }
+
+    for path in [
+        "examples/quickstart/agentenv.yaml",
+        "examples/enterprise-hub/agentenv.yaml",
+        "examples/headless-ci/agentenv.yaml",
+    ] {
+        let doc = std::fs::read_to_string(workspace_path(path)).unwrap();
+        let blueprint = Blueprint::from_yaml(&doc).unwrap();
+
+        assert_eq!(blueprint.version, "0.1.0", "{path}");
+        assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
+        assert_eq!(
+            blueprint
+                .inference
+                .as_ref()
+                .map(|section| section.driver.as_str()),
+            Some("passthrough"),
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn interpolation_resolves_env_variable() {
     let _guard = env_lock().lock().unwrap();
     std::env::set_var("MCP_URL", "https://93.184.216.34");
