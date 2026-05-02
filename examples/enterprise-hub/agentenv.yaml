@@ -4,7 +4,8 @@ min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
   version: ">=0.0.1-alpha0,<0.1"
-  image: registry.internal.example.com/agentenv/company-base:latest
+  image: registry.internal.example.com/agentenv/company-base:2026.05
+  digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
 agent:
   driver: claude

@@ -45,10 +45,12 @@ Required environment:
 Usage:
 
 ```sh
-export MCP_URL=https://mcp.internal.company.com
+export MCP_URL=https://example.com/mcp
 export MCP_TOKEN=mcp-token-example
 agentenv create docs --blueprint blueprints/codex+mcp-generic+openshell.yaml
 ```
+
+Note: the templates collect `MCP_TOKEN` as a credential reference, but the current generic MCP driver does not attach it to endpoint headers yet. Use endpoints that do not require header auth, or add driver support before relying on token auth.
 
 Trade-off: the `restricted` policy keeps egress narrow and allows only the configured MCP endpoint by default.
 
@@ -80,7 +82,7 @@ Required environment:
 Usage:
 
 ```sh
-export NEXUS_HUB_URL=https://nexus.company.com
+export NEXUS_HUB_URL=https://example.com/nexus
 export NEXUS_TOKEN=nexus-token-example
 agentenv create enterprise --blueprint blueprints/claude+nexus+openshell.yaml
 ```

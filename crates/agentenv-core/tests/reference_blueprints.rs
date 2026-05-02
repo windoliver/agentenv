@@ -1,6 +1,8 @@
 use std::sync::{Mutex, OnceLock};
 
-use agentenv_core::{blueprint::Blueprint, error::BlueprintError};
+use agentenv_core::{
+    blueprint::Blueprint, error::BlueprintError, lifecycle::verify_blueprint_yaml,
+};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -252,6 +254,7 @@ fn sample_project_blueprints_parse() {
         let doc = std::fs::read_to_string(workspace_path(path))
             .unwrap_or_else(|err| panic!("{path}: {err}"));
         let blueprint = Blueprint::from_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
+        verify_blueprint_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
 
         assert_eq!(blueprint.version, "0.1.0", "{path}");
         assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
