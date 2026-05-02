@@ -159,10 +159,11 @@ fn run_case(workspace: &PathBuf, case: &BlueprintCase) -> Result<(), Box<dyn std
         ],
     )?;
     if !create.status.success() {
-        remove_temp_home(&home);
         panic!(
-            "`agentenv create` failed for {}\nstdout:\n{}\nstderr:\n{}",
+            "`agentenv create` failed for {}\nenv: {}\ntemp HOME preserved at: {}\nstdout:\n{}\nstderr:\n{}",
             case.path,
+            env_name,
+            home.display(),
             String::from_utf8_lossy(&create.stdout),
             String::from_utf8_lossy(&create.stderr)
         );
@@ -189,17 +190,32 @@ fn run_case(workspace: &PathBuf, case: &BlueprintCase) -> Result<(), Box<dyn std
             OsString::from("--non-interactive"),
         ],
     );
+
+    let destroy = match destroy {
+        Ok(output) => output,
+        Err(error) => {
+            panic!(
+                "failed to run `agentenv destroy` for {}\nenv: {}\ntemp HOME preserved at: {}\nerror: {}",
+                case.path,
+                env_name,
+                home.display(),
+                error
+            );
+        }
+    };
+    if !destroy.status.success() {
+        panic!(
+            "`agentenv destroy` failed for {}\nenv: {}\ntemp HOME preserved at: {}\nstdout:\n{}\nstderr:\n{}",
+            case.path,
+            env_name,
+            home.display(),
+            String::from_utf8_lossy(&destroy.stdout),
+            String::from_utf8_lossy(&destroy.stderr)
+        );
+    }
     remove_temp_home(&home);
 
     let exec = exec?;
-    let destroy = destroy?;
-    assert!(
-        destroy.status.success(),
-        "`agentenv destroy` failed for {}\nstdout:\n{}\nstderr:\n{}",
-        case.path,
-        String::from_utf8_lossy(&destroy.stdout),
-        String::from_utf8_lossy(&destroy.stderr)
-    );
     assert!(
         exec.status.success(),
         "`agentenv exec` failed for {}\nstdout:\n{}\nstderr:\n{}",
@@ -254,7 +270,11 @@ fn agentenv_output_with_home<const N: usize>(
     args: [OsString; N],
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let mut command = agentenv_command(workspace);
-    command.args(args).env("HOME", home).current_dir(workspace);
+    command
+        .args(args)
+        .env("HOME", home)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .current_dir(workspace);
     if let Some(driver_path) = driver_path_with_original_home() {
         command.env("AGENTENV_DRIVER_PATH", driver_path);
     }
