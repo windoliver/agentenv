@@ -6,8 +6,27 @@ Behavior:
 
 - Requires `openshell >= 0.0.30` and a working OpenShell gateway for runtime use.
 - Creates sandboxes from the `openclaw` image by default unless another image is provided.
+- Supports BYO sandbox Dockerfiles through `sandbox.image.source: byo` or
+  `agentenv create --from <path>`. The Dockerfile parent directory is copied to
+  `~/.agentenv/build/<env>/`, the selected Dockerfile is staged as `Dockerfile`,
+  and that staged context is passed to `openshell sandbox create --from`.
 - Translates `agentenv` network policy into OpenShell policy documents and supports hot-reload for network and inference policy updates.
 - Passes credentials into the sandbox as environment variables only; they do not flow through argv, policy files, or image layers.
+
+BYO Dockerfiles may declare these stable build arguments:
+
+| ARG | Value |
+| --- | --- |
+| `AGENTENV_VERSION` | Version of the `agentenv` binary building the image. |
+| `AGENTENV_AGENT` | Agent driver name, for example `codex` or `claude`. |
+| `AGENTENV_MCP_PORT` | MCP HTTP port when the context endpoint uses an HTTP transport. Empty otherwise. |
+| `AGENTENV_WORKSPACE_MOUNT` | Sandbox workspace path, currently `/sandbox`. |
+
+The driver also builds the staged context locally so it can inspect the image ID.
+If `sandbox.image.expected_digest` is set, the driver compares it with the built
+image ID and fails before sandbox creation on mismatch. If omitted, the computed
+digest is written to `~/.agentenv/build/<env>/image-digest` for the core to
+record in `lock.yaml`.
 
 Integration test command:
 

@@ -5,6 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     io::Write,
+    path::Component,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{Arc, Mutex},
@@ -21,7 +22,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use agentenv_core::driver::{DriverError, DriverResult, SandboxDriver};
+use agentenv_core::{
+    digest::parse_sha256_digest,
+    driver::{DriverError, DriverResult, SandboxDriver},
+};
 use agentenv_policy::{
     InferenceUpdate, OpenShellTranslator, PolicyError, PolicyTranslator, TranslatedPolicy,
 };
@@ -362,8 +366,19 @@ pub struct OpenShellDriver {
     runner: Arc<dyn CommandRunner>,
     host_bootstrap: bool,
     runtime_app_override: Option<String>,
+    workdir: Mutex<PathBuf>,
     current_policies: Mutex<BTreeMap<String, NetworkPolicy>>,
     log_streams: Mutex<Vec<LogStream>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ByoDockerfileConfig {
+    dockerfile: PathBuf,
+    expected_digest: Option<String>,
+    agentenv_version: String,
+    agent: String,
+    mcp_port: String,
+    workspace_mount: String,
 }
 
 struct LogStream {
@@ -378,6 +393,7 @@ impl Default for OpenShellDriver {
             runner: Arc::new(ProcessCommandRunner),
             host_bootstrap: true,
             runtime_app_override: None,
+            workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
         }
@@ -392,6 +408,19 @@ impl OpenShellDriver {
             runner,
             host_bootstrap: false,
             runtime_app_override: None,
+            workdir: Mutex::new(default_agentenv_workdir()),
+            current_policies: Mutex::new(BTreeMap::new()),
+            log_streams: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_command_runner_and_workdir(runner: Arc<dyn CommandRunner>, workdir: &Path) -> Self {
+        Self {
+            binary: OPEN_SHELL_BINARY.to_owned(),
+            runner,
+            host_bootstrap: false,
+            runtime_app_override: None,
+            workdir: Mutex::new(workdir.to_path_buf()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
         }
@@ -404,6 +433,7 @@ impl OpenShellDriver {
             runner,
             host_bootstrap: true,
             runtime_app_override: None,
+            workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
         }
@@ -419,6 +449,7 @@ impl OpenShellDriver {
             runner,
             host_bootstrap: true,
             runtime_app_override: Some(runtime_app.into()),
+            workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
         }
@@ -435,6 +466,7 @@ impl Drop for OpenShellDriver {
 impl SandboxDriver for OpenShellDriver {
     async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
         assert_compatible_schema_version(&params.schema_version)?;
+        self.set_workdir(PathBuf::from(params.workdir));
 
         Ok(InitializeResult {
             driver: DriverInfo {
@@ -587,7 +619,6 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
         let spec = _spec;
-        let image = spec.image.unwrap_or_else(|| "openclaw".to_owned());
         let name = match spec.metadata.get("name") {
             Some(Value::String(value)) if !value.is_empty() => value.clone(),
             Some(Value::String(_)) | None => format!("agentenv-{}", Uuid::new_v4()),
@@ -596,6 +627,10 @@ impl SandboxDriver for OpenShellDriver {
                     message: "metadata.name must be a string when set".to_owned(),
                 });
             }
+        };
+        let image = match byo_dockerfile_config(&spec.metadata)? {
+            Some(config) => self.prepare_byo_dockerfile_context(&name, &config)?,
+            None => spec.image.unwrap_or_else(|| "openclaw".to_owned()),
         };
         let remote = match spec.metadata.get("remote") {
             Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
@@ -909,6 +944,109 @@ impl SandboxDriver for OpenShellDriver {
 }
 
 impl OpenShellDriver {
+    fn set_workdir(&self, workdir: PathBuf) {
+        match self.workdir.lock() {
+            Ok(mut current) => *current = workdir,
+            Err(poisoned) => *poisoned.into_inner() = workdir,
+        }
+    }
+
+    fn workdir(&self) -> PathBuf {
+        match self.workdir.lock() {
+            Ok(current) => current.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn prepare_byo_dockerfile_context(
+        &self,
+        name: &str,
+        config: &ByoDockerfileConfig,
+    ) -> DriverResult<String> {
+        let dockerfile =
+            fs::canonicalize(&config.dockerfile).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to resolve BYO Dockerfile `{}`: {source}",
+                    config.dockerfile.display()
+                ),
+            })?;
+        if !dockerfile.is_file() {
+            return Err(DriverError::InvalidInput {
+                message: format!("BYO Dockerfile `{}` is not a file", dockerfile.display()),
+            });
+        }
+        let context_dir = dockerfile
+            .parent()
+            .ok_or_else(|| DriverError::InvalidInput {
+                message: format!(
+                    "BYO Dockerfile `{}` has no parent directory",
+                    dockerfile.display()
+                ),
+            })?;
+        let build_name = sanitize_build_name(name);
+        let stage_dir = self.workdir().join("build").join(&build_name);
+        stage_build_context(context_dir, &dockerfile, &stage_dir)?;
+
+        let tag = format!("agentenv-byo-{build_name}:latest");
+        let dockerfile_arg = stage_dir.join("Dockerfile").display().to_string();
+        let stage_arg = stage_dir.display().to_string();
+        let build_args = vec![
+            "build".to_owned(),
+            "--file".to_owned(),
+            dockerfile_arg,
+            "--tag".to_owned(),
+            tag.clone(),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_VERSION={}", config.agentenv_version),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_AGENT={}", config.agent),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_MCP_PORT={}", config.mcp_port),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_WORKSPACE_MOUNT={}", config.workspace_mount),
+            stage_arg.clone(),
+        ];
+        self.run_checked_host_command(
+            "docker",
+            CommandRequest {
+                args: build_args,
+                env: BTreeMap::new(),
+            },
+        )?;
+
+        let output = self.run_checked_host_command(
+            "docker",
+            command_request(&["image", "inspect", "--format", "{{.Id}}", &tag]),
+        )?;
+        let digest = output.stdout.trim();
+        parse_sha256_digest(digest).map_err(|source| DriverError::InvalidInput {
+            message: format!("Docker image `{tag}` returned invalid digest `{digest}`: {source}"),
+        })?;
+        if let Some(expected) = config.expected_digest.as_deref() {
+            parse_sha256_digest(expected).map_err(|source| DriverError::InvalidInput {
+                message: format!("expected BYO image digest `{expected}` is invalid: {source}"),
+            })?;
+            if expected != digest {
+                return Err(DriverError::InvalidInput {
+                    message: format!(
+                        "BYO image digest mismatch for `{}`: expected `{expected}`, got `{digest}`",
+                        config.dockerfile.display()
+                    ),
+                });
+            }
+        }
+        fs::write(stage_dir.join("image-digest"), format!("{digest}\n")).map_err(|source| {
+            DriverError::InvalidInput {
+                message: format!(
+                    "failed to record BYO image digest under `{}`: {source}",
+                    stage_dir.display()
+                ),
+            }
+        })?;
+
+        Ok(stage_arg)
+    }
+
     fn run_command_request(&self, request: CommandRequest) -> io::Result<CommandOutput> {
         self.run_host_command(&self.binary, request)
     }
@@ -1469,6 +1607,337 @@ fn command_request_with_env(args: &[&str], env: BTreeMap<String, String>) -> Com
     CommandRequest {
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         env,
+    }
+}
+
+fn byo_dockerfile_config(
+    metadata: &BTreeMap<String, Value>,
+) -> DriverResult<Option<ByoDockerfileConfig>> {
+    let Some(dockerfile) = optional_metadata_string(metadata, "byo_dockerfile")? else {
+        return Ok(None);
+    };
+
+    Ok(Some(ByoDockerfileConfig {
+        dockerfile: PathBuf::from(dockerfile),
+        expected_digest: optional_metadata_string(metadata, "byo_expected_digest")?,
+        agentenv_version: optional_metadata_string(metadata, "agentenv_version")?
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
+        agent: optional_metadata_string(metadata, "agentenv_agent")?.unwrap_or_default(),
+        mcp_port: optional_metadata_string(metadata, "agentenv_mcp_port")?.unwrap_or_default(),
+        workspace_mount: optional_metadata_string(metadata, "agentenv_workspace_mount")?
+            .unwrap_or_else(|| SANDBOX_WORKING_DIR.to_owned()),
+    }))
+}
+
+fn optional_metadata_string(
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> DriverResult<Option<String>> {
+    match metadata.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must be a string when set"),
+        }),
+    }
+}
+
+fn default_agentenv_workdir() -> PathBuf {
+    std::env::var_os("AGENTENV_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agentenv")))
+        .unwrap_or_else(|| PathBuf::from(".agentenv"))
+}
+
+fn sanitize_build_name(name: &str) -> String {
+    let mut output = String::new();
+    for byte in name.bytes() {
+        let ch = byte.to_ascii_lowercase() as char;
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-' | '_') {
+            output.push(ch);
+        } else {
+            output.push('-');
+        }
+    }
+    let trimmed = output.trim_matches('-');
+    if trimmed.is_empty() {
+        "sandbox".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn stage_build_context(
+    context_dir: &Path,
+    dockerfile: &Path,
+    stage_dir: &Path,
+) -> DriverResult<()> {
+    if stage_dir.exists() {
+        fs::remove_dir_all(stage_dir).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to clear staged BYO build context `{}`: {source}",
+                stage_dir.display()
+            ),
+        })?;
+    }
+    copy_dir_contents(context_dir, stage_dir).map_err(|source| DriverError::InvalidInput {
+        message: format!(
+            "failed to stage BYO build context `{}` to `{}`: {source}",
+            context_dir.display(),
+            stage_dir.display()
+        ),
+    })?;
+    fs::copy(dockerfile, stage_dir.join("Dockerfile")).map_err(|source| {
+        DriverError::InvalidInput {
+            message: format!(
+                "failed to stage BYO Dockerfile `{}`: {source}",
+                dockerfile.display()
+            ),
+        }
+    })?;
+    Ok(())
+}
+
+fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
+    let dockerignore = DockerIgnore::load(src)?;
+    fs::create_dir_all(dst)?;
+    let _ = copy_dir_contents_inner(src, dst, Path::new(""), &dockerignore, false, true)?;
+    Ok(())
+}
+
+fn copy_dir_contents_inner(
+    src: &Path,
+    dst: &Path,
+    relative: &Path,
+    dockerignore: &DockerIgnore,
+    parent_ignored: bool,
+    create_current: bool,
+) -> io::Result<bool> {
+    if create_current {
+        fs::create_dir_all(dst)?;
+    }
+    let mut copied_any = create_current;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let file_type = metadata.file_type();
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let relative_path = if relative.as_os_str().is_empty() {
+            PathBuf::from(entry.file_name())
+        } else {
+            relative.join(entry.file_name())
+        };
+        let is_dir = file_type.is_dir();
+        let ignored = dockerignore.is_ignored(&relative_path, is_dir, parent_ignored);
+        if file_type.is_dir() {
+            if ignored && !dockerignore.may_reinclude_descendant(&relative_path) {
+                continue;
+            }
+            if copy_dir_contents_inner(
+                &src_path,
+                &dst_path,
+                &relative_path,
+                dockerignore,
+                ignored,
+                !ignored,
+            )? {
+                copied_any = true;
+            }
+        } else if ignored {
+            continue;
+        } else if file_type.is_symlink() {
+            fs::create_dir_all(dst)?;
+            copy_symlink(&src_path, &dst_path)?;
+            copied_any = true;
+        } else if file_type.is_file() {
+            fs::create_dir_all(dst)?;
+            fs::copy(&src_path, &dst_path)?;
+            copied_any = true;
+        }
+    }
+    Ok(copied_any)
+}
+
+#[derive(Debug, Clone, Default)]
+struct DockerIgnore {
+    rules: Vec<DockerIgnoreRule>,
+}
+
+#[derive(Debug, Clone)]
+struct DockerIgnoreRule {
+    pattern: String,
+    negated: bool,
+    has_slash: bool,
+}
+
+impl DockerIgnore {
+    fn load(context_dir: &Path) -> io::Result<Self> {
+        match fs::read_to_string(context_dir.join(".dockerignore")) {
+            Ok(contents) => Ok(Self::parse(&contents)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(source),
+        }
+    }
+
+    fn parse(contents: &str) -> Self {
+        let rules = contents
+            .lines()
+            .filter_map(DockerIgnoreRule::parse)
+            .collect();
+        Self { rules }
+    }
+
+    fn is_ignored(&self, relative_path: &Path, is_dir: bool, parent_ignored: bool) -> bool {
+        let Some(relative_path) = normalized_relative_path(relative_path) else {
+            return parent_ignored;
+        };
+        let mut ignored = parent_ignored;
+        for rule in &self.rules {
+            if rule.matches(&relative_path, is_dir) {
+                ignored = !rule.negated;
+            }
+        }
+        ignored
+    }
+
+    fn may_reinclude_descendant(&self, relative_dir: &Path) -> bool {
+        let Some(relative_dir) = normalized_relative_path(relative_dir) else {
+            return false;
+        };
+        self.rules
+            .iter()
+            .any(|rule| rule.negated && rule.may_match_descendant(&relative_dir))
+    }
+}
+
+impl DockerIgnoreRule {
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (negated, pattern) = line
+            .strip_prefix('!')
+            .map(|pattern| (true, pattern.trim()))
+            .unwrap_or((false, line));
+        let pattern = clean_dockerignore_pattern(pattern)?;
+        let has_slash = pattern.contains('/');
+        Some(Self {
+            pattern,
+            negated,
+            has_slash,
+        })
+    }
+
+    fn matches(&self, relative_path: &str, _is_dir: bool) -> bool {
+        dockerignore_pattern_matches(&self.pattern, self.has_slash, relative_path)
+    }
+
+    fn may_match_descendant(&self, relative_dir: &str) -> bool {
+        if !self.has_slash {
+            return true;
+        }
+        self.pattern.starts_with(&format!("{relative_dir}/"))
+            || self.pattern == relative_dir
+            || self.pattern.contains("**")
+    }
+}
+
+fn clean_dockerignore_pattern(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim().trim_matches('/');
+    if pattern.is_empty() || pattern == "." {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let normalized = pattern.replace('\\', "/");
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let pattern = parts.join("/");
+    (!pattern.is_empty() && pattern != ".").then_some(pattern)
+}
+
+fn normalized_relative_path(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn dockerignore_pattern_matches(pattern: &str, has_slash: bool, relative_path: &str) -> bool {
+    if !has_slash {
+        return relative_path
+            .split('/')
+            .any(|part| wildcard_matches(pattern, part));
+    }
+
+    let pattern_parts = pattern.split('/').collect::<Vec<_>>();
+    let path_parts = relative_path.split('/').collect::<Vec<_>>();
+    dockerignore_segments_match(&pattern_parts, &path_parts)
+}
+
+fn dockerignore_segments_match(pattern: &[&str], path: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return path.is_empty();
+    }
+    if pattern[0] == "**" {
+        return dockerignore_segments_match(&pattern[1..], path)
+            || (!path.is_empty() && dockerignore_segments_match(pattern, &path[1..]));
+    }
+    !path.is_empty()
+        && wildcard_matches(pattern[0], path[0])
+        && dockerignore_segments_match(&pattern[1..], &path[1..])
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let mut matches = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+    matches[0][0] = true;
+    for i in 1..=pattern.len() {
+        if pattern[i - 1] == '*' {
+            matches[i][0] = matches[i - 1][0];
+        }
+    }
+    for i in 1..=pattern.len() {
+        for j in 1..=text.len() {
+            matches[i][j] = match pattern[i - 1] {
+                '*' => matches[i - 1][j] || matches[i][j - 1],
+                '?' => matches[i - 1][j - 1],
+                ch => ch == text[j - 1] && matches[i - 1][j - 1],
+            };
+        }
+    }
+    matches[pattern.len()][text.len()]
+}
+
+#[cfg(unix)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(src)?, dst)
+}
+
+#[cfg(windows)]
+fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    let target = fs::read_link(src)?;
+    if fs::metadata(src)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        std::os::windows::fs::symlink_dir(target, dst)
+    } else {
+        std::os::windows::fs::symlink_file(target, dst)
     }
 }
 
@@ -2433,6 +2902,21 @@ mod driver_tests {
                 original: original_path,
             },
         )
+    }
+
+    fn unique_tempdir(prefix: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let tempdir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tempdir).expect("create tempdir");
+        tempdir
     }
 
     fn write_fake_binary(dir: &Path, binary: &str, executable: bool) {
@@ -4119,6 +4603,243 @@ mod driver_tests {
                 ),
             }]
         );
+    }
+
+    #[test]
+    fn create_builds_byo_dockerfile_and_uses_staged_context() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-build");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&context_dir).expect("create context");
+        let dockerfile = context_dir.join("Containerfile.agentenv");
+        std::fs::write(
+            &dockerfile,
+            "FROM alpine:3.20\nARG AGENTENV_VERSION\nRUN test -n \"$AGENTENV_VERSION\"\n",
+        )
+        .expect("write Dockerfile");
+        std::fs::write(context_dir.join("internal-cli"), "demo").expect("write context file");
+        let workdir = tempdir.join(".agentenv");
+        let stage_dir = workdir.join("build").join("devbox");
+        let stage_dockerfile = stage_dir.join("Dockerfile");
+        let stage_dir_arg = stage_dir.display().to_string();
+        let tag = "agentenv-byo-devbox:latest";
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let expected_build_args = vec![
+            "build".to_owned(),
+            "--file".to_owned(),
+            stage_dockerfile.display().to_string(),
+            "--tag".to_owned(),
+            tag.to_owned(),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_VERSION={}", env!("CARGO_PKG_VERSION")),
+            "--build-arg".to_owned(),
+            "AGENTENV_AGENT=codex".to_owned(),
+            "--build-arg".to_owned(),
+            "AGENTENV_MCP_PORT=3333".to_owned(),
+            "--build-arg".to_owned(),
+            "AGENTENV_WORKSPACE_MOUNT=/sandbox".to_owned(),
+            stage_dir_arg.clone(),
+        ];
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(call.request.args, expected_build_args);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                },
+                &format!("{digest}\n"),
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--no-auto-providers",
+                            "--from",
+                            &stage_dir_arg,
+                            "--",
+                            "true",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("agentenv_agent".to_owned(), json!("codex")),
+                            ("agentenv_mcp_port".to_owned(), json!("3333")),
+                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                            (
+                                "agentenv_version".to_owned(),
+                                json!(env!("CARGO_PKG_VERSION")),
+                            ),
+                        ]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert_eq!(result.handle, "devbox");
+        assert_eq!(runner.calls().len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(&stage_dockerfile).expect("staged Dockerfile"),
+            std::fs::read_to_string(&dockerfile).expect("source Dockerfile")
+        );
+        assert!(stage_dir.join("internal-cli").is_file());
+        assert_eq!(
+            std::fs::read_to_string(stage_dir.join("image-digest")).expect("digest file"),
+            format!("{digest}\n")
+        );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_rejects_byo_dockerfile_digest_mismatch_before_openshell_create() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-digest-mismatch");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&context_dir).expect("create context");
+        let dockerfile = context_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+        let workdir = tempdir.join(".agentenv");
+        let tag = "agentenv-byo-devbox:latest";
+        let actual = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let expected = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success("docker", |_| {}, "", ""),
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                },
+                &format!("{actual}\n"),
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("byo_expected_digest".to_owned(), json!(expected)),
+                        ]),
+                    })
+                    .await
+            })
+            .expect_err("digest mismatch should reject create");
+
+        assert!(err.to_string().contains("digest mismatch"));
+        assert_eq!(runner.calls().len(), 2);
+        assert!(!workdir
+            .join("build")
+            .join("devbox")
+            .join("image-digest")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_build_context_honors_dockerignore_and_preserves_symlinks() {
+        let tempdir = unique_tempdir("sandbox-openshell-stage-context");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(context_dir.join("ignored-dir")).expect("create context");
+        let dockerfile = context_dir.join("Containerfile.agentenv");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+        std::fs::write(
+            context_dir.join(".dockerignore"),
+            "secret.txt\nignored-dir\n*.log\n!keep.log\n",
+        )
+        .expect("write dockerignore");
+        std::fs::write(context_dir.join("secret.txt"), "secret").expect("write secret");
+        std::fs::write(context_dir.join("ignored-dir").join("hidden.txt"), "hidden")
+            .expect("write ignored file");
+        std::fs::write(context_dir.join("app.log"), "ignored").expect("write ignored log");
+        std::fs::write(context_dir.join("keep.log"), "included").expect("write included log");
+        std::fs::write(context_dir.join("real.txt"), "real").expect("write symlink target");
+        std::os::unix::fs::symlink("real.txt", context_dir.join("linked-real"))
+            .expect("create symlink");
+        let stage_dir = tempdir.join(".agentenv").join("build").join("devbox");
+
+        super::stage_build_context(&context_dir, &dockerfile, &stage_dir).expect("stage context");
+
+        assert!(stage_dir.join("Dockerfile").is_file());
+        assert!(stage_dir.join("keep.log").is_file());
+        assert!(stage_dir.join("real.txt").is_file());
+        assert!(!stage_dir.join("secret.txt").exists());
+        assert!(!stage_dir.join("ignored-dir").join("hidden.txt").exists());
+        assert!(!stage_dir.join("app.log").exists());
+        assert!(std::fs::symlink_metadata(stage_dir.join("linked-real"))
+            .expect("staged symlink metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(stage_dir.join("linked-real")).expect("staged symlink target"),
+            PathBuf::from("real.txt")
+        );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
     #[test]

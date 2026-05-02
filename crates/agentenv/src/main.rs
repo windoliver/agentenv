@@ -95,6 +95,12 @@ struct CreateArgs {
     blueprint: Option<PathBuf>,
     #[arg(long, value_name = "FILE")]
     reproduce: Option<PathBuf>,
+    #[arg(
+        long = "from",
+        env = "AGENTENV_FROM_DOCKERFILE",
+        value_name = "DOCKERFILE"
+    )]
+    from: Option<PathBuf>,
     #[arg(long)]
     preflight_only: bool,
     #[arg(long)]
@@ -780,6 +786,14 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
         Err(error) if args.json => exit_json_error(ReasonCode::InvalidBlueprint, error),
         Err(error) => return Err(error),
     };
+    let blueprint_yaml = match args.from.as_deref() {
+        Some(from) => match overlay_from_dockerfile(&blueprint_yaml, from, &cwd) {
+            Ok(yaml) => yaml,
+            Err(error) if args.json => exit_json_error(ReasonCode::InvalidBlueprint, error),
+            Err(error) => return Err(error),
+        },
+        None => blueprint_yaml,
+    };
     let factory = builtin_factory::BuiltInDriverFactory;
 
     if args.preflight_only {
@@ -796,7 +810,13 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
         };
         match agentenv_core::runtime::run_preflight_only(&options, &factory, &args.name, &selection)
             .await
-        {
+            .map(|mut report| {
+                agentenv_core::runtime::add_byo_dockerfile_preflight_warnings(
+                    &mut report,
+                    &resolved.blueprint.sandbox.extra,
+                );
+                report
+            }) {
             Ok(report) if args.json => {
                 render::print_json(&report)?;
                 if report.status == agentenv_core::admission::AdmissionStatus::Rejected {
@@ -3534,6 +3554,50 @@ fn derive_reproduced_env_name(path: &Path) -> String {
         .unwrap_or_else(|| "reproduced-env".to_string())
 }
 
+fn overlay_from_dockerfile(yaml: &str, from: &Path, cwd: &Path) -> Result<String> {
+    let dockerfile_path = resolve_dockerfile_path(from, cwd)?;
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).context("failed to parse blueprint YAML")?;
+    let root = value
+        .as_mapping_mut()
+        .context("blueprint YAML root must be a mapping")?;
+    let sandbox_key = serde_yaml::Value::String("sandbox".to_owned());
+    let sandbox = root
+        .get_mut(&sandbox_key)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .context("blueprint must contain a sandbox mapping")?;
+
+    let mut image = serde_yaml::Mapping::new();
+    image.insert(
+        serde_yaml::Value::String("source".to_owned()),
+        serde_yaml::Value::String("byo".to_owned()),
+    );
+    image.insert(
+        serde_yaml::Value::String("dockerfile".to_owned()),
+        serde_yaml::Value::String(dockerfile_path.display().to_string()),
+    );
+    sandbox.insert(
+        serde_yaml::Value::String("image".to_owned()),
+        serde_yaml::Value::Mapping(image),
+    );
+
+    serde_yaml::to_string(&value).context("failed to render blueprint YAML")
+}
+
+fn resolve_dockerfile_path(path: &Path, cwd: &Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("failed to resolve Dockerfile `{}`", candidate.display()))?;
+    if !canonical.is_file() {
+        bail!("Dockerfile `{}` is not a file", canonical.display());
+    }
+    Ok(canonical)
+}
+
 fn read_text_file(path: &Path, description: &str) -> Result<String> {
     fs::read_to_string(path)
         .with_context(|| format!("failed to read {description} file `{}`", path.display()))
@@ -3664,6 +3728,62 @@ drivers:
         assert_eq!(
             derive_reproduced_env_name(Path::new("/tmp/agentenv.lock")),
             "agentenv"
+        );
+    }
+
+    #[test]
+    fn create_from_dockerfile_overlay_sets_byo_image() {
+        let temp_dir = make_temp_dir("create-from-overlay");
+        let dockerfile_dir = temp_dir.join("enterprise-sandbox");
+        fs::create_dir_all(&dockerfile_dir).unwrap();
+        let dockerfile = dockerfile_dir.join("Containerfile");
+        fs::write(&dockerfile, "FROM alpine:3.20\n").unwrap();
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+policy:
+  tier: restricted
+  presets: []
+"#;
+
+        let rendered = overlay_from_dockerfile(
+            yaml,
+            Path::new("enterprise-sandbox/Containerfile"),
+            &temp_dir,
+        )
+        .unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let image = value["sandbox"]["image"].as_mapping().unwrap();
+
+        assert_eq!(
+            image
+                .get(serde_yaml::Value::String("source".to_owned()))
+                .and_then(serde_yaml::Value::as_str),
+            Some("byo")
+        );
+        assert_eq!(
+            image
+                .get(serde_yaml::Value::String("dockerfile".to_owned()))
+                .and_then(serde_yaml::Value::as_str),
+            Some(
+                fs::canonicalize(&dockerfile)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(
+            image
+                .get(serde_yaml::Value::String("expected_digest".to_owned()))
+                .is_none(),
+            "CLI --from should not invent an expected digest"
         );
     }
 

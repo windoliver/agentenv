@@ -215,3 +215,86 @@ fn roundtrip_missing_digest_blueprint_is_rejected() {
 
     assert!(err.to_string().contains("missing digest"));
 }
+
+#[test]
+fn roundtrip_byo_sandbox_image_allows_omitted_expected_digest() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image:
+    source: byo
+    dockerfile: ./enterprise-sandbox/Containerfile
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
+    let lockfile = Lockfile::from_yaml(&frozen).unwrap();
+
+    assert!(!lockfile.artifacts.contains_key("sandbox-image"));
+}
+
+#[test]
+fn roundtrip_byo_sandbox_image_rejects_non_string_expected_digest() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image:
+    source: byo
+    dockerfile: ./enterprise-sandbox/Containerfile
+    expected_digest: 123
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+policy:
+  tier: restricted
+  presets: []
+"#;
+
+    let err = agentenv_core::lifecycle::verify_blueprint_yaml(yaml).unwrap_err();
+
+    assert!(err.to_string().contains("sandbox.image.expected_digest"));
+    assert!(err.to_string().contains("expected string"));
+}
+
+#[test]
+fn roundtrip_byo_sandbox_image_records_expected_digest_artifact() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image:
+    source: byo
+    dockerfile: ./enterprise-sandbox/Containerfile
+    expected_digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let frozen = agentenv_core::lifecycle::freeze_from_blueprint_yaml(yaml).unwrap();
+    let lockfile = Lockfile::from_yaml(&frozen).unwrap();
+
+    assert_eq!(
+        lockfile.artifacts["sandbox-image"],
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+}

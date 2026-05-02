@@ -617,6 +617,35 @@ pub async fn run_preflight_only(
     .await
 }
 
+pub fn add_byo_dockerfile_preflight_warnings(
+    report: &mut crate::admission::AdmissionReport,
+    sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
+) {
+    let Some(dockerfile) = byo_dockerfile_path(sandbox_extra) else {
+        return;
+    };
+    let issues = dockerfile_preflight_warnings(&dockerfile);
+    if issues.is_empty() {
+        return;
+    }
+
+    if let Some(check) = report
+        .checks
+        .iter_mut()
+        .find(|check| check.kind == DriverKind::Sandbox)
+    {
+        check.issues.extend(issues);
+        return;
+    }
+
+    report.checks.push(crate::admission::PreflightCheck {
+        kind: DriverKind::Sandbox,
+        driver: "openshell".to_owned(),
+        ok: true,
+        issues,
+    });
+}
+
 async fn run_preflight_with_pins(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
@@ -1018,16 +1047,15 @@ async fn create_env_with_input(
         let restore_policy_after_install = create_policy != policy;
 
         let sandbox_create_start = Instant::now();
-        let sandbox_handle = match set
-            .sandbox
-            .create(agentenv_proto::SandboxSpec {
-                image: None,
-                env,
-                policy: Some(create_policy.clone()),
-                metadata: BTreeMap::new(),
-            })
-            .await
-        {
+        let sandbox_spec = sandbox_spec_for_create(
+            name,
+            &selection,
+            &resolved.blueprint.sandbox.extra,
+            &context_endpoint,
+            env,
+            Some(create_policy.clone()),
+        )?;
+        let sandbox_handle = match set.sandbox.create(sandbox_spec).await {
             Ok(handle) => {
                 emit_runtime_event(
                     events.as_ref(),
@@ -1071,6 +1099,12 @@ async fn create_env_with_input(
         };
         let sandbox_handle_value = sandbox_handle.handle.clone();
         rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle_value.clone());
+        record_computed_byo_image_digest(
+            &temp_paths,
+            &options.root,
+            name,
+            &resolved.blueprint.sandbox.extra,
+        )?;
         install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
         if restore_policy_after_install {
             let apply_policy_start = Instant::now();
@@ -1713,6 +1747,289 @@ fn blueprint_component_from_portable(
         },
         extra: component.extra.clone(),
     }
+}
+
+fn sandbox_spec_for_create(
+    name: &str,
+    selection: &DriverSelection,
+    sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
+    context_endpoint: &agentenv_proto::McpEndpoint,
+    env: BTreeMap<String, String>,
+    policy: Option<agentenv_proto::NetworkPolicy>,
+) -> RuntimeResult<agentenv_proto::SandboxSpec> {
+    let mut metadata = BTreeMap::from([
+        ("name".to_owned(), serde_json::json!(name)),
+        (
+            "agentenv_version".to_owned(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        ),
+        (
+            "agentenv_agent".to_owned(),
+            serde_json::json!(selection.agent.clone()),
+        ),
+        (
+            "agentenv_mcp_port".to_owned(),
+            serde_json::json!(mcp_endpoint_port(context_endpoint).unwrap_or_default()),
+        ),
+        (
+            "agentenv_workspace_mount".to_owned(),
+            serde_json::json!("/sandbox"),
+        ),
+    ]);
+    let image = match sandbox_extra.get("image") {
+        Some(serde_yaml::Value::String(image)) => Some(image.clone()),
+        Some(serde_yaml::Value::Mapping(image)) => {
+            let source = optional_yaml_mapping_string(image, "source", "sandbox.image.source")?
+                .unwrap_or_default();
+            if source != "byo" {
+                return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                    message: format!("unsupported sandbox image source `{source}`"),
+                }));
+            }
+            let dockerfile =
+                required_yaml_mapping_string(image, "dockerfile", "sandbox.image.dockerfile")?
+                    .ok_or_else(|| {
+                        RuntimeError::Driver(DriverError::InvalidInput {
+                            message: "sandbox.image.dockerfile is required when source is `byo`"
+                                .to_owned(),
+                        })
+                    })?;
+            metadata.insert("byo_dockerfile".to_owned(), serde_json::json!(dockerfile));
+            if let Some(expected_digest) = optional_yaml_mapping_string(
+                image,
+                "expected_digest",
+                "sandbox.image.expected_digest",
+            )? {
+                metadata.insert(
+                    "byo_expected_digest".to_owned(),
+                    serde_json::json!(expected_digest),
+                );
+            }
+            None
+        }
+        Some(_) => {
+            return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                message: "sandbox.image must be a string or mapping".to_owned(),
+            }));
+        }
+        None => None,
+    };
+
+    Ok(agentenv_proto::SandboxSpec {
+        image,
+        env,
+        policy,
+        metadata,
+    })
+}
+
+fn record_computed_byo_image_digest(
+    temp_paths: &crate::env::EnvPaths,
+    runtime_root: &Path,
+    name: &str,
+    sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
+) -> RuntimeResult<()> {
+    if !byo_image_needs_computed_digest(sandbox_extra) {
+        return Ok(());
+    }
+
+    let digest_path = runtime_root
+        .join("build")
+        .join(sanitize_byo_build_name(name))
+        .join("image-digest");
+    let digest = fs::read_to_string(&digest_path).map_err(|source| crate::env::EnvError::Io {
+        path: digest_path.clone(),
+        source,
+    })?;
+    let digest = digest.trim();
+    crate::digest::parse_sha256_digest(digest).map_err(|source| {
+        RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!(
+                "invalid computed BYO image digest in `{}`: {source}",
+                digest_path.display()
+            ),
+        })
+    })?;
+
+    let lock_path = temp_paths.lock_path();
+    let lock_yaml =
+        String::from_utf8(crate::env::read_regular_file(&lock_path)?).map_err(|source| {
+            crate::env::EnvError::Io {
+                path: lock_path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+            }
+        })?;
+    let mut lockfile = crate::lockfile::Lockfile::from_yaml(&lock_yaml)?;
+    lockfile
+        .artifacts
+        .insert("sandbox-image".to_owned(), digest.to_owned());
+    let rendered = lockfile.to_yaml_deterministic()?;
+    fs::write(&lock_path, rendered).map_err(|source| crate::env::EnvError::Io {
+        path: lock_path,
+        source,
+    })?;
+    Ok(())
+}
+
+fn byo_image_needs_computed_digest(sandbox_extra: &BTreeMap<String, serde_yaml::Value>) -> bool {
+    sandbox_extra
+        .get("image")
+        .and_then(serde_yaml::Value::as_mapping)
+        .is_some_and(|image| {
+            yaml_mapping_string(image, "source") == Some("byo")
+                && yaml_mapping_string(image, "expected_digest").is_none()
+        })
+}
+
+fn byo_dockerfile_path(sandbox_extra: &BTreeMap<String, serde_yaml::Value>) -> Option<PathBuf> {
+    let image = sandbox_extra.get("image")?.as_mapping()?;
+    if yaml_mapping_string(image, "source") != Some("byo") {
+        return None;
+    }
+    yaml_mapping_string(image, "dockerfile").map(PathBuf::from)
+}
+
+fn dockerfile_preflight_warnings(path: &Path) -> Vec<agentenv_proto::PreflightIssue> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(source) => {
+            return vec![preflight_warning(
+                "byo_dockerfile_unreadable",
+                format!(
+                    "could not read BYO Dockerfile `{}`: {source}",
+                    path.display()
+                ),
+                Some("Check the Dockerfile path and permissions before creating the environment"),
+            )];
+        }
+    };
+
+    let mut saw_privileged = false;
+    let mut saw_cap_add = false;
+    let mut final_user = None;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("--privileged") {
+            saw_privileged = true;
+        }
+        if lower.contains("cap_add") || lower.contains("cap-add") {
+            saw_cap_add = true;
+        }
+        if let Some(rest) = lower.strip_prefix("user ") {
+            final_user = rest
+                .split_whitespace()
+                .next()
+                .map(|user| user.split(':').next().unwrap_or(user).to_owned());
+        }
+    }
+
+    let mut issues = Vec::new();
+    if saw_privileged {
+        issues.push(preflight_warning(
+            "byo_dockerfile_privileged",
+            format!(
+                "BYO Dockerfile `{}` references `--privileged`, which conflicts with sandbox isolation expectations",
+                path.display()
+            ),
+            Some("Remove privileged container nesting from the sandbox image build"),
+        ));
+    }
+    if saw_cap_add {
+        issues.push(preflight_warning(
+            "byo_dockerfile_cap_add",
+            format!(
+                "BYO Dockerfile `{}` references `cap_add`, which may conflict with sandbox capability policy",
+                path.display()
+            ),
+            Some("Move Linux capability requirements into agentenv policy instead of the image"),
+        ));
+    }
+    if matches!(final_user.as_deref(), Some("root" | "0")) {
+        issues.push(preflight_warning(
+            "byo_dockerfile_user_root",
+            format!(
+                "BYO Dockerfile `{}` leaves the final image user as root",
+                path.display()
+            ),
+            Some("Set a non-root final USER that matches the sandbox policy"),
+        ));
+    }
+    issues
+}
+
+fn preflight_warning(
+    code: &str,
+    message: String,
+    remediation: Option<&str>,
+) -> agentenv_proto::PreflightIssue {
+    agentenv_proto::PreflightIssue {
+        severity: agentenv_proto::IssueSeverity::Warning,
+        code: code.to_owned(),
+        message,
+        remediation: remediation.map(ToOwned::to_owned),
+    }
+}
+
+fn sanitize_byo_build_name(name: &str) -> String {
+    let mut output = String::new();
+    for byte in name.bytes() {
+        let ch = byte.to_ascii_lowercase() as char;
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-' | '_') {
+            output.push(ch);
+        } else {
+            output.push('-');
+        }
+    }
+    let trimmed = output.trim_matches('-');
+    if trimmed.is_empty() {
+        "sandbox".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn yaml_mapping_string<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
+    yaml_mapping_value(mapping, key).and_then(serde_yaml::Value::as_str)
+}
+
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping.get(serde_yaml::Value::String(key.to_owned()))
+}
+
+fn required_yaml_mapping_string<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+    path: &str,
+) -> RuntimeResult<Option<&'a str>> {
+    optional_yaml_mapping_string(mapping, key, path)
+}
+
+fn optional_yaml_mapping_string<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+    path: &str,
+) -> RuntimeResult<Option<&'a str>> {
+    match yaml_mapping_value(mapping, key) {
+        Some(serde_yaml::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!("{path} must be a string when set"),
+        })),
+        None => Ok(None),
+    }
+}
+
+fn mcp_endpoint_port(endpoint: &agentenv_proto::McpEndpoint) -> Option<String> {
+    url::Url::parse(&endpoint.url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .map(|port| port.to_string())
 }
 
 impl RuntimeError {
@@ -3531,8 +3848,11 @@ mod tests {
         copied_paths: Mutex<Vec<String>>,
         exec_cmds: Mutex<Vec<String>>,
         agent_spec_versions: Mutex<Vec<Option<String>>>,
+        create_specs: Mutex<Vec<agentenv_proto::SandboxSpec>>,
         create_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
         applied_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
+        byo_digest_root: Mutex<Option<std::path::PathBuf>>,
+        byo_digest: Mutex<Option<String>>,
         preinstall_probe_succeeds: AtomicBool,
     }
 
@@ -3807,6 +4127,39 @@ mod tests {
             &self,
             spec: agentenv_proto::SandboxSpec,
         ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            self.tracker
+                .create_specs
+                .lock()
+                .expect("create spec tracker")
+                .push(spec.clone());
+            if spec.metadata.contains_key("byo_dockerfile") {
+                let root = self
+                    .tracker
+                    .byo_digest_root
+                    .lock()
+                    .expect("digest root tracker")
+                    .clone();
+                let digest = self
+                    .tracker
+                    .byo_digest
+                    .lock()
+                    .expect("digest tracker")
+                    .clone();
+                if let (Some(root), Some(digest)) = (root, digest) {
+                    let name = spec
+                        .metadata
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("demo");
+                    let path = root
+                        .join("build")
+                        .join(super::sanitize_byo_build_name(name))
+                        .join("image-digest");
+                    fs::create_dir_all(path.parent().expect("digest parent"))
+                        .expect("create digest dir");
+                    fs::write(path, format!("{digest}\n")).expect("write digest sidecar");
+                }
+            }
             if let Some(policy) = spec.policy.clone() {
                 self.tracker
                     .create_policies
@@ -5432,6 +5785,171 @@ policy:
         assert!(env_dir.join("lock.yaml").is_file());
         assert!(env_dir.join("state.json").is_file());
         assert!(env_dir.join("events.jsonl").is_file());
+    }
+
+    #[tokio::test]
+    async fn create_env_passes_byo_dockerfile_metadata_to_sandbox() {
+        let root = unique_root("agentenv-create-byo-dockerfile");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image:
+    source: byo
+    dockerfile: /tmp/enterprise-sandbox/Containerfile
+    expected_digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        let metadata = &specs[0].metadata;
+        assert_eq!(metadata["name"], serde_json::json!("demo"));
+        assert_eq!(
+            metadata["byo_dockerfile"],
+            serde_json::json!("/tmp/enterprise-sandbox/Containerfile")
+        );
+        assert_eq!(
+            metadata["byo_expected_digest"],
+            serde_json::json!(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            )
+        );
+        assert_eq!(metadata["agentenv_agent"], serde_json::json!("codex"));
+    }
+
+    #[tokio::test]
+    async fn create_env_records_computed_byo_digest_in_lockfile() {
+        let root = unique_root("agentenv-create-byo-digest-lock");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image:
+    source: byo
+    dockerfile: /tmp/enterprise-sandbox/Containerfile
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        *tracker.byo_digest_root.lock().expect("digest root tracker") = Some(root.clone());
+        *tracker.byo_digest.lock().expect("digest tracker") = Some(
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        );
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let lock_yaml = fs::read_to_string(root.join("envs").join("demo").join("lock.yaml"))
+            .expect("read persisted lockfile");
+        let lockfile = crate::lockfile::Lockfile::from_yaml(&lock_yaml).unwrap();
+        assert_eq!(
+            lockfile.artifacts["sandbox-image"],
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        );
+    }
+
+    #[test]
+    fn byo_dockerfile_preflight_warnings_detect_conflicting_patterns() {
+        let root = unique_root("agentenv-byo-preflight-warnings");
+        fs::create_dir_all(root.join("sandbox")).unwrap();
+        let dockerfile = root.join("sandbox").join("Dockerfile");
+        fs::write(
+            &dockerfile,
+            r#"
+FROM alpine:3.20
+RUN docker run --privileged alpine true
+RUN echo cap_add: NET_ADMIN
+USER root
+"#,
+        )
+        .unwrap();
+        let mut image = serde_yaml::Mapping::new();
+        image.insert(
+            serde_yaml::Value::String("source".to_owned()),
+            serde_yaml::Value::String("byo".to_owned()),
+        );
+        image.insert(
+            serde_yaml::Value::String("dockerfile".to_owned()),
+            serde_yaml::Value::String(dockerfile.display().to_string()),
+        );
+        let sandbox_extra =
+            BTreeMap::from([("image".to_owned(), serde_yaml::Value::Mapping(image))]);
+        let mut report = crate::admission::AdmissionReport::from_checks(
+            "demo",
+            vec![crate::admission::PreflightCheck {
+                kind: DriverKind::Sandbox,
+                driver: "openshell".to_owned(),
+                ok: true,
+                issues: Vec::new(),
+            }],
+        );
+
+        super::add_byo_dockerfile_preflight_warnings(&mut report, &sandbox_extra);
+
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        let codes = report.checks[0]
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"byo_dockerfile_privileged"));
+        assert!(codes.contains(&"byo_dockerfile_cap_add"));
+        assert!(codes.contains(&"byo_dockerfile_user_root"));
+        assert!(report.checks[0]
+            .issues
+            .iter()
+            .all(|issue| issue.severity == agentenv_proto::IssueSeverity::Warning));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
