@@ -15,6 +15,8 @@ Replace `NEXUS_HUB_URL` with your Nexus hub URL before use.
 
 Build and publish the internal base image referenced by `agentenv.yaml`:
 
+Replace `certs/company-ca.pem` with your organization's PEM-encoded root CA certificate before building the sample image.
+
 ```sh
 docker build -t registry.internal.example.com/agentenv/company-base:2026.05 .
 docker push registry.internal.example.com/agentenv/company-base:2026.05
