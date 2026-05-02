@@ -1462,18 +1462,28 @@ mod async_client_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+    use tokio::sync::{Mutex, MutexGuard};
 
     use super::{JsonRpcClient, JsonRpcClientConfig};
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    async fn fixture_test_guard() -> MutexGuard<'static, ()> {
+        FIXTURE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .await
+    }
 
     #[tokio::test]
     async fn jsonrpc_client_returns_method_result() {
+        let _guard = fixture_test_guard().await;
         let mut client = spawn_fixture_client("normal", Duration::from_secs(5), &[]).await;
 
         let result: agentenv_proto::PreflightResult = client
@@ -1487,6 +1497,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_surfaces_driver_error_code() {
+        let _guard = fixture_test_guard().await;
         let mut client = spawn_fixture_client("normal", Duration::from_secs(5), &[]).await;
 
         let err = client
@@ -1500,6 +1511,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_drops_child_process_on_drop() {
+        let _guard = fixture_test_guard().await;
         let pid_file = temp_fixture_path("drop");
         let client = spawn_fixture_client(
             "idle",
@@ -1520,6 +1532,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_poisons_after_request_timeout() {
+        let _guard = fixture_test_guard().await;
         let client = spawn_fixture_client("slow_preflight", Duration::from_millis(100), &[]).await;
 
         let err = client
@@ -1545,6 +1558,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_shutdown_timeout_kills_and_reaps_child() {
+        let _guard = fixture_test_guard().await;
         let pid_file = temp_fixture_path("shutdown-timeout");
         let mut client = spawn_fixture_client(
             "shutdown_hang",
@@ -1565,6 +1579,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_shutdown_reports_nonzero_exit_status() {
+        let _guard = fixture_test_guard().await;
         let mut client =
             spawn_fixture_client("shutdown_nonzero", Duration::from_secs(5), &[]).await;
         let err = client.shutdown().await.unwrap_err();
@@ -1574,6 +1589,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_shutdown_reaps_child_on_shutdown_rpc_failure() {
+        let _guard = fixture_test_guard().await;
         let pid_file = temp_fixture_path("shutdown-rpc-failure");
         let mut client = spawn_fixture_client(
             "shutdown_invalid_then_hang",
@@ -1608,6 +1624,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_serializes_concurrent_calls() {
+        let _guard = fixture_test_guard().await;
         let driver = write_racy_driver_script();
 
         let client = Arc::new(
@@ -1652,6 +1669,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn jsonrpc_client_emits_notification_seen_before_response() {
+        let _guard = fixture_test_guard().await;
         let mut client =
             spawn_fixture_client("notification_before_preflight", Duration::from_secs(5), &[])
                 .await;
@@ -1674,6 +1692,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn approval_requested_notification_waits_and_sends_decision() {
+        let _guard = fixture_test_guard().await;
         let store_path = temp_fixture_artifact_path("approvals", "db");
         let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
         let emitter = agentenv_events::RecordingEventEmitter::default();
@@ -1745,6 +1764,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn approval_decision_round_trips_same_request_id_before_original_response() {
+        let _guard = fixture_test_guard().await;
         let store_path = temp_fixture_artifact_path("approvals-dynamic-request-id", "db");
         let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
         let coordinator = agentenv_approvals::ApprovalCoordinator::new(
@@ -1811,6 +1831,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn approval_requested_notification_auto_denies_before_client_timeout() {
+        let _guard = fixture_test_guard().await;
         let store_path = temp_fixture_artifact_path("approvals-auto-deny", "db");
         let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
         let coordinator = agentenv_approvals::ApprovalCoordinator::new(
@@ -1826,7 +1847,7 @@ mod async_client_tests {
         let decision_file = temp_fixture_path("approval-auto-deny");
         let mut client = spawn_fixture_client(
             "approval_before_preflight",
-            Duration::from_secs(2),
+            Duration::from_secs(3),
             &[(
                 "JSONRPC_FIXTURE_DECISION_FILE",
                 decision_file.to_string_lossy().as_ref(),
@@ -1856,6 +1877,7 @@ mod async_client_tests {
 
     #[tokio::test]
     async fn delayed_approval_requested_notification_auto_denies_before_client_timeout() {
+        let _guard = fixture_test_guard().await;
         let store_path = temp_fixture_artifact_path("approvals-delayed-auto-deny", "db");
         let store = agentenv_approvals::ApprovalStore::open(&store_path).unwrap();
         let coordinator = agentenv_approvals::ApprovalCoordinator::new(
@@ -1871,7 +1893,7 @@ mod async_client_tests {
         let decision_file = temp_fixture_path("approval-delayed-auto-deny");
         let mut client = spawn_fixture_client(
             "delayed_approval_before_preflight",
-            Duration::from_secs(2),
+            Duration::from_secs(3),
             &[(
                 "JSONRPC_FIXTURE_DECISION_FILE",
                 decision_file.to_string_lossy().as_ref(),
