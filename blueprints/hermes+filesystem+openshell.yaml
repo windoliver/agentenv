@@ -1,0 +1,36 @@
+# Reference blueprint - Hermes subprocess agent in OpenShell with a local filesystem context.
+# Good for: demonstrating an external polyglot agent driver against local code.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY=sk-openai-example
+#   agentenv drivers list   # confirm the hermes agent driver is installed
+#
+# Usage:
+#   agentenv create research --blueprint blueprints/hermes+filesystem+openshell.yaml
+#   agentenv enter research
+
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+
+sandbox:
+  driver: openshell
+  version: ">=0.0.1-alpha0,<0.1"
+
+agent:
+  driver: hermes
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+
+context:
+  driver: filesystem
+  mount: ~/projects
+
+inference:
+  driver: passthrough
+
+policy:
+  tier: balanced
+  presets:
+    - github_read

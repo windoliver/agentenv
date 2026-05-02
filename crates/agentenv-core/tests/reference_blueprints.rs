@@ -1,6 +1,8 @@
 use std::sync::{Mutex, OnceLock};
 
-use agentenv_core::{blueprint::Blueprint, error::BlueprintError};
+use agentenv_core::{
+    blueprint::Blueprint, error::BlueprintError, lifecycle::verify_blueprint_yaml,
+};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -13,6 +15,125 @@ fn workspace_path(path: &str) -> std::path::PathBuf {
         .join(path)
 }
 
+struct ReferenceBlueprint {
+    path: &'static str,
+    agent_driver: &'static str,
+    context_driver: &'static str,
+    tier: &'static str,
+    persists_home: Option<bool>,
+    context: ContextExpectation,
+}
+
+enum ContextExpectation {
+    Filesystem {
+        mount: &'static str,
+    },
+    GenericMcp {
+        url: &'static str,
+        transport: &'static str,
+    },
+    Nexus {
+        hub_url: &'static str,
+    },
+}
+
+fn reference_blueprints() -> Vec<ReferenceBlueprint> {
+    vec![
+        ReferenceBlueprint {
+            path: "blueprints/claude+filesystem+openshell.yaml",
+            agent_driver: "claude",
+            context_driver: "filesystem",
+            tier: "balanced",
+            persists_home: Some(true),
+            context: ContextExpectation::Filesystem {
+                mount: "~/projects",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/codex+filesystem+openshell.yaml",
+            agent_driver: "codex",
+            context_driver: "filesystem",
+            tier: "balanced",
+            persists_home: Some(true),
+            context: ContextExpectation::Filesystem {
+                mount: "~/projects",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/openclaw+filesystem+openshell.yaml",
+            agent_driver: "openclaw",
+            context_driver: "filesystem",
+            tier: "balanced",
+            persists_home: Some(true),
+            context: ContextExpectation::Filesystem {
+                mount: "~/projects",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/claude+mcp-generic+openshell.yaml",
+            agent_driver: "claude",
+            context_driver: "mcp-generic",
+            tier: "restricted",
+            persists_home: Some(true),
+            context: ContextExpectation::GenericMcp {
+                url: "https://93.184.216.34",
+                transport: "http+sse",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/hermes+filesystem+openshell.yaml",
+            agent_driver: "hermes",
+            context_driver: "filesystem",
+            tier: "balanced",
+            persists_home: None,
+            context: ContextExpectation::Filesystem {
+                mount: "~/projects",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/claude+nexus+openshell.yaml",
+            agent_driver: "claude",
+            context_driver: "nexus",
+            tier: "balanced",
+            persists_home: Some(true),
+            context: ContextExpectation::Nexus {
+                hub_url: "https://93.184.216.35",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/codex+mcp-generic+openshell.yaml",
+            agent_driver: "codex",
+            context_driver: "mcp-generic",
+            tier: "restricted",
+            persists_home: None,
+            context: ContextExpectation::GenericMcp {
+                url: "https://93.184.216.34",
+                transport: "http+sse",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/hermes+nexus+openshell.yaml",
+            agent_driver: "hermes",
+            context_driver: "nexus",
+            tier: "balanced",
+            persists_home: None,
+            context: ContextExpectation::Nexus {
+                hub_url: "https://93.184.216.35",
+            },
+        },
+        ReferenceBlueprint {
+            path: "blueprints/openclaw+nexus+openshell.yaml",
+            agent_driver: "openclaw",
+            context_driver: "nexus",
+            tier: "balanced",
+            persists_home: Some(true),
+            context: ContextExpectation::Nexus {
+                hub_url: "https://93.184.216.35",
+            },
+        },
+    ]
+}
+
 #[test]
 fn all_reference_blueprints_parse() {
     let _guard = env_lock().lock().unwrap();
@@ -20,38 +141,12 @@ fn all_reference_blueprints_parse() {
     std::env::set_var("MCP_URL", "https://93.184.216.34");
     std::env::set_var("NEXUS_HUB_URL", "https://93.184.216.35");
 
-    for (path, agent_driver, context_driver, tier, persists_home) in [
-        (
-            "blueprints/claude+filesystem+openshell.yaml",
-            "claude",
-            "filesystem",
-            "balanced",
-            Some(true),
-        ),
-        (
-            "blueprints/codex+mcp-generic+openshell.yaml",
-            "codex",
-            "mcp-generic",
-            "restricted",
-            None,
-        ),
-        (
-            "blueprints/hermes+nexus+openshell.yaml",
-            "hermes",
-            "nexus",
-            "balanced",
-            None,
-        ),
-        (
-            "blueprints/openclaw+nexus+openshell.yaml",
-            "openclaw",
-            "nexus",
-            "balanced",
-            Some(true),
-        ),
-    ] {
-        let doc = std::fs::read_to_string(workspace_path(path)).unwrap();
+    for expected in reference_blueprints() {
+        let path = expected.path;
+        let doc = std::fs::read_to_string(workspace_path(path))
+            .unwrap_or_else(|err| panic!("{path}: {err}"));
         let blueprint = Blueprint::from_yaml(&doc).unwrap();
+        verify_blueprint_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
 
         assert_eq!(blueprint.version, "0.1.0", "{path}");
         assert_eq!(
@@ -60,9 +155,9 @@ fn all_reference_blueprints_parse() {
             "{path}"
         );
         assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
-        assert_eq!(blueprint.agent.driver, agent_driver, "{path}");
-        assert_eq!(blueprint.context.driver, context_driver, "{path}");
-        assert_eq!(blueprint.policy.tier, tier, "{path}");
+        assert_eq!(blueprint.agent.driver, expected.agent_driver, "{path}");
+        assert_eq!(blueprint.context.driver, expected.context_driver, "{path}");
+        assert_eq!(blueprint.policy.tier, expected.tier, "{path}");
         assert_eq!(
             blueprint
                 .inference
@@ -76,12 +171,14 @@ fn all_reference_blueprints_parse() {
                 .state
                 .as_ref()
                 .and_then(|state| state.persist_home),
-            persists_home,
+            expected.persists_home,
             "{path}"
         );
 
-        match context_driver {
-            "filesystem" => {
+        match expected.context {
+            ContextExpectation::Filesystem {
+                mount: expected_mount,
+            } => {
                 let mount = blueprint
                     .context
                     .extra
@@ -89,16 +186,21 @@ fn all_reference_blueprints_parse() {
                     .unwrap()
                     .as_str()
                     .unwrap();
-                assert_eq!(mount, "~/projects", "{path}");
+                assert_eq!(mount, expected_mount, "{path}");
             }
-            "mcp-generic" => {
+            ContextExpectation::GenericMcp {
+                url: expected_url,
+                transport: expected_transport,
+            } => {
                 let endpoint = blueprint.context.extra.get("endpoint").unwrap();
                 let url = yaml_string_field(endpoint, "url");
                 let transport = yaml_string_field(endpoint, "transport");
-                assert_eq!(url, "https://93.184.216.34", "{path}");
-                assert_eq!(transport, "http+sse", "{path}");
+                assert_eq!(url, expected_url, "{path}");
+                assert_eq!(transport, expected_transport, "{path}");
             }
-            "nexus" => {
+            ContextExpectation::Nexus {
+                hub_url: expected_hub_url,
+            } => {
                 assert_eq!(
                     blueprint
                         .context
@@ -118,12 +220,53 @@ fn all_reference_blueprints_parse() {
                         .unwrap()
                         .as_str()
                         .unwrap(),
-                    "https://93.184.216.35",
+                    expected_hub_url,
                     "{path}"
                 );
             }
-            _ => unreachable!(),
         }
+    }
+}
+
+#[test]
+fn docs_catalog_mentions_every_reference_blueprint() {
+    let docs = std::fs::read_to_string(workspace_path("docs/BLUEPRINTS.md")).unwrap();
+
+    for case in reference_blueprints() {
+        let file_name = case.path.strip_prefix("blueprints/").unwrap();
+        assert!(
+            docs.contains(file_name),
+            "docs/BLUEPRINTS.md must mention {file_name}"
+        );
+    }
+}
+
+#[test]
+fn sample_project_blueprints_parse() {
+    let _guard = env_lock().lock().unwrap();
+
+    std::env::set_var("NEXUS_HUB_URL", "https://93.184.216.35");
+
+    for path in [
+        "examples/quickstart/agentenv.yaml",
+        "examples/enterprise-hub/agentenv.yaml",
+        "examples/headless-ci/agentenv.yaml",
+    ] {
+        let doc = std::fs::read_to_string(workspace_path(path))
+            .unwrap_or_else(|err| panic!("{path}: {err}"));
+        let blueprint = Blueprint::from_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
+        verify_blueprint_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
+
+        assert_eq!(blueprint.version, "0.1.0", "{path}");
+        assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
+        assert_eq!(
+            blueprint
+                .inference
+                .as_ref()
+                .map(|section| section.driver.as_str()),
+            Some("passthrough"),
+            "{path}"
+        );
     }
 }
 

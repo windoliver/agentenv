@@ -1,0 +1,29 @@
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+
+sandbox:
+  driver: openshell
+  version: ">=0.0.1-alpha0,<0.1"
+
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+
+context:
+  driver: filesystem
+  mount: .
+
+inference:
+  driver: passthrough
+
+policy:
+  tier: balanced
+  presets:
+    - github_read
+    - npm_read
+
+state:
+  persist_home: false
