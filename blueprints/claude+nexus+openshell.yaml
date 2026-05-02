@@ -1,15 +1,15 @@
-# Reference blueprint - OpenClaw in OpenShell with a shared Nexus hub.
-# Good for: enterprise teams using OpenClaw with shared company context.
+# Reference blueprint - Claude Code in OpenShell with a shared Nexus hub.
+# Good for: enterprise teams using Claude with shared company context.
 #
 # Prerequisites:
-#   export OPENAI_API_KEY=sk-openai-example
+#   export ANTHROPIC_API_KEY=sk-ant-example
 #   export NEXUS_HUB_URL=https://nexus.company.com
 #   export NEXUS_TOKEN=nexus-token-example
 #   agentenv drivers list   # confirm the nexus context driver is installed
 #
 # Usage:
-#   agentenv create assistant --blueprint blueprints/openclaw+nexus+openshell.yaml
-#   agentenv enter assistant
+#   agentenv create enterprise --blueprint blueprints/claude+nexus+openshell.yaml
+#   agentenv enter enterprise
 
 version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
@@ -19,17 +19,14 @@ sandbox:
   version: ">=0.0.1-alpha0,<0.1"
 
 agent:
-  driver: openclaw
-  config:
-    provider: openai
+  driver: claude
   credentials:
-    OPENAI_API_KEY:
+    ANTHROPIC_API_KEY:
       source: env
       required: true
 
 context:
   driver: nexus
-  # External subprocess driver installed at ~/.agentenv/drivers/context-nexus/.
   mode: hub
   hub_url: ${NEXUS_HUB_URL}
   credentials:
@@ -49,4 +46,4 @@ policy:
     - allow: "${NEXUS_HUB_URL}"
 
 state:
-  persist_home: true            # OpenClaw's always-on assistant state lives here
+  persist_home: true

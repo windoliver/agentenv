@@ -1,14 +1,14 @@
-# Reference blueprint - OpenAI Codex in OpenShell with a generic MCP context server.
-# Good for: connecting Codex to any MCP-compatible knowledge service.
+# Reference blueprint - Claude Code in OpenShell with a generic MCP context server.
+# Good for: connecting Claude to any MCP-compatible knowledge service.
 #
 # Prerequisites:
-#   export OPENAI_API_KEY=sk-openai-example
+#   export ANTHROPIC_API_KEY=sk-ant-example
 #   export MCP_URL=https://mcp.internal.company.com
 #   export MCP_TOKEN=mcp-token-example
 #
 # Usage:
-#   agentenv create legal --blueprint blueprints/codex+mcp-generic+openshell.yaml
-#   agentenv enter legal
+#   agentenv create docs --blueprint blueprints/claude+mcp-generic+openshell.yaml
+#   agentenv enter docs
 
 version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
@@ -18,9 +18,9 @@ sandbox:
   version: ">=0.0.1-alpha0,<0.1"
 
 agent:
-  driver: codex
+  driver: claude
   credentials:
-    OPENAI_API_KEY:
+    ANTHROPIC_API_KEY:
       source: env
       required: true
 
@@ -38,7 +38,10 @@ inference:
   driver: passthrough
 
 policy:
-  tier: restricted              # legal work — tight default
+  tier: restricted
   presets: []
   overrides:
     - allow: "${MCP_URL}"
+
+state:
+  persist_home: true

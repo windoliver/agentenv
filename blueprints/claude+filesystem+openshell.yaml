@@ -1,5 +1,8 @@
-# Reference blueprint — Claude Code in OpenShell with a local filesystem context.
-# The simplest viable agentenv composition. No remote context backend, no hub.
+# Reference blueprint - Claude Code in OpenShell with a local filesystem context.
+# Good for: getting started with Claude against a local project tree.
+#
+# Prerequisites:
+#   export ANTHROPIC_API_KEY=sk-ant-example
 #
 # Usage:
 #   agentenv create myapp --blueprint blueprints/claude+filesystem+openshell.yaml
