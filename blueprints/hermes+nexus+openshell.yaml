@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   export OPENAI_API_KEY=sk-openai-example
-#   export NEXUS_HUB_URL=https://nexus.company.com
+#   export NEXUS_HUB_URL=https://example.com/nexus
 #   export NEXUS_TOKEN=nexus-token-example
 #   agentenv drivers list   # confirm hermes and nexus drivers are installed
 #

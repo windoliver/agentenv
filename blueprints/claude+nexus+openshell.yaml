@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   export ANTHROPIC_API_KEY=sk-ant-example
-#   export NEXUS_HUB_URL=https://nexus.company.com
+#   export NEXUS_HUB_URL=https://example.com/nexus
 #   export NEXUS_TOKEN=nexus-token-example
 #   agentenv drivers list   # confirm the nexus context driver is installed
 #

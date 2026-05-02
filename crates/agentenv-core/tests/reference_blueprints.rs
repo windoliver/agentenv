@@ -146,6 +146,7 @@ fn all_reference_blueprints_parse() {
         let doc = std::fs::read_to_string(workspace_path(path))
             .unwrap_or_else(|err| panic!("{path}: {err}"));
         let blueprint = Blueprint::from_yaml(&doc).unwrap();
+        verify_blueprint_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
 
         assert_eq!(blueprint.version, "0.1.0", "{path}");
         assert_eq!(

@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   export OPENAI_API_KEY=sk-openai-example
-#   export MCP_URL=https://mcp.internal.company.com
+#   export MCP_URL=https://example.com/mcp
 #   export MCP_TOKEN=mcp-token-example
 #
 # Usage:
