@@ -240,18 +240,18 @@ fn docs_catalog_mentions_every_reference_blueprint() {
 
 #[test]
 fn sample_project_blueprints_parse() {
-    {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var("NEXUS_HUB_URL", "https://93.184.216.35");
-    }
+    let _guard = env_lock().lock().unwrap();
+
+    std::env::set_var("NEXUS_HUB_URL", "https://93.184.216.35");
 
     for path in [
         "examples/quickstart/agentenv.yaml",
         "examples/enterprise-hub/agentenv.yaml",
         "examples/headless-ci/agentenv.yaml",
     ] {
-        let doc = std::fs::read_to_string(workspace_path(path)).unwrap();
-        let blueprint = Blueprint::from_yaml(&doc).unwrap();
+        let doc = std::fs::read_to_string(workspace_path(path))
+            .unwrap_or_else(|err| panic!("{path}: {err}"));
+        let blueprint = Blueprint::from_yaml(&doc).unwrap_or_else(|err| panic!("{path}: {err}"));
 
         assert_eq!(blueprint.version, "0.1.0", "{path}");
         assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
