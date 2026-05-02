@@ -23,6 +23,7 @@ members = [
     "crates/drivers/inference-anthropic",
     "crates/drivers/inference-ollama",
     "tests/driver-conformance",
+    "tests/blueprint-integration",
 ]
 
 [workspace.package]
