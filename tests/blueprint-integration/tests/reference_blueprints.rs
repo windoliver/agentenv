@@ -229,7 +229,14 @@ fn workspace_root() -> PathBuf {
 fn driver_list_contains(output: &str, required: &DriverRequirement) -> bool {
     output.lines().any(|line| {
         let mut fields = line.split_whitespace();
-        fields.next() == Some(required.kind) && fields.next() == Some(required.name)
+        let kind = fields.next();
+        let name = fields.next();
+        let _version = fields.next();
+        let source = fields.next();
+
+        kind == Some(required.kind)
+            && name == Some(required.name)
+            && matches!(source, Some("installed" | "override"))
     })
 }
 
@@ -308,4 +315,27 @@ fn remove_temp_home(home: &PathBuf) {
     if let Err(error) = fs::remove_dir_all(home) {
         eprintln!("failed to remove temp HOME `{}`: {error}", home.display());
     }
+}
+
+#[test]
+fn driver_list_contains_requires_subprocess_source() {
+    let output = "\
+KIND       NAME                     VERSION        SOURCE     BINARY
+agent      hermes                   0.0.1-alpha0   built-in   -
+context    nexus                    0.0.1-alpha0   built-in   -
+agent      hermes                   0.0.1-alpha0   installed  /tmp/hermes
+context    nexus                    0.0.1-alpha0   override   /tmp/nexus
+";
+
+    assert!(driver_list_contains(output, &AGENT_HERMES));
+    assert!(driver_list_contains(output, &CONTEXT_NEXUS));
+
+    let built_in_only = "\
+KIND       NAME                     VERSION        SOURCE     BINARY
+agent      hermes                   0.0.1-alpha0   built-in   -
+context    nexus                    0.0.1-alpha0   built-in   -
+";
+
+    assert!(!driver_list_contains(built_in_only, &AGENT_HERMES));
+    assert!(!driver_list_contains(built_in_only, &CONTEXT_NEXUS));
 }
