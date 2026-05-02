@@ -1,0 +1,37 @@
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+
+sandbox:
+  driver: openshell
+  version: ">=0.0.1-alpha0,<0.1"
+  image: registry.internal.example.com/agentenv/company-base:latest
+
+agent:
+  driver: claude
+  credentials:
+    ANTHROPIC_API_KEY:
+      source: env
+      required: true
+
+context:
+  driver: nexus
+  mode: hub
+  hub_url: ${NEXUS_HUB_URL}
+  credentials:
+    NEXUS_TOKEN:
+      source: env
+      required: true
+
+inference:
+  driver: passthrough
+
+policy:
+  tier: balanced
+  presets:
+    - github_read
+    - npm_read
+  overrides:
+    - allow: "${NEXUS_HUB_URL}"
+
+state:
+  persist_home: true
