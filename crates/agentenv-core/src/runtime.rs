@@ -282,6 +282,8 @@ pub enum RuntimeError {
     #[error(transparent)]
     PortableLockfile(#[from] crate::portable_lockfile::PortableLockfileError),
     #[error(transparent)]
+    Hardening(#[from] crate::hardening::HardeningError),
+    #[error(transparent)]
     ApprovalConfig(#[from] agentenv_approvals::ApprovalConfigError),
     #[error(transparent)]
     ApprovalNotification(#[from] agentenv_approvals::ApprovalNotificationError),
@@ -1001,6 +1003,14 @@ async fn create_env_with_input(
                 handle: context_handle.handle.clone(),
             })
             .await?;
+        let resolved_hardening =
+            crate::hardening::resolve_sandbox_hardening(&resolved.blueprint.sandbox)?;
+        let persist_home = resolved
+            .blueprint
+            .state
+            .as_ref()
+            .and_then(|state| state.persist_home)
+            .unwrap_or(false);
 
         let (inference_handle, inference_endpoint) = match (
             set.inference.as_ref(),
@@ -1040,6 +1050,11 @@ async fn create_env_with_input(
             })?,
         };
         if input.resolved_policy.is_none() {
+            crate::hardening::apply_resolved_hardening_to_policy(
+                &mut policy,
+                &resolved_hardening,
+                persist_home,
+            )?;
             policy.network.allow.extend(context_network_rules.rules);
         }
 
@@ -1054,6 +1069,7 @@ async fn create_env_with_input(
             &context_endpoint,
             env,
             Some(create_policy.clone()),
+            &resolved_hardening,
         )?;
         let sandbox_handle = match set.sandbox.create(sandbox_spec).await {
             Ok(handle) => {
@@ -1756,6 +1772,7 @@ fn sandbox_spec_for_create(
     context_endpoint: &agentenv_proto::McpEndpoint,
     env: BTreeMap<String, String>,
     policy: Option<agentenv_proto::NetworkPolicy>,
+    resolved_hardening: &crate::hardening::ResolvedHardening,
 ) -> RuntimeResult<agentenv_proto::SandboxSpec> {
     let mut metadata = BTreeMap::from([
         ("name".to_owned(), serde_json::json!(name)),
@@ -1776,6 +1793,7 @@ fn sandbox_spec_for_create(
             serde_json::json!("/sandbox"),
         ),
     ]);
+    metadata.extend(resolved_hardening.metadata.clone());
     let image = match sandbox_extra.get("image") {
         Some(serde_yaml::Value::String(image)) => Some(image.clone()),
         Some(serde_yaml::Value::Mapping(image)) => {
@@ -3323,6 +3341,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::Lifecycle(_)
         | RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::Hardening(_)
         | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
@@ -5843,6 +5862,104 @@ policy:
             )
         );
         assert_eq!(metadata["agentenv_agent"], serde_json::json!("codex"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_spec_defaults_to_baseline_hardening_metadata() {
+        let root = unique_root("agentenv-create-baseline-hardening");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].metadata["hardening_profile"],
+            serde_json::json!("baseline")
+        );
+        assert!(specs[0]
+            .metadata
+            .contains_key("hardening_dockerfile_fragment"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_spec_propagates_strict_hardening_metadata() {
+        let root = unique_root("agentenv-create-strict-hardening");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  hardening: strict
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].metadata["hardening_profile"],
+            serde_json::json!("strict")
+        );
+        assert_eq!(
+            specs[0].metadata["hardening_ulimit_nproc"],
+            serde_json::json!(512)
+        );
     }
 
     #[tokio::test]

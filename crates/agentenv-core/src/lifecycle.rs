@@ -165,6 +165,8 @@ pub enum LifecycleError {
         #[source]
         source: Box<SsrfBlocked>,
     },
+    #[error(transparent)]
+    Hardening(#[from] crate::hardening::HardeningError),
     #[error("failed to serialize canonical resolved blueprint: {0}")]
     CanonicalBlueprintSerialize(serde_yaml::Error),
 }
@@ -215,6 +217,7 @@ fn verify_resolved_blueprint(
     resolved: ResolvedBlueprint,
 ) -> Result<ResolvedBlueprint, LifecycleError> {
     validate_blueprint_urls(&resolved.blueprint)?;
+    crate::hardening::resolve_sandbox_hardening(&resolved.blueprint.sandbox)?;
     let canonical = canonical_blueprint(&resolved)?;
     collect_credentials(&canonical)?;
     Ok(resolved)
@@ -251,6 +254,7 @@ pub fn reproduce_from_lockfile(
 fn build_lockfile_from_blueprint_yaml(yaml: &str) -> Result<Lockfile, LifecycleError> {
     let resolved = resolve_blueprint(yaml)?;
     validate_blueprint_urls(&resolved.blueprint)?;
+    crate::hardening::resolve_sandbox_hardening(&resolved.blueprint.sandbox)?;
     let canonical = canonical_blueprint(&resolved)?;
     let credentials = collect_credentials(&canonical)?;
 
