@@ -282,6 +282,8 @@ pub enum RuntimeError {
     #[error(transparent)]
     PortableLockfile(#[from] crate::portable_lockfile::PortableLockfileError),
     #[error(transparent)]
+    Blueprint(#[from] crate::error::BlueprintError),
+    #[error(transparent)]
     Hardening(#[from] crate::hardening::HardeningError),
     #[error(transparent)]
     ApprovalConfig(#[from] agentenv_approvals::ApprovalConfigError),
@@ -623,10 +625,21 @@ pub fn add_byo_dockerfile_preflight_warnings(
     report: &mut crate::admission::AdmissionReport,
     sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
 ) {
-    let Some(dockerfile) = byo_dockerfile_path(sandbox_extra) else {
-        return;
+    let sandbox = crate::blueprint::ComponentSection {
+        driver: "openshell".to_owned(),
+        version: None,
+        credentials: None,
+        extra: sandbox_extra.clone(),
     };
-    let issues = dockerfile_preflight_warnings(&dockerfile);
+    let issues = match crate::hardening::lint_sandbox_hardening(&sandbox, Path::new(".")) {
+        Ok(report) => hardening_lint_preflight_issues(&report.diagnostics),
+        Err(error) => vec![agentenv_proto::PreflightIssue {
+            severity: agentenv_proto::IssueSeverity::Error,
+            code: "dockerfile_lint_failed".to_owned(),
+            message: format!("failed to lint BYO Dockerfile hardening: {error}"),
+            remediation: Some("Check sandbox.image and sandbox.hardening configuration".to_owned()),
+        }],
+    };
     if issues.is_empty() {
         return;
     }
@@ -637,6 +650,7 @@ pub fn add_byo_dockerfile_preflight_warnings(
         .find(|check| check.kind == DriverKind::Sandbox)
     {
         check.issues.extend(issues);
+        refresh_preflight_status(report);
         return;
     }
 
@@ -646,6 +660,51 @@ pub fn add_byo_dockerfile_preflight_warnings(
         ok: true,
         issues,
     });
+    refresh_preflight_status(report);
+}
+
+fn hardening_lint_preflight_issues(
+    diagnostics: &[crate::hardening::HardeningLintDiagnostic],
+) -> Vec<agentenv_proto::PreflightIssue> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| agentenv_proto::PreflightIssue {
+            severity: match diagnostic.severity {
+                crate::hardening::HardeningLintSeverity::Info => {
+                    agentenv_proto::IssueSeverity::Info
+                }
+                crate::hardening::HardeningLintSeverity::Warning => {
+                    agentenv_proto::IssueSeverity::Warning
+                }
+                crate::hardening::HardeningLintSeverity::Error => {
+                    agentenv_proto::IssueSeverity::Error
+                }
+            },
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+            remediation: diagnostic.remediation.clone(),
+        })
+        .collect()
+}
+
+fn refresh_preflight_status(report: &mut crate::admission::AdmissionReport) {
+    let has_error = report.checks.iter().any(|check| {
+        !check.ok
+            || check
+                .issues
+                .iter()
+                .any(|issue| issue.severity == agentenv_proto::IssueSeverity::Error)
+    });
+    report.status = if has_error {
+        crate::admission::AdmissionStatus::Rejected
+    } else {
+        crate::admission::AdmissionStatus::Accepted
+    };
+    report.reason_code = if has_error {
+        crate::admission::ReasonCode::PreflightFailed
+    } else {
+        crate::admission::ReasonCode::Created
+    };
 }
 
 async fn run_preflight_with_pins(
@@ -1897,99 +1956,6 @@ fn byo_image_needs_computed_digest(sandbox_extra: &BTreeMap<String, serde_yaml::
             yaml_mapping_string(image, "source") == Some("byo")
                 && yaml_mapping_string(image, "expected_digest").is_none()
         })
-}
-
-fn byo_dockerfile_path(sandbox_extra: &BTreeMap<String, serde_yaml::Value>) -> Option<PathBuf> {
-    let image = sandbox_extra.get("image")?.as_mapping()?;
-    if yaml_mapping_string(image, "source") != Some("byo") {
-        return None;
-    }
-    yaml_mapping_string(image, "dockerfile").map(PathBuf::from)
-}
-
-fn dockerfile_preflight_warnings(path: &Path) -> Vec<agentenv_proto::PreflightIssue> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(source) => {
-            return vec![preflight_warning(
-                "byo_dockerfile_unreadable",
-                format!(
-                    "could not read BYO Dockerfile `{}`: {source}",
-                    path.display()
-                ),
-                Some("Check the Dockerfile path and permissions before creating the environment"),
-            )];
-        }
-    };
-
-    let mut saw_privileged = false;
-    let mut saw_cap_add = false;
-    let mut final_user = None;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.contains("--privileged") {
-            saw_privileged = true;
-        }
-        if lower.contains("cap_add") || lower.contains("cap-add") {
-            saw_cap_add = true;
-        }
-        if let Some(rest) = lower.strip_prefix("user ") {
-            final_user = rest
-                .split_whitespace()
-                .next()
-                .map(|user| user.split(':').next().unwrap_or(user).to_owned());
-        }
-    }
-
-    let mut issues = Vec::new();
-    if saw_privileged {
-        issues.push(preflight_warning(
-            "byo_dockerfile_privileged",
-            format!(
-                "BYO Dockerfile `{}` references `--privileged`, which conflicts with sandbox isolation expectations",
-                path.display()
-            ),
-            Some("Remove privileged container nesting from the sandbox image build"),
-        ));
-    }
-    if saw_cap_add {
-        issues.push(preflight_warning(
-            "byo_dockerfile_cap_add",
-            format!(
-                "BYO Dockerfile `{}` references `cap_add`, which may conflict with sandbox capability policy",
-                path.display()
-            ),
-            Some("Move Linux capability requirements into agentenv policy instead of the image"),
-        ));
-    }
-    if matches!(final_user.as_deref(), Some("root" | "0")) {
-        issues.push(preflight_warning(
-            "byo_dockerfile_user_root",
-            format!(
-                "BYO Dockerfile `{}` leaves the final image user as root",
-                path.display()
-            ),
-            Some("Set a non-root final USER that matches the sandbox policy"),
-        ));
-    }
-    issues
-}
-
-fn preflight_warning(
-    code: &str,
-    message: String,
-    remediation: Option<&str>,
-) -> agentenv_proto::PreflightIssue {
-    agentenv_proto::PreflightIssue {
-        severity: agentenv_proto::IssueSeverity::Warning,
-        code: code.to_owned(),
-        message,
-        remediation: remediation.map(ToOwned::to_owned),
-    }
 }
 
 fn sanitize_byo_build_name(name: &str) -> String {
@@ -3341,6 +3307,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::Lifecycle(_)
         | RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::Blueprint(_)
         | RuntimeError::Hardening(_)
         | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
@@ -6053,19 +6020,25 @@ USER root
 
         super::add_byo_dockerfile_preflight_warnings(&mut report, &sandbox_extra);
 
-        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Rejected);
+        assert_eq!(
+            report.reason_code,
+            crate::admission::ReasonCode::PreflightFailed
+        );
         let codes = report.checks[0]
             .issues
             .iter()
             .map(|issue| issue.code.as_str())
             .collect::<Vec<_>>();
-        assert!(codes.contains(&"byo_dockerfile_privileged"));
-        assert!(codes.contains(&"byo_dockerfile_cap_add"));
-        assert!(codes.contains(&"byo_dockerfile_user_root"));
+        assert!(codes.contains(&"dockerfile_privileged"));
+        assert!(codes.contains(&"dockerfile_cap_add"));
+        assert!(codes.contains(&"dockerfile_user_root"));
+        assert!(codes.contains(&"dockerfile_missing_hardening_marker"));
         assert!(report.checks[0]
             .issues
             .iter()
-            .all(|issue| issue.severity == agentenv_proto::IssueSeverity::Warning));
+            .any(|issue| issue.code == "dockerfile_user_root"
+                && issue.severity == agentenv_proto::IssueSeverity::Error));
         fs::remove_dir_all(root).unwrap();
     }
 
