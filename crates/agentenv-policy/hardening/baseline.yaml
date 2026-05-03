@@ -1,0 +1,45 @@
+name: baseline
+description: Default production hardening for agentenv sandbox images.
+packages:
+  strip:
+    - gcc
+    - g++
+    - make
+    - nc
+    - tcpdump
+    - nmap
+    - strace
+    - gdb
+mounts:
+  read_only:
+    - /etc
+    - /usr
+    - /opt
+  read_write:
+    - /workspace
+    - /tmp
+    - /var/tmp
+  tmpfs: []
+ulimits:
+  nproc: 512
+  nofile: 4096
+capabilities:
+  drop:
+    - NET_RAW
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=baseline
+  fragment: |
+    RUN set -eu; \
+        if command -v apt-get >/dev/null 2>&1; then \
+          apt-get purge -y gcc g++ make netcat-openbsd netcat-traditional tcpdump nmap strace gdb || true; \
+          apt-get autoremove -y || true; \
+          rm -rf /var/lib/apt/lists/*; \
+        elif command -v apk >/dev/null 2>&1; then \
+          apk del gcc g++ make netcat-openbsd tcpdump nmap strace gdb || true; \
+        else \
+          echo "agentenv hardening: unsupported package manager" >&2; \
+          exit 78; \
+        fi; \
+        find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true
+disable_core_dumps: false
+disable_user_namespaces: false

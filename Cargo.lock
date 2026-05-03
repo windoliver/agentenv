@@ -223,6 +223,7 @@ dependencies = [
  "agentenv-proto",
  "once_cell",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
 ]

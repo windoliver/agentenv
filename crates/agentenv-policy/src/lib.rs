@@ -2,12 +2,18 @@
 
 pub mod engine;
 pub mod error;
+pub mod hardening;
 pub mod model;
 pub mod presets;
 pub mod translate;
 
 pub use crate::engine::{compose_policy, Tier};
 pub use crate::error::{PolicyError, PolicyResult};
+pub use crate::hardening::{
+    apply_hardening_to_policy, builtin_hardening_profile, hardening_metadata,
+    resolve_hardening_profile, HardeningCapabilities, HardeningDockerfile, HardeningMounts,
+    HardeningPackages, HardeningProfile, HardeningTmpfsMount, HardeningUlimits,
+};
 pub use crate::model::{PresetAccess, PresetSelection};
 pub use crate::presets::PresetRegistry;
 pub use crate::translate::{
