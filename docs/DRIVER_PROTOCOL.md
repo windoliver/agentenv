@@ -137,8 +137,8 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `destroy` | `{handle}` | `{}` |
 
 Image hardening profiles are create-time sandbox configuration in schema 1.1.
-Core resolves `sandbox.hardening`, merges supported filesystem and process
-settings into `SandboxSpec.policy`, and sends image/runtime settings through
+Core resolves `sandbox.hardening`, merges supported filesystem settings into
+`SandboxSpec.policy`, and sends process, runtime, and image settings through
 `SandboxSpec.metadata` keys prefixed with `hardening_`. Sandbox drivers may
 consume that metadata during `create`; schema 1.1 does not define a separate
 `apply_hardening` method.

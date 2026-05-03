@@ -20,10 +20,11 @@ Blueprints may set `sandbox.hardening` to choose an image hardening profile.
 When omitted, the core uses `baseline`.
 
 - `baseline` is the default production posture. It removes common compilers and
-  network/debug tools, drops `NET_RAW`, and keeps normal developer writable
-  paths.
+  network/debug tools at the image layer, requests `NET_RAW` capability
+  dropping, and keeps normal developer writable paths.
 - `strict` is for sensitive work. It strips more tools, drops additional
-  capabilities, tightens `/tmp`, and disables core dumps and user namespaces.
+  packages, and includes runtime recommendations for capability drops, `/tmp`
+  tmpfs, core dumps, and user namespaces.
 - `open` keeps only minimal image hardening for exploratory environments where
   tool availability matters more than locked-down images.
 
@@ -35,6 +36,11 @@ agentenv blueprint lint <agentenv.yaml>
 
 The linter resolves the selected profile and reports Dockerfile patterns that
 conflict with hardening before creating the environment.
+
+Current OpenShell BYO enforcement injects the selected Dockerfile fragment and
+uses the supported filesystem policy merge. Runtime hardening metadata is parsed
+and validated for future driver mappings; it is not currently translated into
+extra OpenShell CLI arguments.
 
 ## Getting-Started Filesystem Blueprints
 

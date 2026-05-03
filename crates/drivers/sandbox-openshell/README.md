@@ -40,8 +40,11 @@ match the hardened image.
 The driver parses and validates runtime hardening metadata such as ulimits,
 core-dump disabling, and user-namespace disabling, but the current OpenShell
 implementation does not add unsupported runtime CLI arguments to
-`openshell sandbox create`. Unsupported runtime hardening fields are surfaced by
-blueprint lint and preflight diagnostics instead of being silently ignored.
+`openshell sandbox create`; valid runtime metadata is not currently enforced by
+the OpenShell CLI integration. Blueprint lint and preflight currently catch BYO
+Dockerfile conflicts such as a root final user, privileged or `cap-add`
+references, missing hardening marker, and reintroduction of packages stripped by
+the selected profile.
 
 Integration test command:
 
