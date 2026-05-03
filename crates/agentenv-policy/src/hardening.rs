@@ -209,6 +209,8 @@ pub fn apply_hardening_to_policy(
     profile: &HardeningProfile,
     persist_home: bool,
 ) -> PolicyResult<()> {
+    profile.validate(&profile.name)?;
+
     for path in &profile.mounts.read_only {
         merge_path(
             &mut policy.filesystem.read_only,

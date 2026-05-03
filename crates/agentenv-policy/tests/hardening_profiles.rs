@@ -6,7 +6,7 @@ use std::{
 
 use agentenv_policy::{
     apply_hardening_to_policy, builtin_hardening_profile, compose_policy, hardening_metadata,
-    resolve_hardening_profile, HardeningProfile, PresetRegistry, Tier,
+    resolve_hardening_profile, HardeningProfile, HardeningUlimits, PresetRegistry, Tier,
 };
 
 #[test]
@@ -107,7 +107,6 @@ dockerfile:
 #[test]
 fn resolve_hardening_profile_loads_env_dir_yaml_name() {
     let _guard = env_mutex().lock().expect("env mutex");
-    let previous_dir = std::env::var_os("AGENTENV_HARDENING_PROFILE_DIR");
     let dir = temp_profile_path("env-dir");
     fs::create_dir_all(&dir).expect("create temp profile dir");
     fs::write(
@@ -123,22 +122,9 @@ dockerfile:
     )
     .expect("write env profile");
 
-    // SAFETY: this test serializes all AGENTENV_HARDENING_PROFILE_DIR access
-    // through env_mutex, and restores the previous value before releasing it.
-    unsafe {
-        std::env::set_var("AGENTENV_HARDENING_PROFILE_DIR", &dir);
-    }
+    let _env_guard = EnvVarGuard::set("AGENTENV_HARDENING_PROFILE_DIR", &dir);
 
     let resolved = resolve_hardening_profile("env-custom");
-
-    // SAFETY: guarded by env_mutex; see set_var safety note above.
-    unsafe {
-        if let Some(previous_dir) = previous_dir {
-            std::env::set_var("AGENTENV_HARDENING_PROFILE_DIR", previous_dir);
-        } else {
-            std::env::remove_var("AGENTENV_HARDENING_PROFILE_DIR");
-        }
-    }
     fs::remove_dir_all(dir).expect("remove temp profile dir");
 
     let profile = resolved.expect("resolve env profile");
@@ -175,6 +161,27 @@ dockerfile:
         assert!(message.contains("path"));
         assert!(message.contains("absolute") || message.contains("non-empty"));
     }
+}
+
+#[test]
+fn hardening_merge_rejects_directly_constructed_invalid_filesystem_paths() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let mut policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+    let mut profile = builtin_hardening_profile("open").expect("load open");
+    profile.mounts.read_write = vec!["relative".to_owned()];
+    profile.ulimits = HardeningUlimits::default();
+
+    let err = apply_hardening_to_policy(&mut policy, &profile, false)
+        .expect_err("apply should validate directly constructed profile");
+    let message = err.to_string();
+
+    assert!(message.contains("read_write"));
+    assert!(message.contains("path"));
+    assert!(message.contains("absolute"));
+    assert!(!policy
+        .filesystem
+        .read_write
+        .contains(&"relative".to_owned()));
 }
 
 #[test]
@@ -269,4 +276,35 @@ fn temp_profile_path(name: &str) -> std::path::PathBuf {
 fn env_mutex() -> &'static Mutex<()> {
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     ENV_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: callers hold env_mutex while this guard is live, serializing
+        // mutation of the process environment for this test.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: callers hold env_mutex while this guard is live, serializing
+        // mutation of the process environment for this test.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
 }
