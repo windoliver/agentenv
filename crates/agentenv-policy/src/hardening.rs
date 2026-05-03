@@ -244,18 +244,14 @@ pub fn hardening_metadata(
         "hardening_disable_user_namespaces".to_owned(),
         Value::Bool(profile.disable_user_namespaces),
     );
-    if let Some(nproc) = profile.ulimits.nproc {
-        metadata.insert(
-            "hardening_ulimit_nproc".to_owned(),
-            Value::Number(nproc.into()),
-        );
-    }
-    if let Some(nofile) = profile.ulimits.nofile {
-        metadata.insert(
-            "hardening_ulimit_nofile".to_owned(),
-            Value::Number(nofile.into()),
-        );
-    }
+    metadata.insert(
+        "hardening_ulimit_nproc".to_owned(),
+        serde_json::to_value(profile.ulimits.nproc).map_err(json_error)?,
+    );
+    metadata.insert(
+        "hardening_ulimit_nofile".to_owned(),
+        serde_json::to_value(profile.ulimits.nofile).map_err(json_error)?,
+    );
 
     Ok(metadata)
 }

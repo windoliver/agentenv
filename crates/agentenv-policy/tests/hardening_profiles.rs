@@ -106,11 +106,24 @@ fn hardening_metadata_is_stable_json() {
 
     assert_eq!(metadata["hardening_profile"], "strict");
     assert_eq!(metadata["hardening_ulimit_nproc"], 512);
+    assert_eq!(metadata["hardening_ulimit_nofile"], 4096);
     assert_eq!(metadata["hardening_disable_core_dumps"], true);
     assert!(metadata["hardening_packages_strip"]
         .as_array()
         .expect("strip array")
         .contains(&serde_json::Value::String("curl".to_owned())));
+
+    let open = builtin_hardening_profile("open").expect("load open");
+    let open_metadata = hardening_metadata(&open).expect("metadata");
+
+    assert_eq!(
+        open_metadata["hardening_ulimit_nproc"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        open_metadata["hardening_ulimit_nofile"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]
