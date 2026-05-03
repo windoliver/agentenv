@@ -245,6 +245,89 @@ fn verify_blueprint_succeeds_on_reference_blueprint() {
 }
 
 #[test]
+fn cli_includes_commands() {
+    let output = Command::new(agentenv_bin()).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let blueprint = stdout
+        .find("blueprint")
+        .unwrap_or_else(|| panic!("stdout was: {stdout}"));
+    let credentials = stdout
+        .find("credentials")
+        .unwrap_or_else(|| panic!("stdout was: {stdout}"));
+    assert!(
+        blueprint < credentials,
+        "`blueprint` should be listed before `credentials`; stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn blueprint_lint_reports_json_diagnostics() {
+    let temp_dir = make_temp_dir("blueprint-lint-json-diagnostics");
+    let dockerfile = temp_dir.join("Dockerfile");
+    fs::write(
+        &dockerfile,
+        r#"
+FROM alpine:3.20
+RUN apk add --no-cache curl
+USER root
+"#,
+    )
+    .unwrap();
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  hardening: strict
+  image:
+    source: byo
+    dockerfile: Dockerfile
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("blueprint")
+        .arg("lint")
+        .arg(&blueprint)
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(json["profile"], "strict");
+    let codes = json["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array")
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(codes.contains("dockerfile_user_root"), "codes: {codes:?}");
+    assert!(
+        codes.contains("dockerfile_reintroduces_stripped_package"),
+        "codes: {codes:?}"
+    );
+}
+
+#[test]
 fn drivers_list_includes_built_in_drivers() {
     let temp_dir = make_temp_dir("drivers-list-builtins");
 

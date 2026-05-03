@@ -18,6 +18,7 @@ use agentenv_approvals::{
 };
 use agentenv_core::admission::{AdmissionReport, AdmissionStatus, ReasonCode};
 use agentenv_core::driver_catalog::{DiscoveredDriver, DriverCatalog};
+use agentenv_core::hardening::HardeningLintSeverity;
 use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
 use agentenv_events::{
     audit::{AuditPolicy, AuditSigningKey, AuditStore},
@@ -72,6 +73,7 @@ enum Commands {
     Approvals(ApprovalsArgs),
     Term(TermArgs),
     Exec(ExecArgs),
+    Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
     VerifyBlueprint {
@@ -435,6 +437,24 @@ struct TermArgs {
 }
 
 #[derive(Debug, Args)]
+struct BlueprintArgs {
+    #[command(subcommand)]
+    command: BlueprintCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BlueprintCommand {
+    Lint(BlueprintLintArgs),
+}
+
+#[derive(Debug, Args)]
+struct BlueprintLintArgs {
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct CredentialsArgs {
     #[command(subcommand)]
     command: CredentialCommand,
@@ -521,6 +541,7 @@ async fn run() -> Result<()> {
         Some(Commands::Approvals(args)) => run_approvals(args, &cli.events_sink).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Term(args)) => run_term(args).await,
+        Some(Commands::Blueprint(command)) => run_blueprint(command),
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
@@ -3308,6 +3329,75 @@ async fn run_credentials(args: CredentialsArgs, event_sink_args: &[String]) -> R
     }
 }
 
+fn run_blueprint(args: BlueprintArgs) -> Result<()> {
+    match args.command {
+        BlueprintCommand::Lint(args) => run_blueprint_lint(args),
+    }
+}
+
+fn run_blueprint_lint(args: BlueprintLintArgs) -> Result<()> {
+    let blueprint_yaml = read_text_file(&args.file, "blueprint")?;
+    let cwd = args
+        .file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let report = agentenv_core::hardening::lint_blueprint_hardening(&blueprint_yaml, cwd)
+        .with_context(|| format!("failed to lint blueprint `{}`", args.file.display()))?;
+    let has_error = report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == HardeningLintSeverity::Error);
+
+    if args.json {
+        render::print_json(&report)?;
+    } else {
+        print_hardening_lint_text(&report);
+    }
+
+    if has_error {
+        exit_process(1);
+    }
+    Ok(())
+}
+
+fn print_hardening_lint_text(report: &agentenv_core::hardening::HardeningLintReport) {
+    println!("profile: {}", report.profile);
+    if let Some(path) = report.dockerfile.as_ref() {
+        println!("dockerfile: {}", path.display());
+    }
+
+    if report.diagnostics.is_empty() {
+        println!("diagnostics: none");
+        return;
+    }
+
+    for diagnostic in &report.diagnostics {
+        let line = diagnostic
+            .line
+            .map(|line| format!(" line {line}"))
+            .unwrap_or_default();
+        println!(
+            "{} {}{}: {}",
+            hardening_lint_severity_label(diagnostic.severity),
+            diagnostic.code,
+            line,
+            diagnostic.message
+        );
+        if let Some(remediation) = diagnostic.remediation.as_ref() {
+            println!("  remediation: {remediation}");
+        }
+    }
+}
+
+fn hardening_lint_severity_label(severity: HardeningLintSeverity) -> &'static str {
+    match severity {
+        HardeningLintSeverity::Info => "info",
+        HardeningLintSeverity::Warning => "warning",
+        HardeningLintSeverity::Error => "error",
+    }
+}
+
 fn run_drivers(args: DriversArgs) -> Result<()> {
     match args.command {
         DriverCommand::List => {
@@ -3641,6 +3731,7 @@ mod tests {
                 "approvals".to_string(),
                 "term".to_string(),
                 "exec".to_string(),
+                "blueprint".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
                 "verify-blueprint".to_string(),
