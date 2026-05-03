@@ -11,24 +11,34 @@ const BUILTIN_PROFILE_NAMES: [&str; 3] = ["baseline", "strict", "open"];
 pub struct HardeningProfile {
     pub name: String,
     pub description: String,
+    #[serde(default)]
     pub packages: HardeningPackages,
+    #[serde(default)]
     pub mounts: HardeningMounts,
+    #[serde(default)]
     pub ulimits: HardeningUlimits,
+    #[serde(default)]
     pub capabilities: HardeningCapabilities,
     pub dockerfile: HardeningDockerfile,
+    #[serde(default)]
     pub disable_core_dumps: bool,
+    #[serde(default)]
     pub disable_user_namespaces: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardeningPackages {
+    #[serde(default)]
     pub strip: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardeningMounts {
+    #[serde(default)]
     pub read_only: Vec<String>,
+    #[serde(default)]
     pub read_write: Vec<String>,
+    #[serde(default)]
     pub tmpfs: Vec<HardeningTmpfsMount>,
 }
 
@@ -44,8 +54,9 @@ pub struct HardeningUlimits {
     pub nofile: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HardeningCapabilities {
+    #[serde(default)]
     pub drop: Vec<String>,
 }
 
@@ -109,6 +120,8 @@ impl HardeningProfile {
                 ));
             }
         }
+        validate_filesystem_paths(&self.name, "read_only", &self.mounts.read_only)?;
+        validate_filesystem_paths(&self.name, "read_write", &self.mounts.read_write)?;
         for mount in &self.mounts.tmpfs {
             if !mount.path.starts_with('/') {
                 return Err(hardening_error(
@@ -129,6 +142,25 @@ impl HardeningProfile {
         }
         Ok(())
     }
+}
+
+fn validate_filesystem_paths(name: &str, field: &str, paths: &[String]) -> PolicyResult<()> {
+    for path in paths {
+        if path.trim().is_empty() {
+            return Err(hardening_error(
+                name,
+                format!("mounts.{field} path must be non-empty and absolute"),
+            ));
+        }
+        if !path.starts_with('/') {
+            return Err(hardening_error(
+                name,
+                format!("mounts.{field} path `{path}` must be absolute"),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn builtin_hardening_profile(name: &str) -> PolicyResult<HardeningProfile> {

@@ -1,5 +1,6 @@
 use std::{
     fs,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -75,6 +76,105 @@ disable_user_namespaces: false
     assert_eq!(profile.mounts.tmpfs[0].size.as_deref(), Some("64m"));
 
     fs::remove_file(path).expect("remove temp profile");
+}
+
+#[test]
+fn minimal_custom_profile_uses_empty_defaults() {
+    let profile = HardeningProfile::from_yaml(
+        "minimal",
+        r#"
+name: minimal
+description: Minimal custom profile for tests.
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=minimal
+  fragment: |
+    RUN true
+"#,
+    )
+    .expect("minimal profile should parse");
+
+    assert!(profile.packages.strip.is_empty());
+    assert!(profile.mounts.read_only.is_empty());
+    assert!(profile.mounts.read_write.is_empty());
+    assert!(profile.mounts.tmpfs.is_empty());
+    assert_eq!(profile.ulimits.nproc, None);
+    assert_eq!(profile.ulimits.nofile, None);
+    assert!(profile.capabilities.drop.is_empty());
+    assert!(!profile.disable_core_dumps);
+    assert!(!profile.disable_user_namespaces);
+}
+
+#[test]
+fn resolve_hardening_profile_loads_env_dir_yaml_name() {
+    let _guard = env_mutex().lock().expect("env mutex");
+    let previous_dir = std::env::var_os("AGENTENV_HARDENING_PROFILE_DIR");
+    let dir = temp_profile_path("env-dir");
+    fs::create_dir_all(&dir).expect("create temp profile dir");
+    fs::write(
+        dir.join("env-custom.yaml"),
+        r#"
+name: env-custom
+description: Env dir custom profile for tests.
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=env-custom
+  fragment: |
+    RUN true
+"#,
+    )
+    .expect("write env profile");
+
+    // SAFETY: this test serializes all AGENTENV_HARDENING_PROFILE_DIR access
+    // through env_mutex, and restores the previous value before releasing it.
+    unsafe {
+        std::env::set_var("AGENTENV_HARDENING_PROFILE_DIR", &dir);
+    }
+
+    let resolved = resolve_hardening_profile("env-custom");
+
+    // SAFETY: guarded by env_mutex; see set_var safety note above.
+    unsafe {
+        if let Some(previous_dir) = previous_dir {
+            std::env::set_var("AGENTENV_HARDENING_PROFILE_DIR", previous_dir);
+        } else {
+            std::env::remove_var("AGENTENV_HARDENING_PROFILE_DIR");
+        }
+    }
+    fs::remove_dir_all(dir).expect("remove temp profile dir");
+
+    let profile = resolved.expect("resolve env profile");
+    assert_eq!(profile.name, "env-custom");
+}
+
+#[test]
+fn invalid_profile_rejects_non_absolute_filesystem_paths() {
+    for (field, path) in [
+        ("read_only", "relative"),
+        ("read_only", ""),
+        ("read_write", "relative"),
+        ("read_write", ""),
+    ] {
+        let yaml = format!(
+            r#"
+name: bad-path
+description: Bad filesystem path profile for tests.
+mounts:
+  {field}:
+    - "{path}"
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=bad-path
+  fragment: |
+    RUN true
+"#
+        );
+
+        let err = HardeningProfile::from_yaml("bad-path", &yaml)
+            .expect_err("relative or empty path should fail");
+        let message = err.to_string();
+
+        assert!(message.contains(field));
+        assert!(message.contains("path"));
+        assert!(message.contains("absolute") || message.contains("non-empty"));
+    }
 }
 
 #[test]
@@ -164,4 +264,9 @@ fn temp_profile_path(name: &str) -> std::path::PathBuf {
         .expect("time")
         .as_nanos();
     std::env::temp_dir().join(format!("agentenv-policy-{unique}-{name}"))
+}
+
+fn env_mutex() -> &'static Mutex<()> {
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_MUTEX.get_or_init(|| Mutex::new(()))
 }
