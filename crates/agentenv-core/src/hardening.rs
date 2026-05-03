@@ -290,12 +290,11 @@ fn analyze_dockerfile(contents: &str, profile: &HardeningProfile) -> DockerfileA
         .map(|package| normalize_package_token(package))
         .collect::<BTreeSet<_>>();
     let mut analysis = DockerfileAnalysis::default();
+    let mut current_stage_root_user = None;
 
-    for (index, line) in contents.lines().enumerate() {
-        let line_number = index + 1;
-        let Some(active) = active_dockerfile_line(line) else {
-            continue;
-        };
+    for instruction in dockerfile_instructions(contents) {
+        let line_number = instruction.line;
+        let active = instruction.text.as_str();
         let lower = active.to_ascii_lowercase();
 
         if active.contains(&profile.dockerfile.marker) {
@@ -309,8 +308,11 @@ fn analyze_dockerfile(contents: &str, profile: &HardeningProfile) -> DockerfileA
         {
             analysis.first_cap_add_line = Some(line_number);
         }
+        if is_from_instruction(active) {
+            current_stage_root_user = None;
+        }
         if let Some(user) = final_user_from_line(active) {
-            analysis.final_root_user = if matches!(user.as_str(), "root" | "0") {
+            current_stage_root_user = if matches!(user.as_str(), "root" | "0") {
                 Some((line_number, user))
             } else {
                 None
@@ -328,7 +330,58 @@ fn analyze_dockerfile(contents: &str, profile: &HardeningProfile) -> DockerfileA
         }
     }
 
+    analysis.final_root_user = current_stage_root_user;
     analysis
+}
+
+#[derive(Debug)]
+struct DockerfileInstruction {
+    line: usize,
+    text: String,
+}
+
+fn dockerfile_instructions(contents: &str) -> Vec<DockerfileInstruction> {
+    let mut instructions = Vec::new();
+    let mut current = String::new();
+    let mut current_line = None;
+
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let Some(active) = active_dockerfile_line(line) else {
+            continue;
+        };
+        if current_line.is_none() {
+            current_line = Some(line_number);
+        }
+
+        let (segment, continued) = continuation_segment(active);
+        if !segment.is_empty() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(segment);
+        }
+
+        if !continued {
+            if !current.is_empty() {
+                instructions.push(DockerfileInstruction {
+                    line: current_line.unwrap_or(line_number),
+                    text: current,
+                });
+            }
+            current = String::new();
+            current_line = None;
+        }
+    }
+
+    if !current.is_empty() {
+        instructions.push(DockerfileInstruction {
+            line: current_line.unwrap_or(1),
+            text: current,
+        });
+    }
+
+    instructions
 }
 
 fn active_dockerfile_line(line: &str) -> Option<&str> {
@@ -338,6 +391,20 @@ fn active_dockerfile_line(line: &str) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+fn continuation_segment(line: &str) -> (&str, bool) {
+    let trimmed = line.trim_end();
+    let Some(segment) = trimmed.strip_suffix('\\') else {
+        return (trimmed, false);
+    };
+    (segment.trim_end(), true)
+}
+
+fn is_from_instruction(line: &str) -> bool {
+    line.split_whitespace()
+        .next()
+        .is_some_and(|instruction| instruction.eq_ignore_ascii_case("FROM"))
 }
 
 fn final_user_from_line(line: &str) -> Option<String> {

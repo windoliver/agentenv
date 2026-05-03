@@ -124,6 +124,76 @@ USER agent
 }
 
 #[test]
+fn strict_detects_package_reintroduction_from_multiline_apt_install() {
+    let root = unique_root("agentenv-hardening-lint-multiline-apt");
+    let sandbox_dir = root.join("sandbox");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    fs::write(
+        sandbox_dir.join("Dockerfile"),
+        r#"
+FROM ubuntu:24.04
+ENV AGENTENV_HARDENING_PROFILE=strict
+RUN apt-get update && apt-get install -y \
+    gcc \
+    git
+USER agent
+"#,
+    )
+    .unwrap();
+
+    let yaml = blueprint("sandbox/Dockerfile", Some("strict"));
+    let report = lint_blueprint_hardening(&yaml, Path::new(&root)).unwrap();
+
+    let package_diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "dockerfile_reintroduces_stripped_package")
+        .expect("expected package reintroduction diagnostic");
+    assert_eq!(package_diagnostic.severity, HardeningLintSeverity::Error);
+    assert!(
+        package_diagnostic.message.contains("gcc") && package_diagnostic.message.contains("git"),
+        "unexpected diagnostic message: {}",
+        package_diagnostic.message
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn builder_stage_user_root_does_not_apply_to_final_stage() {
+    let root = unique_root("agentenv-hardening-lint-multistage-user");
+    let sandbox_dir = root.join("sandbox");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    fs::write(
+        sandbox_dir.join("Dockerfile"),
+        r#"
+FROM alpine:3.20 AS builder
+USER root
+RUN echo building
+
+FROM alpine:3.20
+ENV AGENTENV_HARDENING_PROFILE=strict
+RUN echo final
+"#,
+    )
+    .unwrap();
+
+    let yaml = blueprint("sandbox/Dockerfile", Some("strict"));
+    let report = lint_blueprint_hardening(&yaml, Path::new(&root)).unwrap();
+
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "dockerfile_user_root"),
+        "builder-stage USER root should not be reported for final stage: {:?}",
+        report.diagnostics
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn lint_severity_serializes_lowercase() {
     assert_eq!(
         serde_json::to_value(HardeningLintSeverity::Warning).unwrap(),
