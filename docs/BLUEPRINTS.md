@@ -14,6 +14,28 @@ Reference blueprints are checked-in `agentenv.yaml` compositions that double as 
 | `hermes+nexus+openshell.yaml` | Polyglot enterprise demos | Nexus hub | `balanced` | You want Hermes through subprocess drivers with Nexus context. |
 | `openclaw+nexus+openshell.yaml` | Enterprise reference | Nexus hub | `balanced` | You want OpenClaw with shared company context. |
 
+## Hardening Profiles
+
+Blueprints may set `sandbox.hardening` to choose an image hardening profile.
+When omitted, the core uses `baseline`.
+
+- `baseline` is the default production posture. It removes common compilers and
+  network/debug tools, drops `NET_RAW`, and keeps normal developer writable
+  paths.
+- `strict` is for sensitive work. It strips more tools, drops additional
+  capabilities, tightens `/tmp`, and disables core dumps and user namespaces.
+- `open` keeps only minimal image hardening for exploratory environments where
+  tool availability matters more than locked-down images.
+
+For BYO Dockerfiles, run:
+
+```sh
+agentenv blueprint lint <agentenv.yaml>
+```
+
+The linter resolves the selected profile and reports Dockerfile patterns that
+conflict with hardening before creating the environment.
+
 ## Getting-Started Filesystem Blueprints
 
 `claude+filesystem+openshell.yaml`, `codex+filesystem+openshell.yaml`, and `openclaw+filesystem+openshell.yaml` mount `~/projects` through the filesystem context driver and expose it over MCP inside OpenShell. They are the lowest-friction templates because they do not require remote context infrastructure.
