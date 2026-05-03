@@ -164,6 +164,56 @@ dockerfile:
 }
 
 #[test]
+fn invalid_profile_rejects_unknown_nested_fields() {
+    let err = HardeningProfile::from_yaml(
+        "bad-field",
+        r#"
+name: bad-field
+description: Misspelled field profile for tests.
+mounts:
+  readwrite:
+    - /tmp
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=bad-field
+  fragment: |
+    RUN true
+"#,
+    )
+    .expect_err("unknown field should fail");
+
+    let message = err.to_string();
+    assert!(message.contains("unknown field"));
+    assert!(message.contains("readwrite"));
+}
+
+#[test]
+fn invalid_profile_rejects_empty_or_whitespace_capability_drops() {
+    for capability in ["", "SYS ADMIN"] {
+        let yaml = format!(
+            r#"
+name: bad-capability
+description: Bad capability profile for tests.
+capabilities:
+  drop:
+    - "{capability}"
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=bad-capability
+  fragment: |
+    RUN true
+"#
+        );
+
+        let err = HardeningProfile::from_yaml("bad-capability", &yaml)
+            .expect_err("invalid capability should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("capabilities.drop"));
+        assert!(message.contains("non-empty"));
+        assert!(message.contains("whitespace"));
+    }
+}
+
+#[test]
 fn hardening_merge_rejects_directly_constructed_invalid_filesystem_paths() {
     let registry = PresetRegistry::load_builtin().expect("load presets");
     let mut policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");

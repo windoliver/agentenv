@@ -8,6 +8,7 @@ use crate::{model::NetworkPolicy, PolicyError, PolicyResult};
 const BUILTIN_PROFILE_NAMES: [&str; 3] = ["baseline", "strict", "open"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningProfile {
     pub name: String,
     pub description: String,
@@ -27,12 +28,14 @@ pub struct HardeningProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningPackages {
     #[serde(default)]
     pub strip: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningMounts {
     #[serde(default)]
     pub read_only: Vec<String>,
@@ -43,24 +46,28 @@ pub struct HardeningMounts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningTmpfsMount {
     pub path: String,
     pub size: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningUlimits {
     pub nproc: Option<u64>,
     pub nofile: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningCapabilities {
     #[serde(default)]
     pub drop: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardeningDockerfile {
     pub marker: String,
     pub fragment: String,
@@ -117,6 +124,14 @@ impl HardeningProfile {
                 return Err(hardening_error(
                     &self.name,
                     "package strip entries must be non-empty and contain no whitespace",
+                ));
+            }
+        }
+        for capability in &self.capabilities.drop {
+            if capability.trim().is_empty() || capability.chars().any(char::is_whitespace) {
+                return Err(hardening_error(
+                    &self.name,
+                    "capabilities.drop entries must be non-empty and contain no whitespace",
                 ));
             }
         }
