@@ -1816,8 +1816,18 @@ fn append_hardening_fragment(
         contents.push_str(marker);
         contents.push('\n');
     }
+    let final_user = final_stage_user(&contents);
+    let restore_user = final_user.filter(|user| !dockerfile_user_is_root(user));
+    if restore_user.is_some() {
+        contents.push_str("USER root\n");
+    }
     contents.push_str(fragment);
     if !fragment.ends_with('\n') {
+        contents.push('\n');
+    }
+    if let Some(user) = restore_user {
+        contents.push_str("USER ");
+        contents.push_str(&user);
         contents.push('\n');
     }
 
@@ -1827,6 +1837,38 @@ fn append_hardening_fragment(
             staged_dockerfile.display()
         ),
     })
+}
+
+fn final_stage_user(contents: &str) -> Option<String> {
+    let mut user = None;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (instruction, rest) = split_dockerfile_instruction(line);
+        if instruction.eq_ignore_ascii_case("FROM") {
+            user = None;
+        } else if instruction.eq_ignore_ascii_case("USER") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                user = Some(rest.to_owned());
+            }
+        }
+    }
+    user
+}
+
+fn split_dockerfile_instruction(line: &str) -> (&str, &str) {
+    match line.find(char::is_whitespace) {
+        Some(index) => (&line[..index], &line[index..]),
+        None => (line, ""),
+    }
+}
+
+fn dockerfile_user_is_root(user: &str) -> bool {
+    let user = user.split(':').next().unwrap_or(user).trim();
+    matches!(user, "root" | "0")
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
@@ -4877,6 +4919,40 @@ mod driver_tests {
             std::fs::read_to_string(stage_dir.join("image-digest")).expect("digest file"),
             format!("{digest}\n")
         );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn append_hardening_fragment_runs_as_root_and_restores_final_user() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-hardening-user");
+        let staged_dockerfile = tempdir.join("Dockerfile");
+        std::fs::write(
+            &staged_dockerfile,
+            "FROM alpine:3.20\nRUN adduser -D sandbox\nUSER sandbox\n",
+        )
+        .expect("write staged Dockerfile");
+        let hardening = super::OpenShellHardeningConfig {
+            profile: Some("strict".to_owned()),
+            dockerfile_marker: Some("AGENTENV_HARDENING_PROFILE=strict".to_owned()),
+            dockerfile_fragment: Some("RUN echo hardening\n".to_owned()),
+            ulimit_nproc: None,
+            ulimit_nofile: None,
+            disable_core_dumps: None,
+            disable_user_namespaces: None,
+        };
+
+        super::append_hardening_fragment(&staged_dockerfile, &hardening)
+            .expect("append hardening fragment");
+
+        let contents = std::fs::read_to_string(&staged_dockerfile).expect("staged Dockerfile");
+        let user_root = contents.find("USER root\n").expect("root user switch");
+        let run_fragment = contents
+            .find("RUN echo hardening\n")
+            .expect("hardening fragment");
+        let restore_user = contents.rfind("USER sandbox\n").expect("restored user");
+        assert!(user_root < run_fragment);
+        assert!(run_fragment < restore_user);
+        assert!(contents.trim_end().ends_with("USER sandbox"));
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 

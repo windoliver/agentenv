@@ -75,6 +75,8 @@ pub enum PortableLockfileError {
     #[error(transparent)]
     Lockfile(#[from] crate::lockfile::LockfileError),
     #[error(transparent)]
+    Hardening(#[from] crate::hardening::HardeningError),
+    #[error(transparent)]
     Policy(#[from] agentenv_policy::PolicyError),
     #[error("missing artifact for {kind} driver `{name}` version `{version}`")]
     MissingDriverArtifact {
@@ -95,16 +97,12 @@ pub fn build_portable_lockfile(
 ) -> Result<PortableLockfile, PortableLockfileError> {
     let registry = registry_from_artifacts(&input.driver_artifacts);
     let resolved = verify_blueprint_yaml_with_registry(&input.blueprint_yaml, &registry)?;
-    let composition = portable_canonical_blueprint(&resolved)?;
+    let mut composition = portable_canonical_blueprint(&resolved)?;
+    lock_default_sandbox_hardening(&mut composition);
     let blueprint_hash = portable_blueprint_hash(&composition)?;
     let policy = PortablePolicy {
         declared: composition.policy.clone(),
-        resolved: compose_policy(
-            parse_tier(&composition.policy.tier)?,
-            &parse_presets(&composition.policy.presets)?,
-            policy_overrides(&composition.policy.overrides),
-            &PresetRegistry::load_builtin()?,
-        )?,
+        resolved: resolved_policy_for_composition(&composition)?,
     };
     let credentials = collect_portable_credentials(&composition);
     let artifacts = portable_collect_artifacts(&composition)?;
@@ -388,16 +386,7 @@ fn verify_policy(lockfile: &PortableLockfile, report: &mut PortableVerifyReport)
         return;
     }
 
-    let recomputed = parse_tier(&lockfile.policy.declared.tier).and_then(|tier| {
-        let presets = parse_presets(&lockfile.policy.declared.presets)?;
-        let registry = PresetRegistry::load_builtin()?;
-        compose_policy(
-            tier,
-            &presets,
-            policy_overrides(&lockfile.policy.declared.overrides),
-            &registry,
-        )
-    });
+    let recomputed = resolved_policy_for_composition(&lockfile.composition);
 
     match recomputed {
         Ok(policy) if policy == lockfile.policy.resolved => {}
@@ -538,6 +527,50 @@ fn collect_portable_credentials(
         credentials.extend(inference.credentials.clone());
     }
     credentials
+}
+
+fn lock_default_sandbox_hardening(composition: &mut crate::lockfile::PortableComposition) {
+    if matches!(
+        composition.sandbox.extra.get("hardening"),
+        None | Some(serde_yaml::Value::Null)
+    ) {
+        composition.sandbox.extra.insert(
+            "hardening".to_owned(),
+            serde_yaml::Value::String(crate::hardening::DEFAULT_HARDENING_PROFILE.to_owned()),
+        );
+    }
+}
+
+fn resolved_policy_for_composition(
+    composition: &crate::lockfile::PortableComposition,
+) -> Result<NetworkPolicy, PortableLockfileError> {
+    let mut policy = compose_policy(
+        parse_tier(&composition.policy.tier)?,
+        &parse_presets(&composition.policy.presets)?,
+        policy_overrides(&composition.policy.overrides),
+        &PresetRegistry::load_builtin()?,
+    )?;
+    apply_portable_hardening_to_policy(&mut policy, composition)?;
+    Ok(policy)
+}
+
+fn apply_portable_hardening_to_policy(
+    policy: &mut NetworkPolicy,
+    composition: &crate::lockfile::PortableComposition,
+) -> Result<(), PortableLockfileError> {
+    let sandbox = blueprint_component_from_portable(&composition.sandbox);
+    if !crate::hardening::sandbox_hardening_declared(&sandbox) {
+        return Ok(());
+    }
+
+    let resolved = crate::hardening::resolve_sandbox_hardening(&sandbox)?;
+    let persist_home = composition
+        .state
+        .as_ref()
+        .and_then(|state| state.persist_home)
+        .unwrap_or(false);
+    crate::hardening::apply_resolved_hardening_to_policy(policy, &resolved, persist_home)?;
+    Ok(())
 }
 
 fn blueprint_yaml_from_portable_composition(

@@ -1062,8 +1062,15 @@ async fn create_env_with_input(
                 handle: context_handle.handle.clone(),
             })
             .await?;
-        let resolved_hardening =
-            crate::hardening::resolve_sandbox_hardening(&resolved.blueprint.sandbox)?;
+        let send_hardening_metadata = input.resolved_policy.is_none()
+            || crate::hardening::sandbox_hardening_declared(&resolved.blueprint.sandbox);
+        let resolved_hardening = if send_hardening_metadata {
+            Some(crate::hardening::resolve_sandbox_hardening(
+                &resolved.blueprint.sandbox,
+            )?)
+        } else {
+            None
+        };
         let persist_home = resolved
             .blueprint
             .state
@@ -1108,10 +1115,12 @@ async fn create_env_with_input(
                 })
             })?,
         };
-        if input.resolved_policy.is_none() {
+        if let (None, Some(resolved_hardening)) =
+            (input.resolved_policy.as_ref(), resolved_hardening.as_ref())
+        {
             crate::hardening::apply_resolved_hardening_to_policy(
                 &mut policy,
-                &resolved_hardening,
+                resolved_hardening,
                 persist_home,
             )?;
             policy.network.allow.extend(context_network_rules.rules);
@@ -1128,7 +1137,7 @@ async fn create_env_with_input(
             &context_endpoint,
             env,
             Some(create_policy.clone()),
-            &resolved_hardening,
+            resolved_hardening.as_ref(),
         )?;
         let sandbox_handle = match set.sandbox.create(sandbox_spec).await {
             Ok(handle) => {
@@ -1468,6 +1477,9 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     if let crate::lockfile::LockfileDocument::Portable(mut lockfile) =
         crate::lockfile::LockfileDocument::from_yaml(&description.lock_yaml)?
     {
+        let env_blueprint = crate::blueprint::Blueprint::from_yaml(&description.blueprint_yaml)?;
+        let env_hardening_declared =
+            crate::hardening::sandbox_hardening_declared(&env_blueprint.sandbox);
         let expected_lockfile = crate::portable_lockfile::build_portable_lockfile(
             crate::portable_lockfile::PortableLockfileInput {
                 name: description.state.name.clone(),
@@ -1475,10 +1487,11 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
                 driver_artifacts: driver_artifacts.clone(),
             },
         )?;
-        if lockfile.composition != expected_lockfile.composition
-            || lockfile.blueprint_hash != expected_lockfile.blueprint_hash
-            || lockfile.policy.declared != expected_lockfile.composition.policy
-        {
+        if !portable_lockfile_matches_env_blueprint(
+            &lockfile,
+            &expected_lockfile,
+            env_hardening_declared,
+        )? {
             return Err(RuntimeError::PortableLockfileVerification {
                 details:
                     "portable lockfile composition does not match env blueprint or declared policy"
@@ -1521,6 +1534,29 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     }
 
     Ok(lockfile.to_yaml_deterministic()?)
+}
+
+fn portable_lockfile_matches_env_blueprint(
+    lockfile: &crate::lockfile::PortableLockfile,
+    expected: &crate::lockfile::PortableLockfile,
+    env_hardening_declared: bool,
+) -> RuntimeResult<bool> {
+    if lockfile.policy.declared != expected.composition.policy {
+        return Ok(false);
+    }
+    if lockfile.composition == expected.composition
+        && lockfile.blueprint_hash == expected.blueprint_hash
+    {
+        return Ok(true);
+    }
+    if env_hardening_declared || lockfile.composition.sandbox.extra.contains_key("hardening") {
+        return Ok(false);
+    }
+
+    let mut legacy_expected = expected.composition.clone();
+    legacy_expected.sandbox.extra.remove("hardening");
+    let legacy_hash = crate::lifecycle::portable_blueprint_hash(&legacy_expected)?;
+    Ok(lockfile.composition == legacy_expected && lockfile.blueprint_hash == legacy_hash)
 }
 
 pub async fn reproduce_env(
@@ -1831,7 +1867,7 @@ fn sandbox_spec_for_create(
     context_endpoint: &agentenv_proto::McpEndpoint,
     env: BTreeMap<String, String>,
     policy: Option<agentenv_proto::NetworkPolicy>,
-    resolved_hardening: &crate::hardening::ResolvedHardening,
+    resolved_hardening: Option<&crate::hardening::ResolvedHardening>,
 ) -> RuntimeResult<agentenv_proto::SandboxSpec> {
     let mut metadata = BTreeMap::from([
         ("name".to_owned(), serde_json::json!(name)),
@@ -1852,7 +1888,9 @@ fn sandbox_spec_for_create(
             serde_json::json!("/sandbox"),
         ),
     ]);
-    metadata.extend(resolved_hardening.metadata.clone());
+    if let Some(resolved_hardening) = resolved_hardening {
+        metadata.extend(resolved_hardening.metadata.clone());
+    }
     let image = match sandbox_extra.get("image") {
         Some(serde_yaml::Value::String(image)) => Some(image.clone()),
         Some(serde_yaml::Value::Mapping(image)) => {
@@ -5929,6 +5967,50 @@ policy:
         );
     }
 
+    #[test]
+    fn portable_lockfile_records_default_hardening_profile() {
+        let root = unique_root("agentenv-portable-default-hardening");
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+
+        assert_eq!(
+            lockfile.composition.sandbox.extra["hardening"],
+            serde_yaml::Value::String("baseline".to_owned())
+        );
+        assert!(lockfile
+            .policy
+            .resolved
+            .filesystem
+            .read_only
+            .contains(&"/etc".to_owned()));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn create_env_records_computed_byo_digest_in_lockfile() {
         let root = unique_root("agentenv-create-byo-digest-lock");
@@ -6584,6 +6666,10 @@ version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
+  image:
+    source: byo
+    dockerfile: /tmp/legacy-sandbox/Dockerfile
+    expected_digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 agent:
   driver: codex
 context:
@@ -6606,6 +6692,17 @@ policy:
             },
         )
         .expect("build portable lockfile");
+        lockfile.composition.sandbox.extra.remove("hardening");
+        lockfile.blueprint_hash = crate::lifecycle::portable_blueprint_hash(&lockfile.composition)
+            .expect("recompute legacy blueprint hash");
+        let registry = agentenv_policy::PresetRegistry::load_builtin().expect("load presets");
+        lockfile.policy.resolved = agentenv_policy::compose_policy(
+            agentenv_policy::Tier::Restricted,
+            &[],
+            None,
+            &registry,
+        )
+        .expect("compose legacy policy");
         let pinned_rule = agentenv_proto::NetworkRule {
             target: NetworkTarget::Host {
                 host: "pinned.example".to_owned(),
@@ -6655,6 +6752,26 @@ policy:
         assert!(
             !create_policies[0].network.allow.contains(&context_rule),
             "sandbox create policy should not add context-required rules during reproduce"
+        );
+        let create_specs = tracker
+            .create_specs
+            .lock()
+            .expect("create spec tracker")
+            .clone();
+        assert_eq!(create_specs.len(), 1);
+        assert_eq!(
+            create_specs[0].metadata["byo_dockerfile"],
+            serde_json::json!("/tmp/legacy-sandbox/Dockerfile")
+        );
+        assert!(
+            !create_specs[0]
+                .metadata
+                .contains_key("hardening_dockerfile_fragment"),
+            "legacy lockfiles without sandbox.hardening must not inject image hardening"
+        );
+        assert!(
+            !create_specs[0].metadata.contains_key("hardening_profile"),
+            "legacy lockfiles without sandbox.hardening must not default hardening metadata"
         );
         let applied_policies = tracker
             .applied_policies
@@ -6945,6 +7062,89 @@ policy:
         assert!(frozen.contains("name: renamed-demo"));
         assert!(frozen.contains("resolved:"));
         assert!(frozen.contains("frozen-pinned.example"));
+    }
+
+    #[tokio::test]
+    async fn freeze_after_reproduce_accepts_legacy_lockfile_without_hardening() {
+        let root = unique_root("agentenv-freeze-legacy-no-hardening");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "source-demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.composition.sandbox.extra.remove("hardening");
+        lockfile.blueprint_hash = crate::lifecycle::portable_blueprint_hash(&lockfile.composition)
+            .expect("recompute legacy blueprint hash");
+        let registry = agentenv_policy::PresetRegistry::load_builtin().expect("load presets");
+        lockfile.policy.resolved = agentenv_policy::compose_policy(
+            agentenv_policy::Tier::Restricted,
+            &[],
+            None,
+            &registry,
+        )
+        .expect("compose legacy policy");
+        lockfile
+            .policy
+            .resolved
+            .network
+            .allow
+            .push(agentenv_proto::NetworkRule {
+                target: NetworkTarget::Host {
+                    host: "legacy-pinned.example".to_owned(),
+                    port: Some(443),
+                    scheme: Some("https".to_owned()),
+                    http_access: None,
+                },
+            });
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(
+            &options,
+            &TinyFactory,
+            &mut credentials,
+            "legacy-demo",
+            &lockfile_yaml,
+        )
+        .await
+        .expect("reproduce env");
+
+        let frozen = super::freeze_env_lockfile(&options, "legacy-demo").expect("freeze env");
+
+        assert!(frozen.contains("legacy-pinned.example"));
+        assert!(
+            !frozen.contains("hardening: baseline"),
+            "freezing a reproduced legacy lockfile should preserve absent hardening"
+        );
     }
 
     #[tokio::test]

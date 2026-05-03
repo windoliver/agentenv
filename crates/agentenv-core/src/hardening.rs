@@ -16,7 +16,7 @@ use crate::{
     runtime::RuntimeError,
 };
 
-const DEFAULT_HARDENING_PROFILE: &str = "baseline";
+pub(crate) const DEFAULT_HARDENING_PROFILE: &str = "baseline";
 const DOCKERFILE_UNREADABLE: &str = "dockerfile_unreadable";
 const DOCKERFILE_USER_ROOT: &str = "dockerfile_user_root";
 const DOCKERFILE_PRIVILEGED: &str = "dockerfile_privileged";
@@ -111,6 +111,10 @@ pub fn apply_resolved_hardening_to_policy(
             source,
         }
     })
+}
+
+pub(crate) fn sandbox_hardening_declared(sandbox: &ComponentSection) -> bool {
+    sandbox.extra.contains_key("hardening")
 }
 
 pub fn lint_blueprint_hardening(
