@@ -283,6 +283,25 @@ fn readwrite_presets_translate_to_read_write_access() {
 }
 
 #[test]
+fn persisted_home_marker_translates_to_absolute_sandbox_home() {
+    let mut policy = supported_policy();
+    policy.filesystem.read_write.push("$HOME".to_owned());
+
+    let translated = translator().translate(&policy).expect("translate policy");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&translated.policy_yaml).expect("parse policy yaml");
+    let read_write = document["filesystem_policy"]["read_write"]
+        .as_sequence()
+        .expect("read_write sequence")
+        .iter()
+        .filter_map(serde_yaml::Value::as_str)
+        .collect::<Vec<_>>();
+
+    assert!(read_write.contains(&"/home/sandbox"));
+    assert!(!read_write.contains(&"$HOME"));
+}
+
+#[test]
 fn full_npm_registry_access_translates_to_l4_passthrough() {
     let mut policy = supported_policy();
     policy.network.allow = vec![NetworkRule {
