@@ -29,8 +29,14 @@ impl super::PolicyTranslator for OpenShellTranslator {
             version: 1,
             filesystem_policy: FilesystemPolicyDocument {
                 include_workdir: true,
-                read_only: policy.filesystem.read_only.clone(),
-                read_write: policy.filesystem.read_write.clone(),
+                read_only: openshell_filesystem_paths(
+                    &policy.filesystem.read_only,
+                    &policy.process.run_as_user,
+                )?,
+                read_write: openshell_filesystem_paths(
+                    &policy.filesystem.read_write,
+                    &policy.process.run_as_user,
+                )?,
             },
             landlock: LandlockDocument {
                 compatibility: "best_effort",
@@ -67,6 +73,44 @@ impl super::PolicyTranslator for OpenShellTranslator {
                 }),
         })
     }
+}
+
+fn openshell_filesystem_paths(
+    paths: &[String],
+    run_as_user: &str,
+) -> crate::PolicyResult<Vec<String>> {
+    paths
+        .iter()
+        .map(|path| openshell_filesystem_path(path, run_as_user))
+        .collect()
+}
+
+fn openshell_filesystem_path(path: &str, run_as_user: &str) -> crate::PolicyResult<String> {
+    if path == "$HOME" {
+        return openshell_home_path(run_as_user);
+    }
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        return Ok(format!("{}/{}", openshell_home_path(run_as_user)?, rest));
+    }
+    Ok(path.to_owned())
+}
+
+fn openshell_home_path(run_as_user: &str) -> crate::PolicyResult<String> {
+    let user = run_as_user.trim();
+    if user.is_empty() || matches!(user, "root" | "0") {
+        return Ok("/root".to_owned());
+    }
+    if user
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Ok(format!("/home/{user}"));
+    }
+
+    Err(crate::PolicyError::TranslationUnsupported {
+        translator: "openshell",
+        message: format!("unsupported run_as_user for $HOME filesystem path: {run_as_user}"),
+    })
 }
 
 fn reject_unsupported_process(policy: &NetworkPolicy) -> crate::PolicyResult<()> {

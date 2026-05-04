@@ -1,0 +1,21 @@
+name: open
+description: Minimal hardening for research and exploratory sandboxes.
+packages:
+  strip: []
+mounts:
+  read_only: []
+  read_write:
+    - /workspace
+    - /tmp
+    - /var/tmp
+  tmpfs: []
+ulimits: {}
+capabilities:
+  drop: []
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=open
+  fragment: |
+    RUN set -eu; \
+        find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true
+disable_core_dumps: false
+disable_user_namespaces: false
