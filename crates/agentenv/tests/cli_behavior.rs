@@ -759,6 +759,8 @@ fn logs_context_follow_streams_appended_events_jsonl() {
     let temp_dir = make_temp_dir("logs-context-follow-events");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
     let events_path = env_dir.join("events.jsonl");
+    let stdout_path = temp_dir.join("logs-context-follow.stdout");
+    let stderr_path = temp_dir.join("logs-context-follow.stderr");
     fs::write(&events_path, "").unwrap();
 
     let mut child = Command::new(agentenv_bin())
@@ -768,8 +770,12 @@ fn logs_context_follow_streams_appended_events_jsonl() {
         .arg("context")
         .arg("--follow")
         .env("HOME", &temp_dir)
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
+        .stdout(process::Stdio::from(
+            fs::File::create(&stdout_path).unwrap(),
+        ))
+        .stderr(process::Stdio::from(
+            fs::File::create(&stderr_path).unwrap(),
+        ))
         .spawn()
         .unwrap();
 
@@ -786,14 +792,28 @@ fn logs_context_follow_streams_appended_events_jsonl() {
             b"{\"ts\":\"2026-04-21T00:00:01Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context followed\"}\n",
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(400));
-    let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stdout = String::new();
+    while Instant::now() < deadline {
+        stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        if stdout.contains("context followed") {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+            panic!(
+                "logs --follow exited before appended event was printed; status: {status}; stdout: {stdout}; stderr: {stderr}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("context followed"),
-        "stdout was: {}",
-        String::from_utf8_lossy(&output.stdout)
+        stdout.contains("context followed"),
+        "stdout was: {stdout}; stderr was: {}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
     );
 }
 
