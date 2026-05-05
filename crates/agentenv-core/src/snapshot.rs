@@ -45,6 +45,8 @@ pub enum SnapshotError {
     UnsupportedVersion { version: String },
     #[error("invalid signing key length: expected 32 bytes, got {actual}")]
     InvalidSigningKeyLength { actual: usize },
+    #[error("section mismatch for `{section}`")]
+    SectionMismatch { section: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +223,8 @@ pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManife
     }
 
     let inventory = build_inventory(snapshot_dir)?;
+    let inventory_merkle_root = inventory.merkle_root.clone();
+
     let mut actual_by_path = BTreeMap::new();
     for entry in inventory.files {
         actual_by_path.insert(entry.path.clone(), entry);
@@ -263,10 +267,10 @@ pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManife
         }
     }
 
-    if manifest.merkle_root != compute_merkle_root(&manifest.files) {
+    if manifest.merkle_root != inventory_merkle_root {
         return Err(SnapshotError::MerkleRootMismatch {
             expected: manifest.merkle_root.clone(),
-            actual: compute_merkle_root(&manifest.files),
+            actual: inventory_merkle_root,
         });
     }
 
@@ -276,6 +280,8 @@ pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManife
             actual: manifest.merkle_root.clone(),
         });
     }
+
+    ensure_sections_match(&manifest.sections, &inventory.sections)?;
 
     let actual_manifest_hash = sha256_prefixed(&manifest_bytes);
     if actual_manifest_hash != signatures.manifest_sha256 {
@@ -435,6 +441,32 @@ fn build_sections(
     }
 
     Ok(sections)
+}
+
+fn ensure_sections_match(
+    manifest_sections: &BTreeMap<String, SnapshotSection>,
+    inventory_sections: &BTreeMap<String, SnapshotSection>,
+) -> SnapshotResult<()> {
+    for (name, inventory_section) in inventory_sections {
+        match manifest_sections.get(name) {
+            Some(manifest_section) if manifest_section == inventory_section => {}
+            _ => {
+                return Err(SnapshotError::SectionMismatch {
+                    section: name.clone(),
+                });
+            }
+        }
+    }
+
+    for name in manifest_sections.keys() {
+        if !inventory_sections.contains_key(name) {
+            return Err(SnapshotError::SectionMismatch {
+                section: name.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn has_prefix(files: &[SnapshotFileEntry], prefix: &str) -> bool {
@@ -637,12 +669,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_rejects_non_lexicographic_manifest_order() {
+        let root = temp_dir("snapshot-verify-order");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mut manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        manifest.files.reverse();
+        manifest.merkle_root = compute_merkle_root(&manifest.files);
+        write_signed_manifest(&root, &key_path, &manifest).expect("rewrite signed snapshot");
+
+        let error = verify_snapshot_dir(&root).expect_err("manifest order mismatch must fail");
+        assert!(
+            error.to_string().contains("merkle root mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_manifest_section_mismatch() {
+        let root = temp_dir("snapshot-verify-sections");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mut manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        manifest.sections.remove("blueprint");
+        write_signed_manifest(&root, &key_path, &manifest).expect("rewrite signed snapshot");
+
+        let error = verify_snapshot_dir(&root).expect_err("section mismatch must fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("section")
+                || rendered.contains("blueprint")
+                || rendered.contains("digest mismatch"),
+            "unexpected error: {rendered}"
+        );
+    }
+
     fn write_minimal_payload(root: &Path) {
         fs::create_dir_all(root.join("workspace")).unwrap();
         fs::write(root.join("blueprint.yaml"), "version: 0.1.0\n").unwrap();
         fs::write(root.join("lock.yaml"), "version: 0.2.0\n").unwrap();
         fs::write(root.join("policy.yaml"), "network: {}\n").unwrap();
         fs::write(root.join("workspace/README.md"), "hello\n").unwrap();
+    }
+
+    fn read_manifest(path: &Path) -> SnapshotResult<SnapshotManifest> {
+        let bytes = fs::read(path)?;
+        let manifest = serde_json::from_slice(&bytes)?;
+        Ok(manifest)
     }
 
     fn temp_dir(name: &str) -> PathBuf {
