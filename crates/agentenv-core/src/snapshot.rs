@@ -62,6 +62,8 @@ pub enum SnapshotError {
     UnsupportedSignatureAlgorithm { algorithm: String },
     #[error("unsupported hash algorithm `{algorithm}`")]
     UnsupportedHashAlgorithm { algorithm: String },
+    #[error("insecure signing key permissions at `{path}`")]
+    InsecureSigningKeyPermissions { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,7 +300,7 @@ pub fn read_signatures(path: &Path) -> SnapshotResult<SnapshotSignatures> {
 
 fn build_inventory(root: &Path) -> SnapshotResult<Inventory> {
     let mut files = Vec::new();
-    walk_payload(root, root, &mut files)?;
+    let _ = walk_payload(root, root, &mut files)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
 
     let merkle_root = compute_merkle_root(&files);
@@ -315,13 +317,14 @@ fn walk_payload(
     root: &Path,
     current: &Path,
     files: &mut Vec<SnapshotFileEntry>,
-) -> SnapshotResult<()> {
+) -> SnapshotResult<String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(current)? {
         entries.push(entry?);
     }
 
     entries.sort_by_key(|left| left.file_name());
+    let mut digest_parts = Vec::new();
 
     for entry in entries {
         let path = entry.path();
@@ -339,30 +342,41 @@ fn walk_payload(
 
         let file_type = metadata.file_type();
         if file_type.is_dir() {
-            walk_payload(root, &path, files)?;
+            let digest = walk_payload(root, &path, files)?;
+            files.push(SnapshotFileEntry {
+                path: relative_display.clone(),
+                kind: SnapshotEntryKind::Directory,
+                sha256: digest.clone(),
+                size: None,
+            });
+            digest_parts.push((relative_display, SnapshotEntryKind::Directory, digest));
             continue;
         }
 
         if file_type.is_file() {
             let bytes = fs::read(&path)?;
+            let digest = sha256_prefixed(&bytes);
             files.push(SnapshotFileEntry {
-                path: relative_display,
+                path: relative_display.clone(),
                 kind: SnapshotEntryKind::File,
-                sha256: sha256_prefixed(&bytes),
+                sha256: digest.clone(),
                 size: Some(bytes.len() as u64),
             });
+            digest_parts.push((relative_display, SnapshotEntryKind::File, digest));
             continue;
         }
 
         if file_type.is_symlink() {
             let target = fs::read_link(&path)?;
             let target_bytes = symlink_target_bytes(&target);
+            let digest = sha256_prefixed(&target_bytes);
             files.push(SnapshotFileEntry {
-                path: relative_display,
+                path: relative_display.clone(),
                 kind: SnapshotEntryKind::Symlink,
-                sha256: sha256_prefixed(&target_bytes),
+                sha256: digest.clone(),
                 size: None,
             });
+            digest_parts.push((relative_display, SnapshotEntryKind::Symlink, digest));
             continue;
         }
 
@@ -371,7 +385,7 @@ fn walk_payload(
         });
     }
 
-    Ok(())
+    Ok(compute_directory_digest(&digest_parts))
 }
 
 fn build_sections(
@@ -381,7 +395,7 @@ fn build_sections(
 
     for (name, path) in [
         ("blueprint", "blueprint.yaml"),
-        ("lock", "lock.yaml"),
+        ("lockfile", "lock.yaml"),
         ("policy", "policy.yaml"),
     ] {
         let entry = files
@@ -411,23 +425,29 @@ fn build_sections(
         );
     }
 
-    if has_prefix(files, "workspace/") {
+    if let Some(entry) = files
+        .iter()
+        .find(|entry| entry.path == "workspace" && entry.kind == SnapshotEntryKind::Directory)
+    {
         sections.insert(
             "workspace".to_owned(),
             SnapshotSection {
                 path: "workspace".to_owned(),
-                sha256: subtree_digest(files, "workspace/"),
+                sha256: entry.sha256.clone(),
                 kind: Some(SnapshotEntryKind::Directory),
             },
         );
     }
 
-    if has_prefix(files, "home/") {
+    if let Some(entry) = files
+        .iter()
+        .find(|entry| entry.path == "home" && entry.kind == SnapshotEntryKind::Directory)
+    {
         sections.insert(
             "home".to_owned(),
             SnapshotSection {
                 path: "home".to_owned(),
-                sha256: subtree_digest(files, "home/"),
+                sha256: entry.sha256.clone(),
                 kind: Some(SnapshotEntryKind::Directory),
             },
         );
@@ -475,23 +495,32 @@ fn ensure_manifest_files_match(
         }
     }
 
-    if manifest_files == inventory_files {
-        return Ok(());
-    }
-
     let mut inventory_by_path = BTreeMap::new();
     for entry in inventory_files {
         inventory_by_path.insert(entry.path.clone(), entry);
     }
 
-    for entry in manifest_files {
-        let actual = inventory_by_path
-            .get(&entry.path)
-            .ok_or_else(|| SnapshotError::DigestMismatch {
+    for entry in inventory_files {
+        if !seen_manifest_paths.contains(&entry.path) {
+            return Err(SnapshotError::ExtraPayload {
                 path: entry.path.clone(),
-                expected: entry.sha256.clone(),
-                actual: "<missing>".to_owned(),
-            })?;
+            });
+        }
+    }
+
+    if manifest_files == inventory_files {
+        return Ok(());
+    }
+
+    for entry in manifest_files {
+        let actual =
+            inventory_by_path
+                .get(&entry.path)
+                .ok_or_else(|| SnapshotError::DigestMismatch {
+                    path: entry.path.clone(),
+                    expected: entry.sha256.clone(),
+                    actual: "<missing>".to_owned(),
+                })?;
 
         if entry.kind != actual.kind {
             return Err(SnapshotError::DigestMismatch {
@@ -514,28 +543,20 @@ fn ensure_manifest_files_match(
         }
     }
 
-    for entry in inventory_files {
-        if !seen_manifest_paths.contains(&entry.path) {
-            return Err(SnapshotError::ExtraPayload {
-                path: entry.path.clone(),
-            });
-        }
-    }
-
     Err(SnapshotError::NonCanonicalManifestFileOrder)
 }
 
-fn has_prefix(files: &[SnapshotFileEntry], prefix: &str) -> bool {
-    files.iter().any(|entry| entry.path.starts_with(prefix))
-}
-
-fn subtree_digest(files: &[SnapshotFileEntry], prefix: &str) -> String {
-    let subset: Vec<SnapshotFileEntry> = files
-        .iter()
-        .filter(|entry| entry.path.starts_with(prefix))
-        .cloned()
-        .collect();
-    compute_merkle_root(&subset)
+fn compute_directory_digest(parts: &[(String, SnapshotEntryKind, String)]) -> String {
+    let mut hasher = Sha256::new();
+    for (path, kind, digest) in parts {
+        hasher.update(path.as_bytes());
+        hasher.update([0_u8]);
+        hasher.update(kind.as_str().as_bytes());
+        hasher.update([0_u8]);
+        hasher.update(digest.as_bytes());
+        hasher.update([0_u8]);
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn compute_merkle_root(files: &[SnapshotFileEntry]) -> String {
@@ -557,7 +578,12 @@ fn validate_relative_display_path(path: &Path) -> SnapshotResult<String> {
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::Normal(part) => {
+                let component = part.to_str().ok_or_else(|| SnapshotError::InvalidPath {
+                    path: path.display().to_string(),
+                })?;
+                parts.push(component.to_owned());
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(SnapshotError::InvalidPath {
@@ -597,6 +623,8 @@ fn canonical_signed_message(manifest_sha256: &str, merkle_root: &str) -> Snapsho
 
 fn load_or_create_signing_key(key_path: &Path) -> SnapshotResult<SigningKey> {
     if key_path.exists() {
+        #[cfg(unix)]
+        ensure_unix_key_file_hygiene(key_path)?;
         let bytes = fs::read(key_path)?;
         if bytes.len() != 32 {
             return Err(SnapshotError::InvalidSigningKeyLength {
@@ -615,6 +643,24 @@ fn load_or_create_signing_key(key_path: &Path) -> SnapshotResult<SigningKey> {
     OsRng.fill_bytes(&mut secret);
     write_new_signing_key(key_path, &secret)?;
     Ok(SigningKey::from_bytes(&secret))
+}
+
+#[cfg(unix)]
+fn ensure_unix_key_file_hygiene(key_path: &Path) -> SnapshotResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::symlink_metadata(key_path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(SnapshotError::InsecureSigningKeyPermissions {
+            path: key_path.display().to_string(),
+        });
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(SnapshotError::InsecureSigningKeyPermissions {
+            path: key_path.display().to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -841,7 +887,8 @@ mod tests {
         let key_path = root.with_extension("key");
         write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
 
-        let mut signatures = read_signatures(&root.join("signatures.json")).expect("read signatures");
+        let mut signatures =
+            read_signatures(&root.join("signatures.json")).expect("read signatures");
         signatures.signature_algorithm = "rsa".to_owned();
         signatures.hash_algorithm = "sha1".to_owned();
         fs::write(
@@ -855,6 +902,41 @@ mod tests {
         assert!(
             rendered.contains("algorithm") || rendered.contains("signature"),
             "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn manifest_sections_use_lockfile_key() {
+        let root = temp_dir("snapshot-sections-lockfile");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        assert!(manifest.sections.contains_key("lockfile"));
+        assert!(!manifest.sections.contains_key("lock"));
+    }
+
+    #[test]
+    fn inventory_includes_empty_directories_and_verify_rejects_new_empty_directory() {
+        let root = temp_dir("snapshot-empty-dirs");
+        write_minimal_payload(&root);
+        fs::create_dir_all(root.join("workspace/empty")).unwrap();
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        assert!(manifest
+            .files
+            .iter()
+            .any(|entry| entry.path == "workspace/empty"
+                && entry.kind == SnapshotEntryKind::Directory));
+
+        fs::create_dir_all(root.join("workspace/new-empty")).unwrap();
+        let error = verify_snapshot_dir(&root).expect_err("extra empty directory must fail");
+        assert!(
+            error.to_string().contains("not listed in manifest"),
+            "unexpected error: {error}"
         );
     }
 
@@ -873,6 +955,50 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "key mode must not expose group/world bits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_dir("snapshot-non-utf8");
+        write_minimal_payload(&root);
+        let bad = OsString::from_vec(vec![b'b', b'a', b'd', 0x80]);
+        if fs::write(root.join(bad), "oops\n").is_err() {
+            return;
+        }
+
+        let error = build_inventory(&root).expect_err("non-utf8 path must fail");
+        assert!(
+            error.to_string().contains("invalid snapshot path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_insecure_signing_key_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("snapshot-key-insecure-existing");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        fs::write(&key_path, [0x11_u8; 32]).unwrap();
+
+        let mut permissions = fs::metadata(&key_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&key_path, permissions).unwrap();
+
+        let error = write_manifest_and_signature(&root, &key_path)
+            .expect_err("insecure existing key must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("insecure signing key permissions"),
+            "unexpected error: {error}"
+        );
     }
 
     fn write_minimal_payload(root: &Path) {
