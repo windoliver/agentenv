@@ -352,6 +352,18 @@ pub struct SnapshotEnvResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRestoreArgs {
+    pub snapshot: PathBuf,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRestoreResult {
+    pub name: String,
+    pub snapshot: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotVerifyResult {
     pub path: PathBuf,
     pub file_count: usize,
@@ -1586,6 +1598,61 @@ pub fn verify_snapshot(path: &Path) -> RuntimeResult<SnapshotVerifyResult> {
     })
 }
 
+pub async fn restore_snapshot_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    credentials: &mut dyn CredentialProvider,
+    args: SnapshotRestoreArgs,
+) -> RuntimeResult<SnapshotRestoreResult> {
+    let manifest = crate::snapshot::verify_snapshot_dir(&args.snapshot)?;
+    let name = args.name.unwrap_or_else(|| manifest.source_env.clone());
+    let env_name = crate::env::validate_env_name(&name)?;
+    check_snapshot_credentials(credentials, &manifest)?;
+
+    let lock_path = args.snapshot.join("lock.yaml");
+    let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| crate::env::EnvError::Io {
+        path: lock_path,
+        source,
+    })?;
+
+    reproduce_env(options, factory, credentials, env_name.as_str(), &lock_yaml).await?;
+
+    let description = describe_env(options, env_name.as_str())?;
+    let selection = selection_from_state(&description.state);
+    let handle = required_sandbox_handle(&description.state, env_name.as_str())?;
+    let events: Arc<dyn EventEmitter> = Arc::new(NoopEventEmitter);
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        env_name.as_str(),
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            env_name.as_str(),
+            Arc::clone(&events),
+        )?),
+    )?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+
+    copy_host_path_into_sandbox(
+        set.sandbox.as_ref(),
+        &handle,
+        &args.snapshot.join("workspace"),
+        "/sandbox",
+    )
+    .await?;
+
+    let home_path = args.snapshot.join("home");
+    if home_path.is_dir() {
+        let home = resolve_sandbox_home(set.sandbox.as_ref(), &handle).await?;
+        copy_host_path_into_sandbox(set.sandbox.as_ref(), &handle, &home_path, &home).await?;
+    }
+
+    Ok(SnapshotRestoreResult {
+        name: env_name.as_str().to_owned(),
+        snapshot: args.snapshot,
+    })
+}
+
 pub async fn reproduce_env(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
@@ -1739,6 +1806,37 @@ fn check_required_lockfile_credentials(
         }
 
         let reference = credential.reference.as_deref().unwrap_or(name);
+        match credential.source.as_str() {
+            "env" if std::env::var_os(reference).is_none() => {
+                return Err(RuntimeError::MissingCredential {
+                    name: reference.to_owned(),
+                });
+            }
+            "credstore" => match credentials.backend_name(reference)? {
+                Some(backend) if is_credstore_backend(&backend) => {}
+                _ => {
+                    return Err(RuntimeError::MissingCredential {
+                        name: reference.to_owned(),
+                    });
+                }
+            },
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn check_snapshot_credentials(
+    credentials: &mut dyn CredentialProvider,
+    manifest: &crate::snapshot::SnapshotManifest,
+) -> RuntimeResult<()> {
+    for credential in &manifest.credential_requirements {
+        if credential.required == Some(false) {
+            continue;
+        }
+
+        let reference = credential.reference.as_deref().unwrap_or(&credential.name);
         match credential.source.as_str() {
             "env" if std::env::var_os(reference).is_none() => {
                 return Err(RuntimeError::MissingCredential {
@@ -2957,6 +3055,22 @@ async fn copy_sandbox_path_out(
     Ok(())
 }
 
+async fn copy_host_path_into_sandbox(
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+    src_host_path: &Path,
+    dst_sandbox_path: &str,
+) -> RuntimeResult<()> {
+    sandbox
+        .copy_in(agentenv_proto::CopyInParams {
+            handle: handle.to_owned(),
+            src_host_path: src_host_path.display().to_string(),
+            dst_sandbox_path: dst_sandbox_path.to_owned(),
+        })
+        .await?;
+    Ok(())
+}
+
 async fn resolve_sandbox_home(sandbox: &dyn SandboxDriver, handle: &str) -> RuntimeResult<String> {
     let command = r#"printf %s "$HOME""#;
     let result = sandbox
@@ -4134,6 +4248,45 @@ policy:
             &env_dir,
             state_fixture(name).with_sandbox_handle("sb-snapshot"),
         );
+    }
+
+    fn write_signed_snapshot_fixture(
+        root: &std::path::Path,
+        source_env: &str,
+        credential_requirements: Vec<crate::snapshot::SnapshotCredentialRequirement>,
+    ) -> std::path::PathBuf {
+        let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
+        fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+        fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+        fs::write(
+            snapshot_dir.join("blueprint.yaml"),
+            snapshot_blueprint_yaml(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("lock.yaml"),
+            snapshot_lockfile_yaml(root, source_env, snapshot_blueprint_yaml()),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("policy.yaml"),
+            serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+        )
+        .unwrap();
+        let manifest = crate::snapshot::manifest_for_snapshot_dir(
+            &snapshot_dir,
+            source_env,
+            credential_requirements,
+            Vec::new(),
+        )
+        .expect("manifest");
+        crate::snapshot::write_signed_manifest(
+            &snapshot_dir,
+            &root.join("snapshot-signing.key"),
+            &manifest,
+        )
+        .expect("write signed manifest");
+        snapshot_dir
     }
 
     #[test]
@@ -7248,6 +7401,88 @@ policy:
         assert_eq!(result.path, snapshot_dir);
         assert_eq!(result.file_count, manifest.files.len());
         assert_eq!(result.merkle_root, manifest.merkle_root);
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_refuses_missing_credentials_before_create() {
+        let root = unique_root("agentenv-runtime-restore-missing-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let previous_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("restore must fail before creating env");
+
+        if let Some(value) = previous_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        }
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+        assert!(
+            !root.join("envs").join("restored").exists(),
+            "credential failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_reproduces_then_copies_workspace() {
+        let root = unique_root("agentenv-runtime-restore-workspace");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let snapshot_dir = write_signed_snapshot_fixture(&root, "demo", Vec::new());
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore snapshot");
+
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+        let copied_in = factory.copied_in.lock().expect("copy in tracker").clone();
+        assert!(copied_in.iter().any(|(src, dst)| {
+            std::path::Path::new(src).ends_with("workspace") && dst == "/sandbox"
+        }));
     }
 
     #[tokio::test]
