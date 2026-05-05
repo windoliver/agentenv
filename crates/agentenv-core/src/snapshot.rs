@@ -175,6 +175,17 @@ struct Inventory {
 /// This helper always uses `source_env = "test-env"`. Production flows should
 /// construct a complete [`SnapshotManifest`] and call [`write_signed_manifest`].
 pub fn write_manifest_and_signature(snapshot_dir: &Path, key_path: &Path) -> SnapshotResult<()> {
+    let manifest = manifest_for_snapshot_dir(snapshot_dir, "test-env", Vec::new(), Vec::new())?;
+
+    write_signed_manifest(snapshot_dir, key_path, &manifest)
+}
+
+pub fn manifest_for_snapshot_dir(
+    snapshot_dir: &Path,
+    source_env: &str,
+    credential_requirements: Vec<SnapshotCredentialRequirement>,
+    stripped: Vec<SnapshotStrippedEntry>,
+) -> SnapshotResult<SnapshotManifest> {
     let workspace = snapshot_dir.join("workspace");
     if !workspace.is_dir() {
         return Err(SnapshotError::MissingWorkspace {
@@ -183,21 +194,19 @@ pub fn write_manifest_and_signature(snapshot_dir: &Path, key_path: &Path) -> Sna
     }
 
     let inventory = build_inventory(snapshot_dir)?;
-    let manifest = SnapshotManifest {
+    Ok(SnapshotManifest {
         version: SNAPSHOT_VERSION.to_owned(),
         agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
-        source_env: "test-env".to_owned(),
-        created_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+        source_env: source_env.to_owned(),
+        created_at: snapshot_timestamp()?,
         min_agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
         driver_protocol_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
         sections: inventory.sections,
         files: inventory.files,
-        credential_requirements: Vec::new(),
-        stripped: Vec::new(),
+        credential_requirements,
+        stripped,
         merkle_root: inventory.merkle_root,
-    };
-
-    write_signed_manifest(snapshot_dir, key_path, &manifest)
+    })
 }
 
 pub fn write_signed_manifest(
@@ -693,6 +702,10 @@ fn compute_merkle_root(files: &[SnapshotFileEntry]) -> String {
         hasher.update([0_u8]);
     }
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn snapshot_timestamp() -> SnapshotResult<String> {
+    Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
 
 fn read_dir_sorted(path: &Path) -> SnapshotResult<Vec<fs::DirEntry>> {
