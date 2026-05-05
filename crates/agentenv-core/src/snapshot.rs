@@ -10,7 +10,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SNAPSHOT_VERSION: &str = "0.1.0";
 
@@ -64,6 +64,8 @@ pub enum SnapshotError {
     UnsupportedHashAlgorithm { algorithm: String },
     #[error("insecure signing key permissions at `{path}`")]
     InsecureSigningKeyPermissions { path: String },
+    #[error("snapshot time formatting error: {0}")]
+    TimeFormat(#[from] time::error::Format),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +91,7 @@ impl SnapshotEntryKind {
 pub struct SnapshotFileEntry {
     pub path: String,
     pub kind: SnapshotEntryKind,
+    pub mode: SnapshotEntryKind,
     pub sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
@@ -175,7 +178,7 @@ pub fn write_manifest_and_signature(snapshot_dir: &Path, key_path: &Path) -> Sna
         version: SNAPSHOT_VERSION.to_owned(),
         agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
         source_env: "test-env".to_owned(),
-        created_at: OffsetDateTime::now_utc().unix_timestamp().to_string(),
+        created_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
         min_agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
         driver_protocol_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
         sections: inventory.sections,
@@ -260,6 +263,15 @@ pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManife
 
     let inventory = build_inventory(snapshot_dir)?;
     let inventory_merkle_root = inventory.merkle_root.clone();
+    if !inventory
+        .files
+        .iter()
+        .any(|entry| entry.path == "workspace" && entry.kind == SnapshotEntryKind::Directory)
+    {
+        return Err(SnapshotError::MissingWorkspace {
+            path: "workspace".to_owned(),
+        });
+    }
     ensure_manifest_files_match(&manifest.files, &inventory.files)?;
 
     if manifest.merkle_root != inventory_merkle_root {
@@ -346,6 +358,7 @@ fn walk_payload(
             files.push(SnapshotFileEntry {
                 path: relative_display.clone(),
                 kind: SnapshotEntryKind::Directory,
+                mode: SnapshotEntryKind::Directory,
                 sha256: digest.clone(),
                 size: None,
             });
@@ -359,6 +372,7 @@ fn walk_payload(
             files.push(SnapshotFileEntry {
                 path: relative_display.clone(),
                 kind: SnapshotEntryKind::File,
+                mode: SnapshotEntryKind::File,
                 sha256: digest.clone(),
                 size: Some(bytes.len() as u64),
             });
@@ -373,6 +387,7 @@ fn walk_payload(
             files.push(SnapshotFileEntry {
                 path: relative_display.clone(),
                 kind: SnapshotEntryKind::Symlink,
+                mode: SnapshotEntryKind::Symlink,
                 sha256: digest.clone(),
                 size: None,
             });
@@ -527,6 +542,11 @@ fn ensure_manifest_files_match(
                 path: entry.path.clone(),
                 expected: entry.kind.as_str().to_owned(),
                 actual: actual.kind.as_str().to_owned(),
+            });
+        }
+        if entry.mode != actual.mode {
+            return Err(SnapshotError::ManifestFileEntryMismatch {
+                path: entry.path.clone(),
             });
         }
         if entry.sha256 != actual.sha256 {
@@ -918,6 +938,26 @@ mod tests {
     }
 
     #[test]
+    fn written_manifest_entries_include_mode_field() {
+        let root = temp_dir("snapshot-mode-field");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let raw = fs::read_to_string(root.join("manifest.json")).expect("read manifest json");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
+        let files = json
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .expect("files array");
+        assert!(!files.is_empty());
+        assert!(files.iter().all(|entry| entry.get("mode").is_some()));
+
+        let manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        assert!(manifest.files.iter().all(|entry| entry.kind == entry.mode));
+    }
+
+    #[test]
     fn inventory_includes_empty_directories_and_verify_rejects_new_empty_directory() {
         let root = temp_dir("snapshot-empty-dirs");
         write_minimal_payload(&root);
@@ -938,6 +978,74 @@ mod tests {
             error.to_string().contains("not listed in manifest"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn verify_rejects_manifest_mode_mismatch() {
+        let root = temp_dir("snapshot-mode-mismatch");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mut manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        let entry = manifest
+            .files
+            .iter_mut()
+            .find(|entry| entry.path == "workspace/README.md")
+            .expect("workspace file");
+        entry.mode = SnapshotEntryKind::Directory;
+        write_signed_manifest(&root, &key_path, &manifest).expect("rewrite signed snapshot");
+
+        let error = verify_snapshot_dir(&root).expect_err("mode mismatch must fail");
+        assert!(
+            error.to_string().contains("manifest file entry mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_missing_workspace_payload() {
+        let root = temp_dir("snapshot-missing-workspace");
+        fs::write(root.join("blueprint.yaml"), "version: 0.1.0\n").unwrap();
+        fs::write(root.join("lock.yaml"), "version: 0.2.0\n").unwrap();
+        fs::write(root.join("policy.yaml"), "network: {}\n").unwrap();
+        let key_path = root.with_extension("key");
+
+        let inventory = build_inventory(&root).expect("inventory");
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_VERSION.to_owned(),
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            source_env: "test-env".to_owned(),
+            created_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .expect("format timestamp"),
+            min_agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            driver_protocol_version: agentenv_proto::SCHEMA_VERSION.to_owned(),
+            sections: inventory.sections,
+            files: inventory.files,
+            credential_requirements: Vec::new(),
+            stripped: Vec::new(),
+            merkle_root: inventory.merkle_root,
+        };
+        write_signed_manifest(&root, &key_path, &manifest).expect("write signed snapshot");
+
+        let error = verify_snapshot_dir(&root).expect_err("missing workspace must fail");
+        assert!(
+            error.to_string().contains("missing required workspace"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn helper_created_at_is_rfc3339_utc_shape() {
+        let root = temp_dir("snapshot-created-at");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        assert!(manifest.created_at.contains('T'));
+        assert!(manifest.created_at.ends_with('Z'));
     }
 
     #[cfg(unix)]
