@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -13,6 +13,8 @@ use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SNAPSHOT_VERSION: &str = "0.1.0";
+const SECRET_SCAN_CHUNK_BYTES: usize = 8 * 1024;
+const SECRET_SCAN_TAIL_BYTES: usize = 4 * 1024;
 
 pub type SnapshotResult<T> = Result<T, SnapshotError>;
 
@@ -395,12 +397,8 @@ fn redact_structured_files(root: &Path) -> SnapshotResult<()> {
 fn scan_for_remaining_secrets(root: &Path) -> SnapshotResult<()> {
     let mut findings = Vec::new();
     for path in payload_files(root, root)? {
-        let bytes = fs::read(&path)?;
-        let Some(content) = String::from_utf8(bytes).ok() else {
-            continue;
-        };
         let relative = relative_path(root, &path)?;
-        for pattern_class in detect_secret_pattern_classes(&content) {
+        for pattern_class in scan_file_for_secret_pattern_classes(&path)? {
             findings.push(format!("{relative}:{pattern_class}"));
         }
     }
@@ -808,7 +806,9 @@ fn structured_file_format(path: &Path) -> Option<StructuredFileFormat> {
 
 fn redact_json_file(path: &Path) -> SnapshotResult<()> {
     let content = fs::read(path)?;
-    let mut value: serde_json::Value = serde_json::from_slice(&content)?;
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&content) else {
+        return Ok(());
+    };
 
     if redact_json_value(&mut value) {
         fs::write(path, serde_json::to_vec_pretty(&value)?)?;
@@ -847,7 +847,9 @@ fn redact_json_value(value: &mut serde_json::Value) -> bool {
 
 fn redact_yaml_file(path: &Path) -> SnapshotResult<()> {
     let content = fs::read(path)?;
-    let mut value: serde_yaml::Value = serde_yaml::from_slice(&content)?;
+    let Ok(mut value) = serde_yaml::from_slice::<serde_yaml::Value>(&content) else {
+        return Ok(());
+    };
 
     if redact_yaml_value(&mut value) {
         fs::write(path, serde_yaml::to_string(&value)?)?;
@@ -958,6 +960,33 @@ fn detect_secret_pattern_classes(content: &str) -> Vec<&'static str> {
     }
 
     classes.into_iter().collect()
+}
+
+fn scan_file_for_secret_pattern_classes(path: &Path) -> SnapshotResult<Vec<&'static str>> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; SECRET_SCAN_CHUNK_BYTES];
+    let mut tail = Vec::new();
+    let mut classes = BTreeSet::new();
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        let mut window = Vec::with_capacity(tail.len() + read);
+        window.extend_from_slice(&tail);
+        window.extend_from_slice(&buffer[..read]);
+
+        let text = String::from_utf8_lossy(&window);
+        classes.extend(detect_secret_pattern_classes(&text));
+
+        let tail_start = window.len().saturating_sub(SECRET_SCAN_TAIL_BYTES);
+        tail.clear();
+        tail.extend_from_slice(&window[tail_start..]);
+    }
+
+    Ok(classes.into_iter().collect())
 }
 
 fn is_secret_token_character(character: char) -> bool {
@@ -1517,8 +1546,24 @@ mod tests {
     fn sanitizer_fails_closed_when_secret_pattern_remains() {
         let root = temp_dir("snapshot-sanitize-fails-closed");
         fs::create_dir_all(root.join("workspace")).unwrap();
-        let secret = "github_pat_11ABCDEFGSECRETSECRETSECRETSECRETSECRET";
-        fs::write(root.join("workspace/leak.txt"), format!("token={secret}\n")).unwrap();
+        let openai_secret = "sk-testABCDEFGHIJKLMNOP";
+        let ghp_secret = "ghp_ABCDEFGHIJKLMNOP";
+        let github_pat_secret = "github_pat_11ABCDEFGSECRETSECRETSECRETSECRETSECRET";
+        fs::write(
+            root.join("workspace/openai.txt"),
+            format!("token={openai_secret}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("workspace/ghp.txt"),
+            format!("token={ghp_secret}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("workspace/github-pat.txt"),
+            format!("token={github_pat_secret}\n"),
+        )
+        .unwrap();
         fs::write(
             root.join("workspace/aws.txt"),
             "aws_access_key_id = AKIAABCDEFGHIJKLMNOP\n",
@@ -1527,17 +1572,69 @@ mod tests {
 
         let error = sanitize_snapshot_tree(&root).expect_err("leaks must fail");
         let rendered = error.to_string();
-        assert!(rendered.contains("workspace/leak.txt"));
+        assert!(rendered.contains("workspace/openai.txt"));
+        assert!(rendered.contains("openai_token"));
+        assert!(rendered.contains("workspace/ghp.txt"));
         assert!(rendered.contains("github_token"));
+        assert!(rendered.contains("workspace/github-pat.txt"));
         assert!(rendered.contains("workspace/aws.txt"));
         assert!(rendered.contains("aws_access_key_id"));
         assert!(
-            !rendered.contains(secret),
+            !rendered.contains(openai_secret),
+            "error leaked injected secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(ghp_secret),
+            "error leaked injected secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains(github_pat_secret),
             "error leaked injected secret: {rendered}"
         );
         assert!(
             !rendered.contains("AKIAABCDEFGHIJKLMNOP"),
             "error leaked AWS fixture: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_ignores_malformed_structured_files_with_safe_text() {
+        let root = temp_dir("snapshot-sanitize-malformed-safe");
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        fs::write(root.join("workspace/bad.json"), "{ not valid json: safe\n").unwrap();
+        fs::write(root.join("workspace/bad.yaml"), "safe: [not valid yaml\n").unwrap();
+
+        let report = sanitize_snapshot_tree(&root).expect("safe malformed files should sanitize");
+        assert!(report.stripped.is_empty());
+        assert_eq!(
+            fs::read_to_string(root.join("workspace/bad.json")).unwrap(),
+            "{ not valid json: safe\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("workspace/bad.yaml")).unwrap(),
+            "safe: [not valid yaml\n"
+        );
+    }
+
+    #[test]
+    fn sanitizer_scans_malformed_structured_files_for_deny_patterns() {
+        let root = temp_dir("snapshot-sanitize-malformed-leak");
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        let secret = "sk-testMALFORMEDSECRET";
+        fs::write(
+            root.join("workspace/bad.json"),
+            format!("{{ token: {secret}\n"),
+        )
+        .unwrap();
+        fs::write(root.join("workspace/bad.yaml"), "safe: [not valid yaml\n").unwrap();
+
+        let error = sanitize_snapshot_tree(&root).expect_err("malformed leaked secret must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("workspace/bad.json"));
+        assert!(rendered.contains("openai_token"));
+        assert!(
+            !rendered.contains(secret),
+            "error leaked secret: {rendered}"
         );
     }
 
