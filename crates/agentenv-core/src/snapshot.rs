@@ -66,6 +66,8 @@ pub enum SnapshotError {
     InsecureSigningKeyPermissions { path: String },
     #[error("snapshot time formatting error: {0}")]
     TimeFormat(#[from] time::error::Format),
+    #[error("secret patterns detected after snapshot sanitization: {findings}")]
+    SecretPatternDetected { findings: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +124,11 @@ pub struct SnapshotCredentialRequirement {
 pub struct SnapshotStrippedEntry {
     pub path: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizerReport {
+    pub stripped: Vec<SnapshotStrippedEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +311,23 @@ pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManife
     Ok(manifest)
 }
 
+pub fn sanitize_snapshot_tree(root: &Path) -> SnapshotResult<SanitizerReport> {
+    let mut report = SanitizerReport {
+        stripped: Vec::new(),
+    };
+
+    strip_credential_paths(root, root, &mut report)?;
+    redact_structured_files(root)?;
+    scan_for_remaining_secrets(root)?;
+
+    report.stripped.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.reason.cmp(&right.reason))
+    });
+    Ok(report)
+}
+
 pub fn read_signatures(path: &Path) -> SnapshotResult<SnapshotSignatures> {
     let content = fs::read(path)?;
     let signatures: SnapshotSignatures = serde_json::from_slice(&content)?;
@@ -325,20 +349,101 @@ fn build_inventory(root: &Path) -> SnapshotResult<Inventory> {
     })
 }
 
+fn strip_credential_paths(
+    root: &Path,
+    current: &Path,
+    report: &mut SanitizerReport,
+) -> SnapshotResult<()> {
+    for entry in read_dir_sorted(current)? {
+        let path = entry.path();
+        let relative = relative_path(root, &path)?;
+        if is_credential_path(Path::new(&relative)) {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+            report.stripped.push(SnapshotStrippedEntry {
+                path: relative,
+                reason: "credential_path".to_owned(),
+            });
+            continue;
+        }
+
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
+            strip_credential_paths(root, &path, report)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn redact_structured_files(root: &Path) -> SnapshotResult<()> {
+    for path in payload_files(root, root)? {
+        match structured_file_format(&path) {
+            Some(StructuredFileFormat::Json) => redact_json_file(&path)?,
+            Some(StructuredFileFormat::Yaml) => redact_yaml_file(&path)?,
+            None => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn scan_for_remaining_secrets(root: &Path) -> SnapshotResult<()> {
+    let mut findings = Vec::new();
+    for path in payload_files(root, root)? {
+        let bytes = fs::read(&path)?;
+        let Some(content) = String::from_utf8(bytes).ok() else {
+            continue;
+        };
+        let relative = relative_path(root, &path)?;
+        for pattern_class in detect_secret_pattern_classes(&content) {
+            findings.push(format!("{relative}:{pattern_class}"));
+        }
+    }
+
+    findings.sort();
+    findings.dedup();
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    Err(SnapshotError::SecretPatternDetected {
+        findings: findings.join(", "),
+    })
+}
+
+fn payload_files(root: &Path, current: &Path) -> SnapshotResult<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    for entry in read_dir_sorted(current)? {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
+            files.extend(payload_files(root, &path)?);
+            continue;
+        }
+
+        if metadata.file_type().is_file() {
+            let relative = relative_path(root, &path)?;
+            if relative != "manifest.json" && relative != "signatures.json" {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
 fn walk_payload(
     root: &Path,
     current: &Path,
     files: &mut Vec<SnapshotFileEntry>,
 ) -> SnapshotResult<String> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(current)? {
-        entries.push(entry?);
-    }
-
-    entries.sort_by_key(|left| left.file_name());
     let mut digest_parts = Vec::new();
 
-    for entry in entries {
+    for entry in read_dir_sorted(current)? {
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         let relative = path
@@ -592,6 +697,24 @@ fn compute_merkle_root(files: &[SnapshotFileEntry]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+fn read_dir_sorted(path: &Path) -> SnapshotResult<Vec<fs::DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(path)? {
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn relative_path(root: &Path, path: &Path) -> SnapshotResult<String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| SnapshotError::InvalidPath {
+            path: path.display().to_string(),
+        })?;
+    validate_relative_display_path(relative)
+}
+
 fn validate_relative_display_path(path: &Path) -> SnapshotResult<String> {
     use std::path::Component;
 
@@ -620,6 +743,263 @@ fn validate_relative_display_path(path: &Path) -> SnapshotResult<String> {
     }
 
     Ok(parts.join("/"))
+}
+
+fn is_credential_path(path: &Path) -> bool {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+
+    let Some(basename) = components.last() else {
+        return false;
+    };
+
+    if basename.starts_with("credentials") {
+        return true;
+    }
+
+    if components
+        .windows(3)
+        .any(|window| window[0] == ".config" && window[1] == "gh" && window[2] == "hosts.yml")
+    {
+        return true;
+    }
+
+    let credential_dirs = [".agentenv", ".codex", ".claude", ".openclaw"];
+    for (index, component) in components.iter().enumerate() {
+        if credential_dirs.contains(&component.as_str())
+            && components
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with("credentials"))
+        {
+            return true;
+        }
+
+        if component == ".aws"
+            && components
+                .iter()
+                .skip(index + 1)
+                .any(|part| part.contains("credentials"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredFileFormat {
+    Json,
+    Yaml,
+}
+
+fn structured_file_format(path: &Path) -> Option<StructuredFileFormat> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("json") => Some(StructuredFileFormat::Json),
+        Some("yaml" | "yml") => Some(StructuredFileFormat::Yaml),
+        _ => None,
+    }
+}
+
+fn redact_json_file(path: &Path) -> SnapshotResult<()> {
+    let content = fs::read(path)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&content)?;
+
+    if redact_json_value(&mut value) {
+        fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+    }
+    Ok(())
+}
+
+fn redact_json_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for (key, child) in map {
+                if is_secret_like_key(key) {
+                    if *child != serde_json::Value::String("[redacted]".to_owned()) {
+                        *child = serde_json::Value::String("[redacted]".to_owned());
+                        changed = true;
+                    }
+                } else if redact_json_value(child) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                if redact_json_value(item) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn redact_yaml_file(path: &Path) -> SnapshotResult<()> {
+    let content = fs::read(path)?;
+    let mut value: serde_yaml::Value = serde_yaml::from_slice(&content)?;
+
+    if redact_yaml_value(&mut value) {
+        fs::write(path, serde_yaml::to_string(&value)?)?;
+    }
+    Ok(())
+}
+
+fn redact_yaml_value(value: &mut serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            let mut changed = false;
+            for (key, child) in map {
+                if yaml_key_is_secret_like(key) {
+                    if *child != serde_yaml::Value::String("[redacted]".to_owned()) {
+                        *child = serde_yaml::Value::String("[redacted]".to_owned());
+                        changed = true;
+                    }
+                } else if redact_yaml_value(child) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        serde_yaml::Value::Sequence(items) => {
+            let mut changed = false;
+            for item in items {
+                if redact_yaml_value(item) {
+                    changed = true;
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn yaml_key_is_secret_like(key: &serde_yaml::Value) -> bool {
+    match key {
+        serde_yaml::Value::String(key) => is_secret_like_key(key),
+        _ => false,
+    }
+}
+
+fn is_secret_like_key(key: &str) -> bool {
+    let normalized = normalize_secret_key(key);
+    let secret_markers = [
+        "token",
+        "secret",
+        "password",
+        "apikey",
+        "authorization",
+        "credential",
+    ];
+    let secret_like = secret_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let provider_secret_like = (normalized.contains("mcp") || normalized.contains("nexus"))
+        && (secret_like || normalized.contains("key"));
+
+    secret_like || provider_secret_like
+}
+
+fn normalize_secret_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn detect_secret_pattern_classes(content: &str) -> Vec<&'static str> {
+    let mut classes = BTreeSet::new();
+    for token in content.split(|character: char| !is_secret_token_character(character)) {
+        if token.starts_with("sk-ant-") {
+            classes.insert("anthropic_token");
+        } else if token.starts_with("sk-") {
+            classes.insert("openai_token");
+        }
+
+        if token.starts_with("ghp_")
+            || token.starts_with("gho_")
+            || token.starts_with("ghu_")
+            || token.starts_with("ghs_")
+            || token.starts_with("ghr_")
+            || token.starts_with("github_pat_")
+        {
+            classes.insert("github_token");
+        }
+
+        if token.starts_with("AKIA") || token.starts_with("ASIA") {
+            classes.insert("aws_access_key_id");
+        }
+
+        if token.starts_with("xoxb-") || token.starts_with("xoxp-") || token.starts_with("xapp-") {
+            classes.insert("slack_token");
+        }
+    }
+
+    for line in content.lines() {
+        if key_value_line_has_non_empty_secret(line, &["webhook"]) {
+            classes.insert("webhook_secret");
+        }
+        if key_value_line_has_non_empty_secret(line, &["mcp"]) {
+            classes.insert("mcp_token");
+        }
+        if key_value_line_has_non_empty_secret(line, &["nexus"]) {
+            classes.insert("nexus_token");
+        }
+    }
+
+    classes.into_iter().collect()
+}
+
+fn is_secret_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+}
+
+fn key_value_line_has_non_empty_secret(line: &str, required_key_markers: &[&str]) -> bool {
+    let Some((raw_key, raw_value)) = split_key_value(line) else {
+        return false;
+    };
+
+    let key = normalize_secret_key(raw_key);
+    let value = raw_value
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    if value.is_empty() || value == "[redacted]" {
+        return false;
+    }
+
+    required_key_markers
+        .iter()
+        .all(|marker| key.contains(marker))
+        && (key.contains("token")
+            || key.contains("secret")
+            || key.contains("password")
+            || key.contains("apikey")
+            || key.contains("authorization")
+            || key.contains("credential")
+            || key.contains("key"))
+}
+
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    for delimiter in ['=', ':'] {
+        if let Some((key, value)) = line.split_once(delimiter) {
+            return Some((key, value));
+        }
+    }
+
+    None
 }
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
@@ -1033,6 +1413,131 @@ mod tests {
         assert!(
             error.to_string().contains("missing required workspace"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_removes_known_credential_paths() {
+        let root = temp_dir("snapshot-sanitize-paths");
+        fs::create_dir_all(root.join("home/.agentenv/credentials.d")).unwrap();
+        fs::create_dir_all(root.join("home/.codex")).unwrap();
+        fs::create_dir_all(root.join("home/.claude")).unwrap();
+        fs::create_dir_all(root.join("home/.openclaw")).unwrap();
+        fs::create_dir_all(root.join("home/.config/gh")).unwrap();
+        fs::create_dir_all(root.join("home/.aws/profile")).unwrap();
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        fs::write(root.join("home/.agentenv/credentials.d/token"), "secret").unwrap();
+        fs::write(root.join("home/.codex/credentials.json"), "secret").unwrap();
+        fs::write(root.join("home/.claude/credentials.yml"), "secret").unwrap();
+        fs::write(root.join("home/.openclaw/credentials"), "secret").unwrap();
+        fs::write(root.join("home/.config/gh/hosts.yml"), "secret").unwrap();
+        fs::write(root.join("home/.aws/profile/credentials.backup"), "secret").unwrap();
+        fs::write(root.join("workspace/credentials.local"), "secret").unwrap();
+        fs::write(root.join("workspace/keep.txt"), "safe").unwrap();
+
+        let report = sanitize_snapshot_tree(&root).expect("sanitize tree");
+        let mut stripped_paths: Vec<_> = report
+            .stripped
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.reason.as_str()))
+            .collect();
+        stripped_paths.sort_unstable();
+
+        assert_eq!(
+            stripped_paths,
+            vec![
+                ("home/.agentenv/credentials.d", "credential_path"),
+                ("home/.aws/profile/credentials.backup", "credential_path"),
+                ("home/.claude/credentials.yml", "credential_path"),
+                ("home/.codex/credentials.json", "credential_path"),
+                ("home/.config/gh/hosts.yml", "credential_path"),
+                ("home/.openclaw/credentials", "credential_path"),
+                ("workspace/credentials.local", "credential_path"),
+            ]
+        );
+        assert!(!root.join("home/.agentenv/credentials.d").exists());
+        assert!(!root.join("home/.codex/credentials.json").exists());
+        assert!(!root.join("home/.config/gh/hosts.yml").exists());
+        assert!(!root.join("home/.aws/profile/credentials.backup").exists());
+        assert!(!root.join("workspace/credentials.local").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("workspace/keep.txt")).unwrap(),
+            "safe"
+        );
+    }
+
+    #[test]
+    fn sanitizer_redacts_structured_json_and_yaml_secrets() {
+        let root = temp_dir("snapshot-sanitize-redact");
+        fs::create_dir_all(root.join("workspace/config")).unwrap();
+        fs::write(
+            root.join("workspace/config/settings.json"),
+            r#"{
+  "token": "sk-test-redact-json",
+  "nested": {
+    "mcp_token": "mcp-secret",
+    "safe": "keep"
+  },
+  "items": [
+    {"nexus_api_key": "nexus-secret"}
+  ]
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("workspace/config/settings.yaml"),
+            "service:\n  password: yaml-secret\n  authorization: bearer-secret\n  nested:\n    - credential: nested-secret\n    - name: safe\n",
+        )
+        .unwrap();
+
+        let report = sanitize_snapshot_tree(&root).expect("sanitize tree");
+        assert!(report.stripped.is_empty());
+
+        let json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("workspace/config/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["token"], "[redacted]");
+        assert_eq!(json["nested"]["mcp_token"], "[redacted]");
+        assert_eq!(json["nested"]["safe"], "keep");
+        assert_eq!(json["items"][0]["nexus_api_key"], "[redacted]");
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            &fs::read_to_string(root.join("workspace/config/settings.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(yaml["service"]["password"], "[redacted]");
+        assert_eq!(yaml["service"]["authorization"], "[redacted]");
+        assert_eq!(yaml["service"]["nested"][0]["credential"], "[redacted]");
+        assert_eq!(yaml["service"]["nested"][1]["name"], "safe");
+    }
+
+    #[test]
+    fn sanitizer_fails_closed_when_secret_pattern_remains() {
+        let root = temp_dir("snapshot-sanitize-fails-closed");
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        let secret = "github_pat_11ABCDEFGSECRETSECRETSECRETSECRETSECRET";
+        fs::write(root.join("workspace/leak.txt"), format!("token={secret}\n")).unwrap();
+        fs::write(
+            root.join("workspace/aws.txt"),
+            "aws_access_key_id = AKIAABCDEFGHIJKLMNOP\n",
+        )
+        .unwrap();
+
+        let error = sanitize_snapshot_tree(&root).expect_err("leaks must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("workspace/leak.txt"));
+        assert!(rendered.contains("github_token"));
+        assert!(rendered.contains("workspace/aws.txt"));
+        assert!(rendered.contains("aws_access_key_id"));
+        assert!(
+            !rendered.contains(secret),
+            "error leaked injected secret: {rendered}"
+        );
+        assert!(
+            !rendered.contains("AKIAABCDEFGHIJKLMNOP"),
+            "error leaked AWS fixture: {rendered}"
         );
     }
 
