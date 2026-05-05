@@ -1494,7 +1494,17 @@ pub async fn snapshot_env(
 
     let selection = selection_from_state(&description.state);
     let handle = required_sandbox_handle(&description.state, env_name.as_str())?;
-    let mut set = factory.build(&selection)?;
+    let events: Arc<dyn EventEmitter> = Arc::new(NoopEventEmitter);
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        env_name.as_str(),
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            env_name.as_str(),
+            Arc::clone(&events),
+        )?),
+    )?;
     initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
 
     let staging_dir = create_temp_snapshot_dir(&options.root, env_name.as_str());
@@ -1558,14 +1568,7 @@ pub async fn snapshot_env(
         }
     };
 
-    if let Err(source) = fs::rename(&staging_dir, &args.output) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(crate::env::EnvError::Io {
-            path: args.output.clone(),
-            source,
-        }
-        .into());
-    }
+    finalize_snapshot_dir_no_clobber(&staging_dir, &args.output)?;
 
     Ok(SnapshotEnvResult {
         path: args.output,
@@ -2955,19 +2958,16 @@ async fn copy_sandbox_path_out(
 }
 
 async fn resolve_sandbox_home(sandbox: &dyn SandboxDriver, handle: &str) -> RuntimeResult<String> {
+    let command = r#"printf %s "$HOME""#;
     let result = sandbox
         .exec(agentenv_proto::ExecParams {
             handle: handle.to_owned(),
-            cmd: r#"printf %s "$HOME""#.to_owned(),
+            cmd: command.to_owned(),
             tty: false,
             env: BTreeMap::new(),
         })
         .await?;
-    if result.status != 0 {
-        return Err(RuntimeError::CommandStatus {
-            status: result.status,
-        });
-    }
+    ensure_command_success(command, &result, &[0])?;
 
     let home = result.stdout.trim().to_owned();
     if home.is_empty() {
@@ -3029,9 +3029,7 @@ fn portable_snapshot_lockfile(
 
 fn reject_existing_snapshot_output(output: &Path) -> RuntimeResult<()> {
     match fs::symlink_metadata(output) {
-        Ok(_) => Err(RuntimeError::Driver(DriverError::InvalidInput {
-            message: format!("snapshot output `{}` already exists", output.display()),
-        })),
+        Ok(_) => Err(snapshot_output_exists_error(output)),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(crate::env::EnvError::Io {
             path: output.to_path_buf(),
@@ -3039,6 +3037,64 @@ fn reject_existing_snapshot_output(output: &Path) -> RuntimeResult<()> {
         }
         .into()),
     }
+}
+
+fn finalize_snapshot_dir_no_clobber(staging_dir: &Path, output: &Path) -> RuntimeResult<()> {
+    match fs::create_dir(output) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(snapshot_output_exists_error(output));
+        }
+        Err(source) => {
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(crate::env::EnvError::Io {
+                path: output.to_path_buf(),
+                source,
+            }
+            .into());
+        }
+    }
+
+    let result = move_snapshot_entries(staging_dir, output);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_dir_all(output);
+            let _ = fs::remove_dir_all(staging_dir);
+            Err(error)
+        }
+    }
+}
+
+fn move_snapshot_entries(staging_dir: &Path, output: &Path) -> RuntimeResult<()> {
+    let entries = fs::read_dir(staging_dir).map_err(|source| crate::env::EnvError::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| crate::env::EnvError::Io {
+            path: staging_dir.to_path_buf(),
+            source,
+        })?;
+        let file_name = entry.file_name();
+        let destination = output.join(file_name);
+        fs::rename(entry.path(), &destination).map_err(|source| crate::env::EnvError::Io {
+            path: destination,
+            source,
+        })?;
+    }
+    fs::remove_dir(staging_dir).map_err(|source| crate::env::EnvError::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn snapshot_output_exists_error(output: &Path) -> RuntimeError {
+    RuntimeError::Driver(DriverError::InvalidInput {
+        message: format!("snapshot output `{}` already exists", output.display()),
+    })
 }
 
 fn write_snapshot_registry_files(
@@ -4010,6 +4066,46 @@ policy:
 "#
     }
 
+    fn snapshot_persist_home_blueprint_yaml() -> &'static str {
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+state:
+  persist_home: true
+"#
+    }
+
+    fn snapshot_credential_blueprint_yaml() -> &'static str {
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#
+    }
+
     fn snapshot_lockfile_yaml(root: &std::path::Path, name: &str, blueprint_yaml: &str) -> String {
         let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
         discovery_config.installed_root = root.join("drivers");
@@ -4025,6 +4121,19 @@ policy:
         )
         .expect("build portable lockfile");
         lockfile.to_yaml_deterministic().expect("render lockfile")
+    }
+
+    fn write_snapshot_env_fixture(root: &std::path::Path, name: &str, blueprint_yaml: &str) {
+        let env_dir = root.join("envs").join(name);
+        let lock_yaml = snapshot_lockfile_yaml(root, name, blueprint_yaml);
+        fs::create_dir_all(&env_dir).unwrap();
+        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+        fs::write(env_dir.join("lock.yaml"), lock_yaml).unwrap();
+        let _store = agentenv_approvals::ApprovalStore::open(env_dir.join("events.db")).unwrap();
+        write_state_json(
+            &env_dir,
+            state_fixture(name).with_sandbox_handle("sb-snapshot"),
+        );
     }
 
     #[test]
@@ -4127,14 +4236,39 @@ policy:
     struct SnapshotFactory {
         copied_out: Arc<Mutex<Vec<(String, String)>>>,
         copied_in: Arc<Mutex<Vec<(String, String)>>>,
+        execs: Arc<Mutex<Vec<String>>>,
+        env_builds: Arc<Mutex<Vec<String>>>,
+        output_race: Arc<Mutex<Option<SnapshotOutputRace>>>,
     }
 
     impl DriverFactory for SnapshotFactory {
         fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            self.build_snapshot_driver_set()
+        }
+
+        fn build_for_env_observed(
+            &self,
+            _selection: &super::DriverSelection,
+            env: &str,
+            _events: Arc<dyn EventEmitter>,
+            _approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+        ) -> super::RuntimeResult<DriverSet> {
+            self.env_builds
+                .lock()
+                .expect("env build tracker")
+                .push(env.to_owned());
+            self.build_snapshot_driver_set()
+        }
+    }
+
+    impl SnapshotFactory {
+        fn build_snapshot_driver_set(&self) -> super::RuntimeResult<DriverSet> {
             Ok(DriverSet {
                 sandbox: Box::new(SnapshotSandbox {
                     copied_out: Arc::clone(&self.copied_out),
                     copied_in: Arc::clone(&self.copied_in),
+                    execs: Arc::clone(&self.execs),
+                    output_race: Arc::clone(&self.output_race),
                 }),
                 agent: Box::new(super::tests_support::TinyAgentDriver),
                 context: Box::new(TinyContextDriver),
@@ -4143,9 +4277,17 @@ policy:
         }
     }
 
+    #[derive(Clone)]
+    enum SnapshotOutputRace {
+        File(std::path::PathBuf),
+        Directory(std::path::PathBuf),
+    }
+
     struct SnapshotSandbox {
         copied_out: Arc<Mutex<Vec<(String, String)>>>,
         copied_in: Arc<Mutex<Vec<(String, String)>>>,
+        execs: Arc<Mutex<Vec<String>>>,
+        output_race: Arc<Mutex<Option<SnapshotOutputRace>>>,
     }
 
     #[async_trait]
@@ -4176,6 +4318,10 @@ policy:
             &self,
             params: agentenv_proto::ExecParams,
         ) -> DriverResult<agentenv_proto::ExecResult> {
+            self.execs
+                .lock()
+                .expect("exec tracker")
+                .push(params.cmd.clone());
             if params.cmd == r#"printf %s "$HOME""# {
                 return Ok(agentenv_proto::ExecResult {
                     status: 0,
@@ -4202,6 +4348,24 @@ policy:
                 params.src_sandbox_path.clone(),
                 params.dst_host_path.clone(),
             ));
+            if let Some(race) = self.output_race.lock().expect("output race tracker").take() {
+                match race {
+                    SnapshotOutputRace::File(path) => {
+                        fs::write(path, "existing output\n").map_err(|source| {
+                            crate::driver::DriverError::InvalidInput {
+                                message: format!("create raced output file: {source}"),
+                            }
+                        })?;
+                    }
+                    SnapshotOutputRace::Directory(path) => {
+                        fs::create_dir_all(&path).map_err(|source| {
+                            crate::driver::DriverError::InvalidInput {
+                                message: format!("create raced output dir: {source}"),
+                            }
+                        })?;
+                    }
+                }
+            }
             let dst = std::path::PathBuf::from(&params.dst_host_path);
             fs::create_dir_all(&dst).map_err(|source| {
                 crate::driver::DriverError::InvalidInput {
@@ -6868,17 +7032,8 @@ policy:
             log_level: LogLevel::Info,
             non_interactive: true,
         };
-        let env_dir = root.join("envs").join("demo");
         let blueprint_yaml = snapshot_blueprint_yaml();
-        let lock_yaml = snapshot_lockfile_yaml(&root, "demo", blueprint_yaml);
-        fs::create_dir_all(&env_dir).unwrap();
-        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
-        fs::write(env_dir.join("lock.yaml"), &lock_yaml).unwrap();
-        fs::write(env_dir.join("events.db"), "event db\n").unwrap();
-        write_state_json(
-            &env_dir,
-            state_fixture("demo").with_sandbox_handle("sb-snapshot"),
-        );
+        write_snapshot_env_fixture(&root, "demo", blueprint_yaml);
         let output = root.join("demo.agentenvsnap");
         let factory = SnapshotFactory::default();
 
@@ -6912,6 +7067,145 @@ policy:
         assert!(copied_out.iter().any(|(src, dst)| {
             src == "/sandbox" && std::path::Path::new(dst).ends_with("workspace")
         }));
+        assert_eq!(
+            *factory.env_builds.lock().expect("env build tracker"),
+            vec!["demo".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_rejects_output_file_created_during_finalize_without_clobbering() {
+        let root = unique_root("agentenv-runtime-snapshot-output-file");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+        *factory.output_race.lock().expect("output race tracker") =
+            Some(SnapshotOutputRace::File(output.clone()));
+
+        let err = super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect_err("snapshot must reject raced output file");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Driver(crate::driver::DriverError::InvalidInput { .. })
+        ));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing output\n");
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_rejects_output_directory_created_during_finalize_without_clobbering() {
+        let root = unique_root("agentenv-runtime-snapshot-output-dir");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+        *factory.output_race.lock().expect("output race tracker") =
+            Some(SnapshotOutputRace::Directory(output.clone()));
+
+        let err = super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect_err("snapshot must reject raced output directory");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Driver(crate::driver::DriverError::InvalidInput { .. })
+        ));
+        assert!(output.is_dir());
+        assert!(!output.join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_persist_home_resolves_home_and_copies_it_out() {
+        let root = unique_root("agentenv-runtime-snapshot-home");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_persist_home_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+
+        super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect("snapshot env");
+
+        assert!(factory
+            .execs
+            .lock()
+            .expect("exec tracker")
+            .contains(&r#"printf %s "$HOME""#.to_owned()));
+        let copied_out = factory.copied_out.lock().expect("copy out tracker").clone();
+        assert!(copied_out.iter().any(|(src, dst)| {
+            src == "/home/agent" && std::path::Path::new(dst).ends_with("home")
+        }));
+        let manifest = crate::snapshot::verify_snapshot_dir(&output).expect("verify snapshot");
+        assert!(manifest.sections.contains_key("home"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_manifest_includes_portable_lockfile_credential_requirements() {
+        let root = unique_root("agentenv-runtime-snapshot-credentials");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_credential_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+
+        super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect("snapshot env");
+
+        let manifest = crate::snapshot::verify_snapshot_dir(&output).expect("verify snapshot");
+        assert_eq!(manifest.credential_requirements.len(), 1);
+        assert_eq!(manifest.credential_requirements[0].name, "OPENAI_API_KEY");
+        assert_eq!(manifest.credential_requirements[0].source, "env");
+        assert_eq!(
+            manifest.credential_requirements[0].reference.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(manifest.credential_requirements[0].required, Some(true));
     }
 
     #[test]
