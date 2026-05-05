@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{self, Write},
+    path::Path,
+};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH};
 use rand_core::{OsRng, RngCore};
@@ -47,6 +52,16 @@ pub enum SnapshotError {
     InvalidSigningKeyLength { actual: usize },
     #[error("section mismatch for `{section}`")]
     SectionMismatch { section: String },
+    #[error("duplicate manifest file entry for path `{path}`")]
+    DuplicateManifestPath { path: String },
+    #[error("manifest file entry mismatch for `{path}`")]
+    ManifestFileEntryMismatch { path: String },
+    #[error("manifest files are not in canonical deterministic order")]
+    NonCanonicalManifestFileOrder,
+    #[error("unsupported signature algorithm `{algorithm}`")]
+    UnsupportedSignatureAlgorithm { algorithm: String },
+    #[error("unsupported hash algorithm `{algorithm}`")]
+    UnsupportedHashAlgorithm { algorithm: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +156,10 @@ struct Inventory {
     sections: BTreeMap<String, SnapshotSection>,
 }
 
+/// Writes and signs a minimal snapshot manifest for tests and simple callers.
+///
+/// This helper always uses `source_env = "test-env"`. Production flows should
+/// construct a complete [`SnapshotManifest`] and call [`write_signed_manifest`].
 pub fn write_manifest_and_signature(snapshot_dir: &Path, key_path: &Path) -> SnapshotResult<()> {
     let workspace = snapshot_dir.join("workspace");
     if !workspace.is_dir() {
@@ -198,6 +217,11 @@ pub fn write_signed_manifest(
     Ok(())
 }
 
+/// Verifies snapshot integrity against the embedded public key material.
+///
+/// This validates payload digests, canonical inventory, manifest/signature
+/// linkage, and Ed25519 signature correctness, but it does not establish
+/// external signer trust.
 pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManifest> {
     let manifest_path = snapshot_dir.join("manifest.json");
     let manifest_bytes = fs::read(&manifest_path)?;
@@ -221,51 +245,20 @@ pub fn verify_snapshot_dir(snapshot_dir: &Path) -> SnapshotResult<SnapshotManife
             version: signatures.version.clone(),
         });
     }
+    if signatures.signature_algorithm != "ed25519" {
+        return Err(SnapshotError::UnsupportedSignatureAlgorithm {
+            algorithm: signatures.signature_algorithm.clone(),
+        });
+    }
+    if signatures.hash_algorithm != "sha256" {
+        return Err(SnapshotError::UnsupportedHashAlgorithm {
+            algorithm: signatures.hash_algorithm.clone(),
+        });
+    }
 
     let inventory = build_inventory(snapshot_dir)?;
     let inventory_merkle_root = inventory.merkle_root.clone();
-
-    let mut actual_by_path = BTreeMap::new();
-    for entry in inventory.files {
-        actual_by_path.insert(entry.path.clone(), entry);
-    }
-
-    let mut listed_by_path = BTreeMap::new();
-    for entry in &manifest.files {
-        listed_by_path.insert(entry.path.clone(), entry);
-    }
-
-    for path in actual_by_path.keys() {
-        if !listed_by_path.contains_key(path) {
-            return Err(SnapshotError::ExtraPayload { path: path.clone() });
-        }
-    }
-
-    for (path, expected) in listed_by_path {
-        let actual = actual_by_path
-            .get(&path)
-            .ok_or_else(|| SnapshotError::DigestMismatch {
-                path: path.clone(),
-                expected: expected.sha256.clone(),
-                actual: "<missing>".to_owned(),
-            })?;
-
-        if expected.kind != actual.kind {
-            return Err(SnapshotError::DigestMismatch {
-                path,
-                expected: expected.kind.as_str().to_owned(),
-                actual: actual.kind.as_str().to_owned(),
-            });
-        }
-
-        if expected.sha256 != actual.sha256 {
-            return Err(SnapshotError::DigestMismatch {
-                path,
-                expected: expected.sha256.clone(),
-                actual: actual.sha256.clone(),
-            });
-        }
-    }
+    ensure_manifest_files_match(&manifest.files, &inventory.files)?;
 
     if manifest.merkle_root != inventory_merkle_root {
         return Err(SnapshotError::MerkleRootMismatch {
@@ -469,6 +462,69 @@ fn ensure_sections_match(
     Ok(())
 }
 
+fn ensure_manifest_files_match(
+    manifest_files: &[SnapshotFileEntry],
+    inventory_files: &[SnapshotFileEntry],
+) -> SnapshotResult<()> {
+    let mut seen_manifest_paths = BTreeSet::new();
+    for entry in manifest_files {
+        if !seen_manifest_paths.insert(entry.path.clone()) {
+            return Err(SnapshotError::DuplicateManifestPath {
+                path: entry.path.clone(),
+            });
+        }
+    }
+
+    if manifest_files == inventory_files {
+        return Ok(());
+    }
+
+    let mut inventory_by_path = BTreeMap::new();
+    for entry in inventory_files {
+        inventory_by_path.insert(entry.path.clone(), entry);
+    }
+
+    for entry in manifest_files {
+        let actual = inventory_by_path
+            .get(&entry.path)
+            .ok_or_else(|| SnapshotError::DigestMismatch {
+                path: entry.path.clone(),
+                expected: entry.sha256.clone(),
+                actual: "<missing>".to_owned(),
+            })?;
+
+        if entry.kind != actual.kind {
+            return Err(SnapshotError::DigestMismatch {
+                path: entry.path.clone(),
+                expected: entry.kind.as_str().to_owned(),
+                actual: actual.kind.as_str().to_owned(),
+            });
+        }
+        if entry.sha256 != actual.sha256 {
+            return Err(SnapshotError::DigestMismatch {
+                path: entry.path.clone(),
+                expected: entry.sha256.clone(),
+                actual: actual.sha256.clone(),
+            });
+        }
+        if entry.size != actual.size {
+            return Err(SnapshotError::ManifestFileEntryMismatch {
+                path: entry.path.clone(),
+            });
+        }
+    }
+
+    for entry in inventory_files {
+        if !seen_manifest_paths.contains(&entry.path) {
+            return Err(SnapshotError::ExtraPayload {
+                path: entry.path.clone(),
+            });
+        }
+    }
+
+    Err(SnapshotError::NonCanonicalManifestFileOrder)
+}
+
 fn has_prefix(files: &[SnapshotFileEntry], prefix: &str) -> bool {
     files.iter().any(|entry| entry.path.starts_with(prefix))
 }
@@ -557,8 +613,27 @@ fn load_or_create_signing_key(key_path: &Path) -> SnapshotResult<SigningKey> {
     }
     let mut secret = [0_u8; 32];
     OsRng.fill_bytes(&mut secret);
-    fs::write(key_path, secret)?;
+    write_new_signing_key(key_path, &secret)?;
     Ok(SigningKey::from_bytes(&secret))
+}
+
+#[cfg(unix)]
+fn write_new_signing_key(key_path: &Path, secret: &[u8; 32]) -> SnapshotResult<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(key_path)?;
+    file.write_all(secret)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_new_signing_key(key_path: &Path, secret: &[u8; 32]) -> SnapshotResult<()> {
+    fs::write(key_path, secret)?;
+    Ok(())
 }
 
 fn verify_signature(signatures: &SnapshotSignatures, message: &[u8]) -> SnapshotResult<()> {
@@ -683,7 +758,8 @@ mod tests {
 
         let error = verify_snapshot_dir(&root).expect_err("manifest order mismatch must fail");
         assert!(
-            error.to_string().contains("merkle root mismatch"),
+            error.to_string().contains("merkle root mismatch")
+                || error.to_string().contains("canonical"),
             "unexpected error: {error}"
         );
     }
@@ -707,6 +783,96 @@ mod tests {
                 || rendered.contains("digest mismatch"),
             "unexpected error: {rendered}"
         );
+    }
+
+    #[test]
+    fn verify_rejects_duplicate_manifest_paths() {
+        let root = temp_dir("snapshot-verify-duplicate-path");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mut manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        let duplicate = manifest
+            .files
+            .iter()
+            .find(|entry| entry.path == "workspace/README.md")
+            .expect("workspace file")
+            .clone();
+        manifest.files.push(duplicate);
+        write_signed_manifest(&root, &key_path, &manifest).expect("rewrite signed snapshot");
+
+        let error = verify_snapshot_dir(&root).expect_err("duplicate paths must fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("duplicate") || rendered.contains("manifest"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_manifest_size_mismatch() {
+        let root = temp_dir("snapshot-verify-size-mismatch");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mut manifest = read_manifest(&root.join("manifest.json")).expect("read manifest");
+        let workspace_entry = manifest
+            .files
+            .iter_mut()
+            .find(|entry| entry.path == "workspace/README.md")
+            .expect("workspace file");
+        workspace_entry.size = Some(workspace_entry.size.unwrap_or(0) + 1);
+        write_signed_manifest(&root, &key_path, &manifest).expect("rewrite signed snapshot");
+
+        let error = verify_snapshot_dir(&root).expect_err("size mismatch must fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("size") || rendered.contains("manifest"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_unsupported_signature_algorithms() {
+        let root = temp_dir("snapshot-verify-algorithms");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mut signatures = read_signatures(&root.join("signatures.json")).expect("read signatures");
+        signatures.signature_algorithm = "rsa".to_owned();
+        signatures.hash_algorithm = "sha1".to_owned();
+        fs::write(
+            root.join("signatures.json"),
+            serde_json::to_string_pretty(&signatures).expect("serialize signatures"),
+        )
+        .expect("write signatures");
+
+        let error = verify_snapshot_dir(&root).expect_err("unsupported algorithms must fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("algorithm") || rendered.contains("signature"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_signing_key_is_not_group_or_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("snapshot-key-mode");
+        write_minimal_payload(&root);
+        let key_path = root.with_extension("key");
+        write_manifest_and_signature(&root, &key_path).expect("write signed snapshot");
+
+        let mode = fs::metadata(&key_path)
+            .expect("key metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "key mode must not expose group/world bits");
     }
 
     fn write_minimal_payload(root: &Path) {
