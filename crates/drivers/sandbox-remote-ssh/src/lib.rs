@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, io, process::Command, sync::Arc};
+use std::{collections::BTreeMap, io, path::PathBuf, process::Command, sync::Arc};
 
 use agentenv_core::driver::{
     persistent_sessions_missing, DriverError, DriverResult, SandboxDriver,
@@ -14,6 +14,8 @@ use agentenv_proto::{
     SandboxCapabilities, SandboxHandle, SandboxSpec, SandboxStatus, SandboxStatusParams,
     SessionHandle, ShellHandle, ShutdownParams, StopParams, SCHEMA_VERSION,
 };
+use serde_json::Value;
+use url::Url;
 
 const DRIVER_NAME: &str = "remote-ssh";
 const REMOTE_LOGS_CAPABILITY: &str = "remote_logs";
@@ -131,6 +133,163 @@ fn invalid_handle(handle: String, message: impl Into<String>) -> DriverError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteSshTarget {
+    host: String,
+    user: String,
+    port: u16,
+    identity_file: Option<String>,
+    jump_host: Option<String>,
+    enforce_remote_firewall: bool,
+}
+
+impl RemoteSshTarget {
+    fn from_metadata(metadata: &BTreeMap<String, Value>) -> DriverResult<Self> {
+        let host = required_metadata_string(metadata, "host")?;
+        let user = required_metadata_string(metadata, "user")?;
+        let port = metadata_port(metadata)?;
+        let identity_file =
+            optional_metadata_string(metadata, "identity_file")?.map(expand_leading_home);
+        let jump_host = optional_metadata_string(metadata, "jump_host")?;
+        let enforce_remote_firewall =
+            optional_metadata_bool(metadata, "enforce_remote_firewall")?.unwrap_or(false);
+
+        Ok(Self {
+            host,
+            user,
+            port,
+            identity_file,
+            jump_host,
+            enforce_remote_firewall,
+        })
+    }
+
+    fn to_handle(&self) -> DriverResult<String> {
+        let base = format!("remote-ssh://{}@{}:{}", self.user, self.host, self.port);
+        let mut url = Url::parse(&base).map_err(|source| DriverError::InvalidInput {
+            message: format!("failed to build remote-ssh handle: {source}"),
+        })?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(identity_file) = self.identity_file.as_deref() {
+                pairs.append_pair("identity_file", identity_file);
+            }
+            if let Some(jump_host) = self.jump_host.as_deref() {
+                pairs.append_pair("jump_host", jump_host);
+            }
+        }
+        Ok(url.to_string())
+    }
+
+    fn from_handle(handle: &str) -> DriverResult<Self> {
+        let url = Url::parse(handle)
+            .map_err(|source| invalid_handle(handle.to_owned(), source.to_string()))?;
+        if url.scheme() != "remote-ssh" {
+            return Err(invalid_handle(
+                handle.to_owned(),
+                "expected remote-ssh scheme",
+            ));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| invalid_handle(handle.to_owned(), "missing host"))?
+            .to_owned();
+        let user = url.username();
+        if user.is_empty() {
+            return Err(invalid_handle(handle.to_owned(), "missing user"));
+        }
+        let mut identity_file = None;
+        let mut jump_host = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "identity_file" => identity_file = Some(value.into_owned()),
+                "jump_host" => jump_host = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        Ok(Self {
+            host,
+            user: user.to_owned(),
+            port: url.port().unwrap_or(22),
+            identity_file,
+            jump_host,
+            enforce_remote_firewall: false,
+        })
+    }
+}
+
+fn required_metadata_string(metadata: &BTreeMap<String, Value>, key: &str) -> DriverResult<String> {
+    match metadata.get(key) {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value.clone()),
+        Some(Value::String(_)) | None => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} is required"),
+        }),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must be a string when set"),
+        }),
+    }
+}
+
+fn optional_metadata_string(
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> DriverResult<Option<String>> {
+    match metadata.get(key) {
+        Some(Value::String(value)) if value.is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must be a string when set"),
+        }),
+    }
+}
+
+fn optional_metadata_bool(
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> DriverResult<Option<bool>> {
+    match metadata.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must be a boolean when set"),
+        }),
+    }
+}
+
+fn metadata_port(metadata: &BTreeMap<String, Value>) -> DriverResult<u16> {
+    match metadata.get("port") {
+        None | Some(Value::Null) => Ok(22),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| DriverError::InvalidInput {
+                message: "metadata.port must be in range 1..=65535".to_owned(),
+            }),
+        Some(Value::String(value)) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| DriverError::InvalidInput {
+                message: "metadata.port must be a numeric string in range 1..=65535".to_owned(),
+            }),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: "metadata.port must be an integer or numeric string when set".to_owned(),
+        }),
+    }
+}
+
+fn expand_leading_home(value: String) -> String {
+    let Some(rest) = value.strip_prefix("~/") else {
+        return value;
+    };
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(rest).to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("~/{rest}"))
+}
+
 #[async_trait::async_trait]
 impl SandboxDriver for RemoteSshDriver {
     async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
@@ -188,16 +347,22 @@ impl SandboxDriver for RemoteSshDriver {
         })
     }
 
-    async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
-        Err(DriverError::InvalidInput {
-            message: "metadata.host is required".to_owned(),
+    async fn create(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle> {
+        let target = RemoteSshTarget::from_metadata(&spec.metadata)?;
+        if target.enforce_remote_firewall {
+            return Err(policy_missing());
+        }
+
+        Ok(SandboxHandle {
+            handle: target.to_handle()?,
         })
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle> {
+        let _target = RemoteSshTarget::from_handle(&params.handle)?;
         Err(invalid_handle(
             params.handle,
-            "remote-ssh handle parsing is not implemented",
+            "remote-ssh connect is not implemented",
         ))
     }
 
@@ -218,23 +383,26 @@ impl SandboxDriver for RemoteSshDriver {
     }
 
     async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult> {
+        let _target = RemoteSshTarget::from_handle(&params.handle)?;
         Err(invalid_handle(
             params.handle,
-            "remote-ssh handle parsing is not implemented",
+            "remote-ssh exec is not implemented",
         ))
     }
 
     async fn copy_in(&self, params: CopyInParams) -> DriverResult<EmptyResult> {
+        let _target = RemoteSshTarget::from_handle(&params.handle)?;
         Err(invalid_handle(
             params.handle,
-            "remote-ssh handle parsing is not implemented",
+            "remote-ssh copy_in is not implemented",
         ))
     }
 
     async fn copy_out(&self, params: CopyOutParams) -> DriverResult<EmptyResult> {
+        let _target = RemoteSshTarget::from_handle(&params.handle)?;
         Err(invalid_handle(
             params.handle,
-            "remote-ssh handle parsing is not implemented",
+            "remote-ssh copy_out is not implemented",
         ))
     }
 
@@ -243,9 +411,10 @@ impl SandboxDriver for RemoteSshDriver {
     }
 
     async fn status(&self, params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
+        let _target = RemoteSshTarget::from_handle(&params.handle)?;
         Err(invalid_handle(
             params.handle,
-            "remote-ssh handle parsing is not implemented",
+            "remote-ssh status is not implemented",
         ))
     }
 
@@ -283,7 +452,9 @@ mod tests {
         Capabilities, DriverKind, InitializeParams, LogLevel, PreflightParams, SCHEMA_VERSION,
     };
 
-    use super::RemoteSshDriver;
+    use serde_json::json;
+
+    use super::{RemoteSshDriver, RemoteSshTarget};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CommandRequest {
@@ -416,6 +587,83 @@ mod tests {
         ) -> io::Result<Option<i32>> {
             self.run(program, request).map(|output| output.status)
         }
+    }
+
+    #[test]
+    fn target_from_metadata_accepts_required_fields_and_defaults_port() {
+        let metadata = BTreeMap::from([
+            ("host".to_owned(), json!("dev-vm.example.com")),
+            ("user".to_owned(), json!("alice")),
+        ]);
+
+        let target = RemoteSshTarget::from_metadata(&metadata).expect("target");
+
+        assert_eq!(target.host, "dev-vm.example.com");
+        assert_eq!(target.user, "alice");
+        assert_eq!(target.port, 22);
+        assert_eq!(target.identity_file, None);
+        assert_eq!(target.jump_host, None);
+        assert!(!target.enforce_remote_firewall);
+    }
+
+    #[test]
+    fn target_from_metadata_accepts_string_port_identity_and_jump_host() {
+        let metadata = BTreeMap::from([
+            ("host".to_owned(), json!("dev-vm.example.com")),
+            ("user".to_owned(), json!("alice")),
+            ("port".to_owned(), json!("2222")),
+            ("identity_file".to_owned(), json!("~/.ssh/id_ed25519")),
+            ("jump_host".to_owned(), json!("bastion.example.com")),
+            ("enforce_remote_firewall".to_owned(), json!(false)),
+        ]);
+
+        let target = RemoteSshTarget::from_metadata(&metadata).expect("target");
+
+        assert_eq!(target.port, 2222);
+        assert!(target
+            .identity_file
+            .as_ref()
+            .expect("identity")
+            .ends_with(".ssh/id_ed25519"));
+        assert_eq!(target.jump_host.as_deref(), Some("bastion.example.com"));
+    }
+
+    #[test]
+    fn target_from_metadata_rejects_missing_host_user_bad_port_and_bad_firewall_type() {
+        for metadata in [
+            BTreeMap::from([("user".to_owned(), json!("alice"))]),
+            BTreeMap::from([("host".to_owned(), json!("dev-vm.example.com"))]),
+            BTreeMap::from([
+                ("host".to_owned(), json!("dev-vm.example.com")),
+                ("user".to_owned(), json!("alice")),
+                ("port".to_owned(), json!(70000)),
+            ]),
+            BTreeMap::from([
+                ("host".to_owned(), json!("dev-vm.example.com")),
+                ("user".to_owned(), json!("alice")),
+                ("enforce_remote_firewall".to_owned(), json!("yes")),
+            ]),
+        ] {
+            let err = RemoteSshTarget::from_metadata(&metadata).expect_err("metadata should fail");
+            assert!(err.to_string().contains("metadata."));
+        }
+    }
+
+    #[test]
+    fn uri_handle_round_trips_target_fields() {
+        let target = RemoteSshTarget {
+            host: "dev-vm.example.com".to_owned(),
+            user: "alice".to_owned(),
+            port: 2222,
+            identity_file: Some("/Users/alice/.ssh/id_ed25519".to_owned()),
+            jump_host: Some("bastion.example.com".to_owned()),
+            enforce_remote_firewall: false,
+        };
+
+        let handle = target.to_handle().expect("handle");
+        let parsed = RemoteSshTarget::from_handle(&handle).expect("parse handle");
+
+        assert_eq!(parsed, target);
     }
 
     #[tokio::test]
