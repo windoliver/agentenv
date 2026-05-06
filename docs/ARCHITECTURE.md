@@ -6,15 +6,16 @@
 
 1. [Design principles](#design-principles)
 2. [The four pluggable axes](#the-four-pluggable-axes)
-3. [The narrow waist: MCP](#the-narrow-waist-mcp)
-4. [Driver architecture](#driver-architecture)
-5. [Blueprint lifecycle](#blueprint-lifecycle)
-6. [Policy model](#policy-model)
-7. [Credential store](#credential-store)
-8. [Sessions vs. sandboxes](#sessions-vs-sandboxes)
-9. [Observability & approvals](#observability--approvals)
-10. [Crate layout](#crate-layout)
-11. [Prior art & what we borrowed](#prior-art--what-we-borrowed)
+3. [Skills as a core-managed resource](#skills-as-a-core-managed-resource)
+4. [The narrow waist: MCP](#the-narrow-waist-mcp)
+5. [Driver architecture](#driver-architecture)
+6. [Blueprint lifecycle](#blueprint-lifecycle)
+7. [Policy model](#policy-model)
+8. [Credential store](#credential-store)
+9. [Sessions vs. sandboxes](#sessions-vs-sandboxes)
+10. [Observability & approvals](#observability--approvals)
+11. [Crate layout](#crate-layout)
+12. [Prior art & what we borrowed](#prior-art--what-we-borrowed)
 
 ---
 
@@ -99,6 +100,41 @@ Concrete: `passthrough` (agent uses its own API key directly), `openai` / `anthr
 Optional. When the sandbox driver declares `supports_native_inference_routing = true` (e.g., OpenShell's Privacy Router), we delegate. Otherwise we run an in-sandbox inference proxy process.
 
 Capability flags: `strips_caller_credentials`, `supports_model_switching`.
+
+---
+
+## Skills as a core-managed resource
+
+**Decision.** Skills are a core-managed resource, not a `ContextDriver`
+sub-kind and not a fifth pluggable axis.
+
+A skill packages agent behavior: instructions, procedures, metadata, and
+support files. Unlike a context backend, a skill does not provision a live MCP
+endpoint, own runtime handles, or report health. `agentenv` therefore treats
+skills like static artifacts referenced by blueprints, resolved before sandbox
+creation, cached under `~/.agentenv/skills/`, verified, and injected into the
+sandbox or agent configuration during `create`.
+
+Core owns the skill lifecycle:
+
+- Resolve blueprint skill references or CLI handles to exact artifact versions.
+- Fetch from trusted sources such as local paths, HTTP, OCI, or git through
+  lightweight registry adapters.
+- Verify digests, signatures, versions, and revocation policy before injection.
+- Cache immutable artifacts and record exact pins in `agentenv.lock`.
+- Expose only the selected skill bundle to the sandbox; credential values do
+  not flow through skill fetching or generic driver RPC.
+
+Registry adapters are not JSON-RPC drivers. They are core-managed fetch and
+verify backends, analogous to package registries in Cargo, npm, and pip. If a
+registry adapter needs network access, its URLs pass through the SSRF validator
+and its output becomes an artifact pin in the lockfile.
+
+At runtime, agents discover skills through the conventions their `AgentDriver`
+supports. Agent drivers may render config or install steps that point the agent
+at injected skill directories, but they do not resolve trust, fetch artifacts,
+or verify signatures themselves. `ContextDriver` remains the MCP
+knowledge-backend axis.
 
 ---
 
@@ -211,13 +247,13 @@ Notifications (`▷`) are push-only from driver to core.
 └─────────┘   └────────┘   └──────┘   └───────┘   └────────┘
 ```
 
-1. **resolve** — parse `agentenv.yaml`, check `min_agentenv_version`, look up each driver by name in the registry (built-in or subprocess), pin versions.
-2. **verify** — check digest pins (drivers, images, blueprints referenced by URL), validate `agentenv.lock` if present.
-3. **plan** — ask each driver to describe what it will create/update. Print a human-readable plan. Fail fast on capability mismatches.
-4. **apply** — execute the plan. Each driver produces resources and declares ownership.
+1. **resolve** — parse `agentenv.yaml`, check `min_agentenv_version`, look up each driver by name in the registry (built-in or subprocess), pin versions, and resolve skill handles to exact artifact refs.
+2. **verify** — check digest pins (drivers, images, skills, blueprints referenced by URL), validate `agentenv.lock` if present, and reject untrusted or revoked skill artifacts.
+3. **plan** — ask each driver to describe what it will create/update, include core-owned skill fetch/cache/injection actions, print a human-readable plan, and fail fast on capability mismatches.
+4. **apply** — execute the plan. Core fetches and injects verified skill artifacts; each driver produces resources and declares ownership.
 5. **status** — report current state; streamed into `agentenv describe`.
 
-`freeze` writes `agentenv.lock` with exact driver versions, image digests, and blueprint hash. `reproduce` rebuilds from a lockfile on any machine.
+`freeze` writes `agentenv.lock` with exact driver versions, image digests, skill artifact pins, and blueprint hash. `reproduce` rebuilds from a lockfile on any machine.
 
 ---
 
@@ -370,6 +406,7 @@ agentenv/
 | **conda / pixi / devbox / nix-shell** | Env-manager CLI shape (`create` / `enter` / `list` / `destroy` / `freeze` / `reproduce`); lockfiles for reproducibility; committed config at project root. |
 | **docker-compose** | `compose.yaml`-style single-file declaration; `up` / `down` commands; service composition as the primary abstraction. |
 | **uv / ruff / mise** | Rust single-binary distribution story; `curl \| sh` installer; fast cold-start expectation for CLI tools. |
+| **Anthropic Skills / agent-skills discovery** | Skill bundle shape, progressive disclosure, and discovery vocabulary; `agentenv` treats skills as core-managed artifacts rather than drivers. |
 
 ---
 
