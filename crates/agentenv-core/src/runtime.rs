@@ -8202,6 +8202,19 @@ policy:
         assert!(copied_in.iter().any(|(src, dst)| {
             std::path::Path::new(src).ends_with("workspace") && dst == "/sandbox"
         }));
+        let copied_in_entries = factory
+            .copied_in_entries
+            .lock()
+            .expect("copy in entry tracker")
+            .clone();
+        let (_, _, workspace_entries) = copied_in_entries
+            .iter()
+            .find(|(_, dst, _)| dst == "/sandbox")
+            .expect("workspace copy-in should be recorded");
+        assert!(
+            workspace_entries.iter().any(|entry| entry == "README.md"),
+            "workspace staging directory must remain populated until copy-in"
+        );
     }
 
     #[tokio::test]
@@ -8488,7 +8501,7 @@ policy:
     }
 
     #[tokio::test]
-    async fn restore_snapshot_rejects_unsafe_symlink_before_create() {
+    async fn restore_snapshot_strips_unsafe_symlink_before_copying() {
         let root = unique_root("agentenv-runtime-restore-unsafe-symlink");
         let options = RuntimeOptions {
             root: root.clone(),
@@ -8511,7 +8524,7 @@ policy:
         let factory = SnapshotFactory::default();
         let mut credentials = super::tests_support::EmptyCredentialProvider;
 
-        let err = super::restore_snapshot_env(
+        let result = super::restore_snapshot_env(
             &options,
             &factory,
             &mut credentials,
@@ -8521,27 +8534,26 @@ policy:
             },
         )
         .await
-        .expect_err("unsafe snapshot symlink should fail restore");
+        .expect("unsafe snapshot symlink should be stripped before restore copy-in");
 
-        assert!(err.to_string().contains("unsafe snapshot symlink"));
+        assert_eq!(result.name, "restored");
         assert!(
-            !root.join("envs").join("restored").exists(),
-            "unsafe symlink failure must happen before env creation"
+            root.join("envs").join("restored").exists(),
+            "restore should create the target env after stripping unsafe symlinks"
         );
+        let copied_in_entries = factory
+            .copied_in_entries
+            .lock()
+            .expect("copy in entry tracker")
+            .clone();
+        let (_, _, workspace_entries) = copied_in_entries
+            .iter()
+            .find(|(_, dst, _)| dst == "/sandbox")
+            .expect("workspace copy-in should be recorded");
+        assert!(workspace_entries.iter().any(|entry| entry == "README.md"));
         assert!(
-            factory
-                .env_builds
-                .lock()
-                .expect("env build tracker")
-                .is_empty(),
-            "unsafe symlink failure must happen before env reproduction"
-        );
-        assert!(
-            root.join(".agentenv-tmp")
-                .read_dir()
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(true),
-            "restore staging should be cleaned after unsafe symlink failure"
+            !workspace_entries.iter().any(|entry| entry == "escape"),
+            "unsafe symlink must not be copied into the restored sandbox"
         );
     }
 

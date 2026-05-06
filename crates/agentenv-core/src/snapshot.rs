@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Write},
-    path::Path,
+    path::{Component, Path},
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH};
@@ -328,6 +328,7 @@ pub fn sanitize_snapshot_tree(root: &Path) -> SnapshotResult<SanitizerReport> {
     };
 
     strip_credential_paths(root, root, &mut report)?;
+    strip_unsafe_symlinks(root, root, &mut report)?;
     redact_structured_files(root)?;
     scan_for_remaining_secrets(root)?;
 
@@ -389,6 +390,63 @@ fn strip_credential_paths(
     }
 
     Ok(())
+}
+
+fn strip_unsafe_symlinks(
+    root: &Path,
+    current: &Path,
+    report: &mut SanitizerReport,
+) -> SnapshotResult<()> {
+    for entry in read_dir_sorted(current)? {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            let target = fs::read_link(&path)?;
+            let stripped_reason = if symlink_target_escapes_snapshot_payload(&target) {
+                Some("unsafe_symlink")
+            } else if relative_symlink_target_is_missing(&path, &target) {
+                Some("broken_symlink")
+            } else {
+                None
+            };
+            if let Some(reason) = stripped_reason {
+                let relative = relative_path(root, &path)?;
+                fs::remove_file(&path)?;
+                report.stripped.push(SnapshotStrippedEntry {
+                    path: relative,
+                    reason: reason.to_owned(),
+                });
+            }
+            continue;
+        }
+
+        if file_type.is_dir() {
+            strip_unsafe_symlinks(root, &path, report)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn symlink_target_escapes_snapshot_payload(target: &Path) -> bool {
+    target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+}
+
+fn relative_symlink_target_is_missing(link_path: &Path, target: &Path) -> bool {
+    if symlink_target_escapes_snapshot_payload(target) {
+        return false;
+    }
+
+    let Some(parent) = link_path.parent() else {
+        return false;
+    };
+
+    !parent.join(target).exists()
 }
 
 fn redact_structured_files(root: &Path) -> SnapshotResult<()> {
@@ -987,7 +1045,10 @@ fn normalize_secret_key(key: &str) -> String {
         .collect()
 }
 
-fn detect_secret_pattern_classes(content: &str) -> Vec<&'static str> {
+fn detect_secret_pattern_classes(
+    content: &str,
+    include_key_value_lines: bool,
+) -> Vec<&'static str> {
     let mut classes = BTreeSet::new();
     for token in content.split(|character: char| !is_secret_token_character(character)) {
         if token.starts_with("sk-ant-") {
@@ -1006,7 +1067,7 @@ fn detect_secret_pattern_classes(content: &str) -> Vec<&'static str> {
             classes.insert("github_token");
         }
 
-        if token.starts_with("AKIA") || token.starts_with("ASIA") {
+        if is_aws_access_key_id(token) {
             classes.insert("aws_access_key_id");
         }
 
@@ -1015,15 +1076,17 @@ fn detect_secret_pattern_classes(content: &str) -> Vec<&'static str> {
         }
     }
 
-    for line in content.lines() {
-        if key_value_line_has_non_empty_secret(line, &["webhook"]) {
-            classes.insert("webhook_secret");
-        }
-        if key_value_line_has_non_empty_secret(line, &["mcp"]) {
-            classes.insert("mcp_token");
-        }
-        if key_value_line_has_non_empty_secret(line, &["nexus"]) {
-            classes.insert("nexus_token");
+    if include_key_value_lines {
+        for line in content.lines() {
+            if key_value_line_has_non_empty_secret(line, &["webhook"]) {
+                classes.insert("webhook_secret");
+            }
+            if key_value_line_has_non_empty_secret(line, &["mcp"]) {
+                classes.insert("mcp_token");
+            }
+            if key_value_line_has_non_empty_secret(line, &["nexus"]) {
+                classes.insert("nexus_token");
+            }
         }
     }
 
@@ -1031,6 +1094,7 @@ fn detect_secret_pattern_classes(content: &str) -> Vec<&'static str> {
 }
 
 fn scan_file_for_secret_pattern_classes(path: &Path) -> SnapshotResult<Vec<&'static str>> {
+    let include_key_value_lines = !file_contains_nul_byte(path)?;
     let mut file = fs::File::open(path)?;
     let mut buffer = [0_u8; SECRET_SCAN_CHUNK_BYTES];
     let mut tail = Vec::new();
@@ -1047,7 +1111,10 @@ fn scan_file_for_secret_pattern_classes(path: &Path) -> SnapshotResult<Vec<&'sta
         window.extend_from_slice(&buffer[..read]);
 
         let text = String::from_utf8_lossy(&window);
-        classes.extend(detect_secret_pattern_classes(&text));
+        classes.extend(detect_secret_pattern_classes(
+            &text,
+            include_key_value_lines,
+        ));
 
         let tail_start = window.len().saturating_sub(SECRET_SCAN_TAIL_BYTES);
         tail.clear();
@@ -1057,8 +1124,36 @@ fn scan_file_for_secret_pattern_classes(path: &Path) -> SnapshotResult<Vec<&'sta
     Ok(classes.into_iter().collect())
 }
 
+fn file_contains_nul_byte(path: &Path) -> SnapshotResult<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; SECRET_SCAN_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        if buffer[..read].contains(&0) {
+            return Ok(true);
+        }
+    }
+}
+
 fn is_secret_token_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+}
+
+fn is_aws_access_key_id(token: &str) -> bool {
+    let Some(suffix) = token
+        .strip_prefix("AKIA")
+        .or_else(|| token.strip_prefix("ASIA"))
+    else {
+        return false;
+    };
+
+    suffix.len() == 16
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 fn key_value_line_has_non_empty_secret(line: &str, required_key_markers: &[&str]) -> bool {
@@ -1746,6 +1841,76 @@ composition:
             !rendered.contains(secret),
             "error leaked secret: {rendered}"
         );
+    }
+
+    #[test]
+    fn sanitizer_ignores_binary_runtime_artifacts_with_credential_marker_strings() {
+        let root = temp_dir("snapshot-sanitize-binary-runtime-artifact");
+        fs::create_dir_all(root.join("workspace/.uv/python/bin")).unwrap();
+        fs::write(
+            root.join("workspace/.uv/python/bin/python3.13"),
+            b"\0ELF\0aws_access_key_id\0AKIA\0mcp_token=placeholder\0nexus_token=placeholder\0",
+        )
+        .unwrap();
+
+        let report = sanitize_snapshot_tree(&root).expect("binary marker strings are not leaks");
+        assert!(report.stripped.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitizer_strips_symlinks_that_restore_would_reject() {
+        let root = temp_dir("snapshot-sanitize-unsafe-symlink");
+        fs::create_dir_all(root.join("workspace/.claude/skills")).unwrap();
+        fs::create_dir_all(root.join("workspace/.agents/skills/github")).unwrap();
+        fs::create_dir_all(root.join("workspace/nested")).unwrap();
+        fs::write(root.join("workspace/nested/file.txt"), "safe\n").unwrap();
+        std::os::unix::fs::symlink(
+            "/sandbox/.agents/skills/github/",
+            root.join("workspace/.claude/skills/github"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("workspace/parent-link")).unwrap();
+        std::os::unix::fs::symlink("nested/file.txt", root.join("workspace/safe-link")).unwrap();
+
+        let report = sanitize_snapshot_tree(&root).expect("sanitize tree");
+
+        assert!(fs::symlink_metadata(root.join("workspace/.claude/skills/github")).is_err());
+        assert!(fs::symlink_metadata(root.join("workspace/parent-link")).is_err());
+        assert!(fs::symlink_metadata(root.join("workspace/safe-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(report.stripped.iter().any(|entry| {
+            entry.path == "workspace/.claude/skills/github" && entry.reason == "unsafe_symlink"
+        }));
+        assert!(report.stripped.iter().any(|entry| {
+            entry.path == "workspace/parent-link" && entry.reason == "unsafe_symlink"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitizer_strips_symlinks_broken_by_unsafe_symlink_removal() {
+        let root = temp_dir("snapshot-sanitize-broken-dependent-symlink");
+        fs::create_dir_all(root.join("workspace/.venv/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            "/sandbox/.uv/python/cpython/bin/python",
+            root.join("workspace/.venv/bin/python"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("python", root.join("workspace/.venv/bin/python3")).unwrap();
+
+        let report = sanitize_snapshot_tree(&root).expect("sanitize tree");
+
+        assert!(fs::symlink_metadata(root.join("workspace/.venv/bin/python")).is_err());
+        assert!(fs::symlink_metadata(root.join("workspace/.venv/bin/python3")).is_err());
+        assert!(report.stripped.iter().any(|entry| {
+            entry.path == "workspace/.venv/bin/python" && entry.reason == "unsafe_symlink"
+        }));
+        assert!(report.stripped.iter().any(|entry| {
+            entry.path == "workspace/.venv/bin/python3" && entry.reason == "broken_symlink"
+        }));
     }
 
     #[test]
