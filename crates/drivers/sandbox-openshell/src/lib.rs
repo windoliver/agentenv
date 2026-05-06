@@ -26,6 +26,9 @@ use agentenv_core::{
     digest::parse_sha256_digest,
     driver::{DriverError, DriverResult, SandboxDriver},
 };
+use agentenv_events::{
+    ActivityEvent, ActivityKind, ActivityResult, EventEmitter, NoopEventEmitter,
+};
 use agentenv_policy::{
     InferenceUpdate, OpenShellTranslator, PolicyError, PolicyTranslator, TranslatedPolicy,
 };
@@ -369,6 +372,7 @@ pub struct OpenShellDriver {
     workdir: Mutex<PathBuf>,
     current_policies: Mutex<BTreeMap<String, NetworkPolicy>>,
     log_streams: Mutex<Vec<LogStream>>,
+    events: Arc<dyn EventEmitter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,7 +400,15 @@ impl Default for OpenShellDriver {
             workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
+            events: Arc::new(NoopEventEmitter),
         }
+    }
+}
+
+impl OpenShellDriver {
+    pub fn with_event_emitter(mut self, events: Arc<dyn EventEmitter>) -> Self {
+        self.events = events;
+        self
     }
 }
 
@@ -411,6 +423,7 @@ impl OpenShellDriver {
             workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
+            events: Arc::new(NoopEventEmitter),
         }
     }
 
@@ -423,6 +436,7 @@ impl OpenShellDriver {
             workdir: Mutex::new(workdir.to_path_buf()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
+            events: Arc::new(NoopEventEmitter),
         }
     }
 
@@ -436,6 +450,7 @@ impl OpenShellDriver {
             workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
+            events: Arc::new(NoopEventEmitter),
         }
     }
 
@@ -452,6 +467,7 @@ impl OpenShellDriver {
             workdir: Mutex::new(default_agentenv_workdir()),
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
+            events: Arc::new(NoopEventEmitter),
         }
     }
 }
@@ -936,6 +952,15 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
+        self.events.emit(
+            ActivityEvent::new(
+                now_timestamp_string(),
+                ActivityKind::Log,
+                ActivityResult::Ok,
+                format!("openshell-shutdown-{}", Uuid::new_v4()),
+            )
+            .with_actor_value("driver", serde_json::json!("openshell")),
+        );
         let stream_cleanup = self.terminate_all_log_streams();
         self.clear_current_policies();
         stream_cleanup?;
