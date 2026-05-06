@@ -906,7 +906,7 @@ async fn create_env_with_input(
     );
 
     let result = async {
-        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+        let sandbox_init = initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
         initialize_agent_driver(options, set.agent.as_mut()).await?;
         initialize_context_driver(options, set.context.as_mut()).await?;
         if let Some(inference) = set.inference.as_mut() {
@@ -1043,8 +1043,13 @@ async fn create_env_with_input(
             policy.network.allow.extend(context_network_rules.rules);
         }
 
-        let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
-        let restore_policy_after_install = create_policy != policy;
+        let supports_hot_reload_policy = supports_hot_reload_policy(&sandbox_init.capabilities);
+        let create_policy = if supports_hot_reload_policy {
+            create_policy_for_agent_install(&policy, &agent_setup)
+        } else {
+            policy.clone()
+        };
+        let restore_policy_after_install = supports_hot_reload_policy && create_policy != policy;
 
         let sandbox_create_start = Instant::now();
         let sandbox_spec = sandbox_spec_for_create(
@@ -2728,6 +2733,16 @@ fn supports_persistent_sessions(capabilities: &Capabilities) -> bool {
     )
 }
 
+fn supports_hot_reload_policy(capabilities: &Capabilities) -> bool {
+    matches!(
+        capabilities,
+        Capabilities::Sandbox(agentenv_proto::SandboxCapabilities {
+            supports_hot_reload_policy: true,
+            ..
+        })
+    )
+}
+
 async fn reconcile_sessions_with_driver(
     paths: &crate::env::EnvPaths,
     env: &str,
@@ -3888,6 +3903,27 @@ mod tests {
             Ok(DriverSet {
                 sandbox: Box::new(AgentSetupSandboxDriver {
                     tracker: Arc::clone(&self.tracker),
+                    supports_hot_reload_policy: true,
+                }),
+                agent: Box::new(AgentSetupAgentDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct NoHotReloadAgentSetupFactory {
+        tracker: Arc<AgentSetupTracker>,
+    }
+
+    impl DriverFactory for NoHotReloadAgentSetupFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(AgentSetupSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                    supports_hot_reload_policy: false,
                 }),
                 agent: Box::new(AgentSetupAgentDriver {
                     tracker: Arc::clone(&self.tracker),
@@ -3908,6 +3944,7 @@ mod tests {
             Ok(DriverSet {
                 sandbox: Box::new(AgentSetupSandboxDriver {
                     tracker: Arc::clone(&self.tracker),
+                    supports_hot_reload_policy: true,
                 }),
                 agent: Box::new(AgentSetupAgentDriver {
                     tracker: Arc::clone(&self.tracker),
@@ -4133,13 +4170,18 @@ mod tests {
 
     struct AgentSetupSandboxDriver {
         tracker: Arc<AgentSetupTracker>,
+        supports_hot_reload_policy: bool,
     }
 
     #[async_trait]
     impl SandboxDriver for AgentSetupSandboxDriver {
         async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
             let mut inner = TinySandboxDriver;
-            inner.initialize(params).await
+            let mut result = inner.initialize(params).await?;
+            if let Capabilities::Sandbox(capabilities) = &mut result.capabilities {
+                capabilities.supports_hot_reload_policy = self.supports_hot_reload_policy;
+            }
+            Ok(result)
         }
 
         async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
@@ -4252,6 +4294,11 @@ mod tests {
                 .lock()
                 .expect("apply policy tracker")
                 .push(params.policy.clone());
+            if !self.supports_hot_reload_policy {
+                return Err(crate::driver::DriverError::CapabilityMissing {
+                    capability: "supports_hot_reload_policy".to_owned(),
+                });
+            }
             TinySandboxDriver.apply_policy(params).await
         }
 
@@ -6620,6 +6667,66 @@ policy:
                 .join("agent")
                 .exists(),
             "rendered agent files can contain credentials and must not persist in the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_does_not_restore_policy_when_sandbox_lacks_hot_reload() {
+        let root = unique_root("agentenv-agent-setup-no-hot-reload");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: remote-ssh
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = NoHotReloadAgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect("create env");
+
+        let exec_cmds = tracker.exec_cmds.lock().expect("exec tracker").clone();
+        assert!(exec_cmds
+            .iter()
+            .any(|cmd| cmd.contains("printf agent-installed")));
+        let create_policies = tracker
+            .create_policies
+            .lock()
+            .expect("create policy tracker")
+            .clone();
+        assert_eq!(create_policies.len(), 1);
+        assert!(
+            !create_policies[0]
+                .network
+                .allow
+                .contains(&super::agent_install_npm_registry_rule()),
+            "sandbox create should use final policy when hot reload is unavailable"
+        );
+        let applied_policies = tracker
+            .applied_policies
+            .lock()
+            .expect("apply policy tracker")
+            .clone();
+        assert!(
+            applied_policies.is_empty(),
+            "sandbox policy restore should not be attempted without hot reload"
         );
     }
 

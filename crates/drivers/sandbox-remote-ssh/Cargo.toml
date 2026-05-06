@@ -19,8 +19,8 @@ agentenv-proto = { path = "../../agentenv-proto" }
 async-trait.workspace = true
 serde_json.workspace = true
 url.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 driver-conformance = { path = "../../../tests/driver-conformance" }
 tokio = { version = "1", features = ["macros", "rt"] }
+uuid.workspace = true
