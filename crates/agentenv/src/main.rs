@@ -3759,6 +3759,7 @@ mod tests {
                 "metrics".to_string(),
                 "approvals".to_string(),
                 "term".to_string(),
+                "snapshot".to_string(),
                 "exec".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
