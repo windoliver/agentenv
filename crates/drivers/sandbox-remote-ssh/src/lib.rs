@@ -134,6 +134,12 @@ fn ssh_base_args(target: &RemoteSshTarget) -> Vec<String> {
     let mut args = vec![
         "-o".to_owned(),
         "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "ConnectTimeout=10".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=2".to_owned(),
         "-p".to_owned(),
         target.port.to_string(),
     ];
@@ -317,10 +323,18 @@ impl RemoteSshTarget {
                 }
             }
         }
+        let port = url.port().unwrap_or(22);
+        if port == 0 {
+            return Err(invalid_handle(
+                handle.to_owned(),
+                "port must be in range 1..=65535",
+            ));
+        }
+
         Ok(Self {
             host,
             user: user.to_owned(),
-            port: url.port().unwrap_or(22),
+            port,
             identity_file,
             jump_host,
             enforce_remote_firewall: false,
@@ -983,6 +997,14 @@ mod tests {
     }
 
     #[test]
+    fn uri_handle_rejects_port_zero() {
+        let err = RemoteSshTarget::from_handle("remote-ssh://alice@dev-vm.example.com:0")
+            .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
     fn uri_handle_rejects_invalid_jump_host_query() {
         let err = RemoteSshTarget::from_handle(
             "remote-ssh://alice@dev-vm.example.com:22?jump_host=-bastion.example.com",
@@ -1126,6 +1148,12 @@ mod tests {
                 &[
                     "-o",
                     "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=2",
                     "-p",
                     "2222",
                     "-J",
@@ -1143,6 +1171,12 @@ mod tests {
                 &[
                     "-o",
                     "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=2",
                     "-p",
                     "2222",
                     "-J",
@@ -1217,6 +1251,12 @@ mod tests {
             &[
                 "-o",
                 "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "-p",
                 "22",
                 "alice@dev-vm.example.com",
@@ -1248,6 +1288,12 @@ mod tests {
             &[
                 "-o",
                 "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "-p",
                 "22",
                 "alice@dev-vm.example.com",
