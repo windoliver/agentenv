@@ -1102,83 +1102,90 @@ impl OpenShellDriver {
         }
 
         let key = cache.build_key(&input)?;
-        let Some(_build_lock) = cache.try_lock(&key)? else {
-            let materialized = cache.wait_for_materialization(&key, &input, self)?;
+        loop {
+            let Some(_build_lock) = cache.try_lock(&key)? else {
+                match cache.wait_for_materialization(&key, &input, self)? {
+                    build_cache::BuildWaitOutcome::Materialized(materialized) => {
+                        let _ = (&materialized.image_digest, &materialized.tag);
+                        return Ok(materialized.image_ref);
+                    }
+                    build_cache::BuildWaitOutcome::LockReleased => continue,
+                }
+            };
+            let _slot = cache.acquire_build_slot()?;
+            let cache_dir = cache.cache_dir(&key);
+            fs::create_dir_all(&cache_dir).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to create BYO build cache `{}`: {source}",
+                    cache_dir.display()
+                ),
+            })?;
+            let stage_dir = cache_dir.join("context.tmp");
+            build_cache::remove_cache_path(&stage_dir)?;
+            fs::rename(&key_stage_dir, &stage_dir).map_err(|source| DriverError::InvalidInput {
+                message: format!("failed to move staged BYO context into build cache: {source}"),
+            })?;
+            stage_guard.reset(stage_dir.clone());
+
+            let tag = build_cache::tag_for_key(&key);
+            let dockerfile_arg = stage_dir.join("Dockerfile").display().to_string();
+            let stage_arg = stage_dir.display().to_string();
+            let build_args = vec![
+                "build".to_owned(),
+                "--file".to_owned(),
+                dockerfile_arg,
+                "--tag".to_owned(),
+                tag.clone(),
+                "--build-arg".to_owned(),
+                format!("AGENTENV_VERSION={}", config.agentenv_version),
+                "--build-arg".to_owned(),
+                format!("AGENTENV_AGENT={}", config.agent),
+                "--build-arg".to_owned(),
+                format!("AGENTENV_MCP_PORT={}", config.mcp_port),
+                "--build-arg".to_owned(),
+                format!("AGENTENV_WORKSPACE_MOUNT={}", config.workspace_mount),
+                stage_arg.clone(),
+            ];
+            self.run_checked_host_command(
+                "docker",
+                CommandRequest {
+                    args: build_args,
+                    env: BTreeMap::new(),
+                },
+            )?;
+
+            let output = self.run_checked_host_command(
+                "docker",
+                command_request(&["image", "inspect", "--format", "{{.Id}}", &tag]),
+            )?;
+            let digest = output.stdout.trim();
+            parse_sha256_digest(digest).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "Docker image `{tag}` returned invalid digest `{digest}`: {source}"
+                ),
+            })?;
+            if let Some(expected) = config.expected_digest.as_deref() {
+                parse_sha256_digest(expected).map_err(|source| DriverError::InvalidInput {
+                    message: format!("expected BYO image digest `{expected}` is invalid: {source}"),
+                })?;
+                if expected != digest {
+                    return Err(DriverError::InvalidInput {
+                        message: format!(
+                            "BYO image digest mismatch for `{}`: expected `{expected}`, got `{digest}`",
+                            config.dockerfile.display()
+                        ),
+                    });
+                }
+            }
+
+            let mut built_input = input.clone();
+            built_input.staged_context = stage_dir.clone();
+            let materialized =
+                cache.materialize_built(&built_input, stage_arg, digest.to_owned())?;
+            stage_guard.disarm();
             let _ = (&materialized.image_digest, &materialized.tag);
             return Ok(materialized.image_ref);
-        };
-        let _slot = cache.acquire_build_slot()?;
-        let cache_dir = cache.cache_dir(&key);
-        fs::create_dir_all(&cache_dir).map_err(|source| DriverError::InvalidInput {
-            message: format!(
-                "failed to create BYO build cache `{}`: {source}",
-                cache_dir.display()
-            ),
-        })?;
-        let stage_dir = cache_dir.join("context.tmp");
-        build_cache::remove_cache_path(&stage_dir)?;
-        fs::rename(&key_stage_dir, &stage_dir).map_err(|source| DriverError::InvalidInput {
-            message: format!("failed to move staged BYO context into build cache: {source}"),
-        })?;
-        stage_guard.reset(stage_dir.clone());
-
-        let tag = build_cache::tag_for_key(&key);
-        let dockerfile_arg = stage_dir.join("Dockerfile").display().to_string();
-        let stage_arg = stage_dir.display().to_string();
-        let build_args = vec![
-            "build".to_owned(),
-            "--file".to_owned(),
-            dockerfile_arg,
-            "--tag".to_owned(),
-            tag.clone(),
-            "--build-arg".to_owned(),
-            format!("AGENTENV_VERSION={}", config.agentenv_version),
-            "--build-arg".to_owned(),
-            format!("AGENTENV_AGENT={}", config.agent),
-            "--build-arg".to_owned(),
-            format!("AGENTENV_MCP_PORT={}", config.mcp_port),
-            "--build-arg".to_owned(),
-            format!("AGENTENV_WORKSPACE_MOUNT={}", config.workspace_mount),
-            stage_arg.clone(),
-        ];
-        self.run_checked_host_command(
-            "docker",
-            CommandRequest {
-                args: build_args,
-                env: BTreeMap::new(),
-            },
-        )?;
-
-        let output = self.run_checked_host_command(
-            "docker",
-            command_request(&["image", "inspect", "--format", "{{.Id}}", &tag]),
-        )?;
-        let digest = output.stdout.trim();
-        parse_sha256_digest(digest).map_err(|source| DriverError::InvalidInput {
-            message: format!("Docker image `{tag}` returned invalid digest `{digest}`: {source}"),
-        })?;
-        if let Some(expected) = config.expected_digest.as_deref() {
-            parse_sha256_digest(expected).map_err(|source| DriverError::InvalidInput {
-                message: format!("expected BYO image digest `{expected}` is invalid: {source}"),
-            })?;
-            if expected != digest {
-                return Err(DriverError::InvalidInput {
-                    message: format!(
-                        "BYO image digest mismatch for `{}`: expected `{expected}`, got `{digest}`",
-                        config.dockerfile.display()
-                    ),
-                });
-            }
         }
-
-        let built_input = build_cache::BuildInput {
-            staged_context: stage_dir.clone(),
-            ..input
-        };
-        let materialized = cache.materialize_built(&built_input, stage_arg, digest.to_owned())?;
-        stage_guard.disarm();
-        let _ = (&materialized.image_digest, &materialized.tag);
-        Ok(materialized.image_ref)
     }
 
     fn run_command_request(&self, request: CommandRequest) -> io::Result<CommandOutput> {
@@ -2700,6 +2707,7 @@ mod driver_tests {
     };
 
     use agentenv_core::driver::SandboxDriver;
+    use agentenv_events::{ActivityEvent, ActivityKind, EventEmitter};
     use agentenv_proto::{
         AttachSessionParams, Capabilities, CopyInParams, CopyOutParams, CreateSessionParams,
         DestroyParams, DriverKind, ExecParams, InitializeParams, KillSessionParams,
@@ -2761,6 +2769,11 @@ mod driver_tests {
         build_started: mpsc::Sender<()>,
         release_build: Mutex<mpsc::Receiver<()>>,
         digest: String,
+    }
+
+    #[derive(Debug)]
+    struct WaiterSignalEmitter {
+        waiter_entered: Mutex<Option<mpsc::Sender<()>>>,
     }
 
     #[derive(Debug)]
@@ -2949,6 +2962,30 @@ mod driver_tests {
             _request: &super::CommandRequest,
         ) -> io::Result<Box<dyn super::SpawnedCommand>> {
             Ok(Box::new(super::NoopSpawnedCommand))
+        }
+    }
+
+    impl WaiterSignalEmitter {
+        fn new(waiter_entered: mpsc::Sender<()>) -> Self {
+            Self {
+                waiter_entered: Mutex::new(Some(waiter_entered)),
+            }
+        }
+    }
+
+    impl EventEmitter for WaiterSignalEmitter {
+        fn emit(&self, event: ActivityEvent) {
+            if event.kind != ActivityKind::BuildOneflightHit {
+                return;
+            }
+            if let Some(sender) = self
+                .waiter_entered
+                .lock()
+                .expect("waiter signal mutex")
+                .take()
+            {
+                let _ = sender.send(());
+            }
         }
     }
 
@@ -4999,6 +5036,7 @@ mod driver_tests {
         let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let (build_started_tx, build_started_rx) = mpsc::channel();
         let (release_build_tx, release_build_rx) = mpsc::channel();
+        let (waiter_entered_tx, waiter_entered_rx) = mpsc::channel();
         let runner = Arc::new(OneflightRunner {
             calls: Mutex::new(Vec::new()),
             build_count: AtomicUsize::new(0),
@@ -5012,10 +5050,10 @@ mod driver_tests {
             runner.clone(),
             &workdir,
         ));
-        let second_driver = Arc::new(OpenShellDriver::with_command_runner_and_workdir(
-            runner.clone(),
-            &workdir,
-        ));
+        let second_driver = Arc::new(
+            OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir)
+                .with_event_emitter(Arc::new(WaiterSignalEmitter::new(waiter_entered_tx))),
+        );
         let first_spec = SandboxSpec {
             image: None,
             env: BTreeMap::new(),
@@ -5074,8 +5112,9 @@ mod driver_tests {
                     .block_on(async { driver.create(second_spec).await })
             })
         };
-        std::thread::sleep(Duration::from_millis(50));
+        let waiter_entered = waiter_entered_rx.recv_timeout(Duration::from_secs(5));
         release_build_tx.send(()).expect("release first build");
+        waiter_entered.expect("second create entered waiter path");
 
         first.join().expect("first thread").expect("first create");
         second
@@ -5176,6 +5215,153 @@ mod driver_tests {
 
         assert!(err.to_string().contains("build queue saturated"));
         assert!(runner.calls().is_empty());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn byo_waiter_retries_when_lock_disappears_without_metadata() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-transient-lock");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&dockerfile_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let seed = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir,
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: Some(seed.to_owned()),
+        };
+        let key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&key);
+        let lock_dir = cache_dir.join("lock");
+        std::fs::create_dir_all(&lock_dir).expect("create transient lock");
+        let tag = super::build_cache::tag_for_key(&key);
+        let final_context_arg = cache_dir.join("context").display().to_string();
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "docker",
+                |call| {
+                    assert_eq!(call.request.args.first().map(String::as_str), Some("build"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                },
+                &format!("{digest}\n"),
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--no-auto-providers",
+                            "--from",
+                            &final_context_arg,
+                            "--",
+                            "true",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let (waiter_entered_tx, waiter_entered_rx) = mpsc::channel();
+        let driver = OpenShellDriver::with_command_runner_workdir_and_build_config(
+            runner.clone(),
+            &workdir,
+            super::build_cache::BuildQueueConfig {
+                max_inflight: 1,
+                queue_limit: 128,
+                lock_timeout: Duration::from_millis(200),
+            },
+        )
+        .with_event_emitter(Arc::new(WaiterSignalEmitter::new(waiter_entered_tx)));
+
+        let create = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    driver
+                        .create(SandboxSpec {
+                            image: None,
+                            env: BTreeMap::new(),
+                            policy: None,
+                            metadata: BTreeMap::from([
+                                ("name".to_owned(), json!("devbox")),
+                                (
+                                    "byo_dockerfile".to_owned(),
+                                    json!(dockerfile.display().to_string()),
+                                ),
+                                ("agentenv_agent".to_owned(), json!("codex")),
+                                ("agentenv_mcp_port".to_owned(), json!("3333")),
+                                ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                                (
+                                    "agentenv_version".to_owned(),
+                                    json!(env!("CARGO_PKG_VERSION")),
+                                ),
+                                (
+                                    "agentenv_build_oneflight".to_owned(),
+                                    json!("byo-openshell-v1"),
+                                ),
+                                ("agentenv_build_seed_version".to_owned(), json!("1")),
+                                ("agentenv_build_seed".to_owned(), json!(seed)),
+                            ]),
+                        })
+                        .await
+                })
+        });
+
+        waiter_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("create entered waiter path");
+        assert!(lock_dir.is_dir());
+        std::fs::remove_dir_all(&lock_dir).expect("remove transient lock");
+
+        create.join().expect("create thread").expect("create");
+        assert_eq!(runner.calls().len(), 3);
+        assert!(workdir
+            .join("build")
+            .join("devbox")
+            .join("image-digest")
+            .is_file());
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 

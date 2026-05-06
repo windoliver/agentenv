@@ -2,7 +2,7 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 
 use agentenv_core::{
@@ -56,6 +56,11 @@ pub(super) struct BuildMaterialization {
     pub image_ref: String,
     pub image_digest: String,
     pub tag: String,
+}
+
+pub(super) enum BuildWaitOutcome {
+    Materialized(BuildMaterialization),
+    LockReleased,
 }
 
 pub(super) trait DockerImageInspector {
@@ -371,7 +376,7 @@ impl<'a> BuildCache<'a> {
         key: &str,
         input: &BuildInput,
         inspector: &dyn DockerImageInspector,
-    ) -> DriverResult<BuildMaterialization> {
+    ) -> DriverResult<BuildWaitOutcome> {
         let depth = loop {
             let current = BUILD_QUEUE_DEPTH.load(Ordering::SeqCst);
             if current >= self.config.queue_limit {
@@ -394,19 +399,22 @@ impl<'a> BuildCache<'a> {
         let _guard = QueueDepthGuard {
             events: self.events,
         };
-        let started = SystemTime::now();
+        let started = Instant::now();
+        let cache_dir = self.cache_dir(key);
+        let lock_dir = cache_dir.join("lock");
         loop {
-            if let Some(metadata) =
-                self.read_valid_metadata(input, key, &self.cache_dir(key), inspector)?
-            {
+            if let Some(metadata) = self.read_valid_metadata(input, key, &cache_dir, inspector)? {
                 self.write_env_digest(&input.env_name, &metadata.image_digest)?;
-                return Ok(BuildMaterialization {
+                return Ok(BuildWaitOutcome::Materialized(BuildMaterialization {
                     image_ref: metadata.image_ref,
                     image_digest: metadata.image_digest,
                     tag: tag_for_key(key),
-                });
+                }));
             }
-            if started.elapsed().unwrap_or(Duration::ZERO) > self.config.lock_timeout {
+            if !lock_dir.is_dir() {
+                return Ok(BuildWaitOutcome::LockReleased);
+            }
+            if started.elapsed() > self.config.lock_timeout {
                 return Err(DriverError::PreflightFailed {
                     message: format!("timed out waiting for BYO build {key}"),
                 });
