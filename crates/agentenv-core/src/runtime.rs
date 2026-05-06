@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -1629,11 +1629,10 @@ pub async fn restore_snapshot_env(
             source,
         })?;
     }
+    let _staging_cleanup = SnapshotStagingCleanup::new(staging_dir.clone());
     copy_verified_snapshot_to_staging(&args.snapshot, &staging_dir)?;
-    if let Err(error) = crate::snapshot::sanitize_snapshot_tree(&staging_dir) {
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(error.into());
-    }
+    crate::snapshot::sanitize_snapshot_tree(&staging_dir)?;
+    validate_restore_payload_symlinks(&staging_dir)?;
 
     let result = async {
         reproduce_env(options, factory, credentials, env_name.as_str(), &lock_yaml).await?;
@@ -1672,13 +1671,28 @@ pub async fn restore_snapshot_env(
     }
     .await;
 
-    let _ = fs::remove_dir_all(&staging_dir);
     result?;
 
     Ok(SnapshotRestoreResult {
         name: env_name.as_str().to_owned(),
         snapshot: args.snapshot,
     })
+}
+
+struct SnapshotStagingCleanup {
+    path: PathBuf,
+}
+
+impl SnapshotStagingCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for SnapshotStagingCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn read_snapshot_policy(path: &Path) -> RuntimeResult<agentenv_proto::NetworkPolicy> {
@@ -1723,6 +1737,59 @@ fn copy_verified_snapshot_to_staging(snapshot: &Path, staging_dir: &Path) -> Run
         copy_host_tree_entry(&src, &dst)?;
     }
     Ok(())
+}
+
+fn validate_restore_payload_symlinks(root: &Path) -> RuntimeResult<()> {
+    validate_restore_payload_symlinks_inner(root, root)
+}
+
+fn validate_restore_payload_symlinks_inner(root: &Path, current: &Path) -> RuntimeResult<()> {
+    for entry in fs::read_dir(current).map_err(|source| crate::env::EnvError::Io {
+        path: current.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| crate::env::EnvError::Io {
+            path: current.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| crate::env::EnvError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            validate_restore_payload_symlinks_inner(root, &path)?;
+            continue;
+        }
+
+        if file_type.is_symlink() {
+            let target = fs::read_link(&path).map_err(|source| crate::env::EnvError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if symlink_target_escapes_restore_payload(&target) {
+                let relative = path
+                    .strip_prefix(root)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| path.display().to_string());
+                return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                    message: format!(
+                        "unsafe snapshot symlink `{relative}` points outside restore payload"
+                    ),
+                }));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn symlink_target_escapes_restore_payload(target: &Path) -> bool {
+    target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
 }
 
 fn copy_host_tree_entry(src: &Path, dst: &Path) -> RuntimeResult<()> {
@@ -1939,30 +2006,23 @@ fn check_required_lockfile_credentials(
     lockfile: &crate::lockfile::PortableLockfile,
 ) -> RuntimeResult<()> {
     for (name, credential) in &lockfile.credentials {
-        if credential.required == Some(false) {
-            continue;
-        }
-
-        let reference = credential.reference.as_deref().unwrap_or(name);
-        match credential.source.as_str() {
-            "env" if std::env::var_os(reference).is_none() => {
-                return Err(RuntimeError::MissingCredential {
-                    name: reference.to_owned(),
-                });
-            }
-            "credstore" => match credentials.backend_name(reference)? {
-                Some(backend) if is_credstore_backend(&backend) => {}
-                _ => {
-                    return Err(RuntimeError::MissingCredential {
-                        name: reference.to_owned(),
-                    });
-                }
-            },
-            _ => {}
+        let requirement = credential_requirement_from_lockfile_ref(name, credential);
+        if credentials.resolve(&requirement)?.is_none() && requirement.required {
+            return Err(RuntimeError::MissingCredential {
+                name: requirement.name,
+            });
         }
     }
 
     Ok(())
+}
+
+fn credential_requirement_from_lockfile_ref(
+    name: &str,
+    credential: &crate::lockfile::CredentialRef,
+) -> agentenv_proto::CredentialRequirement {
+    let reference = credential.reference.as_deref().unwrap_or(name);
+    credential_requirement(reference, credential.required.unwrap_or(true))
 }
 
 fn check_snapshot_credentials(
@@ -1972,13 +2032,7 @@ fn check_snapshot_credentials(
     for credential in &manifest.credential_requirements {
         let reference = credential.reference.as_deref().unwrap_or(&credential.name);
         let required = credential.required.unwrap_or(true);
-        let requirement = agentenv_proto::CredentialRequirement {
-            name: reference.to_owned(),
-            description: String::new(),
-            kind: Default::default(),
-            required,
-            validator: None,
-        };
+        let requirement = credential_requirement(reference, required);
         if credentials.resolve(&requirement)?.is_none() && required {
             return Err(RuntimeError::MissingCredential {
                 name: requirement.name,
@@ -1987,6 +2041,16 @@ fn check_snapshot_credentials(
     }
 
     Ok(())
+}
+
+fn credential_requirement(name: &str, required: bool) -> agentenv_proto::CredentialRequirement {
+    agentenv_proto::CredentialRequirement {
+        name: name.to_owned(),
+        description: String::new(),
+        kind: Default::default(),
+        required,
+        validator: None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2035,13 +2099,7 @@ impl CredentialProvider for ReproducedCredentialProvider<'_> {
         let mut aliased_requirement = requirement.clone();
         aliased_requirement.name = binding.reference.clone();
         match binding.source.as_str() {
-            "env" => match std::env::var(&binding.reference) {
-                Ok(value) => Ok(Some(RuntimeSecret::new(value))),
-                Err(_) if requirement.required => Err(RuntimeError::MissingCredential {
-                    name: binding.reference.clone(),
-                }),
-                Err(_) => Ok(None),
-            },
+            "env" => self.inner.resolve(&aliased_requirement),
             "credstore" => match self.inner.backend_name(&binding.reference)? {
                 Some(backend) if is_credstore_backend(&backend) => {
                     self.inner.resolve(&aliased_requirement)
@@ -4223,7 +4281,7 @@ mod tests {
         fs,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex,
+            Arc, Mutex, MutexGuard, OnceLock,
         },
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -4402,18 +4460,32 @@ policy:
         policy: agentenv_proto::NetworkPolicy,
         populate: impl FnOnce(&std::path::Path),
     ) -> std::path::PathBuf {
+        write_signed_snapshot_fixture_with_blueprint(
+            root,
+            source_env,
+            credential_requirements,
+            policy,
+            snapshot_blueprint_yaml(),
+            populate,
+        )
+    }
+
+    fn write_signed_snapshot_fixture_with_blueprint(
+        root: &std::path::Path,
+        source_env: &str,
+        credential_requirements: Vec<crate::snapshot::SnapshotCredentialRequirement>,
+        policy: agentenv_proto::NetworkPolicy,
+        blueprint_yaml: &str,
+        populate: impl FnOnce(&std::path::Path),
+    ) -> std::path::PathBuf {
         let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
         fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
         fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
         populate(&snapshot_dir);
-        fs::write(
-            snapshot_dir.join("blueprint.yaml"),
-            snapshot_blueprint_yaml(),
-        )
-        .unwrap();
+        fs::write(snapshot_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
         fs::write(
             snapshot_dir.join("lock.yaml"),
-            snapshot_lockfile_yaml(root, source_env, snapshot_blueprint_yaml()),
+            snapshot_lockfile_yaml(root, source_env, blueprint_yaml),
         )
         .unwrap();
         fs::write(
@@ -4435,6 +4507,38 @@ policy:
         )
         .expect("write signed manifest");
         snapshot_dir
+    }
+
+    struct EnvVarGuard {
+        _lock: MutexGuard<'static, ()>,
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env var test lock");
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self {
+                _lock: lock,
+                name,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
     }
 
     #[test]
@@ -7638,8 +7742,7 @@ policy:
             log_level: LogLevel::Info,
             non_interactive: true,
         };
-        let previous_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
         let snapshot_dir = write_signed_snapshot_fixture(
             &root,
             "demo",
@@ -7665,9 +7768,6 @@ policy:
         .await
         .expect_err("restore must fail before creating env");
 
-        if let Some(value) = previous_key {
-            std::env::set_var("OPENAI_API_KEY", value);
-        }
         assert!(err.to_string().contains("OPENAI_API_KEY"));
         assert!(
             !root.join("envs").join("restored").exists(),
@@ -7683,8 +7783,7 @@ policy:
             log_level: LogLevel::Info,
             non_interactive: true,
         };
-        let previous_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
         let snapshot_dir = write_signed_snapshot_fixture(
             &root,
             "demo",
@@ -7711,9 +7810,6 @@ policy:
         .await
         .expect_err("restore must reject existing target before credentials");
 
-        if let Some(value) = previous_key {
-            std::env::set_var("OPENAI_API_KEY", value);
-        }
         assert!(matches!(
             err,
             RuntimeError::Env(crate::env::EnvError::AlreadyExists { ref name }) if name == "restored"
@@ -7745,8 +7841,7 @@ policy:
             log_level: LogLevel::Info,
             non_interactive: true,
         };
-        let previous_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
         let snapshot_dir = write_signed_snapshot_fixture(
             &root,
             "demo",
@@ -7773,9 +7868,6 @@ policy:
         .await
         .expect("restore should use provider-resolved snapshot credential");
 
-        if let Some(value) = previous_key {
-            std::env::set_var("OPENAI_API_KEY", value);
-        }
         assert_eq!(result.name, "restored");
         assert_eq!(result.snapshot, snapshot_dir);
         assert_eq!(credentials.resolved.len(), 1);
@@ -7789,6 +7881,66 @@ policy:
     }
 
     #[tokio::test]
+    async fn restore_snapshot_resolves_lockfile_credentials_through_provider_without_env() {
+        let root = unique_root("agentenv-runtime-restore-provider-lockfile-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture_with_blueprint(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+            super::empty_policy_override(),
+            snapshot_credential_blueprint_yaml(),
+            |_| {},
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("OPENAI_API_KEY", "sk-test-provider");
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore should use provider-resolved lockfile credential");
+
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert!(
+            credentials
+                .resolved
+                .iter()
+                .filter(|requirement| requirement.name == "OPENAI_API_KEY")
+                .count()
+                >= 2,
+            "restore should resolve both manifest and lockfile credential requirements"
+        );
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+        let copied_in = factory.copied_in.lock().expect("copy in tracker").clone();
+        assert!(copied_in.iter().any(|(src, dst)| {
+            std::path::Path::new(src).ends_with("workspace") && dst == "/sandbox"
+        }));
+    }
+
+    #[tokio::test]
     async fn restore_snapshot_rejects_required_manifest_credential_when_provider_returns_none() {
         let root = unique_root("agentenv-runtime-restore-provider-missing");
         let options = RuntimeOptions {
@@ -7796,8 +7948,7 @@ policy:
             log_level: LogLevel::Info,
             non_interactive: true,
         };
-        let previous_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
         let snapshot_dir = write_signed_snapshot_fixture(
             &root,
             "demo",
@@ -7823,9 +7974,6 @@ policy:
         .await
         .expect_err("restore should reject unresolved required snapshot credential");
 
-        if let Some(value) = previous_key {
-            std::env::set_var("OPENAI_API_KEY", value);
-        }
         assert!(matches!(
             err,
             RuntimeError::MissingCredential { ref name } if name == "OPENAI_API_KEY"
@@ -7853,8 +8001,7 @@ policy:
             log_level: LogLevel::Info,
             non_interactive: true,
         };
-        let previous_key = std::env::var_os("OPENAI_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
         let snapshot_dir = write_signed_snapshot_fixture(
             &root,
             "demo",
@@ -7880,9 +8027,6 @@ policy:
         .await
         .expect("optional unresolved snapshot credential should not block restore");
 
-        if let Some(value) = previous_key {
-            std::env::set_var("OPENAI_API_KEY", value);
-        }
         assert_eq!(result.name, "restored");
         assert_eq!(result.snapshot, snapshot_dir);
         assert_eq!(credentials.resolved.len(), 1);
@@ -8076,6 +8220,64 @@ policy:
         assert!(
             !root.join("envs").join("restored").exists(),
             "sanitizer failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_rejects_unsafe_symlink_before_create() {
+        let root = unique_root("agentenv-runtime-restore-unsafe-symlink");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let snapshot_dir = write_signed_snapshot_fixture_with(
+            &root,
+            "demo",
+            Vec::new(),
+            super::empty_policy_override(),
+            |snapshot_dir| {
+                super::create_host_symlink(
+                    std::path::Path::new("../outside"),
+                    &snapshot_dir.join("workspace").join("escape"),
+                )
+                .expect("create unsafe workspace symlink");
+            },
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("unsafe snapshot symlink should fail restore");
+
+        assert!(err.to_string().contains("unsafe snapshot symlink"));
+        assert!(
+            !root.join("envs").join("restored").exists(),
+            "unsafe symlink failure must happen before env creation"
+        );
+        assert!(
+            factory
+                .env_builds
+                .lock()
+                .expect("env build tracker")
+                .is_empty(),
+            "unsafe symlink failure must happen before env reproduction"
+        );
+        assert!(
+            root.join(".agentenv-tmp")
+                .read_dir()
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "restore staging should be cleaned after unsafe symlink failure"
         );
     }
 
