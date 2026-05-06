@@ -441,7 +441,7 @@ struct SnapshotArgs {
     command: Option<SnapshotCommand>,
     #[arg(value_name = "ENV")]
     env: Option<String>,
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", requires = "env")]
     output: Option<PathBuf>,
 }
 

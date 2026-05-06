@@ -555,6 +555,58 @@ fn snapshot_restore_missing_dir_with_as_fails_before_env_creation() {
 }
 
 #[test]
+fn snapshot_output_before_verify_is_rejected_by_parser() {
+    let temp_dir = make_temp_dir("snapshot-output-before-verify");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("--output")
+        .arg("ignored.agentenvsnap")
+        .arg("verify")
+        .arg("missing.agentenvsnap")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output"), "stderr was: {stderr}");
+    assert!(stderr.contains("<ENV>"), "stderr was: {stderr}");
+}
+
+#[test]
+fn snapshot_output_before_restore_is_rejected_by_parser() {
+    let temp_dir = make_temp_dir("snapshot-output-before-restore");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("--output")
+        .arg("-")
+        .arg("restore")
+        .arg("missing.agentenvsnap")
+        .arg("--as")
+        .arg("restored")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output"), "stderr was: {stderr}");
+    assert!(stderr.contains("<ENV>"), "stderr was: {stderr}");
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state after parser rejection"
+    );
+}
+
+#[test]
 fn snapshot_create_rejects_stdout_output() {
     let temp_dir = make_temp_dir("snapshot-output-dash");
 
