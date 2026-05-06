@@ -147,6 +147,7 @@ impl RemoteSshTarget {
     fn from_metadata(metadata: &BTreeMap<String, Value>) -> DriverResult<Self> {
         let host = required_metadata_string(metadata, "host")?;
         let user = required_metadata_string(metadata, "user")?;
+        validate_remote_ssh_user(&user, "metadata.user")?;
         let port = metadata_port(metadata)?;
         let identity_file =
             optional_metadata_string(metadata, "identity_file")?.map(expand_leading_home);
@@ -190,6 +191,12 @@ impl RemoteSshTarget {
                 "expected remote-ssh scheme",
             ));
         }
+        if url.password().is_some() {
+            return Err(invalid_handle(
+                handle.to_owned(),
+                "passwords are not supported in remote-ssh handles",
+            ));
+        }
         let host = url
             .host_str()
             .ok_or_else(|| invalid_handle(handle.to_owned(), "missing host"))?
@@ -198,6 +205,8 @@ impl RemoteSshTarget {
         if user.is_empty() {
             return Err(invalid_handle(handle.to_owned(), "missing user"));
         }
+        validate_remote_ssh_user(user, "handle username")
+            .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
         let mut identity_file = None;
         let mut jump_host = None;
         for (key, value) in url.query_pairs() {
@@ -216,6 +225,22 @@ impl RemoteSshTarget {
             enforce_remote_firewall: false,
         })
     }
+}
+
+fn validate_remote_ssh_user(user: &str, label: &str) -> DriverResult<()> {
+    if user.chars().any(is_unsupported_remote_ssh_user_char) {
+        return Err(DriverError::InvalidInput {
+            message: format!("{label} contains unsupported characters"),
+        });
+    }
+
+    Ok(())
+}
+
+fn is_unsupported_remote_ssh_user_char(ch: char) -> bool {
+    ch.is_control()
+        || ch.is_whitespace()
+        || matches!(ch, '@' | ':' | '/' | '?' | '#' | '[' | ']' | '%')
 }
 
 fn required_metadata_string(metadata: &BTreeMap<String, Value>, key: &str) -> DriverResult<String> {
@@ -650,6 +675,18 @@ mod tests {
     }
 
     #[test]
+    fn target_from_metadata_rejects_username_that_cannot_round_trip_in_handle() {
+        let metadata = BTreeMap::from([
+            ("host".to_owned(), json!("dev-vm.example.com")),
+            ("user".to_owned(), json!("alice@example.com")),
+        ]);
+
+        let err = RemoteSshTarget::from_metadata(&metadata).expect_err("metadata should fail");
+
+        assert!(err.to_string().contains("metadata.user"));
+    }
+
+    #[test]
     fn uri_handle_round_trips_target_fields() {
         let target = RemoteSshTarget {
             host: "dev-vm.example.com".to_owned(),
@@ -681,6 +718,23 @@ mod tests {
 
         assert_eq!(handle, "remote-ssh://alice@dev-vm.example.com:22");
         assert!(!handle.ends_with('?'));
+    }
+
+    #[test]
+    fn uri_handle_rejects_encoded_username_delimiters() {
+        let err =
+            RemoteSshTarget::from_handle("remote-ssh://alice%40example.com@dev-vm.example.com:22")
+                .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("username"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_password_authority() {
+        let err = RemoteSshTarget::from_handle("remote-ssh://alice:secret@dev-vm.example.com:22")
+            .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("password"));
     }
 
     #[tokio::test]
