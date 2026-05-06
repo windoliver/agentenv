@@ -392,7 +392,7 @@ impl<'a> BuildCache<'a> {
             build_key: key.to_owned(),
             ts: now_timestamp_string(),
             reason_code: "docker_build_failed".to_owned(),
-            message: error.to_string(),
+            message: sanitized_failure_message(error),
         };
         let bytes =
             serde_json::to_vec_pretty(&marker).map_err(|source| DriverError::InvalidInput {
@@ -446,20 +446,21 @@ impl<'a> BuildCache<'a> {
                     tag: tag_for_key(key),
                 }));
             }
+            if lock_dir.is_dir() {
+                if started.elapsed() > self.config.lock_timeout {
+                    return Err(DriverError::PreflightFailed {
+                        message: format!("timed out waiting for BYO build {key}"),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
             if let Some(failure) = self.read_failure(key)? {
                 return Err(DriverError::PreflightFailed {
                     message: failure.message,
                 });
             }
-            if !lock_dir.is_dir() {
-                return Ok(BuildWaitOutcome::LockReleased);
-            }
-            if started.elapsed() > self.config.lock_timeout {
-                return Err(DriverError::PreflightFailed {
-                    message: format!("timed out waiting for BYO build {key}"),
-                });
-            }
-            std::thread::sleep(Duration::from_millis(25));
+            return Ok(BuildWaitOutcome::LockReleased);
         }
     }
 
@@ -750,6 +751,32 @@ fn evict_invalid_cache<T>(cache_dir: &Path) -> DriverResult<Option<T>> {
     Ok(None)
 }
 
+fn sanitized_failure_message(error: &DriverError) -> String {
+    match error {
+        DriverError::CommandFailed {
+            status,
+            stdout,
+            stderr,
+            ..
+        } => {
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                return stderr.to_owned();
+            }
+            let stdout = stdout.trim();
+            if !stdout.is_empty() {
+                return stdout.to_owned();
+            }
+            match status {
+                Some(status) => format!("docker build failed with status {status}"),
+                None => "docker build failed with unknown status".to_owned(),
+            }
+        }
+        DriverError::CommandSpawn { .. } => "failed to start docker build command".to_owned(),
+        _ => "docker build failed".to_owned(),
+    }
+}
+
 fn write_cache_file_atomically(
     cache_dir: &Path,
     file_name: &str,
@@ -897,6 +924,20 @@ mod tests {
 
     static TEST_ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
 
+    struct StaticInspector {
+        digest: String,
+    }
+
+    impl DockerImageInspector for StaticInspector {
+        fn inspect_image(&self, _request: CommandRequest) -> DriverResult<CommandOutput> {
+            Ok(CommandOutput {
+                status: Some(0),
+                stdout: format!("{}\n", self.digest),
+                stderr: String::new(),
+            })
+        }
+    }
+
     fn unique_tempdir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
     }
@@ -991,6 +1032,59 @@ mod tests {
         assert!(cache_dir.join("image-digest").is_file());
         assert!(!cache_dir.join("metadata.json.tmp").exists());
         assert!(!cache_dir.join("image-digest.tmp").exists());
+        fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn wait_for_materialization_ignores_failure_marker_while_lock_active() {
+        let tempdir = unique_tempdir("sandbox-openshell-cache-active-lock-stale-failure");
+        let workdir = tempdir.join(".agentenv");
+        let source_dir = tempdir.join("source");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let dockerfile = source_dir.join("Dockerfile");
+        fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+        let stage_dir = tempdir.join("context.tmp");
+        fs::create_dir_all(&stage_dir).expect("create stage context");
+        fs::write(stage_dir.join("Dockerfile"), "FROM alpine:3.20\n").expect("stage Dockerfile");
+        let context_digest = BuildCache::digest_staged_context(&stage_dir).expect("context digest");
+        let noop = NoopEventEmitter;
+        let cache = BuildCache::new_with_config(
+            workdir.clone(),
+            &noop,
+            BuildQueueConfig {
+                max_inflight: 4,
+                queue_limit: 128,
+                lock_timeout: Duration::ZERO,
+            },
+        );
+        let input = build_input("devbox", dockerfile, stage_dir, context_digest);
+        let key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&key);
+        fs::create_dir_all(cache_dir.join("lock")).expect("active lock");
+        fs::write(
+            cache_dir.join("failure.json"),
+            serde_json::json!({
+                "build_key": key.clone(),
+                "ts": "2026-05-06T12:00:00Z",
+                "reason_code": "docker_build_failed",
+                "message": "stale docker failure"
+            })
+            .to_string(),
+        )
+        .expect("stale failure marker");
+        let inspector = StaticInspector {
+            digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                .to_owned(),
+        };
+
+        let err = match cache.wait_for_materialization(&key, &input, &inspector) {
+            Ok(_) => panic!("active lock should not materialize"),
+            Err(err) => err,
+        };
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("timed out waiting for BYO build"));
+        assert!(!rendered.contains("stale docker failure"));
         fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 

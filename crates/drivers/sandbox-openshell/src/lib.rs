@@ -5393,10 +5393,151 @@ mod driver_tests {
         assert_eq!(failure_files.len(), 1);
         let failure = std::fs::read_to_string(&failure_files[0]).expect("failure marker");
         assert!(failure.contains("docker_build_failed"));
+        assert!(failure.contains("build failed for peer"));
+        assert!(!failure.contains("docker build"));
+        assert!(!failure.contains(&dockerfile.display().to_string()));
+        assert!(!failure.contains("context.tmp"));
         assert!(builder_err.to_string().contains("build failed for peer"));
         assert!(waiter_err.to_string().contains("build failed for peer"));
         assert_eq!(runner.build_count.load(Ordering::SeqCst), 1);
         assert_eq!(runner.sandbox_create_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn byo_waiter_ignores_stale_failure_marker_during_active_rebuild() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-stale-marker-rebuild");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let key_stage_dir = workdir.join("build").join("devbox-a-key");
+        super::stage_build_context(&dockerfile_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let seed = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox-a".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir,
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: Some(seed.to_owned()),
+        };
+        let key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&key);
+        std::fs::create_dir_all(&cache_dir).expect("build cache dir");
+        std::fs::write(
+            cache_dir.join("failure.json"),
+            serde_json::json!({
+                "build_key": key,
+                "ts": "2026-05-06T12:00:00Z",
+                "reason_code": "docker_build_failed",
+                "message": "stale docker failure"
+            })
+            .to_string(),
+        )
+        .expect("stale failure marker");
+        std::fs::remove_dir_all(workdir.join("build").join("devbox-a-key")).ok();
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let (build_started_tx, build_started_rx) = mpsc::channel();
+        let (release_build_tx, release_build_rx) = mpsc::channel();
+        let (waiter_entered_tx, waiter_entered_rx) = mpsc::channel();
+        let runner = Arc::new(OneflightRunner {
+            calls: Mutex::new(Vec::new()),
+            build_count: AtomicUsize::new(0),
+            inspect_count: AtomicUsize::new(0),
+            build_started: build_started_tx,
+            release_build: Mutex::new(release_build_rx),
+            digest: digest.to_owned(),
+        });
+        let first_driver = Arc::new(OpenShellDriver::with_command_runner_and_workdir(
+            runner.clone(),
+            &workdir,
+        ));
+        let second_driver = Arc::new(
+            OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir)
+                .with_event_emitter(Arc::new(WaiterSignalEmitter::new(waiter_entered_tx))),
+        );
+        let first_spec = SandboxSpec {
+            image: None,
+            env: BTreeMap::new(),
+            policy: None,
+            metadata: BTreeMap::from([
+                ("name".to_owned(), json!("devbox-a")),
+                (
+                    "byo_dockerfile".to_owned(),
+                    json!(dockerfile.display().to_string()),
+                ),
+                ("agentenv_agent".to_owned(), json!("codex")),
+                ("agentenv_mcp_port".to_owned(), json!("3333")),
+                ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                (
+                    "agentenv_version".to_owned(),
+                    json!(env!("CARGO_PKG_VERSION")),
+                ),
+                (
+                    "agentenv_build_oneflight".to_owned(),
+                    json!("byo-openshell-v1"),
+                ),
+                ("agentenv_build_seed_version".to_owned(), json!("1")),
+                ("agentenv_build_seed".to_owned(), json!(seed)),
+            ]),
+        };
+        let mut second_spec = first_spec.clone();
+        second_spec
+            .metadata
+            .insert("name".to_owned(), json!("devbox-b"));
+
+        let first = {
+            let driver = Arc::clone(&first_driver);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async { driver.create(first_spec).await })
+            })
+        };
+        build_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first rebuild started");
+        let second = {
+            let driver = Arc::clone(&second_driver);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async { driver.create(second_spec).await })
+            })
+        };
+        waiter_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second create entered waiter path");
+        release_build_tx.send(()).expect("release rebuild");
+
+        first.join().expect("first thread").expect("first create");
+        second
+            .join()
+            .expect("second thread")
+            .expect("second create should materialize rebuild");
+
+        assert_eq!(runner.build_count.load(Ordering::SeqCst), 1);
+        assert!(!cache_dir.join("failure.json").exists());
+        assert!(workdir
+            .join("build")
+            .join("devbox-b")
+            .join("image-digest")
+            .is_file());
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
@@ -5430,7 +5571,8 @@ mod driver_tests {
         };
         let key = cache.build_key(&input).expect("build key");
         let cache_dir = cache.cache_dir(&key);
-        std::fs::create_dir_all(cache_dir.join("lock")).expect("active build lock");
+        let lock_dir = cache_dir.join("lock");
+        std::fs::create_dir_all(&lock_dir).expect("active build lock");
         std::fs::write(
             cache_dir.join("failure.json"),
             serde_json::json!({
@@ -5442,6 +5584,14 @@ mod driver_tests {
             .to_string(),
         )
         .expect("failure marker");
+        let (waiter_entered_tx, waiter_entered_rx) = mpsc::channel();
+        let lock_for_releaser = lock_dir.clone();
+        let releaser = std::thread::spawn(move || {
+            waiter_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("waiter entered");
+            std::fs::remove_dir_all(lock_for_releaser).expect("release active lock");
+        });
         let runner = Arc::new(FlexibleCommandRunner::new(Vec::new()));
         let driver = OpenShellDriver::with_command_runner_workdir_and_build_config(
             runner.clone(),
@@ -5449,9 +5599,10 @@ mod driver_tests {
             super::build_cache::BuildQueueConfig {
                 max_inflight: 4,
                 queue_limit: 128,
-                lock_timeout: Duration::ZERO,
+                lock_timeout: Duration::from_secs(5),
             },
-        );
+        )
+        .with_event_emitter(Arc::new(WaiterSignalEmitter::new(waiter_entered_tx)));
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5489,6 +5640,7 @@ mod driver_tests {
             })
             .expect_err("waiter should receive failure marker");
 
+        releaser.join().expect("lock releaser");
         assert!(err.to_string().contains("docker failed for peer"));
         assert!(runner.calls().is_empty());
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
