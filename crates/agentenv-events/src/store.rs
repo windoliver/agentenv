@@ -299,6 +299,50 @@ impl SqliteEventStore {
         Ok(rows)
     }
 
+    pub fn count_events_by_kind(&self, kind: ActivityKind) -> StoreResult<u64> {
+        let conn = self.connection()?;
+        let kind = enum_to_db_string(kind, "kind")?;
+        let count = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM activity_events
+            WHERE kind = ?1
+            "#,
+            params![kind],
+            |row| row.get::<_, i64>(0),
+        )?;
+        count_to_u64(count)
+    }
+
+    pub fn latest_build_queue_depth(&self) -> StoreResult<u64> {
+        let conn = self.connection()?;
+        let kind = enum_to_db_string(ActivityKind::BuildQueueDepth, "kind")?;
+        let value = conn.query_row(
+            r#"
+            SELECT
+                CASE
+                    WHEN json_type(extras_json, '$.depth') = 'integer'
+                    THEN json_extract(extras_json, '$.depth')
+                    ELSE 0
+                END
+            FROM activity_events
+            WHERE kind = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+            params![kind],
+            |row| row.get::<_, Option<i64>>(0),
+        );
+
+        match value {
+            Ok(Some(depth)) if depth >= 0 => count_to_u64(depth),
+            Ok(Some(depth)) => Err(StoreError::CountOutOfRange(depth)),
+            Ok(None) => Ok(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn policy_blocks_by_kind_driver(&self) -> StoreResult<Vec<PolicyBlockCount>> {
         self.policy_blocks_by_kind_driver_for_env(None)
     }
