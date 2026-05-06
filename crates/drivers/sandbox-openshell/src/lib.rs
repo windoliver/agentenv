@@ -1120,6 +1120,7 @@ impl OpenShellDriver {
                     cache_dir.display()
                 ),
             })?;
+            cache.clear_failure(&key)?;
             let stage_dir = cache_dir.join("context.tmp");
             build_cache::remove_cache_path(&stage_dir)?;
             fs::rename(&key_stage_dir, &stage_dir).map_err(|source| DriverError::InvalidInput {
@@ -1146,13 +1147,16 @@ impl OpenShellDriver {
                 format!("AGENTENV_WORKSPACE_MOUNT={}", config.workspace_mount),
                 stage_arg.clone(),
             ];
-            self.run_checked_host_command(
+            if let Err(err) = self.run_checked_host_command(
                 "docker",
                 CommandRequest {
                     args: build_args,
                     env: BTreeMap::new(),
                 },
-            )?;
+            ) {
+                let _ = cache.write_failure(&key, &err);
+                return Err(err);
+            }
 
             let output = self.run_checked_host_command(
                 "docker",
@@ -5214,6 +5218,168 @@ mod driver_tests {
             .expect_err("queue limit should reject");
 
         assert!(err.to_string().contains("build queue saturated"));
+        assert!(runner.calls().is_empty());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn concurrent_byo_waiter_receives_builder_failure() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-oneflight-failure");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::output("docker", |_| {}, Some(1), "", "build failed"),
+        ]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("agentenv_agent".to_owned(), json!("codex")),
+                            ("agentenv_mcp_port".to_owned(), json!("3333")),
+                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                            (
+                                "agentenv_version".to_owned(),
+                                json!(env!("CARGO_PKG_VERSION")),
+                            ),
+                            (
+                                "agentenv_build_oneflight".to_owned(),
+                                json!("byo-openshell-v1"),
+                            ),
+                            ("agentenv_build_seed_version".to_owned(), json!("1")),
+                            (
+                                "agentenv_build_seed".to_owned(),
+                                json!(
+                                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                                ),
+                            ),
+                        ]),
+                    })
+                    .await
+            })
+            .expect_err("build should fail");
+
+        let failure_files = std::fs::read_dir(workdir.join("build-cache"))
+            .expect("build cache dir")
+            .flat_map(|entry| {
+                let path = entry.expect("cache entry").path().join("failure.json");
+                path.exists().then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failure_files.len(), 1);
+        let failure = std::fs::read_to_string(&failure_files[0]).expect("failure marker");
+        assert!(failure.contains("docker_build_failed"));
+        assert!(err.to_string().contains("build failed"));
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn byo_waiter_receives_builder_failure_marker() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-waiter-failure");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&dockerfile_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let seed = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir,
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: Some(seed.to_owned()),
+        };
+        let key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&key);
+        std::fs::create_dir_all(cache_dir.join("lock")).expect("active build lock");
+        std::fs::write(
+            cache_dir.join("failure.json"),
+            serde_json::json!({
+                "build_key": key,
+                "ts": "2026-05-06T12:00:00Z",
+                "reason_code": "docker_build_failed",
+                "message": "docker failed for peer"
+            })
+            .to_string(),
+        )
+        .expect("failure marker");
+        let runner = Arc::new(FlexibleCommandRunner::new(Vec::new()));
+        let driver = OpenShellDriver::with_command_runner_workdir_and_build_config(
+            runner.clone(),
+            &workdir,
+            super::build_cache::BuildQueueConfig {
+                max_inflight: 4,
+                queue_limit: 128,
+                lock_timeout: Duration::ZERO,
+            },
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("agentenv_agent".to_owned(), json!("codex")),
+                            ("agentenv_mcp_port".to_owned(), json!("3333")),
+                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                            (
+                                "agentenv_version".to_owned(),
+                                json!(env!("CARGO_PKG_VERSION")),
+                            ),
+                            (
+                                "agentenv_build_oneflight".to_owned(),
+                                json!("byo-openshell-v1"),
+                            ),
+                            ("agentenv_build_seed_version".to_owned(), json!("1")),
+                            ("agentenv_build_seed".to_owned(), json!(seed)),
+                        ]),
+                    })
+                    .await
+            })
+            .expect_err("waiter should receive failure marker");
+
+        assert!(err.to_string().contains("docker failed for peer"));
         assert!(runner.calls().is_empty());
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }

@@ -151,6 +151,14 @@ struct BuildSourceMetadata {
     context_digest: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildFailureMarker {
+    build_key: String,
+    ts: String,
+    reason_code: String,
+    message: String,
+}
+
 pub(super) struct BuildCache<'a> {
     root: PathBuf,
     config: BuildQueueConfig,
@@ -337,6 +345,7 @@ impl<'a> BuildCache<'a> {
             "metadata.json.tmp",
             &metadata_json,
         )?;
+        self.clear_failure(&key)?;
         self.write_env_digest(&input.env_name, &image_digest)?;
         self.emit_miss(&input.env_name, &key, &image_digest);
         Ok(BuildMaterialization {
@@ -369,6 +378,32 @@ impl<'a> BuildCache<'a> {
                 ),
             }),
         }
+    }
+
+    pub(super) fn write_failure(&self, key: &str, error: &DriverError) -> DriverResult<()> {
+        let cache_dir = self.cache_dir(key);
+        fs::create_dir_all(&cache_dir).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to create build cache `{}`: {source}",
+                cache_dir.display()
+            ),
+        })?;
+        let marker = BuildFailureMarker {
+            build_key: key.to_owned(),
+            ts: now_timestamp_string(),
+            reason_code: "docker_build_failed".to_owned(),
+            message: error.to_string(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&marker).map_err(|source| DriverError::InvalidInput {
+                message: format!("failed to serialize build failure marker: {source}"),
+            })?;
+
+        write_cache_file_atomically(&cache_dir, "failure.json", "failure.json.tmp", &bytes)
+    }
+
+    pub(super) fn clear_failure(&self, key: &str) -> DriverResult<()> {
+        remove_cache_path(&self.cache_dir(key).join("failure.json"))
     }
 
     pub(super) fn wait_for_materialization(
@@ -410,6 +445,11 @@ impl<'a> BuildCache<'a> {
                     image_digest: metadata.image_digest,
                     tag: tag_for_key(key),
                 }));
+            }
+            if let Some(failure) = self.read_failure(key)? {
+                return Err(DriverError::PreflightFailed {
+                    message: failure.message,
+                });
             }
             if !lock_dir.is_dir() {
                 return Ok(BuildWaitOutcome::LockReleased);
@@ -456,6 +496,27 @@ impl<'a> BuildCache<'a> {
         }
 
         Ok(Some(metadata))
+    }
+
+    fn read_failure(&self, key: &str) -> DriverResult<Option<BuildFailureMarker>> {
+        let path = self.cache_dir(key).join("failure.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to read build failure marker `{}`: {source}",
+                path.display()
+            ),
+        })?;
+        let marker =
+            serde_json::from_slice(&bytes).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to parse build failure marker `{}`: {source}",
+                    path.display()
+                ),
+            })?;
+        Ok(Some(marker))
     }
 
     fn metadata_matches(
