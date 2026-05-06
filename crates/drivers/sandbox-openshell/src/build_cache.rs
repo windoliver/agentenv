@@ -209,22 +209,14 @@ impl<'a> BuildCache<'a> {
             return Ok(None);
         }
 
-        let metadata_bytes =
-            fs::read(&metadata_path).map_err(|source| DriverError::InvalidInput {
-                message: format!(
-                    "failed to read build cache metadata `{}`: {source}",
-                    metadata_path.display()
-                ),
-            })?;
-        let metadata: BuildMetadata =
-            serde_json::from_slice(&metadata_bytes).map_err(|source| {
-                DriverError::InvalidInput {
-                    message: format!(
-                        "failed to parse build cache metadata `{}`: {source}",
-                        metadata_path.display()
-                    ),
-                }
-            })?;
+        let metadata_bytes = match fs::read(&metadata_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return evict_invalid_cache(cache_dir),
+        };
+        let metadata: BuildMetadata = match serde_json::from_slice(&metadata_bytes) {
+            Ok(metadata) => metadata,
+            Err(_) => return evict_invalid_cache(cache_dir),
+        };
 
         if !self.metadata_matches(input, key, cache_dir, &metadata)? {
             return Ok(None);
@@ -252,14 +244,9 @@ impl<'a> BuildCache<'a> {
             return Ok(false);
         }
 
-        parse_sha256_digest(&metadata.image_digest).map_err(|source| {
-            DriverError::InvalidInput {
-                message: format!(
-                    "cached BYO image digest `{}` is invalid: {source}",
-                    metadata.image_digest
-                ),
-            }
-        })?;
+        if parse_sha256_digest(&metadata.image_digest).is_err() {
+            return Ok(false);
+        }
         if let Some(expected) = input.expected_digest.as_deref() {
             parse_sha256_digest(expected).map_err(|source| DriverError::InvalidInput {
                 message: format!("expected BYO image digest `{expected}` is invalid: {source}"),
@@ -270,13 +257,9 @@ impl<'a> BuildCache<'a> {
         }
 
         let digest_path = cache_dir.join("image-digest");
-        let digest_file =
-            fs::read_to_string(&digest_path).map_err(|source| DriverError::InvalidInput {
-                message: format!(
-                    "failed to read build cache digest `{}`: {source}",
-                    digest_path.display()
-                ),
-            })?;
+        let Ok(digest_file) = fs::read_to_string(&digest_path) else {
+            return Ok(false);
+        };
         if digest_file.trim() != metadata.image_digest {
             return Ok(false);
         }
@@ -288,15 +271,9 @@ impl<'a> BuildCache<'a> {
             return Ok(false);
         }
 
-        let source_dockerfile =
-            fs::canonicalize(&metadata.source.dockerfile).map_err(|source| {
-                DriverError::InvalidInput {
-                    message: format!(
-                        "failed to resolve cached BYO Dockerfile `{}`: {source}",
-                        metadata.source.dockerfile
-                    ),
-                }
-            })?;
+        let Ok(source_dockerfile) = fs::canonicalize(&metadata.source.dockerfile) else {
+            return Ok(false);
+        };
         let input_dockerfile =
             fs::canonicalize(&input.dockerfile).map_err(|source| DriverError::InvalidInput {
                 message: format!(
@@ -393,6 +370,11 @@ pub(super) fn tag_for_key(key: &str) -> String {
 
 fn cache_dir_name(key: &str) -> String {
     key.replace(':', "-")
+}
+
+fn evict_invalid_cache<T>(cache_dir: &Path) -> DriverResult<Option<T>> {
+    let _ = fs::remove_file(cache_dir.join("metadata.json"));
+    Ok(None)
 }
 
 fn build_args(input: &BuildInput) -> Vec<String> {

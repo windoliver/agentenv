@@ -4842,6 +4842,167 @@ mod driver_tests {
     }
 
     #[test]
+    fn create_ignores_malformed_byo_build_cache_metadata_and_builds() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-cache-malformed");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(
+            &dockerfile,
+            "FROM alpine:3.20\nARG AGENTENV_VERSION\nRUN test -n \"$AGENTENV_VERSION\"\n",
+        )
+        .expect("write source Dockerfile");
+        std::fs::write(dockerfile_dir.join("internal-cli"), "demo").expect("write context file");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&dockerfile_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir.clone(),
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: Some(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    .to_owned(),
+            ),
+        };
+        let cache_key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&cache_key);
+        std::fs::create_dir_all(cache_dir.join("context")).expect("create cache context");
+        std::fs::write(cache_dir.join("metadata.json"), "{").expect("write malformed metadata");
+        std::fs::write(
+            cache_dir.join("image-digest"),
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n",
+        )
+        .expect("write digest");
+        std::fs::remove_dir_all(&key_stage_dir).expect("remove key stage setup");
+
+        let stage_dir = workdir.join("build").join("devbox");
+        let stage_dockerfile = stage_dir.join("Dockerfile");
+        let stage_dir_arg = stage_dir.display().to_string();
+        let tag = "agentenv-byo-devbox:latest";
+        let digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let expected_build_args = vec![
+            "build".to_owned(),
+            "--file".to_owned(),
+            stage_dockerfile.display().to_string(),
+            "--tag".to_owned(),
+            tag.to_owned(),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_VERSION={}", env!("CARGO_PKG_VERSION")),
+            "--build-arg".to_owned(),
+            "AGENTENV_AGENT=codex".to_owned(),
+            "--build-arg".to_owned(),
+            "AGENTENV_MCP_PORT=3333".to_owned(),
+            "--build-arg".to_owned(),
+            "AGENTENV_WORKSPACE_MOUNT=/sandbox".to_owned(),
+            stage_dir_arg.clone(),
+        ];
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(call.request.args, expected_build_args);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                },
+                &format!("{digest}\n"),
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--no-auto-providers",
+                            "--from",
+                            &stage_dir_arg,
+                            "--",
+                            "true",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("agentenv_agent".to_owned(), json!("codex")),
+                            ("agentenv_mcp_port".to_owned(), json!("3333")),
+                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                            (
+                                "agentenv_version".to_owned(),
+                                json!(env!("CARGO_PKG_VERSION")),
+                            ),
+                            (
+                                "agentenv_build_seed".to_owned(),
+                                json!(
+                                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                                ),
+                            ),
+                        ]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert_eq!(runner.calls().len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(stage_dir.join("image-digest")).expect("digest file"),
+            format!("{digest}\n")
+        );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
     fn create_builds_byo_dockerfile_and_uses_staged_context() {
         let tempdir = unique_tempdir("sandbox-openshell-byo-build");
         let context_dir = tempdir.join("enterprise-sandbox");
