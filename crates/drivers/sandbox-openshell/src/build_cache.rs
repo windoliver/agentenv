@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
@@ -61,13 +61,22 @@ pub(super) trait DockerImageInspector {
     fn inspect_image(&self, request: CommandRequest) -> DriverResult<CommandOutput>;
 }
 
-pub(super) struct BuildSlotGuard;
+pub(super) struct BuildSlotGuard {
+    active: &'static AtomicUsize,
+}
 
 impl BuildSlotGuard {
     fn acquire(config: &BuildQueueConfig) -> DriverResult<Self> {
-        let previous = ACTIVE_BUILDERS.fetch_add(1, Ordering::SeqCst);
+        Self::acquire_with_counter(config, &ACTIVE_BUILDERS)
+    }
+
+    fn acquire_with_counter(
+        config: &BuildQueueConfig,
+        active: &'static AtomicUsize,
+    ) -> DriverResult<Self> {
+        let previous = active.fetch_add(1, Ordering::SeqCst);
         if previous >= config.max_inflight {
-            ACTIVE_BUILDERS.fetch_sub(1, Ordering::SeqCst);
+            active.fetch_sub(1, Ordering::SeqCst);
             return Err(DriverError::PreflightFailed {
                 message: format!(
                     "build queue saturated: {} builders active, max {}",
@@ -75,13 +84,13 @@ impl BuildSlotGuard {
                 ),
             });
         }
-        Ok(Self)
+        Ok(Self { active })
     }
 }
 
 impl Drop for BuildSlotGuard {
     fn drop(&mut self) {
-        ACTIVE_BUILDERS.fetch_sub(1, Ordering::SeqCst);
+        self.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -244,14 +253,7 @@ impl<'a> BuildCache<'a> {
             ),
         })?;
         if Path::new(&image_ref) != context_dir.as_path() {
-            if context_dir.exists() {
-                fs::remove_dir_all(&context_dir).map_err(|source| DriverError::InvalidInput {
-                    message: format!(
-                        "failed to clear cached context `{}`: {source}",
-                        context_dir.display()
-                    ),
-                })?;
-            }
+            remove_cache_path(&context_dir)?;
             fs::rename(&image_ref, &context_dir).map_err(|source| DriverError::InvalidInput {
                 message: format!(
                     "failed to move staged context into build cache `{}`: {source}",
@@ -495,6 +497,35 @@ pub(super) fn tag_for_key(key: &str) -> String {
     format!("agentenv-byo-{suffix}:latest")
 }
 
+pub(super) fn remove_cache_path(path: &Path) -> DriverResult<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DriverError::InvalidInput {
+                message: format!(
+                    "failed to inspect cache path `{}`: {source}",
+                    path.display()
+                ),
+            });
+        }
+    };
+
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to remove cache directory `{}`: {source}",
+                path.display()
+            ),
+        })?;
+    } else {
+        fs::remove_file(path).map_err(|source| DriverError::InvalidInput {
+            message: format!("failed to remove cache file `{}`: {source}", path.display()),
+        })?;
+    }
+    Ok(())
+}
+
 fn cache_dir_name(key: &str) -> String {
     key.replace(':', "-")
 }
@@ -614,4 +645,99 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentenv_events::NoopEventEmitter;
+
+    static TEST_ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_tempdir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
+    }
+
+    fn build_input(
+        env_name: &str,
+        dockerfile: PathBuf,
+        staged_context: PathBuf,
+        context_digest: String,
+    ) -> BuildInput {
+        BuildInput {
+            env_name: env_name.to_owned(),
+            dockerfile,
+            staged_context,
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: None,
+        }
+    }
+
+    #[test]
+    fn materialize_built_replaces_stale_context_file() {
+        let tempdir = unique_tempdir("sandbox-openshell-cache-stale-context-file");
+        let workdir = tempdir.join(".agentenv");
+        let source_dir = tempdir.join("source");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let dockerfile = source_dir.join("Dockerfile");
+        fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+
+        let stage_dir = tempdir.join("context.tmp");
+        fs::create_dir_all(&stage_dir).expect("create stage context");
+        fs::write(stage_dir.join("Dockerfile"), "FROM alpine:3.20\n").expect("stage Dockerfile");
+        fs::write(stage_dir.join("tool"), "demo").expect("stage context file");
+        let context_digest = BuildCache::digest_staged_context(&stage_dir).expect("context digest");
+        let noop = NoopEventEmitter;
+        let cache = BuildCache::new(workdir.clone(), &noop);
+        let input = build_input("devbox", dockerfile, stage_dir.clone(), context_digest);
+        let key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&key);
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("context"), "stale").expect("write stale context file");
+        let digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+        let materialized = cache
+            .materialize_built(&input, stage_dir.display().to_string(), digest.to_owned())
+            .expect("materialize built");
+
+        assert_eq!(
+            materialized.image_ref,
+            cache_dir.join("context").display().to_string()
+        );
+        assert!(cache_dir.join("context").join("tool").is_file());
+        assert_eq!(
+            fs::read_to_string(cache_dir.join("image-digest")).expect("cached digest"),
+            format!("{digest}\n")
+        );
+        fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn build_slot_guard_saturates_and_releases_on_drop() {
+        TEST_ACTIVE_BUILDERS.store(0, Ordering::SeqCst);
+        let config = BuildQueueConfig {
+            max_inflight: 1,
+            queue_limit: 128,
+            lock_timeout: Duration::from_secs(900),
+        };
+
+        let guard = BuildSlotGuard::acquire_with_counter(&config, &TEST_ACTIVE_BUILDERS)
+            .expect("first build slot");
+        let err = match BuildSlotGuard::acquire_with_counter(&config, &TEST_ACTIVE_BUILDERS) {
+            Ok(_) => panic!("second slot should saturate"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, DriverError::PreflightFailed { .. }));
+        drop(guard);
+
+        let later = BuildSlotGuard::acquire_with_counter(&config, &TEST_ACTIVE_BUILDERS)
+            .expect("slot after drop");
+        drop(later);
+        TEST_ACTIVE_BUILDERS.store(0, Ordering::SeqCst);
+    }
 }
