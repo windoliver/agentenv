@@ -437,6 +437,8 @@ impl<'a> CreateEnvRollback<'a> {
 
 static CREATE_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_ENTRYPOINT_PATH: &str = "/sandbox/.agentenv/bin/agentenv-agent";
+const BUILD_ONEFLIGHT_KIND: &str = "byo-openshell-v1";
+const BUILD_ONEFLIGHT_SEED_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnterResult {
@@ -970,7 +972,7 @@ async fn create_env_with_input(
                 source,
             }
         })?;
-        fs::write(temp_paths.lock_path(), lock_yaml).map_err(|source| {
+        fs::write(temp_paths.lock_path(), &lock_yaml).map_err(|source| {
             crate::env::EnvError::Io {
                 path: temp_paths.lock_path(),
                 source,
@@ -1046,6 +1048,15 @@ async fn create_env_with_input(
         let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
         let restore_policy_after_install = create_policy != policy;
 
+        let build_oneflight_seed = build_oneflight_seed_for_byo(
+            blueprint_yaml,
+            &lock_yaml,
+            &selection,
+            &resolved,
+            &context_endpoint,
+            &resolved.blueprint.sandbox.extra,
+        )?;
+
         let sandbox_create_start = Instant::now();
         let sandbox_spec = sandbox_spec_for_create(
             name,
@@ -1054,6 +1065,7 @@ async fn create_env_with_input(
             &context_endpoint,
             env,
             Some(create_policy.clone()),
+            build_oneflight_seed,
         )?;
         let sandbox_handle = match set.sandbox.create(sandbox_spec).await {
             Ok(handle) => {
@@ -1749,6 +1761,78 @@ fn blueprint_component_from_portable(
     }
 }
 
+#[derive(Serialize)]
+struct BuildOneflightSeed<'a> {
+    version: &'static str,
+    blueprint_yaml: &'a str,
+    lock_yaml: &'a str,
+    sandbox_driver: &'a str,
+    sandbox_driver_version: String,
+    agent_driver: &'a str,
+    agent_driver_version: String,
+    context_driver: &'a str,
+    context_driver_version: String,
+    inference_driver: Option<&'a str>,
+    inference_driver_version: Option<String>,
+    metadata: BTreeMap<&'static str, String>,
+}
+
+fn build_oneflight_seed_for_byo(
+    blueprint_yaml: &str,
+    lock_yaml: &str,
+    selection: &DriverSelection,
+    resolved: &crate::lifecycle::ResolvedBlueprint,
+    context_endpoint: &agentenv_proto::McpEndpoint,
+    sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
+) -> RuntimeResult<Option<String>> {
+    if !sandbox_image_is_byo(sandbox_extra) {
+        return Ok(None);
+    }
+
+    let metadata = BTreeMap::from([
+        ("agentenv_version", env!("CARGO_PKG_VERSION").to_owned()),
+        ("agentenv_agent", selection.agent.clone()),
+        (
+            "agentenv_mcp_port",
+            mcp_endpoint_port(context_endpoint).unwrap_or_default(),
+        ),
+        ("agentenv_workspace_mount", "/sandbox".to_owned()),
+    ]);
+    let seed = BuildOneflightSeed {
+        version: BUILD_ONEFLIGHT_SEED_VERSION,
+        blueprint_yaml,
+        lock_yaml,
+        sandbox_driver: &selection.sandbox,
+        sandbox_driver_version: resolved.sandbox.version.to_string(),
+        agent_driver: &selection.agent,
+        agent_driver_version: resolved.agent.version.to_string(),
+        context_driver: &selection.context,
+        context_driver_version: resolved.context.version.to_string(),
+        inference_driver: selection.inference.as_deref(),
+        inference_driver_version: resolved
+            .inference
+            .as_ref()
+            .map(|driver| driver.version.to_string()),
+        metadata,
+    };
+    let bytes = serde_json::to_vec(&seed).map_err(|source| {
+        RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!("failed to serialize build oneflight seed: {source}"),
+        })
+    })?;
+    Ok(Some(format!(
+        "sha256:{}",
+        crate::digest::sha256_hex(&bytes)
+    )))
+}
+
+fn sandbox_image_is_byo(sandbox_extra: &BTreeMap<String, serde_yaml::Value>) -> bool {
+    sandbox_extra
+        .get("image")
+        .and_then(serde_yaml::Value::as_mapping)
+        .is_some_and(|image| yaml_mapping_string(image, "source") == Some("byo"))
+}
+
 fn sandbox_spec_for_create(
     name: &str,
     selection: &DriverSelection,
@@ -1756,6 +1840,7 @@ fn sandbox_spec_for_create(
     context_endpoint: &agentenv_proto::McpEndpoint,
     env: BTreeMap<String, String>,
     policy: Option<agentenv_proto::NetworkPolicy>,
+    build_oneflight_seed: Option<String>,
 ) -> RuntimeResult<agentenv_proto::SandboxSpec> {
     let mut metadata = BTreeMap::from([
         ("name".to_owned(), serde_json::json!(name)),
@@ -1814,6 +1899,18 @@ fn sandbox_spec_for_create(
         }
         None => None,
     };
+
+    if let Some(seed) = build_oneflight_seed {
+        metadata.insert(
+            "agentenv_build_oneflight".to_owned(),
+            serde_json::json!(BUILD_ONEFLIGHT_KIND),
+        );
+        metadata.insert("agentenv_build_seed".to_owned(), serde_json::json!(seed));
+        metadata.insert(
+            "agentenv_build_seed_version".to_owned(),
+            serde_json::json!(BUILD_ONEFLIGHT_SEED_VERSION),
+        );
+    }
 
     Ok(agentenv_proto::SandboxSpec {
         image,
@@ -5843,6 +5940,64 @@ policy:
             )
         );
         assert_eq!(metadata["agentenv_agent"], serde_json::json!("codex"));
+        assert_eq!(
+            metadata["agentenv_build_oneflight"],
+            serde_json::json!("byo-openshell-v1")
+        );
+        assert_eq!(
+            metadata["agentenv_build_seed_version"],
+            serde_json::json!("1")
+        );
+        let seed = metadata["agentenv_build_seed"]
+            .as_str()
+            .expect("seed metadata is a string");
+        crate::digest::parse_sha256_digest(seed).expect("seed is a sha256 digest");
+    }
+
+    #[tokio::test]
+    async fn create_env_omits_build_oneflight_metadata_for_non_byo_image() {
+        let root = unique_root("agentenv-create-non-byo-no-build-seed");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image: openclaw
+  digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        let metadata = &specs[0].metadata;
+        assert!(!metadata.contains_key("agentenv_build_oneflight"));
+        assert!(!metadata.contains_key("agentenv_build_seed"));
+        assert!(!metadata.contains_key("agentenv_build_seed_version"));
     }
 
     #[tokio::test]
