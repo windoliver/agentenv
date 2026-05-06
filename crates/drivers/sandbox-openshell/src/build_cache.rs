@@ -16,7 +16,6 @@ use uuid::Uuid;
 use crate::{now_timestamp_string, sanitize_build_name, CommandOutput, CommandRequest};
 
 static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
-static BUILD_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone)]
 pub(super) struct BuildQueueConfig {
@@ -294,12 +293,7 @@ impl<'a> BuildCache<'a> {
             }
         })?;
         self.write_env_digest(&input.env_name, &image_digest)?;
-        self.emit_miss(
-            &input.env_name,
-            &key,
-            &image_digest,
-            BUILD_QUEUE_DEPTH.load(Ordering::SeqCst),
-        );
+        self.emit_miss(&input.env_name, &key, &image_digest);
         Ok(BuildMaterialization {
             image_ref: context_dir.display().to_string(),
             image_digest,
@@ -452,7 +446,7 @@ impl<'a> BuildCache<'a> {
         self.events.emit(event);
     }
 
-    fn emit_miss(&self, env_name: &str, key: &str, digest: &str, queue_depth: usize) {
+    fn emit_miss(&self, env_name: &str, key: &str, digest: &str) {
         let event = ActivityEvent::new(
             now_timestamp_string(),
             ActivityKind::BuildOneflightMiss,
@@ -463,7 +457,6 @@ impl<'a> BuildCache<'a> {
         .with_actor_value("driver", serde_json::json!("openshell"))
         .with_subject_value("build_key", serde_json::json!(key))
         .with_extra("image_digest", serde_json::json!(digest))
-        .with_extra("queue_depth", serde_json::json!(queue_depth))
         .with_extra("max_inflight", serde_json::json!(self.config.max_inflight))
         .with_extra("queue_limit", serde_json::json!(self.config.queue_limit))
         .with_extra(
