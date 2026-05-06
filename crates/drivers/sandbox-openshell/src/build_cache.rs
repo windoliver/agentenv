@@ -448,9 +448,8 @@ impl<'a> BuildCache<'a> {
             }
             if lock_dir.is_dir() {
                 if started.elapsed() > self.config.lock_timeout {
-                    return Err(DriverError::PreflightFailed {
-                        message: format!("timed out waiting for BYO build {key}"),
-                    });
+                    remove_cache_path(&lock_dir)?;
+                    return Ok(BuildWaitOutcome::LockReleased);
                 }
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
@@ -753,26 +752,13 @@ fn evict_invalid_cache<T>(cache_dir: &Path) -> DriverResult<Option<T>> {
 
 fn sanitized_failure_message(error: &DriverError) -> String {
     match error {
-        DriverError::CommandFailed {
-            status,
-            stdout,
-            stderr,
-            ..
-        } => {
-            let stderr = stderr.trim();
-            if !stderr.is_empty() {
-                return stderr.to_owned();
-            }
-            let stdout = stdout.trim();
-            if !stdout.is_empty() {
-                return stdout.to_owned();
-            }
-            match status {
-                Some(status) => format!("docker build failed with status {status}"),
-                None => "docker build failed with unknown status".to_owned(),
-            }
-        }
+        DriverError::CommandFailed { status, .. } => match status {
+            Some(status) => format!("docker build failed with status {status}"),
+            None => "docker build failed with unknown status".to_owned(),
+        },
         DriverError::CommandSpawn { .. } => "failed to start docker build command".to_owned(),
+        DriverError::InvalidInput { .. } => "BYO build validation failed".to_owned(),
+        DriverError::PreflightFailed { .. } => "BYO build preflight failed".to_owned(),
         _ => "docker build failed".to_owned(),
     }
 }
@@ -1036,7 +1022,33 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_materialization_ignores_failure_marker_while_lock_active() {
+    fn write_failure_sanitizes_command_output_before_persisting() {
+        let tempdir = unique_tempdir("sandbox-openshell-cache-failure-sanitized");
+        let workdir = tempdir.join(".agentenv");
+        let noop = NoopEventEmitter;
+        let cache = BuildCache::new(workdir, &noop);
+        let key = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let error = DriverError::CommandFailed {
+            command: "docker build --secret id=token /tmp/private/context.tmp".to_owned(),
+            status: Some(23),
+            stdout: "stdout contained api-key-123".to_owned(),
+            stderr: "stderr contained api-key-456 and /tmp/private/context.tmp".to_owned(),
+        };
+
+        cache.write_failure(key, &error).expect("write failure");
+
+        let failure =
+            fs::read_to_string(cache.cache_dir(key).join("failure.json")).expect("failure marker");
+        assert!(failure.contains("docker build failed with status 23"));
+        assert!(!failure.contains("api-key-123"));
+        assert!(!failure.contains("api-key-456"));
+        assert!(!failure.contains("--secret"));
+        assert!(!failure.contains("context.tmp"));
+        fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn wait_for_materialization_recovers_stale_lock_without_reading_failure_marker() {
         let tempdir = unique_tempdir("sandbox-openshell-cache-active-lock-stale-failure");
         let workdir = tempdir.join(".agentenv");
         let source_dir = tempdir.join("source");
@@ -1077,14 +1089,12 @@ mod tests {
                 .to_owned(),
         };
 
-        let err = match cache.wait_for_materialization(&key, &input, &inspector) {
-            Ok(_) => panic!("active lock should not materialize"),
-            Err(err) => err,
-        };
+        let outcome = cache
+            .wait_for_materialization(&key, &input, &inspector)
+            .expect("stale lock should return retry outcome");
 
-        let rendered = err.to_string();
-        assert!(rendered.contains("timed out waiting for BYO build"));
-        assert!(!rendered.contains("stale docker failure"));
+        assert!(matches!(outcome, BuildWaitOutcome::LockReleased));
+        assert!(!cache_dir.join("lock").exists());
         fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
