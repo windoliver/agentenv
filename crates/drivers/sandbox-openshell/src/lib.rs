@@ -1073,8 +1073,13 @@ impl OpenShellDriver {
             return Ok(materialized.image_ref);
         }
 
-        let _slot = cache.acquire_build_slot()?;
         let key = cache.build_key(&input)?;
+        let Some(_build_lock) = cache.try_lock(&key)? else {
+            let materialized = cache.wait_for_materialization(&key, &input, self)?;
+            let _ = (&materialized.image_digest, &materialized.tag);
+            return Ok(materialized.image_ref);
+        };
+        let _slot = cache.acquire_build_slot()?;
         let cache_dir = cache.cache_dir(&key);
         fs::create_dir_all(&cache_dir).map_err(|source| DriverError::InvalidInput {
             message: format!(
@@ -2659,7 +2664,10 @@ mod driver_tests {
         ffi::OsString,
         io,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
+        },
     };
 
     use agentenv_core::driver::SandboxDriver;
@@ -2694,12 +2702,35 @@ mod driver_tests {
         original: Option<OsString>,
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
     impl Drop for PathRestoreGuard {
         fn drop(&mut self) {
             if let Some(original) = self.original.take() {
                 std::env::set_var("PATH", original);
             } else {
                 std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
             }
         }
     }
@@ -2714,6 +2745,16 @@ mod driver_tests {
         expectations: Mutex<VecDeque<FlexibleCommandExpectation>>,
         calls: Mutex<Vec<CommandCall>>,
         spawn_calls: Mutex<Vec<CommandCall>>,
+    }
+
+    #[derive(Debug)]
+    struct OneflightRunner {
+        calls: Mutex<Vec<CommandCall>>,
+        build_count: AtomicUsize,
+        inspect_count: AtomicUsize,
+        build_started: Barrier,
+        release_build: Barrier,
+        digest: String,
     }
 
     #[derive(Debug)]
@@ -2846,6 +2887,55 @@ mod driver_tests {
                     request: request.clone(),
                 });
 
+            Ok(Box::new(super::NoopSpawnedCommand))
+        }
+    }
+
+    impl CommandRunner for OneflightRunner {
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            self.calls.lock().expect("calls mutex").push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+            if program == "docker" && request.args.first().map(String::as_str) == Some("build") {
+                let previous = self.build_count.fetch_add(1, Ordering::SeqCst);
+                if previous == 0 {
+                    self.build_started.wait();
+                    self.release_build.wait();
+                }
+                return Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            if program == "docker" && request.args.first().map(String::as_str) == Some("image") {
+                self.inspect_count.fetch_add(1, Ordering::SeqCst);
+                return Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: format!("{}\n", self.digest),
+                    stderr: String::new(),
+                });
+            }
+            if program == "openshell" {
+                return Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Err(io::Error::other("unexpected command"))
+        }
+
+        fn spawn(
+            &self,
+            _program: &str,
+            _request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
             Ok(Box::new(super::NoopSpawnedCommand))
         }
     }
@@ -4883,6 +4973,187 @@ mod driver_tests {
                 .expect("per env digest"),
             format!("{digest}\n")
         );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn concurrent_byo_creates_share_one_build() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-oneflight");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let runner = Arc::new(OneflightRunner {
+            calls: Mutex::new(Vec::new()),
+            build_count: AtomicUsize::new(0),
+            inspect_count: AtomicUsize::new(0),
+            build_started: Barrier::new(2),
+            release_build: Barrier::new(2),
+            digest: digest.to_owned(),
+        });
+
+        let first_driver = Arc::new(OpenShellDriver::with_command_runner_and_workdir(
+            runner.clone(),
+            &workdir,
+        ));
+        let second_driver = Arc::new(OpenShellDriver::with_command_runner_and_workdir(
+            runner.clone(),
+            &workdir,
+        ));
+        let first_spec = SandboxSpec {
+            image: None,
+            env: BTreeMap::new(),
+            policy: None,
+            metadata: BTreeMap::from([
+                ("name".to_owned(), json!("devbox-a")),
+                (
+                    "byo_dockerfile".to_owned(),
+                    json!(dockerfile.display().to_string()),
+                ),
+                ("agentenv_agent".to_owned(), json!("codex")),
+                ("agentenv_mcp_port".to_owned(), json!("3333")),
+                ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                (
+                    "agentenv_version".to_owned(),
+                    json!(env!("CARGO_PKG_VERSION")),
+                ),
+                (
+                    "agentenv_build_oneflight".to_owned(),
+                    json!("byo-openshell-v1"),
+                ),
+                ("agentenv_build_seed_version".to_owned(), json!("1")),
+                (
+                    "agentenv_build_seed".to_owned(),
+                    json!(
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    ),
+                ),
+            ]),
+        };
+        let mut second_spec = first_spec.clone();
+        second_spec
+            .metadata
+            .insert("name".to_owned(), json!("devbox-b"));
+
+        let first = {
+            let driver = Arc::clone(&first_driver);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async { driver.create(first_spec).await })
+            })
+        };
+        runner.build_started.wait();
+        let second = {
+            let driver = Arc::clone(&second_driver);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async { driver.create(second_spec).await })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        runner.release_build.wait();
+
+        first.join().expect("first thread").expect("first create");
+        second
+            .join()
+            .expect("second thread")
+            .expect("second create");
+
+        assert_eq!(runner.build_count.load(Ordering::SeqCst), 1);
+        assert!(workdir
+            .join("build")
+            .join("devbox-a")
+            .join("image-digest")
+            .is_file());
+        assert!(workdir
+            .join("build")
+            .join("devbox-b")
+            .join("image-digest")
+            .is_file());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn build_queue_limit_rejects_waiter_before_sandbox_create() {
+        let _queue_guard = EnvVarGuard::set("AGENTENV_BUILD_QUEUE_LIMIT", "0");
+        let _timeout_guard = EnvVarGuard::set("AGENTENV_BUILD_LOCK_TIMEOUT_SECS", "0");
+        let tempdir = unique_tempdir("sandbox-openshell-byo-queue-limit");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&dockerfile_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let seed = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir,
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: Some(seed.to_owned()),
+        };
+        let key = cache.build_key(&input).expect("build key");
+        std::fs::create_dir_all(cache.cache_dir(&key).join("lock")).expect("create active lock");
+        let runner = Arc::new(FlexibleCommandRunner::new(Vec::new()));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("agentenv_agent".to_owned(), json!("codex")),
+                            ("agentenv_mcp_port".to_owned(), json!("3333")),
+                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                            (
+                                "agentenv_version".to_owned(),
+                                json!(env!("CARGO_PKG_VERSION")),
+                            ),
+                            (
+                                "agentenv_build_oneflight".to_owned(),
+                                json!("byo-openshell-v1"),
+                            ),
+                            ("agentenv_build_seed_version".to_owned(), json!("1")),
+                            ("agentenv_build_seed".to_owned(), json!(seed)),
+                        ]),
+                    })
+                    .await
+            })
+            .expect_err("queue limit should reject");
+
+        assert!(err.to_string().contains("build queue saturated"));
+        assert!(runner.calls().is_empty());
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 

@@ -2,7 +2,7 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use agentenv_core::{
@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{now_timestamp_string, sanitize_build_name, CommandOutput, CommandRequest};
 
 static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
+static BUILD_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone)]
 pub(super) struct BuildQueueConfig {
@@ -63,6 +64,39 @@ pub(super) trait DockerImageInspector {
 
 pub(super) struct BuildSlotGuard {
     active: &'static AtomicUsize,
+}
+
+#[derive(Debug)]
+pub(super) struct BuildLock {
+    path: PathBuf,
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct QueueDepthGuard<'a> {
+    events: &'a dyn EventEmitter,
+}
+
+impl Drop for QueueDepthGuard<'_> {
+    fn drop(&mut self) {
+        let depth = BUILD_QUEUE_DEPTH
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        self.events.emit(
+            ActivityEvent::new(
+                now_timestamp_string(),
+                ActivityKind::BuildQueueDepth,
+                ActivityResult::Ok,
+                format!("openshell-build-cache-{}", Uuid::new_v4()),
+            )
+            .with_actor_value("driver", serde_json::json!("openshell"))
+            .with_extra("depth", serde_json::json!(depth)),
+        );
+    }
 }
 
 impl BuildSlotGuard {
@@ -303,6 +337,80 @@ impl<'a> BuildCache<'a> {
         })
     }
 
+    pub(super) fn try_lock(&self, key: &str) -> DriverResult<Option<BuildLock>> {
+        let lock_dir = self.cache_dir(key).join("lock");
+        let Some(lock_parent) = lock_dir.parent() else {
+            return Err(DriverError::InvalidInput {
+                message: format!(
+                    "build cache lock `{}` has no parent directory",
+                    lock_dir.display()
+                ),
+            });
+        };
+        fs::create_dir_all(lock_parent).map_err(|source| DriverError::InvalidInput {
+            message: format!("failed to create build cache lock parent: {source}"),
+        })?;
+        match fs::create_dir(&lock_dir) {
+            Ok(()) => Ok(Some(BuildLock { path: lock_dir })),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(source) => Err(DriverError::InvalidInput {
+                message: format!(
+                    "failed to create build cache lock `{}`: {source}",
+                    lock_dir.display()
+                ),
+            }),
+        }
+    }
+
+    pub(super) fn wait_for_materialization(
+        &self,
+        key: &str,
+        input: &BuildInput,
+        inspector: &dyn DockerImageInspector,
+    ) -> DriverResult<BuildMaterialization> {
+        let depth = loop {
+            let current = BUILD_QUEUE_DEPTH.load(Ordering::SeqCst);
+            if current >= self.config.queue_limit {
+                return Err(DriverError::PreflightFailed {
+                    message: format!(
+                        "build queue saturated: {} waiters active, limit {}",
+                        current, self.config.queue_limit
+                    ),
+                });
+            }
+            if BUILD_QUEUE_DEPTH
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break current + 1;
+            }
+        };
+        self.emit_queue_depth(depth);
+        self.emit_waiter_hit(&input.env_name, key, depth);
+        let _guard = QueueDepthGuard {
+            events: self.events,
+        };
+        let started = SystemTime::now();
+        loop {
+            if let Some(metadata) =
+                self.read_valid_metadata(input, key, &self.cache_dir(key), inspector)?
+            {
+                self.write_env_digest(&input.env_name, &metadata.image_digest)?;
+                return Ok(BuildMaterialization {
+                    image_ref: metadata.image_ref,
+                    image_digest: metadata.image_digest,
+                    tag: tag_for_key(key),
+                });
+            }
+            if started.elapsed().unwrap_or(Duration::ZERO) > self.config.lock_timeout {
+                return Err(DriverError::PreflightFailed {
+                    message: format!("timed out waiting for BYO build {key}"),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     pub(super) fn acquire_build_slot(&self) -> DriverResult<BuildSlotGuard> {
         BuildSlotGuard::acquire(&self.config)
     }
@@ -459,6 +567,39 @@ impl<'a> BuildCache<'a> {
         .with_actor_value("driver", serde_json::json!("openshell"))
         .with_subject_value("build_key", serde_json::json!(key))
         .with_extra("image_digest", serde_json::json!(digest))
+        .with_extra("max_inflight", serde_json::json!(self.config.max_inflight))
+        .with_extra("queue_limit", serde_json::json!(self.config.queue_limit))
+        .with_extra(
+            "lock_timeout_secs",
+            serde_json::json!(self.config.lock_timeout.as_secs()),
+        );
+        self.events.emit(event);
+    }
+
+    fn emit_queue_depth(&self, depth: usize) {
+        self.events.emit(
+            ActivityEvent::new(
+                now_timestamp_string(),
+                ActivityKind::BuildQueueDepth,
+                ActivityResult::Ok,
+                format!("openshell-build-cache-{}", Uuid::new_v4()),
+            )
+            .with_actor_value("driver", serde_json::json!("openshell"))
+            .with_extra("depth", serde_json::json!(depth)),
+        );
+    }
+
+    fn emit_waiter_hit(&self, env_name: &str, key: &str, depth: usize) {
+        let event = ActivityEvent::new(
+            now_timestamp_string(),
+            ActivityKind::BuildOneflightHit,
+            ActivityResult::Ok,
+            format!("openshell-build-cache-{}", Uuid::new_v4()),
+        )
+        .with_env(env_name)
+        .with_actor_value("driver", serde_json::json!("openshell"))
+        .with_subject_value("build_key", serde_json::json!(key))
+        .with_extra("depth", serde_json::json!(depth))
         .with_extra("max_inflight", serde_json::json!(self.config.max_inflight))
         .with_extra("queue_limit", serde_json::json!(self.config.queue_limit))
         .with_extra(
