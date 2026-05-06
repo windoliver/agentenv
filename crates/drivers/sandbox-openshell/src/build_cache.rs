@@ -270,6 +270,12 @@ impl<'a> BuildCache<'a> {
         {
             return Ok(false);
         }
+        let Ok(cached_context_digest) = Self::digest_staged_context(&expected_context) else {
+            return Ok(false);
+        };
+        if cached_context_digest != metadata.source.context_digest {
+            return Ok(false);
+        }
 
         let Ok(source_dockerfile) = fs::canonicalize(&metadata.source.dockerfile) else {
             return Ok(false);
@@ -399,6 +405,14 @@ fn collect_context_entries(
     })?;
 
     if metadata.is_dir() {
+        if path != root {
+            entries.push(ContextEntry {
+                kind: "dir",
+                path: relative_context_path(root, path)?,
+                mode: file_mode(&metadata),
+                payload: Vec::new(),
+            });
+        }
         let read_dir = fs::read_dir(path).map_err(|source| DriverError::InvalidInput {
             message: format!(
                 "failed to read staged context directory `{}`: {source}",
@@ -417,16 +431,7 @@ fn collect_context_entries(
         return Ok(());
     }
 
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|source| DriverError::InvalidInput {
-            message: format!(
-                "failed to relativize staged context path `{}`: {source}",
-                path.display()
-            ),
-        })?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let relative = relative_context_path(root, path)?;
     let mode = file_mode(&metadata);
 
     if metadata.file_type().is_symlink() {
@@ -455,6 +460,19 @@ fn collect_context_entries(
     }
 
     Ok(())
+}
+
+fn relative_context_path(root: &Path, path: &Path) -> DriverResult<String> {
+    Ok(path
+        .strip_prefix(root)
+        .map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to relativize staged context path `{}`: {source}",
+                path.display()
+            ),
+        })?
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 #[cfg(unix)]
