@@ -197,6 +197,10 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn remote_ssh_command(shell_body: &str) -> String {
+    format!("sh -lc {}", shell_single_quote(shell_body))
+}
+
 fn scp_base_args(target: &RemoteSshTarget) -> Vec<String> {
     let mut args = vec!["-P".to_owned(), target.port.to_string()];
     if let Some(identity_file) = target.identity_file.as_deref() {
@@ -680,11 +684,7 @@ impl SandboxDriver for RemoteSshDriver {
             args: {
                 let mut args = ssh_base_args(&target);
                 args.push("--".to_owned());
-                args.extend(
-                    ["sh", "-lc", remote_cmd.as_str()]
-                        .iter()
-                        .map(|arg| (*arg).to_owned()),
-                );
+                args.push(remote_ssh_command(&remote_cmd));
                 args
             },
             env: BTreeMap::new(),
@@ -1468,9 +1468,7 @@ mod tests {
                 "22",
                 "alice@dev-vm.example.com",
                 "--",
-                "sh",
-                "-lc",
-                "cd /sandbox && echo hi",
+                "sh -lc 'cd /sandbox && echo hi'",
             ],
             Some(7),
             "stdout payload",
@@ -1511,9 +1509,7 @@ mod tests {
                 "22",
                 "alice@dev-vm.example.com",
                 "--",
-                "sh",
-                "-lc",
-                "cd /sandbox && env FOO='bar baz' sh -lc 'echo \"$FOO\"'",
+                "sh -lc 'cd /sandbox && env FOO='\\''bar baz'\\'' sh -lc '\\''echo \"$FOO\"'\\'''",
             ],
             Some(0),
             "bar baz\n",
@@ -1536,6 +1532,17 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].request.env.is_empty());
+        let separator = calls[0]
+            .request
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("ssh separator");
+        let remote_args = &calls[0].request.args[(separator + 1)..];
+        assert_eq!(remote_args.len(), 1);
+        assert!(remote_args[0].starts_with("sh -lc '"));
+        assert!(remote_args[0].contains("env FOO='\\''bar baz'\\''"));
+        assert!(remote_args[0].contains("sh -lc '\\''echo \"$FOO\"'\\''"));
     }
 
     #[tokio::test]
