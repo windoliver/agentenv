@@ -206,6 +206,18 @@ impl RemoteSshTarget {
                 "passwords are not supported in remote-ssh handles",
             ));
         }
+        if !url.path().is_empty() {
+            return Err(invalid_handle(
+                handle.to_owned(),
+                "remote-ssh handles do not support a path",
+            ));
+        }
+        if url.fragment().is_some() {
+            return Err(invalid_handle(
+                handle.to_owned(),
+                "remote-ssh handles do not support a fragment",
+            ));
+        }
         let host = url
             .host_str()
             .ok_or_else(|| invalid_handle(handle.to_owned(), "missing host"))?
@@ -229,7 +241,12 @@ impl RemoteSshTarget {
                         .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
                     jump_host = Some(value);
                 }
-                _ => {}
+                _ => {
+                    return Err(invalid_handle(
+                        handle.to_owned(),
+                        format!("unsupported remote-ssh handle query key `{key}`"),
+                    ));
+                }
             }
         }
         Ok(Self {
@@ -244,7 +261,10 @@ impl RemoteSshTarget {
 }
 
 fn validate_remote_ssh_user(user: &str, label: &str) -> DriverResult<()> {
-    if !user.chars().all(is_supported_remote_ssh_user_char) {
+    if user.is_empty()
+        || user.starts_with('-')
+        || !user.chars().all(is_supported_remote_ssh_user_char)
+    {
         return Err(DriverError::InvalidInput {
             message: format!("{label} contains unsupported characters"),
         });
@@ -734,6 +754,18 @@ mod tests {
     }
 
     #[test]
+    fn target_from_metadata_rejects_option_shaped_username() {
+        let metadata = BTreeMap::from([
+            ("host".to_owned(), json!("dev-vm.example.com")),
+            ("user".to_owned(), json!("-Jbastion")),
+        ]);
+
+        let err = RemoteSshTarget::from_metadata(&metadata).expect_err("metadata should fail");
+
+        assert!(err.to_string().contains("metadata.user"));
+    }
+
+    #[test]
     fn target_from_metadata_rejects_host_delimiters() {
         for host in [
             "dev-vm.example.com?identity_file=/tmp/key",
@@ -809,6 +841,14 @@ mod tests {
     }
 
     #[test]
+    fn uri_handle_rejects_option_shaped_username() {
+        let err = RemoteSshTarget::from_handle("remote-ssh://-Jbastion@dev-vm.example.com:22")
+            .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("username"));
+    }
+
+    #[test]
     fn uri_handle_rejects_percent_encoded_username_characters() {
         let err = RemoteSshTarget::from_handle("remote-ssh://a%3Bb@dev-vm.example.com:22")
             .expect_err("handle should fail");
@@ -848,6 +888,28 @@ mod tests {
         let err = target.to_handle().expect_err("handle should fail");
 
         assert!(err.to_string().contains("jump_host"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_unknown_query_keys() {
+        let err = RemoteSshTarget::from_handle(
+            "remote-ssh://alice@dev-vm.example.com:22?password=secret",
+        )
+        .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("query") || err.to_string().contains("password"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_path_and_fragment() {
+        for (handle, expected) in [
+            ("remote-ssh://alice@dev-vm.example.com:22/tmp", "path"),
+            ("remote-ssh://alice@dev-vm.example.com:22#frag", "fragment"),
+        ] {
+            let err = RemoteSshTarget::from_handle(handle).expect_err("handle should fail");
+
+            assert!(err.to_string().contains(expected));
+        }
     }
 
     #[test]
