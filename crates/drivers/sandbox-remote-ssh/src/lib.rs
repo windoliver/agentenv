@@ -146,6 +146,7 @@ struct RemoteSshTarget {
 impl RemoteSshTarget {
     fn from_metadata(metadata: &BTreeMap<String, Value>) -> DriverResult<Self> {
         let host = required_metadata_string(metadata, "host")?;
+        validate_remote_ssh_host(&host, "metadata.host")?;
         let user = required_metadata_string(metadata, "user")?;
         validate_remote_ssh_user(&user, "metadata.user")?;
         let port = metadata_port(metadata)?;
@@ -166,6 +167,8 @@ impl RemoteSshTarget {
     }
 
     fn to_handle(&self) -> DriverResult<String> {
+        validate_remote_ssh_user(&self.user, "remote-ssh username")?;
+        validate_remote_ssh_host(&self.host, "remote-ssh host")?;
         let base = format!("remote-ssh://{}@{}:{}", self.user, self.host, self.port);
         let mut url = Url::parse(&base).map_err(|source| DriverError::InvalidInput {
             message: format!("failed to build remote-ssh handle: {source}"),
@@ -201,6 +204,8 @@ impl RemoteSshTarget {
             .host_str()
             .ok_or_else(|| invalid_handle(handle.to_owned(), "missing host"))?
             .to_owned();
+        validate_remote_ssh_host(&host, "handle host")
+            .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
         let user = url.username();
         if user.is_empty() {
             return Err(invalid_handle(handle.to_owned(), "missing user"));
@@ -228,7 +233,7 @@ impl RemoteSshTarget {
 }
 
 fn validate_remote_ssh_user(user: &str, label: &str) -> DriverResult<()> {
-    if user.chars().any(is_unsupported_remote_ssh_user_char) {
+    if !user.chars().all(is_supported_remote_ssh_user_char) {
         return Err(DriverError::InvalidInput {
             message: format!("{label} contains unsupported characters"),
         });
@@ -237,10 +242,29 @@ fn validate_remote_ssh_user(user: &str, label: &str) -> DriverResult<()> {
     Ok(())
 }
 
-fn is_unsupported_remote_ssh_user_char(ch: char) -> bool {
-    ch.is_control()
-        || ch.is_whitespace()
-        || matches!(ch, '@' | ':' | '/' | '?' | '#' | '[' | ']' | '%')
+fn is_supported_remote_ssh_user_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
+}
+
+fn validate_remote_ssh_host(host: &str, label: &str) -> DriverResult<()> {
+    let valid_chars = host
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'));
+    let valid_shape = !host.is_empty()
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'));
+
+    if !valid_chars || !valid_shape {
+        return Err(DriverError::InvalidInput {
+            message: format!("{label} contains unsupported characters or label syntax"),
+        });
+    }
+
+    Ok(())
 }
 
 fn required_metadata_string(metadata: &BTreeMap<String, Value>, key: &str) -> DriverResult<String> {
@@ -687,6 +711,35 @@ mod tests {
     }
 
     #[test]
+    fn target_from_metadata_rejects_non_conservative_username_characters() {
+        let metadata = BTreeMap::from([
+            ("host".to_owned(), json!("dev-vm.example.com")),
+            ("user".to_owned(), json!("a;b")),
+        ]);
+
+        let err = RemoteSshTarget::from_metadata(&metadata).expect_err("metadata should fail");
+
+        assert!(err.to_string().contains("metadata.user"));
+    }
+
+    #[test]
+    fn target_from_metadata_rejects_host_delimiters() {
+        for host in [
+            "dev-vm.example.com?identity_file=/tmp/key",
+            "alice@dev-vm.example.com",
+        ] {
+            let metadata = BTreeMap::from([
+                ("host".to_owned(), json!(host)),
+                ("user".to_owned(), json!("alice")),
+            ]);
+
+            let err = RemoteSshTarget::from_metadata(&metadata).expect_err("metadata should fail");
+
+            assert!(err.to_string().contains("metadata.host"));
+        }
+    }
+
+    #[test]
     fn uri_handle_round_trips_target_fields() {
         let target = RemoteSshTarget {
             host: "dev-vm.example.com".to_owned(),
@@ -727,6 +780,22 @@ mod tests {
                 .expect_err("handle should fail");
 
         assert!(err.to_string().contains("username"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_percent_encoded_username_characters() {
+        let err = RemoteSshTarget::from_handle("remote-ssh://a%3Bb@dev-vm.example.com:22")
+            .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("username"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_invalid_host_labels() {
+        let err = RemoteSshTarget::from_handle("remote-ssh://alice@-dev-vm.example.com:22")
+            .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("host"));
     }
 
     #[test]
