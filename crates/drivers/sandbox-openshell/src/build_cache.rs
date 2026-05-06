@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -13,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{now_timestamp_string, sanitize_build_name, CommandOutput, CommandRequest};
+
+static ACTIVE_BUILDERS: AtomicUsize = AtomicUsize::new(0);
+static BUILD_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone)]
 pub(super) struct BuildQueueConfig {
@@ -56,6 +60,30 @@ pub(super) struct BuildMaterialization {
 
 pub(super) trait DockerImageInspector {
     fn inspect_image(&self, request: CommandRequest) -> DriverResult<CommandOutput>;
+}
+
+pub(super) struct BuildSlotGuard;
+
+impl BuildSlotGuard {
+    fn acquire(config: &BuildQueueConfig) -> DriverResult<Self> {
+        let previous = ACTIVE_BUILDERS.fetch_add(1, Ordering::SeqCst);
+        if previous >= config.max_inflight {
+            ACTIVE_BUILDERS.fetch_sub(1, Ordering::SeqCst);
+            return Err(DriverError::PreflightFailed {
+                message: format!(
+                    "build queue saturated: {} builders active, max {}",
+                    previous, config.max_inflight
+                ),
+            });
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for BuildSlotGuard {
+    fn drop(&mut self) {
+        ACTIVE_BUILDERS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +226,91 @@ impl<'a> BuildCache<'a> {
         }))
     }
 
+    pub(super) fn materialize_built(
+        &self,
+        input: &BuildInput,
+        image_ref: String,
+        image_digest: String,
+    ) -> DriverResult<BuildMaterialization> {
+        parse_sha256_digest(&image_digest).map_err(|source| DriverError::InvalidInput {
+            message: format!("Docker image returned invalid digest `{image_digest}`: {source}"),
+        })?;
+        let key = self.build_key(input)?;
+        let cache_dir = self.cache_dir(&key);
+        let context_dir = cache_dir.join("context");
+        fs::create_dir_all(&cache_dir).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to create build cache `{}`: {source}",
+                cache_dir.display()
+            ),
+        })?;
+        if Path::new(&image_ref) != context_dir.as_path() {
+            if context_dir.exists() {
+                fs::remove_dir_all(&context_dir).map_err(|source| DriverError::InvalidInput {
+                    message: format!(
+                        "failed to clear cached context `{}`: {source}",
+                        context_dir.display()
+                    ),
+                })?;
+            }
+            fs::rename(&image_ref, &context_dir).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to move staged context into build cache `{}`: {source}",
+                    context_dir.display()
+                ),
+            })?;
+        }
+        fs::write(cache_dir.join("image-digest"), format!("{image_digest}\n")).map_err(
+            |source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to write cached image digest `{}`: {source}",
+                    cache_dir.display()
+                ),
+            },
+        )?;
+        let metadata = BuildMetadata {
+            version: 1,
+            build_key: key.clone(),
+            driver: "openshell".to_owned(),
+            driver_version: env!("CARGO_PKG_VERSION").to_owned(),
+            image_ref: context_dir.display().to_string(),
+            image_digest: image_digest.clone(),
+            created_at: now_timestamp_string(),
+            source: BuildSourceMetadata {
+                dockerfile: input.dockerfile.display().to_string(),
+                context_digest: input.context_digest.clone(),
+            },
+        };
+        let metadata_json =
+            serde_json::to_vec_pretty(&metadata).map_err(|source| DriverError::InvalidInput {
+                message: format!("failed to serialize build cache metadata: {source}"),
+            })?;
+        fs::write(cache_dir.join("metadata.json"), metadata_json).map_err(|source| {
+            DriverError::InvalidInput {
+                message: format!(
+                    "failed to write build cache metadata `{}`: {source}",
+                    cache_dir.display()
+                ),
+            }
+        })?;
+        self.write_env_digest(&input.env_name, &image_digest)?;
+        self.emit_miss(
+            &input.env_name,
+            &key,
+            &image_digest,
+            BUILD_QUEUE_DEPTH.load(Ordering::SeqCst),
+        );
+        Ok(BuildMaterialization {
+            image_ref: context_dir.display().to_string(),
+            image_digest,
+            tag: tag_for_key(&key),
+        })
+    }
+
+    pub(super) fn acquire_build_slot(&self) -> DriverResult<BuildSlotGuard> {
+        BuildSlotGuard::acquire(&self.config)
+    }
+
     fn read_valid_metadata(
         &self,
         input: &BuildInput,
@@ -220,10 +333,10 @@ impl<'a> BuildCache<'a> {
         };
 
         if !self.metadata_matches(input, key, cache_dir, &metadata)? {
-            return Ok(None);
+            return evict_invalid_cache(cache_dir);
         }
         if !self.docker_image_matches(key, &metadata.image_digest, inspector)? {
-            return Ok(None);
+            return evict_invalid_cache(cache_dir);
         }
 
         Ok(Some(metadata))
@@ -338,6 +451,27 @@ impl<'a> BuildCache<'a> {
         );
         self.events.emit(event);
     }
+
+    fn emit_miss(&self, env_name: &str, key: &str, digest: &str, queue_depth: usize) {
+        let event = ActivityEvent::new(
+            now_timestamp_string(),
+            ActivityKind::BuildOneflightMiss,
+            ActivityResult::Ok,
+            format!("openshell-build-cache-{}", Uuid::new_v4()),
+        )
+        .with_env(env_name)
+        .with_actor_value("driver", serde_json::json!("openshell"))
+        .with_subject_value("build_key", serde_json::json!(key))
+        .with_extra("image_digest", serde_json::json!(digest))
+        .with_extra("queue_depth", serde_json::json!(queue_depth))
+        .with_extra("max_inflight", serde_json::json!(self.config.max_inflight))
+        .with_extra("queue_limit", serde_json::json!(self.config.queue_limit))
+        .with_extra(
+            "lock_timeout_secs",
+            serde_json::json!(self.config.lock_timeout.as_secs()),
+        );
+        self.events.emit(event);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -374,6 +508,7 @@ fn cache_dir_name(key: &str) -> String {
 
 fn evict_invalid_cache<T>(cache_dir: &Path) -> DriverResult<Option<T>> {
     let _ = fs::remove_file(cache_dir.join("metadata.json"));
+    let _ = fs::remove_file(cache_dir.join("image-digest"));
     Ok(None)
 }
 
