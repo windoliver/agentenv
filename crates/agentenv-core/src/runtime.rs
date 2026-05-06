@@ -1591,11 +1591,87 @@ pub async fn snapshot_env(
 
 pub fn verify_snapshot(path: &Path) -> RuntimeResult<SnapshotVerifyResult> {
     let manifest = crate::snapshot::verify_snapshot_dir(path)?;
+    verify_snapshot_contents(path, &manifest)?;
     Ok(SnapshotVerifyResult {
         path: path.to_path_buf(),
         file_count: manifest.files.len(),
         merkle_root: manifest.merkle_root,
     })
+}
+
+fn verify_snapshot_contents(
+    snapshot: &Path,
+    manifest: &crate::snapshot::SnapshotManifest,
+) -> RuntimeResult<()> {
+    verify_snapshot_manifest_compatibility(manifest)?;
+
+    let snapshot_policy = read_snapshot_policy(&snapshot.join("policy.yaml"))?;
+    let lock_path = snapshot.join("lock.yaml");
+    let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| crate::env::EnvError::Io {
+        path: lock_path,
+        source,
+    })?;
+    let lockfile = verify_snapshot_lockfile(&lock_yaml)?;
+    if lockfile.policy.resolved != snapshot_policy {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: "snapshot policy.yaml does not match lock.yaml resolved policy".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn verify_snapshot_manifest_compatibility(
+    manifest: &crate::snapshot::SnapshotManifest,
+) -> RuntimeResult<()> {
+    let min_agentenv_version =
+        semver::Version::parse(&manifest.min_agentenv_version).map_err(|source| {
+            RuntimeError::PortableLockfileVerification {
+                details: format!(
+                    "snapshot min_agentenv_version `{}` is invalid: {source}",
+                    manifest.min_agentenv_version
+                ),
+            }
+        })?;
+    let current_agentenv_version =
+        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be semver");
+    if min_agentenv_version > current_agentenv_version {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: format!(
+                "snapshot min_agentenv_version `{}` is newer than current agentenv version `{}`",
+                manifest.min_agentenv_version,
+                env!("CARGO_PKG_VERSION")
+            ),
+        });
+    }
+
+    agentenv_proto::assert_compatible_schema_version(&manifest.driver_protocol_version).map_err(
+        |_| RuntimeError::PortableLockfileVerification {
+            details: format!(
+                "snapshot driver protocol version `{}` is incompatible with `{SCHEMA_VERSION}`",
+                manifest.driver_protocol_version
+            ),
+        },
+    )?;
+
+    Ok(())
+}
+
+fn verify_snapshot_lockfile(lock_yaml: &str) -> RuntimeResult<crate::lockfile::PortableLockfile> {
+    let document = crate::lockfile::LockfileDocument::from_yaml(lock_yaml)?;
+    let crate::lockfile::LockfileDocument::Portable(lockfile) = document else {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: "snapshot lock.yaml must be a portable 0.2.0 lockfile".to_owned(),
+        });
+    };
+
+    if lockfile.policy.declared != lockfile.composition.policy {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: "lock.yaml policy.declared does not match composition.policy".to_owned(),
+        });
+    }
+
+    Ok(lockfile)
 }
 
 pub async fn restore_snapshot_env(
@@ -1605,6 +1681,7 @@ pub async fn restore_snapshot_env(
     args: SnapshotRestoreArgs,
 ) -> RuntimeResult<SnapshotRestoreResult> {
     let manifest = crate::snapshot::verify_snapshot_dir(&args.snapshot)?;
+    verify_snapshot_contents(&args.snapshot, &manifest)?;
     let name = args.name.unwrap_or_else(|| manifest.source_env.clone());
     let env_name = crate::env::validate_env_name(&name)?;
     let paths = crate::env::EnvPaths::new(options.root.clone(), env_name.clone());
@@ -4426,6 +4503,29 @@ policy:
         lockfile.to_yaml_deterministic().expect("render lockfile")
     }
 
+    fn snapshot_lockfile_yaml_with_policy(
+        root: &std::path::Path,
+        name: &str,
+        blueprint_yaml: &str,
+        policy: agentenv_proto::NetworkPolicy,
+    ) -> String {
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: name.to_owned(),
+                blueprint_yaml: blueprint_yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.policy.resolved = policy;
+        lockfile.to_yaml_deterministic().expect("render lockfile")
+    }
+
     fn write_snapshot_env_fixture(root: &std::path::Path, name: &str, blueprint_yaml: &str) {
         let env_dir = root.join("envs").join(name);
         let lock_yaml = snapshot_lockfile_yaml(root, name, blueprint_yaml);
@@ -4485,7 +4585,7 @@ policy:
         fs::write(snapshot_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
         fs::write(
             snapshot_dir.join("lock.yaml"),
-            snapshot_lockfile_yaml(root, source_env, blueprint_yaml),
+            snapshot_lockfile_yaml_with_policy(root, source_env, blueprint_yaml, policy.clone()),
         )
         .unwrap();
         fs::write(
@@ -4500,6 +4600,49 @@ policy:
             Vec::new(),
         )
         .expect("manifest");
+        crate::snapshot::write_signed_manifest(
+            &snapshot_dir,
+            &root.join("snapshot-signing.key"),
+            &manifest,
+        )
+        .expect("write signed manifest");
+        snapshot_dir
+    }
+
+    fn write_custom_signed_snapshot(
+        root: &std::path::Path,
+        source_env: &str,
+        lock_yaml: &str,
+        policy_yaml: &str,
+    ) -> std::path::PathBuf {
+        write_custom_signed_snapshot_with_manifest(root, source_env, lock_yaml, policy_yaml, |_| {})
+    }
+
+    fn write_custom_signed_snapshot_with_manifest(
+        root: &std::path::Path,
+        source_env: &str,
+        lock_yaml: &str,
+        policy_yaml: &str,
+        mutate_manifest: impl FnOnce(&mut crate::snapshot::SnapshotManifest),
+    ) -> std::path::PathBuf {
+        let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
+        fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+        fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+        fs::write(
+            snapshot_dir.join("blueprint.yaml"),
+            snapshot_blueprint_yaml(),
+        )
+        .unwrap();
+        fs::write(snapshot_dir.join("lock.yaml"), lock_yaml).unwrap();
+        fs::write(snapshot_dir.join("policy.yaml"), policy_yaml).unwrap();
+        let mut manifest = crate::snapshot::manifest_for_snapshot_dir(
+            &snapshot_dir,
+            source_env,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("manifest");
+        mutate_manifest(&mut manifest);
         crate::snapshot::write_signed_manifest(
             &snapshot_dir,
             &root.join("snapshot-signing.key"),
@@ -7690,6 +7833,24 @@ policy:
             Some("OPENAI_API_KEY")
         );
         assert_eq!(manifest.credential_requirements[0].required, Some(true));
+
+        let lock_yaml = fs::read_to_string(output.join("lock.yaml")).unwrap();
+        let crate::lockfile::LockfileDocument::Portable(lockfile) =
+            crate::lockfile::LockfileDocument::from_yaml(&lock_yaml)
+                .expect("snapshot lockfile should remain parseable")
+        else {
+            panic!("snapshot lockfile should be portable");
+        };
+        assert_eq!(
+            lockfile.credentials["OPENAI_API_KEY"].reference.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            lockfile.composition.agent.credentials["OPENAI_API_KEY"]
+                .reference
+                .as_deref(),
+            Some("OPENAI_API_KEY")
+        );
     }
 
     #[test]
@@ -7705,7 +7866,12 @@ policy:
         .unwrap();
         fs::write(
             snapshot_dir.join("lock.yaml"),
-            snapshot_lockfile_yaml(&root, "demo", snapshot_blueprint_yaml()),
+            snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
         )
         .unwrap();
         fs::write(
@@ -7732,6 +7898,104 @@ policy:
         assert_eq!(result.path, snapshot_dir);
         assert_eq!(result.file_count, manifest.files.len());
         assert_eq!(result.merkle_root, manifest.merkle_root);
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_malformed_embedded_lockfile() {
+        let root = unique_root("agentenv-runtime-verify-malformed-lock");
+        let snapshot_dir = write_custom_signed_snapshot(
+            &root,
+            "demo",
+            "version: 0.2.0\ncredentials: '[redacted]'\n",
+            &serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with malformed lockfile must fail verification");
+
+        assert!(
+            err.to_string().contains("lockfile") || err.to_string().contains("credentials"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_malformed_snapshot_policy() {
+        let root = unique_root("agentenv-runtime-verify-malformed-policy");
+        let snapshot_dir = write_custom_signed_snapshot(
+            &root,
+            "demo",
+            &snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+            "filesystem: [\n",
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with malformed policy must fail verification");
+
+        assert!(
+            err.to_string().contains("YAML") || err.to_string().contains("policy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_incompatible_min_agentenv_version() {
+        let root = unique_root("agentenv-runtime-verify-min-version");
+        let snapshot_dir = write_custom_signed_snapshot_with_manifest(
+            &root,
+            "demo",
+            &snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+            &serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+            |manifest| {
+                manifest.min_agentenv_version = "999.0.0".to_owned();
+            },
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with future min_agentenv_version must fail");
+
+        assert!(
+            err.to_string().contains("min_agentenv_version")
+                || err.to_string().contains("agentenv version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_incompatible_driver_protocol_version() {
+        let root = unique_root("agentenv-runtime-verify-driver-protocol");
+        let snapshot_dir = write_custom_signed_snapshot_with_manifest(
+            &root,
+            "demo",
+            &snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+            &serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+            |manifest| {
+                manifest.driver_protocol_version = "999.0".to_owned();
+            },
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with incompatible driver protocol must fail");
+
+        assert!(
+            err.to_string().contains("driver protocol"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

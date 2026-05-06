@@ -3055,9 +3055,7 @@ fn write_minimal_signed_snapshot_with_credentials(
     let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
     fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
     fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
-    fs::write(
-        snapshot_dir.join("blueprint.yaml"),
-        r#"
+    let blueprint_yaml = r#"
 version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
 sandbox:
@@ -3072,82 +3070,28 @@ inference:
 policy:
   tier: balanced
   presets: []
-"#,
+"#;
+    fs::write(snapshot_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+    let mut discovery_config = agentenv_core::driver_catalog::DriverDiscoveryConfig::from_env();
+    discovery_config.installed_root = root.join("drivers");
+    let driver_artifacts =
+        agentenv_core::driver_artifact::discover_driver_artifacts(discovery_config, None).unwrap();
+    let lockfile = agentenv_core::portable_lockfile::build_portable_lockfile(
+        agentenv_core::portable_lockfile::PortableLockfileInput {
+            name: source_env.to_owned(),
+            blueprint_yaml: blueprint_yaml.to_owned(),
+            driver_artifacts,
+        },
     )
     .unwrap();
     fs::write(
         snapshot_dir.join("lock.yaml"),
-        r#"
-version: 0.2.0
-name: demo
-blueprint_hash: sha256:e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
-drivers:
-  sandbox:
-    name: openshell
-    kind: sandbox
-    version: 0.0.1-alpha0
-    source: built_in
-    digest: built-in:openshell
-  agent:
-    name: codex
-    kind: agent
-    version: 0.0.1-alpha0
-    source: built_in
-    digest: built-in:codex
-  context:
-    name: filesystem
-    kind: context
-    version: 0.0.1-alpha0
-    source: built_in
-    digest: built-in:filesystem
-credentials: {}
-composition:
-  sandbox:
-    driver: openshell
-  agent:
-    driver: codex
-  context:
-    driver: filesystem
-    mount: ~/projects
-  policy:
-    tier: balanced
-    presets: []
-policy:
-  declared:
-    tier: balanced
-    presets: []
-  resolved:
-    filesystem:
-      mounts: []
-    network:
-      allow: []
-      deny: []
-      approval: []
-    process:
-      allowed: []
-      denied: []
-    inference:
-      allow_models: []
-      deny_models: []
-"#,
+        lockfile.to_yaml_deterministic().unwrap(),
     )
     .unwrap();
     fs::write(
         snapshot_dir.join("policy.yaml"),
-        r#"
-filesystem:
-  mounts: []
-network:
-  allow: []
-  deny: []
-  approval: []
-process:
-  allowed: []
-  denied: []
-inference:
-  allow_models: []
-  deny_models: []
-"#,
+        serde_yaml::to_string(&lockfile.policy.resolved).unwrap(),
     )
     .unwrap();
     let credential_requirements = credential_names

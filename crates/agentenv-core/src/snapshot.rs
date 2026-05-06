@@ -393,14 +393,26 @@ fn strip_credential_paths(
 
 fn redact_structured_files(root: &Path) -> SnapshotResult<()> {
     for path in payload_files(root, root)? {
+        let preserve_credential_metadata = preserves_reference_credential_metadata(root, &path);
         match structured_file_format(&path) {
-            Some(StructuredFileFormat::Json) => redact_json_file(&path)?,
-            Some(StructuredFileFormat::Yaml) => redact_yaml_file(&path)?,
+            Some(StructuredFileFormat::Json) => {
+                redact_json_file(&path, preserve_credential_metadata)?;
+            }
+            Some(StructuredFileFormat::Yaml) => {
+                redact_yaml_file(&path, preserve_credential_metadata)?;
+            }
             None => {}
         }
     }
 
     Ok(())
+}
+
+fn preserves_reference_credential_metadata(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.to_str())
+        .is_some_and(|relative| matches!(relative, "blueprint.yaml" | "lock.yaml"))
 }
 
 fn scan_for_remaining_secrets(root: &Path) -> SnapshotResult<()> {
@@ -817,29 +829,44 @@ fn structured_file_format(path: &Path) -> Option<StructuredFileFormat> {
     }
 }
 
-fn redact_json_file(path: &Path) -> SnapshotResult<()> {
+fn redact_json_file(path: &Path, preserve_credential_metadata: bool) -> SnapshotResult<()> {
     let content = fs::read(path)?;
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&content) else {
         return Ok(());
     };
 
-    if redact_json_value(&mut value) {
+    if redact_json_value(&mut value, preserve_credential_metadata) {
         fs::write(path, serde_json::to_vec_pretty(&value)?)?;
     }
     Ok(())
 }
 
-fn redact_json_value(value: &mut serde_json::Value) -> bool {
+fn redact_json_value(value: &mut serde_json::Value, preserve_credential_metadata: bool) -> bool {
+    redact_json_value_inner(value, preserve_credential_metadata, false)
+}
+
+fn redact_json_value_inner(
+    value: &mut serde_json::Value,
+    preserve_credential_metadata: bool,
+    in_credential_map: bool,
+) -> bool {
     match value {
         serde_json::Value::Object(map) => {
             let mut changed = false;
             for (key, child) in map {
-                if is_secret_like_key(key) {
+                let preserves_child_credential_map =
+                    preserve_credential_metadata && is_credentials_metadata_key(key);
+                if !in_credential_map && !preserves_child_credential_map && is_secret_like_key(key)
+                {
                     if *child != serde_json::Value::String("[redacted]".to_owned()) {
                         *child = serde_json::Value::String("[redacted]".to_owned());
                         changed = true;
                     }
-                } else if redact_json_value(child) {
+                } else if redact_json_value_inner(
+                    child,
+                    preserve_credential_metadata,
+                    preserves_child_credential_map,
+                ) {
                     changed = true;
                 }
             }
@@ -848,7 +875,7 @@ fn redact_json_value(value: &mut serde_json::Value) -> bool {
         serde_json::Value::Array(items) => {
             let mut changed = false;
             for item in items {
-                if redact_json_value(item) {
+                if redact_json_value_inner(item, preserve_credential_metadata, false) {
                     changed = true;
                 }
             }
@@ -858,29 +885,46 @@ fn redact_json_value(value: &mut serde_json::Value) -> bool {
     }
 }
 
-fn redact_yaml_file(path: &Path) -> SnapshotResult<()> {
+fn redact_yaml_file(path: &Path, preserve_credential_metadata: bool) -> SnapshotResult<()> {
     let content = fs::read(path)?;
     let Ok(mut value) = serde_yaml::from_slice::<serde_yaml::Value>(&content) else {
         return Ok(());
     };
 
-    if redact_yaml_value(&mut value) {
+    if redact_yaml_value(&mut value, preserve_credential_metadata) {
         fs::write(path, serde_yaml::to_string(&value)?)?;
     }
     Ok(())
 }
 
-fn redact_yaml_value(value: &mut serde_yaml::Value) -> bool {
+fn redact_yaml_value(value: &mut serde_yaml::Value, preserve_credential_metadata: bool) -> bool {
+    redact_yaml_value_inner(value, preserve_credential_metadata, false)
+}
+
+fn redact_yaml_value_inner(
+    value: &mut serde_yaml::Value,
+    preserve_credential_metadata: bool,
+    in_credential_map: bool,
+) -> bool {
     match value {
         serde_yaml::Value::Mapping(map) => {
             let mut changed = false;
             for (key, child) in map {
-                if yaml_key_is_secret_like(key) {
+                let preserves_child_credential_map =
+                    preserve_credential_metadata && yaml_key_is_credentials_metadata(key);
+                if !in_credential_map
+                    && !preserves_child_credential_map
+                    && yaml_key_is_secret_like(key)
+                {
                     if *child != serde_yaml::Value::String("[redacted]".to_owned()) {
                         *child = serde_yaml::Value::String("[redacted]".to_owned());
                         changed = true;
                     }
-                } else if redact_yaml_value(child) {
+                } else if redact_yaml_value_inner(
+                    child,
+                    preserve_credential_metadata,
+                    preserves_child_credential_map,
+                ) {
                     changed = true;
                 }
             }
@@ -889,12 +933,19 @@ fn redact_yaml_value(value: &mut serde_yaml::Value) -> bool {
         serde_yaml::Value::Sequence(items) => {
             let mut changed = false;
             for item in items {
-                if redact_yaml_value(item) {
+                if redact_yaml_value_inner(item, preserve_credential_metadata, false) {
                     changed = true;
                 }
             }
             changed
         }
+        _ => false,
+    }
+}
+
+fn yaml_key_is_credentials_metadata(key: &serde_yaml::Value) -> bool {
+    match key {
+        serde_yaml::Value::String(key) => is_credentials_metadata_key(key),
         _ => false,
     }
 }
@@ -904,6 +955,10 @@ fn yaml_key_is_secret_like(key: &serde_yaml::Value) -> bool {
         serde_yaml::Value::String(key) => is_secret_like_key(key),
         _ => false,
     }
+}
+
+fn is_credentials_metadata_key(key: &str) -> bool {
+    normalize_secret_key(key) == "credentials"
 }
 
 fn is_secret_like_key(key: &str) -> bool {
@@ -1505,6 +1560,48 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("workspace/keep.txt")).unwrap(),
             "safe"
+        );
+    }
+
+    #[test]
+    fn sanitizer_preserves_reference_only_credential_maps() {
+        let root = temp_dir("snapshot-sanitize-credential-metadata");
+        fs::create_dir_all(root.join("workspace")).unwrap();
+        fs::write(root.join("workspace/README.md"), "hello\n").unwrap();
+        fs::write(
+            root.join("lock.yaml"),
+            r#"
+credentials:
+  OPENAI_API_KEY:
+    source: env
+    reference: OPENAI_API_KEY
+    required: true
+composition:
+  agent:
+    credentials:
+      OPENAI_API_KEY:
+        source: env
+        reference: OPENAI_API_KEY
+        required: true
+"#,
+        )
+        .unwrap();
+
+        sanitize_snapshot_tree(&root).expect("sanitize tree");
+
+        let lock: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(root.join("lock.yaml")).unwrap()).unwrap();
+        assert_eq!(
+            lock["credentials"]["OPENAI_API_KEY"]["source"],
+            serde_yaml::Value::String("env".to_owned())
+        );
+        assert_eq!(
+            lock["credentials"]["OPENAI_API_KEY"]["reference"],
+            serde_yaml::Value::String("OPENAI_API_KEY".to_owned())
+        );
+        assert_eq!(
+            lock["composition"]["agent"]["credentials"]["OPENAI_API_KEY"]["reference"],
+            serde_yaml::Value::String("OPENAI_API_KEY".to_owned())
         );
     }
 
