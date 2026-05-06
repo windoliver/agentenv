@@ -1970,26 +1970,19 @@ fn check_snapshot_credentials(
     manifest: &crate::snapshot::SnapshotManifest,
 ) -> RuntimeResult<()> {
     for credential in &manifest.credential_requirements {
-        if credential.required == Some(false) {
-            continue;
-        }
-
         let reference = credential.reference.as_deref().unwrap_or(&credential.name);
-        match credential.source.as_str() {
-            "env" if std::env::var_os(reference).is_none() => {
-                return Err(RuntimeError::MissingCredential {
-                    name: reference.to_owned(),
-                });
-            }
-            "credstore" => match credentials.backend_name(reference)? {
-                Some(backend) if is_credstore_backend(&backend) => {}
-                _ => {
-                    return Err(RuntimeError::MissingCredential {
-                        name: reference.to_owned(),
-                    });
-                }
-            },
-            _ => {}
+        let required = credential.required.unwrap_or(true);
+        let requirement = agentenv_proto::CredentialRequirement {
+            name: reference.to_owned(),
+            description: String::new(),
+            kind: Default::default(),
+            required,
+            validator: None,
+        };
+        if credentials.resolve(&requirement)?.is_none() && required {
+            return Err(RuntimeError::MissingCredential {
+                name: requirement.name,
+            });
         }
     }
 
@@ -5035,6 +5028,38 @@ policy:
         }
     }
 
+    #[derive(Default)]
+    struct ResolvingCredentialProvider {
+        values: BTreeMap<String, String>,
+        resolved: Vec<agentenv_proto::CredentialRequirement>,
+    }
+
+    impl ResolvingCredentialProvider {
+        fn with_value(name: &str, value: &str) -> Self {
+            Self {
+                values: BTreeMap::from([(name.to_owned(), value.to_owned())]),
+                resolved: Vec::new(),
+            }
+        }
+    }
+
+    impl super::CredentialProvider for ResolvingCredentialProvider {
+        fn resolve(
+            &mut self,
+            requirement: &agentenv_proto::CredentialRequirement,
+        ) -> super::RuntimeResult<Option<RuntimeSecret>> {
+            self.resolved.push(requirement.clone());
+            Ok(self
+                .values
+                .get(&requirement.name)
+                .map(|value| RuntimeSecret::new(value.clone())))
+        }
+
+        fn backend_name(&self, _name: &str) -> super::RuntimeResult<Option<String>> {
+            Ok(None)
+        }
+    }
+
     struct AgentSetupAgentDriver {
         tracker: Arc<AgentSetupTracker>,
     }
@@ -7710,6 +7735,163 @@ policy:
                 .is_empty(),
             "restore must not copy into an existing env"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_resolves_manifest_credentials_through_provider() {
+        let root = unique_root("agentenv-runtime-restore-provider-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let previous_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("OPENAI_API_KEY", "sk-test-provider");
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore should use provider-resolved snapshot credential");
+
+        if let Some(value) = previous_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        }
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert_eq!(credentials.resolved.len(), 1);
+        assert_eq!(credentials.resolved[0].name, "OPENAI_API_KEY");
+        assert!(credentials.resolved[0].required);
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_rejects_required_manifest_credential_when_provider_returns_none() {
+        let root = unique_root("agentenv-runtime-restore-provider-missing");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let previous_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = ResolvingCredentialProvider::default();
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("restore should reject unresolved required snapshot credential");
+
+        if let Some(value) = previous_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        }
+        assert!(matches!(
+            err,
+            RuntimeError::MissingCredential { ref name } if name == "OPENAI_API_KEY"
+        ));
+        assert_eq!(credentials.resolved.len(), 1);
+        assert!(
+            factory
+                .env_builds
+                .lock()
+                .expect("env build tracker")
+                .is_empty(),
+            "credential failure must happen before env reproduction"
+        );
+        assert!(
+            !root.join("envs").join("restored").exists(),
+            "credential failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_allows_optional_unresolved_manifest_credential() {
+        let root = unique_root("agentenv-runtime-restore-provider-optional");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let previous_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(false),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = ResolvingCredentialProvider::default();
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("optional unresolved snapshot credential should not block restore");
+
+        if let Some(value) = previous_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        }
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert_eq!(credentials.resolved.len(), 1);
+        assert!(!credentials.resolved[0].required);
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
     }
 
     #[tokio::test]
