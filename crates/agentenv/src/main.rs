@@ -456,6 +456,13 @@ struct SnapshotRestoreCliArgs {
     path: PathBuf,
     #[arg(long = "as", value_name = "NEW_NAME")]
     as_name: Option<String>,
+    #[arg(
+        long,
+        env = "AGENTENV_NON_INTERACTIVE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    non_interactive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2375,11 +2382,11 @@ fn run_snapshot_verify(path: PathBuf) -> Result<()> {
 }
 
 async fn run_snapshot_restore(args: SnapshotRestoreCliArgs) -> Result<()> {
-    let options = runtime_options(false)?;
+    let options = runtime_options(args.non_interactive)?;
     let store = CredentialStore::from_default_paths().context("initialize credential store")?;
     let mut provider = CliCredentialProvider {
         store,
-        non_interactive: false,
+        non_interactive: args.non_interactive,
         prompter: Box::new(TerminalCredentialPrompter),
     };
 

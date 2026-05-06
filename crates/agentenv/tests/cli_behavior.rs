@@ -555,6 +555,90 @@ fn snapshot_restore_missing_dir_with_as_fails_before_env_creation() {
 }
 
 #[test]
+fn snapshot_restore_non_interactive_flag_reports_missing_credential() {
+    let temp_dir = make_temp_dir("snapshot-restore-non-interactive-flag");
+    let snapshot_dir =
+        write_minimal_signed_snapshot_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("restore")
+        .arg(&snapshot_dir)
+        .arg("--as")
+        .arg("restored")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPENAI_API_KEY"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing credential") || stderr.contains("missing_credential"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to prompt"),
+        "restore prompted despite --non-interactive: {stderr}"
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state before rejecting missing credential"
+    );
+}
+
+#[test]
+fn snapshot_restore_non_interactive_env_reports_missing_credential() {
+    let temp_dir = make_temp_dir("snapshot-restore-non-interactive-env");
+    let snapshot_dir =
+        write_minimal_signed_snapshot_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("restore")
+        .arg(&snapshot_dir)
+        .arg("--as")
+        .arg("restored")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_NON_INTERACTIVE", "1")
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPENAI_API_KEY"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing credential") || stderr.contains("missing_credential"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to prompt"),
+        "restore prompted despite AGENTENV_NON_INTERACTIVE=1: {stderr}"
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state before rejecting missing credential"
+    );
+}
+
+#[test]
 fn snapshot_output_before_verify_is_rejected_by_parser() {
     let temp_dir = make_temp_dir("snapshot-output-before-verify");
 
@@ -2960,6 +3044,14 @@ fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
 }
 
 fn write_minimal_signed_snapshot(root: &Path, source_env: &str) -> PathBuf {
+    write_minimal_signed_snapshot_with_credentials(root, source_env, &[])
+}
+
+fn write_minimal_signed_snapshot_with_credentials(
+    root: &Path,
+    source_env: &str,
+    credential_names: &[&str],
+) -> PathBuf {
     let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
     fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
     fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
@@ -3058,9 +3150,28 @@ inference:
 "#,
     )
     .unwrap();
-    agentenv_core::snapshot::write_manifest_and_signature(
+    let credential_requirements = credential_names
+        .iter()
+        .map(
+            |name| agentenv_core::snapshot::SnapshotCredentialRequirement {
+                name: (*name).to_owned(),
+                source: "env".to_owned(),
+                reference: Some((*name).to_owned()),
+                required: Some(true),
+            },
+        )
+        .collect();
+    let manifest = agentenv_core::snapshot::manifest_for_snapshot_dir(
+        &snapshot_dir,
+        source_env,
+        credential_requirements,
+        Vec::new(),
+    )
+    .unwrap();
+    agentenv_core::snapshot::write_signed_manifest(
         &snapshot_dir,
         &root.join("snapshot-signing.key"),
+        &manifest,
     )
     .unwrap();
     snapshot_dir
