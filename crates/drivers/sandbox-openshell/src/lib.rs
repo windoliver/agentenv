@@ -375,6 +375,7 @@ pub struct OpenShellDriver {
     current_policies: Mutex<BTreeMap<String, NetworkPolicy>>,
     log_streams: Mutex<Vec<LogStream>>,
     events: Arc<dyn EventEmitter>,
+    build_queue_config_override: Option<build_cache::BuildQueueConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +405,7 @@ impl Default for OpenShellDriver {
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
             events: Arc::new(NoopEventEmitter),
+            build_queue_config_override: None,
         }
     }
 }
@@ -427,6 +429,7 @@ impl OpenShellDriver {
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
             events: Arc::new(NoopEventEmitter),
+            build_queue_config_override: None,
         }
     }
 
@@ -440,6 +443,25 @@ impl OpenShellDriver {
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
             events: Arc::new(NoopEventEmitter),
+            build_queue_config_override: None,
+        }
+    }
+
+    fn with_command_runner_workdir_and_build_config(
+        runner: Arc<dyn CommandRunner>,
+        workdir: &Path,
+        build_config: build_cache::BuildQueueConfig,
+    ) -> Self {
+        Self {
+            binary: OPEN_SHELL_BINARY.to_owned(),
+            runner,
+            host_bootstrap: false,
+            runtime_app_override: None,
+            workdir: Mutex::new(workdir.to_path_buf()),
+            current_policies: Mutex::new(BTreeMap::new()),
+            log_streams: Mutex::new(Vec::new()),
+            events: Arc::new(NoopEventEmitter),
+            build_queue_config_override: Some(build_config),
         }
     }
 
@@ -454,6 +476,7 @@ impl OpenShellDriver {
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
             events: Arc::new(NoopEventEmitter),
+            build_queue_config_override: None,
         }
     }
 
@@ -471,6 +494,7 @@ impl OpenShellDriver {
             current_policies: Mutex::new(BTreeMap::new()),
             log_streams: Mutex::new(Vec::new()),
             events: Arc::new(NoopEventEmitter),
+            build_queue_config_override: None,
         }
     }
 }
@@ -1048,7 +1072,11 @@ impl OpenShellDriver {
                 ),
             })?;
         let build_name = sanitize_build_name(name);
-        let cache = build_cache::BuildCache::new(self.workdir(), self.events.as_ref());
+        let cache = if let Some(config) = self.build_queue_config_override.clone() {
+            build_cache::BuildCache::new_with_config(self.workdir(), self.events.as_ref(), config)
+        } else {
+            build_cache::BuildCache::new(self.workdir(), self.events.as_ref())
+        };
         let key_stage_dir = self
             .workdir()
             .join("build")
@@ -2666,8 +2694,9 @@ mod driver_tests {
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Barrier, Mutex,
+            mpsc, Arc, Mutex,
         },
+        time::Duration,
     };
 
     use agentenv_core::driver::SandboxDriver;
@@ -2702,35 +2731,12 @@ mod driver_tests {
         original: Option<OsString>,
     }
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
     impl Drop for PathRestoreGuard {
         fn drop(&mut self) {
             if let Some(original) = self.original.take() {
                 std::env::set_var("PATH", original);
             } else {
                 std::env::remove_var("PATH");
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
             }
         }
     }
@@ -2752,8 +2758,8 @@ mod driver_tests {
         calls: Mutex<Vec<CommandCall>>,
         build_count: AtomicUsize,
         inspect_count: AtomicUsize,
-        build_started: Barrier,
-        release_build: Barrier,
+        build_started: mpsc::Sender<()>,
+        release_build: Mutex<mpsc::Receiver<()>>,
         digest: String,
     }
 
@@ -2904,8 +2910,14 @@ mod driver_tests {
             if program == "docker" && request.args.first().map(String::as_str) == Some("build") {
                 let previous = self.build_count.fetch_add(1, Ordering::SeqCst);
                 if previous == 0 {
-                    self.build_started.wait();
-                    self.release_build.wait();
+                    self.build_started
+                        .send(())
+                        .map_err(|source| io::Error::other(source.to_string()))?;
+                    self.release_build
+                        .lock()
+                        .expect("release build receiver mutex")
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|source| io::Error::other(source.to_string()))?;
                 }
                 return Ok(CommandOutput {
                     status: Some(0),
@@ -4985,12 +4997,14 @@ mod driver_tests {
         let dockerfile = dockerfile_dir.join("Dockerfile");
         std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
         let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let (build_started_tx, build_started_rx) = mpsc::channel();
+        let (release_build_tx, release_build_rx) = mpsc::channel();
         let runner = Arc::new(OneflightRunner {
             calls: Mutex::new(Vec::new()),
             build_count: AtomicUsize::new(0),
             inspect_count: AtomicUsize::new(0),
-            build_started: Barrier::new(2),
-            release_build: Barrier::new(2),
+            build_started: build_started_tx,
+            release_build: Mutex::new(release_build_rx),
             digest: digest.to_owned(),
         });
 
@@ -5047,7 +5061,9 @@ mod driver_tests {
                     .block_on(async { driver.create(first_spec).await })
             })
         };
-        runner.build_started.wait();
+        build_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first build started");
         let second = {
             let driver = Arc::clone(&second_driver);
             std::thread::spawn(move || {
@@ -5058,8 +5074,8 @@ mod driver_tests {
                     .block_on(async { driver.create(second_spec).await })
             })
         };
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        runner.release_build.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        release_build_tx.send(()).expect("release first build");
 
         first.join().expect("first thread").expect("first create");
         second
@@ -5083,8 +5099,6 @@ mod driver_tests {
 
     #[test]
     fn build_queue_limit_rejects_waiter_before_sandbox_create() {
-        let _queue_guard = EnvVarGuard::set("AGENTENV_BUILD_QUEUE_LIMIT", "0");
-        let _timeout_guard = EnvVarGuard::set("AGENTENV_BUILD_LOCK_TIMEOUT_SECS", "0");
         let tempdir = unique_tempdir("sandbox-openshell-byo-queue-limit");
         let workdir = tempdir.join(".agentenv");
         let dockerfile_dir = tempdir.join("enterprise-sandbox");
@@ -5114,7 +5128,15 @@ mod driver_tests {
         let key = cache.build_key(&input).expect("build key");
         std::fs::create_dir_all(cache.cache_dir(&key).join("lock")).expect("create active lock");
         let runner = Arc::new(FlexibleCommandRunner::new(Vec::new()));
-        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+        let driver = OpenShellDriver::with_command_runner_workdir_and_build_config(
+            runner.clone(),
+            &workdir,
+            super::build_cache::BuildQueueConfig {
+                max_inflight: 4,
+                queue_limit: 0,
+                lock_timeout: Duration::ZERO,
+            },
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -154,9 +154,17 @@ pub(super) struct BuildCache<'a> {
 
 impl<'a> BuildCache<'a> {
     pub(super) fn new(root: PathBuf, events: &'a dyn EventEmitter) -> Self {
+        Self::new_with_config(root, events, BuildQueueConfig::from_env())
+    }
+
+    pub(super) fn new_with_config(
+        root: PathBuf,
+        events: &'a dyn EventEmitter,
+        config: BuildQueueConfig,
+    ) -> Self {
         Self {
             root,
-            config: BuildQueueConfig::from_env(),
+            config,
             events,
         }
     }
@@ -295,13 +303,11 @@ impl<'a> BuildCache<'a> {
                 ),
             })?;
         }
-        fs::write(cache_dir.join("image-digest"), format!("{image_digest}\n")).map_err(
-            |source| DriverError::InvalidInput {
-                message: format!(
-                    "failed to write cached image digest `{}`: {source}",
-                    cache_dir.display()
-                ),
-            },
+        write_cache_file_atomically(
+            &cache_dir,
+            "image-digest",
+            "image-digest.tmp",
+            format!("{image_digest}\n").as_bytes(),
         )?;
         let metadata = BuildMetadata {
             version: 1,
@@ -320,14 +326,12 @@ impl<'a> BuildCache<'a> {
             serde_json::to_vec_pretty(&metadata).map_err(|source| DriverError::InvalidInput {
                 message: format!("failed to serialize build cache metadata: {source}"),
             })?;
-        fs::write(cache_dir.join("metadata.json"), metadata_json).map_err(|source| {
-            DriverError::InvalidInput {
-                message: format!(
-                    "failed to write build cache metadata `{}`: {source}",
-                    cache_dir.display()
-                ),
-            }
-        })?;
+        write_cache_file_atomically(
+            &cache_dir,
+            "metadata.json",
+            "metadata.json.tmp",
+            &metadata_json,
+        )?;
         self.write_env_digest(&input.env_name, &image_digest)?;
         self.emit_miss(&input.env_name, &key, &image_digest);
         Ok(BuildMaterialization {
@@ -677,6 +681,35 @@ fn evict_invalid_cache<T>(cache_dir: &Path) -> DriverResult<Option<T>> {
     Ok(None)
 }
 
+fn write_cache_file_atomically(
+    cache_dir: &Path,
+    file_name: &str,
+    temp_name: &str,
+    contents: &[u8],
+) -> DriverResult<()> {
+    let temp_path = cache_dir.join(temp_name);
+    let final_path = cache_dir.join(file_name);
+    remove_cache_path(&temp_path)?;
+    fs::write(&temp_path, contents).map_err(|source| DriverError::InvalidInput {
+        message: format!(
+            "failed to write build cache temp file `{}`: {source}",
+            temp_path.display()
+        ),
+    })?;
+    match fs::rename(&temp_path, &final_path) {
+        Ok(()) => Ok(()),
+        Err(source) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(DriverError::InvalidInput {
+                message: format!(
+                    "failed to publish build cache file `{}`: {source}",
+                    final_path.display()
+                ),
+            })
+        }
+    }
+}
+
 fn build_args(input: &BuildInput) -> Vec<String> {
     vec![
         format!("AGENTENV_VERSION={}", input.agentenv_version),
@@ -855,6 +888,40 @@ mod tests {
             fs::read_to_string(cache_dir.join("image-digest")).expect("cached digest"),
             format!("{digest}\n")
         );
+        fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn materialize_built_cleans_atomic_publish_temps() {
+        let tempdir = unique_tempdir("sandbox-openshell-cache-atomic-publish");
+        let workdir = tempdir.join(".agentenv");
+        let source_dir = tempdir.join("source");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let dockerfile = source_dir.join("Dockerfile");
+        fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+
+        let stage_dir = tempdir.join("context.tmp");
+        fs::create_dir_all(&stage_dir).expect("create stage context");
+        fs::write(stage_dir.join("Dockerfile"), "FROM alpine:3.20\n").expect("stage Dockerfile");
+        let context_digest = BuildCache::digest_staged_context(&stage_dir).expect("context digest");
+        let noop = NoopEventEmitter;
+        let cache = BuildCache::new(workdir.clone(), &noop);
+        let input = build_input("devbox", dockerfile, stage_dir.clone(), context_digest);
+        let key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&key);
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("metadata.json.tmp"), "stale").expect("write stale metadata tmp");
+        fs::write(cache_dir.join("image-digest.tmp"), "stale").expect("write stale digest tmp");
+        let digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+        cache
+            .materialize_built(&input, stage_dir.display().to_string(), digest.to_owned())
+            .expect("materialize built");
+
+        assert!(cache_dir.join("metadata.json").is_file());
+        assert!(cache_dir.join("image-digest").is_file());
+        assert!(!cache_dir.join("metadata.json.tmp").exists());
+        assert!(!cache_dir.join("image-digest.tmp").exists());
         fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
