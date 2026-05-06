@@ -5734,7 +5734,7 @@ mod driver_tests {
             runner.clone(),
             &workdir,
             super::build_cache::BuildQueueConfig {
-                max_inflight: 1,
+                max_inflight: 128,
                 queue_limit: 128,
                 lock_timeout: Duration::from_millis(200),
             },
