@@ -1607,6 +1607,10 @@ pub async fn restore_snapshot_env(
     let manifest = crate::snapshot::verify_snapshot_dir(&args.snapshot)?;
     let name = args.name.unwrap_or_else(|| manifest.source_env.clone());
     let env_name = crate::env::validate_env_name(&name)?;
+    let paths = crate::env::EnvPaths::new(options.root.clone(), env_name.clone());
+    if paths.env_dir().exists() {
+        return Err(crate::env::EnvError::AlreadyExists { name }.into());
+    }
     check_snapshot_credentials(credentials, &manifest)?;
 
     let policy_path = args.snapshot.join("policy.yaml");
@@ -7643,6 +7647,68 @@ policy:
         assert!(
             !root.join("envs").join("restored").exists(),
             "credential failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_refuses_existing_target_before_credentials() {
+        let root = unique_root("agentenv-runtime-restore-existing-before-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let previous_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        write_snapshot_env_fixture(&root, "restored", snapshot_blueprint_yaml());
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("restore must reject existing target before credentials");
+
+        if let Some(value) = previous_key {
+            std::env::set_var("OPENAI_API_KEY", value);
+        }
+        assert!(matches!(
+            err,
+            RuntimeError::Env(crate::env::EnvError::AlreadyExists { ref name }) if name == "restored"
+        ));
+        assert!(!err.to_string().contains("OPENAI_API_KEY"));
+        assert!(
+            factory
+                .env_builds
+                .lock()
+                .expect("env build tracker")
+                .is_empty(),
+            "restore must not reproduce an existing env"
+        );
+        assert!(
+            factory
+                .copied_in
+                .lock()
+                .expect("copy in tracker")
+                .is_empty(),
+            "restore must not copy into an existing env"
         );
     }
 
