@@ -169,7 +169,7 @@ impl RemoteSshTarget {
         let mut url = Url::parse(&base).map_err(|source| DriverError::InvalidInput {
             message: format!("failed to build remote-ssh handle: {source}"),
         })?;
-        {
+        if self.identity_file.is_some() || self.jump_host.is_some() {
             let mut pairs = url.query_pairs_mut();
             if let Some(identity_file) = self.identity_file.as_deref() {
                 pairs.append_pair("identity_file", identity_file);
@@ -664,6 +664,23 @@ mod tests {
         let parsed = RemoteSshTarget::from_handle(&handle).expect("parse handle");
 
         assert_eq!(parsed, target);
+    }
+
+    #[test]
+    fn uri_handle_omits_query_when_no_optional_fields_are_set() {
+        let target = RemoteSshTarget {
+            host: "dev-vm.example.com".to_owned(),
+            user: "alice".to_owned(),
+            port: 22,
+            identity_file: None,
+            jump_host: None,
+            enforce_remote_firewall: false,
+        };
+
+        let handle = target.to_handle().expect("handle");
+
+        assert_eq!(handle, "remote-ssh://alice@dev-vm.example.com:22");
+        assert!(!handle.ends_with('?'));
     }
 
     #[tokio::test]
