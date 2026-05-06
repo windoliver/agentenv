@@ -155,8 +155,46 @@ fn ssh_base_args(target: &RemoteSshTarget) -> Vec<String> {
     args
 }
 
-fn remote_shell_command(cmd: &str) -> String {
-    format!("cd /sandbox && {cmd}")
+fn remote_shell_command(cmd: &str, env: &BTreeMap<String, String>) -> DriverResult<String> {
+    for key in env.keys() {
+        validate_remote_env_key(key)?;
+    }
+
+    if env.is_empty() {
+        return Ok(format!("cd /sandbox && {cmd}"));
+    }
+
+    let assignments = env
+        .iter()
+        .map(|(key, value)| format!("{key}={}", shell_single_quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "cd /sandbox && env {assignments} sh -lc {}",
+        shell_single_quote(cmd)
+    ))
+}
+
+fn validate_remote_env_key(key: &str) -> DriverResult<()> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(DriverError::InvalidInput {
+            message: "env. is not a valid remote environment variable name".to_owned(),
+        });
+    };
+    let valid_first = first.is_ascii_alphabetic() || first == '_';
+    let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid_first || !valid_rest {
+        return Err(DriverError::InvalidInput {
+            message: format!("env.{key} is not a valid remote environment variable name"),
+        });
+    }
+
+    Ok(())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn scp_base_args(target: &RemoteSshTarget) -> Vec<String> {
@@ -174,6 +212,41 @@ fn scp_base_args(target: &RemoteSshTarget) -> Vec<String> {
 
 fn remote_path(target: &RemoteSshTarget, path: &str) -> String {
     format!("{}:{path}", target_arg(target))
+}
+
+fn validate_host_copy_path(field: &str, path: &str) -> DriverResult<()> {
+    if path.is_empty() {
+        return Err(DriverError::InvalidInput {
+            message: format!("{field} must not be empty"),
+        });
+    }
+    if path.starts_with('-') {
+        return Err(DriverError::InvalidInput {
+            message: format!("{field} must not start with '-'"),
+        });
+    }
+    if path.contains(':') {
+        return Err(DriverError::InvalidInput {
+            message: format!("{field} must not contain ':'"),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_sandbox_copy_path(field: &str, path: &str) -> DriverResult<()> {
+    let inside_sandbox = path == "/sandbox" || path.starts_with("/sandbox/");
+    let valid_chars = path
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'));
+    let has_parent_component = path.split('/').any(|component| component == "..");
+    if !inside_sandbox || !valid_chars || has_parent_component {
+        return Err(DriverError::InvalidInput {
+            message: format!("{field} must be a conservative path under /sandbox"),
+        });
+    }
+
+    Ok(())
 }
 
 fn ssh_request(target: &RemoteSshTarget, remote_args: &[&str]) -> CommandRequest {
@@ -602,7 +675,7 @@ impl SandboxDriver for RemoteSshDriver {
 
     async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult> {
         let target = RemoteSshTarget::from_handle(&params.handle)?;
-        let remote_cmd = remote_shell_command(&params.cmd);
+        let remote_cmd = remote_shell_command(&params.cmd, &params.env)?;
         let request = CommandRequest {
             args: {
                 let mut args = ssh_base_args(&target);
@@ -614,7 +687,7 @@ impl SandboxDriver for RemoteSshDriver {
                 );
                 args
             },
-            env: params.env,
+            env: BTreeMap::new(),
         };
         let command = command_string(&self.ssh_binary, &request.args);
 
@@ -649,7 +722,10 @@ impl SandboxDriver for RemoteSshDriver {
 
     async fn copy_in(&self, params: CopyInParams) -> DriverResult<EmptyResult> {
         let target = RemoteSshTarget::from_handle(&params.handle)?;
+        validate_host_copy_path("src_host_path", &params.src_host_path)?;
+        validate_sandbox_copy_path("dst_sandbox_path", &params.dst_sandbox_path)?;
         let mut args = scp_base_args(&target);
+        args.push("--".to_owned());
         args.push(params.src_host_path);
         args.push(remote_path(&target, &params.dst_sandbox_path));
         let request = CommandRequest {
@@ -672,7 +748,10 @@ impl SandboxDriver for RemoteSshDriver {
 
     async fn copy_out(&self, params: CopyOutParams) -> DriverResult<EmptyResult> {
         let target = RemoteSshTarget::from_handle(&params.handle)?;
+        validate_sandbox_copy_path("src_sandbox_path", &params.src_sandbox_path)?;
+        validate_host_copy_path("dst_host_path", &params.dst_host_path)?;
         let mut args = scp_base_args(&target);
+        args.push("--".to_owned());
         args.push(remote_path(&target, &params.src_sandbox_path));
         args.push(params.dst_host_path);
         let request = CommandRequest {
@@ -1416,6 +1495,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_injects_env_into_remote_shell_not_host_process() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-p",
+                "22",
+                "alice@dev-vm.example.com",
+                "--",
+                "sh",
+                "-lc",
+                "cd /sandbox && env FOO='bar baz' sh -lc 'echo \"$FOO\"'",
+            ],
+            Some(0),
+            "bar baz\n",
+            "",
+        )]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .exec(ExecParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                cmd: "echo \"$FOO\"".to_owned(),
+                tty: false,
+                env: BTreeMap::from([("FOO".to_owned(), "bar baz".to_owned())]),
+            })
+            .await
+            .expect("exec");
+
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, "bar baz\n");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].request.env.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_invalid_env_key_before_running_ssh() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .exec(ExecParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                cmd: "true".to_owned(),
+                tty: false,
+                env: BTreeMap::from([("BAD-NAME".to_owned(), "value".to_owned())]),
+            })
+            .await
+            .expect_err("invalid env key should be rejected");
+
+        assert!(err.to_string().contains("env.BAD-NAME"));
+        assert!(runner.calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn copy_in_and_copy_out_use_scp_with_port_identity_and_jump_host() {
         let handle = "remote-ssh://alice@dev-vm.example.com:2222?identity_file=/Users/alice/.ssh/id_ed25519&jump_host=bastion.example.com";
         let runner = Arc::new(RecordingCommandRunner::new(vec![
@@ -1428,6 +1570,7 @@ mod tests {
                     "/Users/alice/.ssh/id_ed25519",
                     "-J",
                     "bastion.example.com",
+                    "--",
                     "/host/in.txt",
                     "alice@dev-vm.example.com:/sandbox/in.txt",
                 ],
@@ -1444,6 +1587,7 @@ mod tests {
                     "/Users/alice/.ssh/id_ed25519",
                     "-J",
                     "bastion.example.com",
+                    "--",
                     "alice@dev-vm.example.com:/sandbox/out.txt",
                     "/host/out.txt",
                 ],
@@ -1472,6 +1616,123 @@ mod tests {
             .expect("copy_out");
 
         assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn copy_in_rejects_option_shaped_or_remote_host_path_before_scp() {
+        for src_host_path in ["-oProxyCommand=evil", "otherhost:/tmp/x"] {
+            let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+                "scp",
+                &[
+                    "-P",
+                    "22",
+                    src_host_path,
+                    "alice@dev-vm.example.com:/sandbox/in.txt",
+                ],
+                Some(0),
+                "",
+                "",
+            )]));
+            let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+            let err = driver
+                .copy_in(CopyInParams {
+                    handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                    src_host_path: src_host_path.to_owned(),
+                    dst_sandbox_path: "/sandbox/in.txt".to_owned(),
+                })
+                .await
+                .expect_err("invalid src_host_path should be rejected");
+
+            assert!(err.to_string().contains("src_host_path"));
+            assert!(runner.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_out_rejects_option_shaped_or_remote_host_path_before_scp() {
+        for dst_host_path in ["-oProxyCommand=evil", "otherhost:/tmp/x"] {
+            let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+                "scp",
+                &[
+                    "-P",
+                    "22",
+                    "alice@dev-vm.example.com:/sandbox/out.txt",
+                    dst_host_path,
+                ],
+                Some(0),
+                "",
+                "",
+            )]));
+            let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+            let err = driver
+                .copy_out(CopyOutParams {
+                    handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                    src_sandbox_path: "/sandbox/out.txt".to_owned(),
+                    dst_host_path: dst_host_path.to_owned(),
+                })
+                .await
+                .expect_err("invalid dst_host_path should be rejected");
+
+            assert!(err.to_string().contains("dst_host_path"));
+            assert!(runner.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_unsafe_sandbox_path_before_scp() {
+        let copy_in_runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "scp",
+            &[
+                "-P",
+                "22",
+                "/host/in.txt",
+                "alice@dev-vm.example.com:/sandbox/in file.txt",
+            ],
+            Some(0),
+            "",
+            "",
+        )]));
+        let copy_in_driver = RemoteSshDriver::with_command_runner(copy_in_runner.clone());
+
+        let copy_in_err = copy_in_driver
+            .copy_in(CopyInParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                src_host_path: "/host/in.txt".to_owned(),
+                dst_sandbox_path: "/sandbox/in file.txt".to_owned(),
+            })
+            .await
+            .expect_err("unsafe dst_sandbox_path should be rejected");
+
+        assert!(copy_in_err.to_string().contains("dst_sandbox_path"));
+        assert!(copy_in_runner.calls().is_empty());
+
+        let copy_out_runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "scp",
+            &[
+                "-P",
+                "22",
+                "alice@dev-vm.example.com:/sandbox/*.txt",
+                "/host/out.txt",
+            ],
+            Some(0),
+            "",
+            "",
+        )]));
+        let copy_out_driver = RemoteSshDriver::with_command_runner(copy_out_runner.clone());
+
+        let copy_out_err = copy_out_driver
+            .copy_out(CopyOutParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                src_sandbox_path: "/sandbox/*.txt".to_owned(),
+                dst_host_path: "/host/out.txt".to_owned(),
+            })
+            .await
+            .expect_err("unsafe src_sandbox_path should be rejected");
+
+        assert!(copy_out_err.to_string().contains("src_sandbox_path"));
+        assert!(copy_out_runner.calls().is_empty());
     }
 
     #[tokio::test]
