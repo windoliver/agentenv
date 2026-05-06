@@ -1780,6 +1780,11 @@ fn sandbox_spec_for_create(
         if key == "image" {
             continue;
         }
+        if is_reserved_sandbox_metadata_key(key) {
+            return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                message: format!("sandbox.{key} is reserved metadata and cannot be set directly"),
+            }));
+        }
         let value = serde_json::to_value(value).map_err(|source| {
             RuntimeError::ComponentConfigConversion {
                 key: key.clone(),
@@ -1833,6 +1838,12 @@ fn sandbox_spec_for_create(
         policy,
         metadata,
     })
+}
+
+fn is_reserved_sandbox_metadata_key(key: &str) -> bool {
+    key == "name"
+        || key.starts_with("agentenv_")
+        || matches!(key, "byo_dockerfile" | "byo_expected_digest")
 }
 
 fn record_computed_byo_image_digest(
@@ -5855,6 +5866,104 @@ policy:
             )
         );
         assert_eq!(metadata["agentenv_agent"], serde_json::json!("codex"));
+    }
+
+    #[tokio::test]
+    async fn create_env_rejects_direct_byo_dockerfile_sandbox_metadata_extra() {
+        let root = unique_root("agentenv-create-direct-byo-dockerfile");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  byo_dockerfile: /tmp/evil
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("sandbox.byo_dockerfile"),
+            "unexpected error: {err}"
+        );
+        assert!(tracker
+            .create_specs
+            .lock()
+            .expect("create spec tracker")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_env_rejects_agentenv_prefixed_sandbox_metadata_extra() {
+        let root = unique_root("agentenv-create-agentenv-metadata-extra");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: remote-ssh
+  agentenv_agent: evil
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("sandbox.agentenv_agent"),
+            "unexpected error: {err}"
+        );
+        assert!(tracker
+            .create_specs
+            .lock()
+            .expect("create spec tracker")
+            .is_empty());
     }
 
     #[tokio::test]
