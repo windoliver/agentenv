@@ -952,23 +952,51 @@ impl SandboxDriver for OpenShellDriver {
     }
 
     async fn shutdown(&mut self, _params: ShutdownParams) -> DriverResult<EmptyResult> {
-        self.events.emit(
-            ActivityEvent::new(
-                now_timestamp_string(),
-                ActivityKind::Log,
-                ActivityResult::Ok,
-                format!("openshell-shutdown-{}", Uuid::new_v4()),
-            )
-            .with_actor_value("driver", serde_json::json!("openshell")),
-        );
         let stream_cleanup = self.terminate_all_log_streams();
         self.clear_current_policies();
-        stream_cleanup?;
-        Ok(EmptyResult::default())
+        match stream_cleanup {
+            Ok(()) => {
+                self.emit_shutdown_event(ActivityResult::Ok, "openshell_shutdown", None);
+                Ok(EmptyResult::default())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.emit_shutdown_event(
+                    ActivityResult::Error,
+                    "openshell_shutdown_cleanup_failed",
+                    Some(message),
+                );
+                Err(err)
+            }
+        }
     }
 }
 
 impl OpenShellDriver {
+    fn emit_shutdown_event(
+        &self,
+        result: ActivityResult,
+        reason_code: &'static str,
+        error: Option<String>,
+    ) {
+        let mut event = ActivityEvent::new(
+            now_timestamp_string(),
+            ActivityKind::Log,
+            result,
+            format!("openshell-shutdown-{}", Uuid::new_v4()),
+        )
+        .with_actor_value("driver", serde_json::json!("openshell"))
+        .with_subject_value("operation", serde_json::json!("shutdown"))
+        .with_extra("cleanup", serde_json::json!("log_streams"))
+        .with_reason_code(reason_code);
+
+        if let Some(error) = error {
+            event = event.with_extra("error", serde_json::json!(error));
+        }
+
+        self.events.emit(event);
+    }
+
     fn set_workdir(&self, workdir: PathBuf) {
         match self.workdir.lock() {
             Ok(mut current) => *current = workdir,

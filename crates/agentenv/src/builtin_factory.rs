@@ -622,10 +622,11 @@ mod tests {
             })
             .expect("shutdown");
 
-        assert!(events
-            .recorded()
-            .iter()
-            .any(|event| { event.actor.get("driver") == Some(&serde_json::json!("openshell")) }));
+        assert!(events.recorded().iter().any(|event| {
+            event.actor.get("driver") == Some(&serde_json::json!("openshell"))
+                && event.subject.get("operation") == Some(&serde_json::json!("shutdown"))
+                && event.reason_code.as_deref() == Some("openshell_shutdown")
+        }));
     }
 
     #[test]
