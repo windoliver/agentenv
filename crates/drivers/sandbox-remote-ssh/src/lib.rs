@@ -155,6 +155,27 @@ fn ssh_base_args(target: &RemoteSshTarget) -> Vec<String> {
     args
 }
 
+fn remote_shell_command(cmd: &str) -> String {
+    format!("cd /sandbox && {cmd}")
+}
+
+fn scp_base_args(target: &RemoteSshTarget) -> Vec<String> {
+    let mut args = vec!["-P".to_owned(), target.port.to_string()];
+    if let Some(identity_file) = target.identity_file.as_deref() {
+        args.push("-i".to_owned());
+        args.push(identity_file.to_owned());
+    }
+    if let Some(jump_host) = target.jump_host.as_deref() {
+        args.push("-J".to_owned());
+        args.push(jump_host.to_owned());
+    }
+    args
+}
+
+fn remote_path(target: &RemoteSshTarget, path: &str) -> String {
+    format!("{}:{path}", target_arg(target))
+}
+
 fn ssh_request(target: &RemoteSshTarget, remote_args: &[&str]) -> CommandRequest {
     let mut args = ssh_base_args(target);
     args.push("--".to_owned());
@@ -580,27 +601,96 @@ impl SandboxDriver for RemoteSshDriver {
     }
 
     async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult> {
-        let _target = RemoteSshTarget::from_handle(&params.handle)?;
-        Err(invalid_handle(
-            params.handle,
-            "remote-ssh exec is not implemented",
-        ))
+        let target = RemoteSshTarget::from_handle(&params.handle)?;
+        let remote_cmd = remote_shell_command(&params.cmd);
+        let request = CommandRequest {
+            args: {
+                let mut args = ssh_base_args(&target);
+                args.push("--".to_owned());
+                args.extend(
+                    ["sh", "-lc", remote_cmd.as_str()]
+                        .iter()
+                        .map(|arg| (*arg).to_owned()),
+                );
+                args
+            },
+            env: params.env,
+        };
+        let command = command_string(&self.ssh_binary, &request.args);
+
+        if params.tty {
+            let status = self
+                .runner
+                .status(&self.ssh_binary, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command.clone(),
+                    source,
+                })?;
+            return Ok(ExecResult {
+                status: status.unwrap_or(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
+        let output = self
+            .runner
+            .run(&self.ssh_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command.clone(),
+                source,
+            })?;
+        Ok(ExecResult {
+            status: output.status.unwrap_or(1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 
     async fn copy_in(&self, params: CopyInParams) -> DriverResult<EmptyResult> {
-        let _target = RemoteSshTarget::from_handle(&params.handle)?;
-        Err(invalid_handle(
-            params.handle,
-            "remote-ssh copy_in is not implemented",
-        ))
+        let target = RemoteSshTarget::from_handle(&params.handle)?;
+        let mut args = scp_base_args(&target);
+        args.push(params.src_host_path);
+        args.push(remote_path(&target, &params.dst_sandbox_path));
+        let request = CommandRequest {
+            args,
+            env: BTreeMap::new(),
+        };
+        let output = self
+            .runner
+            .run(&self.scp_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.scp_binary, &request.args),
+                source,
+            })?;
+        if output.status != Some(0) {
+            return Err(command_failed(&self.scp_binary, &request, output));
+        }
+
+        Ok(EmptyResult::default())
     }
 
     async fn copy_out(&self, params: CopyOutParams) -> DriverResult<EmptyResult> {
-        let _target = RemoteSshTarget::from_handle(&params.handle)?;
-        Err(invalid_handle(
-            params.handle,
-            "remote-ssh copy_out is not implemented",
-        ))
+        let target = RemoteSshTarget::from_handle(&params.handle)?;
+        let mut args = scp_base_args(&target);
+        args.push(remote_path(&target, &params.src_sandbox_path));
+        args.push(params.dst_host_path);
+        let request = CommandRequest {
+            args,
+            env: BTreeMap::new(),
+        };
+        let output = self
+            .runner
+            .run(&self.scp_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.scp_binary, &request.args),
+                source,
+            })?;
+        if output.status != Some(0) {
+            return Err(command_failed(&self.scp_binary, &request, output));
+        }
+
+        Ok(EmptyResult::default())
     }
 
     async fn apply_policy(&self, _params: ApplyPolicyParams) -> DriverResult<ApplyPolicyResult> {
@@ -660,8 +750,9 @@ mod tests {
 
     use agentenv_core::driver::{DriverError, SandboxDriver};
     use agentenv_proto::{
-        Capabilities, ConnectParams, DriverKind, InitializeParams, LogLevel, PreflightParams,
-        SandboxSpec, SandboxStatusParams, SCHEMA_VERSION,
+        Capabilities, ConnectParams, CopyInParams, CopyOutParams, DriverKind, ExecParams,
+        InitializeParams, LogLevel, PreflightParams, SandboxSpec, SandboxStatusParams,
+        SCHEMA_VERSION,
     };
 
     use serde_json::json;
@@ -1279,6 +1370,121 @@ mod tests {
         assert_eq!(shell.session_id, handle);
         assert!(shell.tty);
         assert_eq!(shell.working_dir.as_deref(), Some("/sandbox"));
+    }
+
+    #[tokio::test]
+    async fn exec_runs_remote_shell_from_sandbox_workdir() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-p",
+                "22",
+                "alice@dev-vm.example.com",
+                "--",
+                "sh",
+                "-lc",
+                "cd /sandbox && echo hi",
+            ],
+            Some(7),
+            "stdout payload",
+            "stderr payload",
+        )]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .exec(ExecParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                cmd: "echo hi".to_owned(),
+                tty: false,
+                env: BTreeMap::new(),
+            })
+            .await
+            .expect("exec");
+
+        assert_eq!(result.status, 7);
+        assert_eq!(result.stdout, "stdout payload");
+        assert_eq!(result.stderr, "stderr payload");
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_in_and_copy_out_use_scp_with_port_identity_and_jump_host() {
+        let handle = "remote-ssh://alice@dev-vm.example.com:2222?identity_file=/Users/alice/.ssh/id_ed25519&jump_host=bastion.example.com";
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "scp",
+                &[
+                    "-P",
+                    "2222",
+                    "-i",
+                    "/Users/alice/.ssh/id_ed25519",
+                    "-J",
+                    "bastion.example.com",
+                    "/host/in.txt",
+                    "alice@dev-vm.example.com:/sandbox/in.txt",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+            CommandScript::output(
+                "scp",
+                &[
+                    "-P",
+                    "2222",
+                    "-i",
+                    "/Users/alice/.ssh/id_ed25519",
+                    "-J",
+                    "bastion.example.com",
+                    "alice@dev-vm.example.com:/sandbox/out.txt",
+                    "/host/out.txt",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+        ]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        driver
+            .copy_in(CopyInParams {
+                handle: handle.to_owned(),
+                src_host_path: "/host/in.txt".to_owned(),
+                dst_sandbox_path: "/sandbox/in.txt".to_owned(),
+            })
+            .await
+            .expect("copy_in");
+        driver
+            .copy_out(CopyOutParams {
+                handle: handle.to_owned(),
+                src_sandbox_path: "/sandbox/out.txt".to_owned(),
+                dst_host_path: "/host/out.txt".to_owned(),
+            })
+            .await
+            .expect("copy_out");
+
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_ssh_driver_satisfies_sandbox_conformance_contract() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output("ssh", &["-V"], Some(0), "", "OpenSSH_9.9\n"),
+            CommandScript::output("scp", &["-V"], Some(1), "", "usage: scp\n"),
+        ]));
+        let mut driver = RemoteSshDriver::with_command_runner(runner);
+
+        driver_conformance::assert_sandbox_driver_contract(&mut driver)
+            .await
+            .expect("remote ssh driver should satisfy in-process conformance");
     }
 
     #[tokio::test]
