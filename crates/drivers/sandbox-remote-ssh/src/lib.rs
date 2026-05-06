@@ -683,6 +683,9 @@ impl SandboxDriver for RemoteSshDriver {
         let request = CommandRequest {
             args: {
                 let mut args = ssh_base_args(&target);
+                if params.tty {
+                    args.insert(args.len() - 1, "-tt".to_owned());
+                }
                 args.push("--".to_owned());
                 args.push(remote_ssh_command(&remote_cmd));
                 args
@@ -1543,6 +1546,60 @@ mod tests {
         assert!(remote_args[0].starts_with("sh -lc '"));
         assert!(remote_args[0].contains("env FOO='\\''bar baz'\\''"));
         assert!(remote_args[0].contains("sh -lc '\\''echo \"$FOO\"'\\''"));
+    }
+
+    #[tokio::test]
+    async fn exec_tty_requests_remote_pty_and_single_remote_command_arg() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-p",
+                "22",
+                "-tt",
+                "alice@dev-vm.example.com",
+                "--",
+                "sh -lc 'cd /sandbox && bash'",
+            ],
+            Some(23),
+            "ignored stdout",
+            "ignored stderr",
+        )]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .exec(ExecParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+                cmd: "bash".to_owned(),
+                tty: true,
+                env: BTreeMap::new(),
+            })
+            .await
+            .expect("exec tty");
+
+        assert_eq!(result.status, 23);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].request.env.is_empty());
+        let separator = calls[0]
+            .request
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("ssh separator");
+        assert_eq!(
+            &calls[0].request.args[(separator + 1)..],
+            &["sh -lc 'cd /sandbox && bash'".to_owned()]
+        );
     }
 
     #[tokio::test]
