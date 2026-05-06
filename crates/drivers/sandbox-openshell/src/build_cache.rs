@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -13,9 +12,7 @@ use agentenv_events::{ActivityEvent, ActivityKind, ActivityResult, EventEmitter}
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{
-    command_string, now_timestamp_string, sanitize_build_name, CommandRequest, CommandRunner,
-};
+use crate::{now_timestamp_string, sanitize_build_name, CommandOutput, CommandRequest};
 
 #[derive(Debug, Clone)]
 pub(super) struct BuildQueueConfig {
@@ -55,6 +52,10 @@ pub(super) struct BuildMaterialization {
     pub image_ref: String,
     pub image_digest: String,
     pub tag: String,
+}
+
+pub(super) trait DockerImageInspector {
+    fn inspect_image(&self, request: CommandRequest) -> DriverResult<CommandOutput>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,11 +180,11 @@ impl<'a> BuildCache<'a> {
     pub(super) fn materialize_cached(
         &self,
         input: &BuildInput,
-        runner: &dyn CommandRunner,
+        inspector: &dyn DockerImageInspector,
     ) -> DriverResult<Option<BuildMaterialization>> {
         let key = self.build_key(input)?;
         let cache_dir = self.cache_dir(&key);
-        let Some(metadata) = self.read_valid_metadata(input, &key, &cache_dir, runner)? else {
+        let Some(metadata) = self.read_valid_metadata(input, &key, &cache_dir, inspector)? else {
             return Ok(None);
         };
 
@@ -202,7 +203,7 @@ impl<'a> BuildCache<'a> {
         input: &BuildInput,
         key: &str,
         cache_dir: &Path,
-        runner: &dyn CommandRunner,
+        inspector: &dyn DockerImageInspector,
     ) -> DriverResult<Option<BuildMetadata>> {
         let metadata_path = cache_dir.join("metadata.json");
         if !metadata_path.is_file() {
@@ -221,7 +222,7 @@ impl<'a> BuildCache<'a> {
         if !self.metadata_matches(input, key, cache_dir, &metadata)? {
             return Ok(None);
         }
-        if !self.docker_image_matches(key, &metadata.image_digest, runner)? {
+        if !self.docker_image_matches(key, &metadata.image_digest, inspector)? {
             return Ok(None);
         }
 
@@ -298,7 +299,7 @@ impl<'a> BuildCache<'a> {
         &self,
         key: &str,
         expected_digest: &str,
-        runner: &dyn CommandRunner,
+        inspector: &dyn DockerImageInspector,
     ) -> DriverResult<bool> {
         let request = CommandRequest {
             args: vec![
@@ -308,16 +309,9 @@ impl<'a> BuildCache<'a> {
                 "{{.Id}}".to_owned(),
                 tag_for_key(key),
             ],
-            env: BTreeMap::new(),
+            env: Default::default(),
         };
-        let command = command_string("docker", &request.args);
-        let output =
-            runner
-                .run("docker", &request)
-                .map_err(|source| DriverError::CommandSpawn {
-                    command: command.clone(),
-                    source,
-                })?;
+        let output = inspector.inspect_image(request)?;
         if output.status.is_none_or(|status| status != 0) {
             return Ok(false);
         }

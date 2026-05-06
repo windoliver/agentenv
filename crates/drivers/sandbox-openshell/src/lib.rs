@@ -481,6 +481,14 @@ impl Drop for OpenShellDriver {
     }
 }
 
+impl build_cache::DockerImageInspector for OpenShellDriver {
+    fn inspect_image(&self, request: CommandRequest) -> DriverResult<CommandOutput> {
+        let command = command_string("docker", &request.args);
+        self.run_host_command("docker", request)
+            .map_err(|source| DriverError::CommandSpawn { command, source })
+    }
+}
+
 #[async_trait::async_trait]
 impl SandboxDriver for OpenShellDriver {
     async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
@@ -1060,7 +1068,7 @@ impl OpenShellDriver {
             workspace_mount: config.workspace_mount.clone(),
             seed: config.build_seed.clone(),
         };
-        if let Some(materialized) = cache.materialize_cached(&input, self.runner.as_ref())? {
+        if let Some(materialized) = cache.materialize_cached(&input, self)? {
             let _ = (&materialized.image_digest, &materialized.tag);
             return Ok(materialized.image_ref);
         }
@@ -4862,6 +4870,152 @@ mod driver_tests {
                 .expect("per env digest"),
             format!("{digest}\n")
         );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_reuses_valid_byo_build_cache_with_host_path_preparation() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-cache-host-path");
+        let workdir = tempdir.join(".agentenv");
+        let dockerfile_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
+        let dockerfile = dockerfile_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&dockerfile_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir.clone(),
+            context_digest: context_digest.clone(),
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: "codex".to_owned(),
+            mcp_port: "3333".to_owned(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: Some(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    .to_owned(),
+            ),
+        };
+        let cache_key = cache.build_key(&input).expect("build key");
+        let cache_dir = cache.cache_dir(&cache_key);
+        let context_dir = cache_dir.join("context");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        std::fs::rename(&key_stage_dir, &context_dir).expect("move staged context to cache");
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        std::fs::write(cache_dir.join("image-digest"), format!("{digest}\n"))
+            .expect("write digest");
+        std::fs::write(
+            cache_dir.join("metadata.json"),
+            serde_json::json!({
+                "version": 1,
+                "build_key": cache_key,
+                "driver": "openshell",
+                "driver_version": env!("CARGO_PKG_VERSION"),
+                "image_ref": context_dir.display().to_string(),
+                "image_digest": digest,
+                "created_at": "2026-05-06T12:00:00Z",
+                "source": {
+                    "dockerfile": dockerfile.display().to_string(),
+                    "context_digest": context_digest
+                }
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+
+        let tag = super::build_cache::tag_for_key(&cache_key);
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                    assert!(call.request.env.contains_key("PATH"));
+                },
+                &format!("{digest}\n"),
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                {
+                    let context_arg = context_dir.display().to_string();
+                    move |call| {
+                        assert_eq!(
+                            call.request.args,
+                            vec![
+                                "sandbox".to_owned(),
+                                "create".to_owned(),
+                                "--name".to_owned(),
+                                "devbox".to_owned(),
+                                "--no-auto-providers".to_owned(),
+                                "--from".to_owned(),
+                                context_arg.clone(),
+                                "--".to_owned(),
+                                "true".to_owned(),
+                            ]
+                        );
+                        assert!(call.request.env.contains_key("PATH"));
+                    }
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_host_command_runner(runner.clone());
+        driver.set_workdir(workdir.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("agentenv_agent".to_owned(), json!("codex")),
+                            ("agentenv_mcp_port".to_owned(), json!("3333")),
+                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                            (
+                                "agentenv_version".to_owned(),
+                                json!(env!("CARGO_PKG_VERSION")),
+                            ),
+                            (
+                                "agentenv_build_seed".to_owned(),
+                                json!(
+                                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                                ),
+                            ),
+                        ]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert_eq!(runner.calls().len(), 2);
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
