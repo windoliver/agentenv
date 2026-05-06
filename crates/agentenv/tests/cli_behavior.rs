@@ -482,6 +482,126 @@ fn sessions_help_includes_list_and_kill_commands() {
 }
 
 #[test]
+fn snapshot_help_includes_create_verify_and_restore_usage() {
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[ENV]"), "stdout was: {stdout}");
+    assert!(stdout.contains("--output"), "stdout was: {stdout}");
+    assert!(stdout.contains("verify"), "stdout was: {stdout}");
+    assert!(stdout.contains("restore"), "stdout was: {stdout}");
+}
+
+#[test]
+fn snapshot_verify_missing_dir_fails_cleanly() {
+    let temp_dir = make_temp_dir("snapshot-verify-missing");
+    let missing = temp_dir.join("missing.agentenvsnap");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("verify")
+        .arg(&missing)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("snapshot"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing.agentenvsnap") || stderr.contains("manifest.json"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn snapshot_restore_missing_dir_with_as_fails_before_env_creation() {
+    let temp_dir = make_temp_dir("snapshot-restore-missing");
+    let missing = temp_dir.join("missing.agentenvsnap");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("restore")
+        .arg(&missing)
+        .arg("--as")
+        .arg("restored")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("snapshot"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing.agentenvsnap") || stderr.contains("manifest.json"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state before verifying the missing snapshot"
+    );
+}
+
+#[test]
+fn snapshot_create_rejects_stdout_output() {
+    let temp_dir = make_temp_dir("snapshot-output-dash");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("demo")
+        .arg("--output")
+        .arg("-")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output -"), "stderr was: {stderr}");
+    assert!(stderr.contains("not supported"), "stderr was: {stderr}");
+    assert!(!temp_dir.join("-").exists());
+}
+
+#[test]
+fn snapshot_verify_prints_signed_snapshot_summary() {
+    let temp_dir = make_temp_dir("snapshot-verify-success");
+    let snapshot_dir = write_minimal_signed_snapshot(&temp_dir, "demo");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("verify")
+        .arg(&snapshot_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Snapshot verified"), "stdout was: {stdout}");
+    assert!(stdout.contains("demo.agentenvsnap"), "stdout was: {stdout}");
+    assert!(stdout.contains("files:"), "stdout was: {stdout}");
+    assert!(stdout.contains("merkle root:"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("signature: verified"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
 fn term_help_lists_flags_and_key_bindings() {
     let output = Command::new(agentenv_bin())
         .arg("term")
@@ -2785,6 +2905,113 @@ fn unique_suffix() -> String {
 
 fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
     write_minimal_env_state_with_credentials(home, name, &[])
+}
+
+fn write_minimal_signed_snapshot(root: &Path, source_env: &str) -> PathBuf {
+    let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
+    fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+    fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+    fs::write(
+        snapshot_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#,
+    )
+    .unwrap();
+    fs::write(
+        snapshot_dir.join("lock.yaml"),
+        r#"
+version: 0.2.0
+name: demo
+blueprint_hash: sha256:e0f55f3c3b82fc73132f1e776095311825afb01a7803c31228985cf0701d0736
+drivers:
+  sandbox:
+    name: openshell
+    kind: sandbox
+    version: 0.0.1-alpha0
+    source: built_in
+    digest: built-in:openshell
+  agent:
+    name: codex
+    kind: agent
+    version: 0.0.1-alpha0
+    source: built_in
+    digest: built-in:codex
+  context:
+    name: filesystem
+    kind: context
+    version: 0.0.1-alpha0
+    source: built_in
+    digest: built-in:filesystem
+credentials: {}
+composition:
+  sandbox:
+    driver: openshell
+  agent:
+    driver: codex
+  context:
+    driver: filesystem
+    mount: ~/projects
+  policy:
+    tier: balanced
+    presets: []
+policy:
+  declared:
+    tier: balanced
+    presets: []
+  resolved:
+    filesystem:
+      mounts: []
+    network:
+      allow: []
+      deny: []
+      approval: []
+    process:
+      allowed: []
+      denied: []
+    inference:
+      allow_models: []
+      deny_models: []
+"#,
+    )
+    .unwrap();
+    fs::write(
+        snapshot_dir.join("policy.yaml"),
+        r#"
+filesystem:
+  mounts: []
+network:
+  allow: []
+  deny: []
+  approval: []
+process:
+  allowed: []
+  denied: []
+inference:
+  allow_models: []
+  deny_models: []
+"#,
+    )
+    .unwrap();
+    agentenv_core::snapshot::write_manifest_and_signature(
+        &snapshot_dir,
+        &root.join("snapshot-signing.key"),
+    )
+    .unwrap();
+    snapshot_dir
 }
 
 fn activity_event(
