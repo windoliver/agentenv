@@ -126,6 +126,74 @@ fn remote_logs_missing() -> DriverError {
     }
 }
 
+fn target_arg(target: &RemoteSshTarget) -> String {
+    format!("{}@{}", target.user, target.host)
+}
+
+fn ssh_base_args(target: &RemoteSshTarget) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-p".to_owned(),
+        target.port.to_string(),
+    ];
+    if let Some(identity_file) = target.identity_file.as_deref() {
+        args.push("-i".to_owned());
+        args.push(identity_file.to_owned());
+    }
+    if let Some(jump_host) = target.jump_host.as_deref() {
+        args.push("-J".to_owned());
+        args.push(jump_host.to_owned());
+    }
+    args.push(target_arg(target));
+    args
+}
+
+fn ssh_request(target: &RemoteSshTarget, remote_args: &[&str]) -> CommandRequest {
+    let mut args = ssh_base_args(target);
+    args.push("--".to_owned());
+    args.extend(remote_args.iter().map(|arg| (*arg).to_owned()));
+    CommandRequest {
+        args,
+        env: BTreeMap::new(),
+    }
+}
+
+fn command_string(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_failed(program: &str, request: &CommandRequest, output: CommandOutput) -> DriverError {
+    DriverError::CommandFailed {
+        command: command_string(program, &request.args),
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
+fn ensure_identity_file_exists(target: &RemoteSshTarget) -> DriverResult<()> {
+    let Some(path) = target.identity_file.as_deref() else {
+        return Ok(());
+    };
+    let path = std::path::Path::new(path);
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.identity_file `{}` is not a file", path.display()),
+        }),
+        Err(source) => Err(DriverError::InvalidInput {
+            message: format!(
+                "metadata.identity_file `{}` is not readable: {source}",
+                path.display()
+            ),
+        }),
+    }
+}
+
 fn invalid_handle(handle: String, message: impl Into<String>) -> DriverError {
     DriverError::InvalidHandle {
         handle,
@@ -432,6 +500,28 @@ impl SandboxDriver for RemoteSshDriver {
         if target.enforce_remote_firewall {
             return Err(policy_missing());
         }
+        ensure_identity_file_exists(&target)?;
+
+        for remote_args in [
+            vec!["true"],
+            vec![
+                "sh",
+                "-lc",
+                "mkdir -p /sandbox/.agentenv/bin && test -w /sandbox",
+            ],
+        ] {
+            let request = ssh_request(&target, &remote_args);
+            let output = self
+                .runner
+                .run(&self.ssh_binary, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command_string(&self.ssh_binary, &request.args),
+                    source,
+                })?;
+            if output.status != Some(0) {
+                return Err(command_failed(&self.ssh_binary, &request, output));
+            }
+        }
 
         Ok(SandboxHandle {
             handle: target.to_handle()?,
@@ -439,11 +529,24 @@ impl SandboxDriver for RemoteSshDriver {
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle> {
-        let _target = RemoteSshTarget::from_handle(&params.handle)?;
-        Err(invalid_handle(
-            params.handle,
-            "remote-ssh connect is not implemented",
-        ))
+        let target = RemoteSshTarget::from_handle(&params.handle)?;
+        let request = ssh_request(&target, &["true"]);
+        let output = self
+            .runner
+            .run(&self.ssh_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.ssh_binary, &request.args),
+                source,
+            })?;
+        if output.status != Some(0) {
+            return Err(command_failed(&self.ssh_binary, &request, output));
+        }
+
+        Ok(ShellHandle {
+            session_id: params.handle,
+            tty: true,
+            working_dir: Some("/sandbox".to_owned()),
+        })
     }
 
     async fn create_session(&self, _params: CreateSessionParams) -> DriverResult<SessionHandle> {
@@ -491,11 +594,25 @@ impl SandboxDriver for RemoteSshDriver {
     }
 
     async fn status(&self, params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
-        let _target = RemoteSshTarget::from_handle(&params.handle)?;
-        Err(invalid_handle(
-            params.handle,
-            "remote-ssh status is not implemented",
-        ))
+        let target = RemoteSshTarget::from_handle(&params.handle)?;
+        let request = ssh_request(&target, &["true"]);
+        let output = self
+            .runner
+            .run(&self.ssh_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.ssh_binary, &request.args),
+                source,
+            })?;
+        let healthy = output.status == Some(0);
+        Ok(SandboxStatus {
+            phase: if healthy {
+                agentenv_proto::SandboxPhase::Running
+            } else {
+                agentenv_proto::SandboxPhase::Error
+            },
+            healthy,
+            last_ping: None,
+        })
     }
 
     async fn logs(&self, _params: LogsParams) -> DriverResult<LogsResult> {
@@ -527,14 +644,15 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use agentenv_core::driver::SandboxDriver;
+    use agentenv_core::driver::{DriverError, SandboxDriver};
     use agentenv_proto::{
-        Capabilities, DriverKind, InitializeParams, LogLevel, PreflightParams, SCHEMA_VERSION,
+        Capabilities, ConnectParams, DriverKind, InitializeParams, LogLevel, PreflightParams,
+        SandboxSpec, SandboxStatusParams, SCHEMA_VERSION,
     };
 
     use serde_json::json;
 
-    use super::{RemoteSshDriver, RemoteSshTarget};
+    use super::{RemoteSshDriver, RemoteSshTarget, POLICY_CAPABILITY};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CommandRequest {
@@ -998,5 +1116,158 @@ mod tests {
         assert!(!result.ok);
         assert_eq!(result.issues[0].code, "remote_ssh_missing_ssh");
         assert!(result.issues[0].message.contains("ssh"));
+    }
+
+    #[tokio::test]
+    async fn create_probes_remote_and_returns_uri_handle() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "ssh",
+                &[
+                    "-o",
+                    "BatchMode=yes",
+                    "-p",
+                    "2222",
+                    "-J",
+                    "bastion.example.com",
+                    "alice@dev-vm.example.com",
+                    "--",
+                    "true",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+            CommandScript::output(
+                "ssh",
+                &[
+                    "-o",
+                    "BatchMode=yes",
+                    "-p",
+                    "2222",
+                    "-J",
+                    "bastion.example.com",
+                    "alice@dev-vm.example.com",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "mkdir -p /sandbox/.agentenv/bin && test -w /sandbox",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+        ]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let handle = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::new(),
+                policy: None,
+                metadata: BTreeMap::from([
+                    ("host".to_owned(), json!("dev-vm.example.com")),
+                    ("user".to_owned(), json!("alice")),
+                    ("port".to_owned(), json!(2222)),
+                    ("jump_host".to_owned(), json!("bastion.example.com")),
+                ]),
+            })
+            .await
+            .expect("create remote ssh sandbox")
+            .handle;
+
+        assert!(handle.starts_with("remote-ssh://alice@dev-vm.example.com:2222"));
+        assert!(handle.contains("jump_host=bastion.example.com"));
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_remote_firewall_before_running_ssh() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::new(),
+                policy: None,
+                metadata: BTreeMap::from([
+                    ("host".to_owned(), json!("dev-vm.example.com")),
+                    ("user".to_owned(), json!("alice")),
+                    ("enforce_remote_firewall".to_owned(), json!(true)),
+                ]),
+            })
+            .await
+            .expect_err("firewall enforcement is not supported");
+
+        match err {
+            DriverError::CapabilityMissing { capability } => {
+                assert_eq!(capability, POLICY_CAPABILITY)
+            }
+            other => panic!("expected CapabilityMissing, got {other:?}"),
+        }
+        assert!(runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_probes_remote_and_returns_sandbox_working_dir() {
+        let handle = "remote-ssh://alice@dev-vm.example.com:22";
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-p",
+                "22",
+                "alice@dev-vm.example.com",
+                "--",
+                "true",
+            ],
+            Some(0),
+            "",
+            "",
+        )]));
+        let driver = RemoteSshDriver::with_command_runner(runner);
+
+        let shell = driver
+            .connect(ConnectParams {
+                handle: handle.to_owned(),
+            })
+            .await
+            .expect("connect");
+
+        assert_eq!(shell.session_id, handle);
+        assert!(shell.tty);
+        assert_eq!(shell.working_dir.as_deref(), Some("/sandbox"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_unhealthy_on_nonzero_ssh_probe() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-p",
+                "22",
+                "alice@dev-vm.example.com",
+                "--",
+                "true",
+            ],
+            Some(255),
+            "",
+            "connection refused",
+        )]));
+        let driver = RemoteSshDriver::with_command_runner(runner);
+
+        let status = driver
+            .status(SandboxStatusParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22".to_owned(),
+            })
+            .await
+            .expect("status");
+
+        assert_eq!(status.phase, agentenv_proto::SandboxPhase::Error);
+        assert!(!status.healthy);
     }
 }
