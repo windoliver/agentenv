@@ -2868,6 +2868,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-remote-ssh"
+version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "driver-conformance",
+ "serde_json",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "schemars"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
