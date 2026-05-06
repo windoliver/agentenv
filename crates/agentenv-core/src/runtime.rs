@@ -1776,6 +1776,18 @@ fn sandbox_spec_for_create(
             serde_json::json!("/sandbox"),
         ),
     ]);
+    for (key, value) in sandbox_extra {
+        if key == "image" {
+            continue;
+        }
+        let value = serde_json::to_value(value).map_err(|source| {
+            RuntimeError::ComponentConfigConversion {
+                key: key.clone(),
+                source,
+            }
+        })?;
+        metadata.insert(key.clone(), value);
+    }
     let image = match sandbox_extra.get("image") {
         Some(serde_yaml::Value::String(image)) => Some(image.clone()),
         Some(serde_yaml::Value::Mapping(image)) => {
@@ -5843,6 +5855,71 @@ policy:
             )
         );
         assert_eq!(metadata["agentenv_agent"], serde_json::json!("codex"));
+    }
+
+    #[tokio::test]
+    async fn create_env_passes_generic_sandbox_extra_metadata_to_sandbox() {
+        let root = unique_root("agentenv-create-remote-ssh-metadata");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: remote-ssh
+  host: dev-vm.example.com
+  user: alice
+  port: 2222
+  identity_file: ~/.ssh/id_ed25519
+  jump_host: bastion.example.com
+  enforce_remote_firewall: false
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        let metadata = &specs[0].metadata;
+        assert_eq!(metadata["name"], serde_json::json!("demo"));
+        assert_eq!(metadata["host"], serde_json::json!("dev-vm.example.com"));
+        assert_eq!(metadata["user"], serde_json::json!("alice"));
+        assert_eq!(metadata["port"], serde_json::json!(2222));
+        assert_eq!(
+            metadata["identity_file"],
+            serde_json::json!("~/.ssh/id_ed25519")
+        );
+        assert_eq!(
+            metadata["jump_host"],
+            serde_json::json!("bastion.example.com")
+        );
+        assert_eq!(
+            metadata["enforce_remote_firewall"],
+            serde_json::json!(false)
+        );
+        assert!(!metadata.contains_key("image"));
     }
 
     #[tokio::test]

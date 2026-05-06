@@ -23,6 +23,10 @@ const BUILT_IN_DRIVER_SPECS: &[BuiltInDriverSpec] = &[
         names: &["openshell", "sandbox-openshell"],
     },
     BuiltInDriverSpec {
+        kind: DriverKind::Sandbox,
+        names: &["remote-ssh", "sandbox-remote-ssh"],
+    },
+    BuiltInDriverSpec {
         kind: DriverKind::Agent,
         names: &["claude", "agent-claude"],
     },
