@@ -2776,6 +2776,16 @@ mod driver_tests {
     }
 
     #[derive(Debug)]
+    struct FailingOneflightRunner {
+        calls: Mutex<Vec<CommandCall>>,
+        build_count: AtomicUsize,
+        sandbox_create_count: AtomicUsize,
+        build_started: mpsc::Sender<()>,
+        release_build: Mutex<mpsc::Receiver<()>>,
+        stderr: String,
+    }
+
+    #[derive(Debug)]
     struct WaiterSignalEmitter {
         waiter_entered: Mutex<Option<mpsc::Sender<()>>>,
     }
@@ -2951,6 +2961,57 @@ mod driver_tests {
                 });
             }
             if program == "openshell" {
+                return Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Err(io::Error::other("unexpected command"))
+        }
+
+        fn spawn(
+            &self,
+            _program: &str,
+            _request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
+            Ok(Box::new(super::NoopSpawnedCommand))
+        }
+    }
+
+    impl CommandRunner for FailingOneflightRunner {
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            self.calls.lock().expect("calls mutex").push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+            if program == "docker" && request.args.first().map(String::as_str) == Some("build") {
+                let previous = self.build_count.fetch_add(1, Ordering::SeqCst);
+                if previous == 0 {
+                    self.build_started
+                        .send(())
+                        .map_err(|source| io::Error::other(source.to_string()))?;
+                    self.release_build
+                        .lock()
+                        .expect("release build receiver mutex")
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|source| io::Error::other(source.to_string()))?;
+                }
+                return Ok(CommandOutput {
+                    status: Some(1),
+                    stdout: String::new(),
+                    stderr: self.stderr.clone(),
+                });
+            }
+            if program == "openshell"
+                && request.args.first().map(String::as_str) == Some("sandbox")
+                && request.args.get(1).map(String::as_str) == Some("create")
+            {
+                self.sandbox_create_count.fetch_add(1, Ordering::SeqCst);
                 return Ok(CommandOutput {
                     status: Some(0),
                     stdout: String::new(),
@@ -5230,51 +5291,97 @@ mod driver_tests {
         std::fs::create_dir_all(&dockerfile_dir).expect("create source context");
         let dockerfile = dockerfile_dir.join("Dockerfile");
         std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write source Dockerfile");
-        let runner = Arc::new(FlexibleCommandRunner::new(vec![
-            FlexibleCommandExpectation::output("docker", |_| {}, Some(1), "", "build failed"),
-        ]));
-        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+        let (build_started_tx, build_started_rx) = mpsc::channel();
+        let (release_build_tx, release_build_rx) = mpsc::channel();
+        let (waiter_entered_tx, waiter_entered_rx) = mpsc::channel();
+        let runner = Arc::new(FailingOneflightRunner {
+            calls: Mutex::new(Vec::new()),
+            build_count: AtomicUsize::new(0),
+            sandbox_create_count: AtomicUsize::new(0),
+            build_started: build_started_tx,
+            release_build: Mutex::new(release_build_rx),
+            stderr: "build failed for peer".to_owned(),
+        });
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let err = runtime
-            .block_on(async {
-                driver
-                    .create(SandboxSpec {
-                        image: None,
-                        env: BTreeMap::new(),
-                        policy: None,
-                        metadata: BTreeMap::from([
-                            ("name".to_owned(), json!("devbox")),
-                            (
-                                "byo_dockerfile".to_owned(),
-                                json!(dockerfile.display().to_string()),
-                            ),
-                            ("agentenv_agent".to_owned(), json!("codex")),
-                            ("agentenv_mcp_port".to_owned(), json!("3333")),
-                            ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
-                            (
-                                "agentenv_version".to_owned(),
-                                json!(env!("CARGO_PKG_VERSION")),
-                            ),
-                            (
-                                "agentenv_build_oneflight".to_owned(),
-                                json!("byo-openshell-v1"),
-                            ),
-                            ("agentenv_build_seed_version".to_owned(), json!("1")),
-                            (
-                                "agentenv_build_seed".to_owned(),
-                                json!(
-                                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-                                ),
-                            ),
-                        ]),
-                    })
-                    .await
+        let first_driver = Arc::new(OpenShellDriver::with_command_runner_and_workdir(
+            runner.clone(),
+            &workdir,
+        ));
+        let second_driver = Arc::new(
+            OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir)
+                .with_event_emitter(Arc::new(WaiterSignalEmitter::new(waiter_entered_tx))),
+        );
+        let first_spec = SandboxSpec {
+            image: None,
+            env: BTreeMap::new(),
+            policy: None,
+            metadata: BTreeMap::from([
+                ("name".to_owned(), json!("devbox-a")),
+                (
+                    "byo_dockerfile".to_owned(),
+                    json!(dockerfile.display().to_string()),
+                ),
+                ("agentenv_agent".to_owned(), json!("codex")),
+                ("agentenv_mcp_port".to_owned(), json!("3333")),
+                ("agentenv_workspace_mount".to_owned(), json!("/sandbox")),
+                (
+                    "agentenv_version".to_owned(),
+                    json!(env!("CARGO_PKG_VERSION")),
+                ),
+                (
+                    "agentenv_build_oneflight".to_owned(),
+                    json!("byo-openshell-v1"),
+                ),
+                ("agentenv_build_seed_version".to_owned(), json!("1")),
+                (
+                    "agentenv_build_seed".to_owned(),
+                    json!(
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    ),
+                ),
+            ]),
+        };
+        let mut second_spec = first_spec.clone();
+        second_spec
+            .metadata
+            .insert("name".to_owned(), json!("devbox-b"));
+
+        let first = {
+            let driver = Arc::clone(&first_driver);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async { driver.create(first_spec).await })
             })
-            .expect_err("build should fail");
+        };
+        build_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first build started");
+        let second = {
+            let driver = Arc::clone(&second_driver);
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async { driver.create(second_spec).await })
+            })
+        };
+        waiter_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second create entered waiter path");
+        release_build_tx.send(()).expect("release first build");
+
+        let builder_err = first
+            .join()
+            .expect("first thread")
+            .expect_err("builder create should fail");
+        let waiter_err = second
+            .join()
+            .expect("second thread")
+            .expect_err("waiter create should receive failure marker");
 
         let failure_files = std::fs::read_dir(workdir.join("build-cache"))
             .expect("build cache dir")
@@ -5286,7 +5393,10 @@ mod driver_tests {
         assert_eq!(failure_files.len(), 1);
         let failure = std::fs::read_to_string(&failure_files[0]).expect("failure marker");
         assert!(failure.contains("docker_build_failed"));
-        assert!(err.to_string().contains("build failed"));
+        assert!(builder_err.to_string().contains("build failed for peer"));
+        assert!(waiter_err.to_string().contains("build failed for peer"));
+        assert_eq!(runner.build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.sandbox_create_count.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
