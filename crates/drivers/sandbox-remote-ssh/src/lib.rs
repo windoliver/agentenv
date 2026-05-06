@@ -153,6 +153,9 @@ impl RemoteSshTarget {
         let identity_file =
             optional_metadata_string(metadata, "identity_file")?.map(expand_leading_home);
         let jump_host = optional_metadata_string(metadata, "jump_host")?;
+        if let Some(jump_host) = jump_host.as_deref() {
+            validate_remote_ssh_host(jump_host, "metadata.jump_host")?;
+        }
         let enforce_remote_firewall =
             optional_metadata_bool(metadata, "enforce_remote_firewall")?.unwrap_or(false);
 
@@ -169,6 +172,9 @@ impl RemoteSshTarget {
     fn to_handle(&self) -> DriverResult<String> {
         validate_remote_ssh_user(&self.user, "remote-ssh username")?;
         validate_remote_ssh_host(&self.host, "remote-ssh host")?;
+        if let Some(jump_host) = self.jump_host.as_deref() {
+            validate_remote_ssh_host(jump_host, "jump_host")?;
+        }
         let base = format!("remote-ssh://{}@{}:{}", self.user, self.host, self.port);
         let mut url = Url::parse(&base).map_err(|source| DriverError::InvalidInput {
             message: format!("failed to build remote-ssh handle: {source}"),
@@ -217,7 +223,12 @@ impl RemoteSshTarget {
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "identity_file" => identity_file = Some(value.into_owned()),
-                "jump_host" => jump_host = Some(value.into_owned()),
+                "jump_host" => {
+                    let value = value.into_owned();
+                    validate_remote_ssh_host(&value, "jump_host")
+                        .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
+                    jump_host = Some(value);
+                }
                 _ => {}
             }
         }
@@ -740,6 +751,21 @@ mod tests {
     }
 
     #[test]
+    fn target_from_metadata_rejects_invalid_jump_host() {
+        for jump_host in ["user@bastion.example.com", "bastion:2222"] {
+            let metadata = BTreeMap::from([
+                ("host".to_owned(), json!("dev-vm.example.com")),
+                ("user".to_owned(), json!("alice")),
+                ("jump_host".to_owned(), json!(jump_host)),
+            ]);
+
+            let err = RemoteSshTarget::from_metadata(&metadata).expect_err("metadata should fail");
+
+            assert!(err.to_string().contains("metadata.jump_host"));
+        }
+    }
+
+    #[test]
     fn uri_handle_round_trips_target_fields() {
         let target = RemoteSshTarget {
             host: "dev-vm.example.com".to_owned(),
@@ -796,6 +822,32 @@ mod tests {
             .expect_err("handle should fail");
 
         assert!(err.to_string().contains("host"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_invalid_jump_host_query() {
+        let err = RemoteSshTarget::from_handle(
+            "remote-ssh://alice@dev-vm.example.com:22?jump_host=-bastion.example.com",
+        )
+        .expect_err("handle should fail");
+
+        assert!(err.to_string().contains("jump_host"));
+    }
+
+    #[test]
+    fn uri_handle_rejects_invalid_jump_host_before_serializing() {
+        let target = RemoteSshTarget {
+            host: "dev-vm.example.com".to_owned(),
+            user: "alice".to_owned(),
+            port: 22,
+            identity_file: None,
+            jump_host: Some("bastion:2222".to_owned()),
+            enforce_remote_firewall: false,
+        };
+
+        let err = target.to_handle().expect_err("handle should fail");
+
+        assert!(err.to_string().contains("jump_host"));
     }
 
     #[test]
