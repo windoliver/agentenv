@@ -45,9 +45,10 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         RuntimeError::UnsupportedDriver { .. } | RuntimeError::MissingSelectedDriver { .. } => {
             ReasonCode::CapabilityMissing
         }
-        RuntimeError::Lifecycle(_) | RuntimeError::InvalidPolicyTier { .. } => {
-            ReasonCode::InvalidBlueprint
-        }
+        RuntimeError::Lifecycle(_)
+        | RuntimeError::Blueprint(_)
+        | RuntimeError::Hardening(_)
+        | RuntimeError::InvalidPolicyTier { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
         | RuntimeError::Snapshot(_)

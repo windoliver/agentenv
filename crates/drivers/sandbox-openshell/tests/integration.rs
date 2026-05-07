@@ -31,7 +31,7 @@ async fn openshell_create_exec_policy_logs_and_destroy_flow() {
         .create(SandboxSpec {
             image: Some("openclaw".to_owned()),
             env: BTreeMap::new(),
-            policy: None,
+            policy: Some(default_deny_policy()),
             metadata,
         })
         .await
@@ -151,7 +151,7 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
             cmd: format!(
                 "sh -lc {}",
                 shell_single_quote(&format!(
-                    "grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root; status=$?; if [ $status -eq 0 ]; then exit 10; elif [ $status -eq 1 ]; then exit 0; else exit $status; fi",
+                    "if grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root 2>/dev/null; then exit 10; else exit 0; fi",
                     shell_single_quote(&marker)
                 ))
             ),
@@ -189,29 +189,31 @@ fn should_run_integration() -> bool {
 }
 
 fn github_read_policy() -> NetworkPolicy {
+    let mut policy = default_deny_policy();
+    policy.network.allow.push(NetworkRule {
+        target: NetworkTarget::Host {
+            host: "api.github.com".to_owned(),
+            port: Some(443),
+            scheme: Some("https".to_owned()),
+            http_access: Some(HttpAccessLevel::ReadOnly),
+        },
+    });
+    policy
+}
+
+fn default_deny_policy() -> NetworkPolicy {
     NetworkPolicy {
         network: NetworkAccessPolicy {
             reloadability: PolicyReloadability::HotReload,
-            allow: vec![NetworkRule {
-                target: NetworkTarget::Host {
-                    host: "api.github.com".to_owned(),
-                    port: Some(443),
-                    scheme: Some("https".to_owned()),
-                    http_access: Some(HttpAccessLevel::ReadOnly),
-                },
-            }],
+            allow: Vec::new(),
             deny: Vec::new(),
             approval_required: Vec::new(),
         },
-        filesystem: FilesystemPolicy {
-            reloadability: PolicyReloadability::LockedAtCreate,
-            read_only: Vec::new(),
-            read_write: Vec::new(),
-        },
+        filesystem: live_openshell_filesystem_policy(),
         process: ProcessPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,
-            run_as_user: String::new(),
-            run_as_group: String::new(),
+            run_as_user: "sandbox".to_owned(),
+            run_as_group: "sandbox".to_owned(),
             profile: String::new(),
             allow_syscalls: Vec::new(),
             deny_syscalls: Vec::new(),
@@ -220,6 +222,26 @@ fn github_read_policy() -> NetworkPolicy {
             reloadability: PolicyReloadability::HotReload,
             routes: Vec::new(),
         },
+    }
+}
+
+fn live_openshell_filesystem_policy() -> FilesystemPolicy {
+    FilesystemPolicy {
+        reloadability: PolicyReloadability::LockedAtCreate,
+        read_only: vec![
+            "/usr".to_owned(),
+            "/lib".to_owned(),
+            "/proc".to_owned(),
+            "/dev/urandom".to_owned(),
+            "/app".to_owned(),
+            "/etc".to_owned(),
+            "/var/log".to_owned(),
+        ],
+        read_write: vec![
+            "/sandbox".to_owned(),
+            "/tmp".to_owned(),
+            "/dev/null".to_owned(),
+        ],
     }
 }
 

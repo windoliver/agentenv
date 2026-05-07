@@ -245,6 +245,89 @@ fn verify_blueprint_succeeds_on_reference_blueprint() {
 }
 
 #[test]
+fn cli_includes_commands() {
+    let output = Command::new(agentenv_bin()).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let blueprint = stdout
+        .find("blueprint")
+        .unwrap_or_else(|| panic!("stdout was: {stdout}"));
+    let credentials = stdout
+        .find("credentials")
+        .unwrap_or_else(|| panic!("stdout was: {stdout}"));
+    assert!(
+        blueprint < credentials,
+        "`blueprint` should be listed before `credentials`; stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn blueprint_lint_reports_json_diagnostics() {
+    let temp_dir = make_temp_dir("blueprint-lint-json-diagnostics");
+    let dockerfile = temp_dir.join("Dockerfile");
+    fs::write(
+        &dockerfile,
+        r#"
+FROM alpine:3.20
+RUN apk add --no-cache curl
+USER root
+"#,
+    )
+    .unwrap();
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  hardening: strict
+  image:
+    source: byo
+    dockerfile: Dockerfile
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("blueprint")
+        .arg("lint")
+        .arg(&blueprint)
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(json["profile"], "strict");
+    let codes = json["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array")
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(codes.contains("dockerfile_user_root"), "codes: {codes:?}");
+    assert!(
+        codes.contains("dockerfile_reintroduces_stripped_package"),
+        "codes: {codes:?}"
+    );
+}
+
+#[test]
 fn drivers_list_includes_built_in_drivers() {
     let temp_dir = make_temp_dir("drivers-list-builtins");
 
@@ -1015,6 +1098,8 @@ fn logs_context_follow_streams_appended_events_jsonl() {
     let temp_dir = make_temp_dir("logs-context-follow-events");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
     let events_path = env_dir.join("events.jsonl");
+    let stdout_path = temp_dir.join("logs-context-follow.stdout");
+    let stderr_path = temp_dir.join("logs-context-follow.stderr");
     fs::write(&events_path, "").unwrap();
 
     let mut child = Command::new(agentenv_bin())
@@ -1024,8 +1109,12 @@ fn logs_context_follow_streams_appended_events_jsonl() {
         .arg("context")
         .arg("--follow")
         .env("HOME", &temp_dir)
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
+        .stdout(process::Stdio::from(
+            fs::File::create(&stdout_path).unwrap(),
+        ))
+        .stderr(process::Stdio::from(
+            fs::File::create(&stderr_path).unwrap(),
+        ))
         .spawn()
         .unwrap();
 
@@ -1042,14 +1131,28 @@ fn logs_context_follow_streams_appended_events_jsonl() {
             b"{\"ts\":\"2026-04-21T00:00:01Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context followed\"}\n",
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(400));
-    let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stdout = String::new();
+    while Instant::now() < deadline {
+        stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        if stdout.contains("context followed") {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+            panic!(
+                "logs --follow exited before appended event was printed; status: {status}; stdout: {stdout}; stderr: {stderr}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("context followed"),
-        "stdout was: {}",
-        String::from_utf8_lossy(&output.stdout)
+        stdout.contains("context followed"),
+        "stdout was: {stdout}; stderr was: {}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
     );
 }
 

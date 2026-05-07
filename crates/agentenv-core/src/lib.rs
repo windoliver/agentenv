@@ -10,6 +10,7 @@ pub mod driver_artifact;
 pub mod driver_catalog;
 pub mod env;
 pub mod error;
+pub mod hardening;
 pub mod inference;
 pub mod lifecycle;
 pub mod lockfile;
