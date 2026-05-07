@@ -72,6 +72,7 @@ enum Commands {
     Metrics(MetricsArgs),
     Approvals(ApprovalsArgs),
     Term(TermArgs),
+    Snapshot(SnapshotArgs),
     Exec(ExecArgs),
     Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
@@ -437,6 +438,36 @@ struct TermArgs {
 }
 
 #[derive(Debug, Args)]
+struct SnapshotArgs {
+    #[command(subcommand)]
+    command: Option<SnapshotCommand>,
+    #[arg(value_name = "ENV")]
+    env: Option<String>,
+    #[arg(long, value_name = "PATH", requires = "env")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    Verify { path: PathBuf },
+    Restore(SnapshotRestoreCliArgs),
+}
+
+#[derive(Debug, Args)]
+struct SnapshotRestoreCliArgs {
+    path: PathBuf,
+    #[arg(long = "as", value_name = "NEW_NAME")]
+    as_name: Option<String>,
+    #[arg(
+        long,
+        env = "AGENTENV_NON_INTERACTIVE",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    non_interactive: bool,
+}
+
+#[derive(Debug, Args)]
 struct BlueprintArgs {
     #[command(subcommand)]
     command: BlueprintCommand,
@@ -539,6 +570,7 @@ async fn run() -> Result<()> {
         Some(Commands::Audit(args)) => run_audit(args),
         Some(Commands::Metrics(args)) => run_metrics(args).await,
         Some(Commands::Approvals(args)) => run_approvals(args, &cli.events_sink).await,
+        Some(Commands::Snapshot(args)) => run_snapshot(args).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Term(args)) => run_term(args).await,
         Some(Commands::Blueprint(command)) => run_blueprint(command),
@@ -2328,6 +2360,93 @@ async fn write_http_response(
         .context("write metrics response")
 }
 
+async fn run_snapshot(args: SnapshotArgs) -> Result<()> {
+    match args.command {
+        Some(SnapshotCommand::Verify { path }) => run_snapshot_verify(path),
+        Some(SnapshotCommand::Restore(args)) => run_snapshot_restore(args).await,
+        None => run_snapshot_create(args).await,
+    }
+}
+
+async fn run_snapshot_create(args: SnapshotArgs) -> Result<()> {
+    let env = args
+        .env
+        .ok_or_else(|| anyhow::anyhow!("snapshot requires an env name or subcommand"))?;
+    let output = match args.output {
+        Some(output) => output,
+        None => default_snapshot_output_path(&env)?,
+    };
+    reject_snapshot_stdout_output(&output)?;
+
+    let options = runtime_options(true)?;
+    let result = agentenv_core::runtime::snapshot_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        agentenv_core::runtime::SnapshotEnvArgs { env, output },
+    )
+    .await?;
+
+    println!("Snapshot written: {}", result.path.display());
+    println!("files: {}", result.file_count);
+    println!("merkle root: {}", result.merkle_root);
+    Ok(())
+}
+
+fn run_snapshot_verify(path: PathBuf) -> Result<()> {
+    let result = agentenv_core::runtime::verify_snapshot(&path)
+        .with_context(|| format!("failed to verify snapshot `{}`", path.display()))?;
+    println!("Snapshot verified: {}", result.path.display());
+    println!("files: {}", result.file_count);
+    println!("merkle root: {}", result.merkle_root);
+    println!("signature: verified");
+    Ok(())
+}
+
+async fn run_snapshot_restore(args: SnapshotRestoreCliArgs) -> Result<()> {
+    let options = runtime_options(args.non_interactive)?;
+    let store = CredentialStore::from_default_paths().context("initialize credential store")?;
+    let mut provider = CliCredentialProvider {
+        store,
+        non_interactive: args.non_interactive,
+        prompter: Box::new(TerminalCredentialPrompter),
+    };
+
+    let result = agentenv_core::runtime::restore_snapshot_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &mut provider,
+        agentenv_core::runtime::SnapshotRestoreArgs {
+            snapshot: args.path.clone(),
+            name: args.as_name,
+        },
+    )
+    .await
+    .with_context(|| format!("failed to restore snapshot `{}`", args.path.display()))?;
+
+    println!(
+        "Environment `{}` restored from snapshot {}",
+        result.name,
+        result.snapshot.display()
+    );
+    Ok(())
+}
+
+fn reject_snapshot_stdout_output(output: &Path) -> Result<()> {
+    if output == Path::new("-") {
+        bail!("--output - is not supported for snapshots; choose a directory path");
+    }
+    Ok(())
+}
+
+fn default_snapshot_output_path(env: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to determine current working directory")?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_nanos();
+    Ok(cwd.join(format!("{env}-{timestamp}.agentenvsnap")))
+}
+
 async fn run_exec(args: ExecArgs, event_sink_args: &[String]) -> Result<()> {
     let options = runtime_options(true)?;
     let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
@@ -3730,6 +3849,7 @@ mod tests {
                 "metrics".to_string(),
                 "approvals".to_string(),
                 "term".to_string(),
+                "snapshot".to_string(),
                 "exec".to_string(),
                 "blueprint".to_string(),
                 "credentials".to_string(),

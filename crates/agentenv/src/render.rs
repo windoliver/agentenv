@@ -51,6 +51,7 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         | RuntimeError::InvalidPolicyTier { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::Snapshot(_)
         | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
