@@ -79,6 +79,9 @@ impl AuditPolicy {
             | ActivityKind::SpawnAdmitted
             | ActivityKind::SpawnStarted
             | ActivityKind::SpawnReady
+            | ActivityKind::BuildOneflightHit
+            | ActivityKind::BuildOneflightMiss
+            | ActivityKind::BuildQueueDepth
             | ActivityKind::Log => false,
         }
     }

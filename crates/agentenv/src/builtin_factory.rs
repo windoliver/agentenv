@@ -98,9 +98,10 @@ fn build_driver_set_with_context(
     let mut catalog = None;
     Ok(DriverSet {
         sandbox: match selection.sandbox.as_str() {
-            "openshell" | "sandbox-openshell" => {
-                Box::new(sandbox_openshell::OpenShellDriver::default())
-            }
+            "openshell" | "sandbox-openshell" => Box::new(
+                sandbox_openshell::OpenShellDriver::default()
+                    .with_event_emitter(Arc::clone(&events)),
+            ),
             "remote-ssh" | "sandbox-remote-ssh" => {
                 Box::new(sandbox_remote_ssh::RemoteSshDriver::default())
             }
@@ -192,7 +193,7 @@ fn build_pinned_driver_set_with_context(
     approval_context: Option<&SubprocessApprovalContext>,
 ) -> RuntimeResult<DriverSet> {
     Ok(DriverSet {
-        sandbox: build_pinned_sandbox(selection, pins.get("sandbox"))?,
+        sandbox: build_pinned_sandbox(selection, pins.get("sandbox"), Arc::clone(&events))?,
         agent: build_pinned_agent(
             selection,
             pins.get("agent"),
@@ -207,6 +208,7 @@ fn build_pinned_driver_set_with_context(
 fn build_pinned_sandbox(
     selection: &DriverSelection,
     pin: Option<&DriverPinIdentity>,
+    events: Arc<dyn EventEmitter>,
 ) -> RuntimeResult<Box<dyn agentenv_core::driver::SandboxDriver>> {
     match selection.sandbox.as_str() {
         "openshell" | "sandbox-openshell" => {
@@ -216,7 +218,9 @@ fn build_pinned_sandbox(
                 &["openshell", "sandbox-openshell"],
                 pin,
             )?;
-            Ok(Box::new(sandbox_openshell::OpenShellDriver::default()))
+            Ok(Box::new(
+                sandbox_openshell::OpenShellDriver::default().with_event_emitter(events),
+            ))
         }
         "remote-ssh" | "sandbox-remote-ssh" => {
             validate_builtin_pin(
@@ -563,7 +567,10 @@ fn subprocess_source_from_pin(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
 
     use agentenv_core::{
         driver_artifact::discover_driver_artifacts,
@@ -610,6 +617,43 @@ mod tests {
             let set = BuiltInDriverFactory.build(&selection).unwrap();
             drop(set);
         }
+    }
+
+    #[test]
+    fn openshell_driver_receives_observed_event_emitter() {
+        let factory = BuiltInDriverFactory;
+        let selection = DriverSelection {
+            sandbox: "openshell".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: None,
+        };
+        let events = Arc::new(agentenv_events::RecordingEventEmitter::default());
+
+        let mut set = factory
+            .build_observed(
+                &selection,
+                Arc::clone(&events) as Arc<dyn agentenv_events::EventEmitter>,
+            )
+            .expect("driver set");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(async {
+                set.sandbox
+                    .shutdown(agentenv_proto::ShutdownParams {})
+                    .await
+            })
+            .expect("shutdown");
+
+        assert!(events.recorded().iter().any(|event| {
+            event.actor.get("driver") == Some(&serde_json::json!("openshell"))
+                && event.subject.get("operation") == Some(&serde_json::json!("shutdown"))
+                && event.reason_code.as_deref() == Some("openshell_shutdown")
+        }));
     }
 
     #[test]

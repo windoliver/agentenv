@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -282,6 +282,12 @@ pub enum RuntimeError {
     #[error(transparent)]
     PortableLockfile(#[from] crate::portable_lockfile::PortableLockfileError),
     #[error(transparent)]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
+    #[error(transparent)]
+    Blueprint(#[from] crate::error::BlueprintError),
+    #[error(transparent)]
+    Hardening(#[from] crate::hardening::HardeningError),
+    #[error(transparent)]
     ApprovalConfig(#[from] agentenv_approvals::ApprovalConfigError),
     #[error(transparent)]
     ApprovalNotification(#[from] agentenv_approvals::ApprovalNotificationError),
@@ -334,6 +340,38 @@ pub struct CreateResult {
     pub admission: crate::admission::AdmissionReport,
     pub state: crate::env::EnvStateFile,
     pub state_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotEnvArgs {
+    pub env: String,
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEnvResult {
+    pub path: PathBuf,
+    pub file_count: usize,
+    pub merkle_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRestoreArgs {
+    pub snapshot: PathBuf,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotRestoreResult {
+    pub name: String,
+    pub snapshot: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotVerifyResult {
+    pub path: PathBuf,
+    pub file_count: usize,
+    pub merkle_root: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -437,6 +475,8 @@ impl<'a> CreateEnvRollback<'a> {
 
 static CREATE_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_ENTRYPOINT_PATH: &str = "/sandbox/.agentenv/bin/agentenv-agent";
+const BUILD_ONEFLIGHT_KIND: &str = "byo-openshell-v1";
+const BUILD_ONEFLIGHT_SEED_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnterResult {
@@ -621,10 +661,21 @@ pub fn add_byo_dockerfile_preflight_warnings(
     report: &mut crate::admission::AdmissionReport,
     sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
 ) {
-    let Some(dockerfile) = byo_dockerfile_path(sandbox_extra) else {
-        return;
+    let sandbox = crate::blueprint::ComponentSection {
+        driver: "openshell".to_owned(),
+        version: None,
+        credentials: None,
+        extra: sandbox_extra.clone(),
     };
-    let issues = dockerfile_preflight_warnings(&dockerfile);
+    let issues = match crate::hardening::lint_sandbox_hardening(&sandbox, Path::new(".")) {
+        Ok(report) => hardening_lint_preflight_issues(&report.diagnostics),
+        Err(error) => vec![agentenv_proto::PreflightIssue {
+            severity: agentenv_proto::IssueSeverity::Error,
+            code: "dockerfile_lint_failed".to_owned(),
+            message: format!("failed to lint BYO Dockerfile hardening: {error}"),
+            remediation: Some("Check sandbox.image and sandbox.hardening configuration".to_owned()),
+        }],
+    };
     if issues.is_empty() {
         return;
     }
@@ -635,6 +686,7 @@ pub fn add_byo_dockerfile_preflight_warnings(
         .find(|check| check.kind == DriverKind::Sandbox)
     {
         check.issues.extend(issues);
+        refresh_preflight_status(report);
         return;
     }
 
@@ -644,6 +696,51 @@ pub fn add_byo_dockerfile_preflight_warnings(
         ok: true,
         issues,
     });
+    refresh_preflight_status(report);
+}
+
+fn hardening_lint_preflight_issues(
+    diagnostics: &[crate::hardening::HardeningLintDiagnostic],
+) -> Vec<agentenv_proto::PreflightIssue> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| agentenv_proto::PreflightIssue {
+            severity: match diagnostic.severity {
+                crate::hardening::HardeningLintSeverity::Info => {
+                    agentenv_proto::IssueSeverity::Info
+                }
+                crate::hardening::HardeningLintSeverity::Warning => {
+                    agentenv_proto::IssueSeverity::Warning
+                }
+                crate::hardening::HardeningLintSeverity::Error => {
+                    agentenv_proto::IssueSeverity::Error
+                }
+            },
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+            remediation: diagnostic.remediation.clone(),
+        })
+        .collect()
+}
+
+fn refresh_preflight_status(report: &mut crate::admission::AdmissionReport) {
+    let has_error = report.checks.iter().any(|check| {
+        !check.ok
+            || check
+                .issues
+                .iter()
+                .any(|issue| issue.severity == agentenv_proto::IssueSeverity::Error)
+    });
+    report.status = if has_error {
+        crate::admission::AdmissionStatus::Rejected
+    } else {
+        crate::admission::AdmissionStatus::Accepted
+    };
+    report.reason_code = if has_error {
+        crate::admission::ReasonCode::PreflightFailed
+    } else {
+        crate::admission::ReasonCode::Created
+    };
 }
 
 async fn run_preflight_with_pins(
@@ -970,7 +1067,7 @@ async fn create_env_with_input(
                 source,
             }
         })?;
-        fs::write(temp_paths.lock_path(), lock_yaml).map_err(|source| {
+        fs::write(temp_paths.lock_path(), &lock_yaml).map_err(|source| {
             crate::env::EnvError::Io {
                 path: temp_paths.lock_path(),
                 source,
@@ -1001,6 +1098,21 @@ async fn create_env_with_input(
                 handle: context_handle.handle.clone(),
             })
             .await?;
+        let send_hardening_metadata = input.resolved_policy.is_none()
+            || crate::hardening::sandbox_hardening_declared(&resolved.blueprint.sandbox);
+        let resolved_hardening = if send_hardening_metadata {
+            Some(crate::hardening::resolve_sandbox_hardening(
+                &resolved.blueprint.sandbox,
+            )?)
+        } else {
+            None
+        };
+        let persist_home = resolved
+            .blueprint
+            .state
+            .as_ref()
+            .and_then(|state| state.persist_home)
+            .unwrap_or(false);
 
         let (inference_handle, inference_endpoint) = match (
             set.inference.as_ref(),
@@ -1039,7 +1151,14 @@ async fn create_env_with_input(
                 })
             })?,
         };
-        if input.resolved_policy.is_none() {
+        if let (None, Some(resolved_hardening)) =
+            (input.resolved_policy.as_ref(), resolved_hardening.as_ref())
+        {
+            crate::hardening::apply_resolved_hardening_to_policy(
+                &mut policy,
+                resolved_hardening,
+                persist_home,
+            )?;
             policy.network.allow.extend(context_network_rules.rules);
         }
 
@@ -1051,14 +1170,27 @@ async fn create_env_with_input(
         };
         let restore_policy_after_install = supports_hot_reload_policy && create_policy != policy;
 
+        let build_oneflight_seed = build_oneflight_seed_for_byo(
+            blueprint_yaml,
+            &lock_yaml,
+            &selection,
+            &resolved,
+            &context_endpoint,
+            &resolved.blueprint.sandbox.extra,
+        )?;
+
         let sandbox_create_start = Instant::now();
         let sandbox_spec = sandbox_spec_for_create(
             name,
             &selection,
             &resolved.blueprint.sandbox.extra,
             &context_endpoint,
-            env,
-            Some(create_policy.clone()),
+            SandboxSpecCreateOptions {
+                env,
+                policy: Some(create_policy.clone()),
+                build_oneflight_seed,
+                resolved_hardening: resolved_hardening.as_ref(),
+            },
         )?;
         let sandbox_handle = match set.sandbox.create(sandbox_spec).await {
             Ok(handle) => {
@@ -1398,6 +1530,9 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     if let crate::lockfile::LockfileDocument::Portable(mut lockfile) =
         crate::lockfile::LockfileDocument::from_yaml(&description.lock_yaml)?
     {
+        let env_blueprint = crate::blueprint::Blueprint::from_yaml(&description.blueprint_yaml)?;
+        let env_hardening_declared =
+            crate::hardening::sandbox_hardening_declared(&env_blueprint.sandbox);
         let expected_lockfile = crate::portable_lockfile::build_portable_lockfile(
             crate::portable_lockfile::PortableLockfileInput {
                 name: description.state.name.clone(),
@@ -1405,10 +1540,11 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
                 driver_artifacts: driver_artifacts.clone(),
             },
         )?;
-        if lockfile.composition != expected_lockfile.composition
-            || lockfile.blueprint_hash != expected_lockfile.blueprint_hash
-            || lockfile.policy.declared != expected_lockfile.composition.policy
-        {
+        if !portable_lockfile_matches_env_blueprint(
+            &lockfile,
+            &expected_lockfile,
+            env_hardening_declared,
+        )? {
             return Err(RuntimeError::PortableLockfileVerification {
                 details:
                     "portable lockfile composition does not match env blueprint or declared policy"
@@ -1451,6 +1587,482 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     }
 
     Ok(lockfile.to_yaml_deterministic()?)
+}
+
+fn portable_lockfile_matches_env_blueprint(
+    lockfile: &crate::lockfile::PortableLockfile,
+    expected: &crate::lockfile::PortableLockfile,
+    env_hardening_declared: bool,
+) -> RuntimeResult<bool> {
+    if lockfile.policy.declared != expected.composition.policy {
+        return Ok(false);
+    }
+    if lockfile.composition == expected.composition
+        && lockfile.blueprint_hash == expected.blueprint_hash
+    {
+        return Ok(true);
+    }
+    if env_hardening_declared || lockfile.composition.sandbox.extra.contains_key("hardening") {
+        return Ok(false);
+    }
+
+    let mut legacy_expected = expected.composition.clone();
+    legacy_expected.sandbox.extra.remove("hardening");
+    let legacy_hash = crate::lifecycle::portable_blueprint_hash(&legacy_expected)?;
+    Ok(lockfile.composition == legacy_expected && lockfile.blueprint_hash == legacy_hash)
+}
+
+pub async fn snapshot_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    args: SnapshotEnvArgs,
+) -> RuntimeResult<SnapshotEnvResult> {
+    reject_existing_snapshot_output(&args.output)?;
+
+    let env_name = crate::env::validate_env_name(&args.env)?;
+    let description = describe_env(options, env_name.as_str())?;
+    let verified_lock_yaml = freeze_env_lockfile(options, env_name.as_str())?;
+    let lockfile = portable_snapshot_lockfile(&verified_lock_yaml)?;
+    let policy = lockfile
+        .as_ref()
+        .map(|lockfile| lockfile.policy.resolved.clone())
+        .or_else(|| description.state.resolved_policy.clone())
+        .unwrap_or_else(empty_policy_override);
+    let credential_requirements = lockfile
+        .as_ref()
+        .map(snapshot_credential_requirements)
+        .unwrap_or_default();
+    let persist_home = blueprint_persist_home(&description.blueprint_yaml, lockfile.as_ref());
+
+    let selection = selection_from_state(&description.state);
+    let handle = required_sandbox_handle(&description.state, env_name.as_str())?;
+    let events: Arc<dyn EventEmitter> = Arc::new(NoopEventEmitter);
+    let mut set = factory.build_for_env_observed(
+        &selection,
+        env_name.as_str(),
+        Arc::clone(&events),
+        Some(approval_coordinator_for_env(
+            options,
+            env_name.as_str(),
+            Arc::clone(&events),
+        )?),
+    )?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+
+    let staging_dir = create_temp_snapshot_dir(&options.root, env_name.as_str());
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).map_err(|source| crate::env::EnvError::Io {
+            path: staging_dir.clone(),
+            source,
+        })?;
+    }
+    fs::create_dir_all(&staging_dir).map_err(|source| crate::env::EnvError::Io {
+        path: staging_dir.clone(),
+        source,
+    })?;
+
+    let result = async {
+        write_snapshot_registry_files(
+            options,
+            env_name.as_str(),
+            &staging_dir,
+            &description.blueprint_yaml,
+            &verified_lock_yaml,
+            &policy,
+        )?;
+        copy_sandbox_path_out(
+            set.sandbox.as_ref(),
+            &handle,
+            "/sandbox",
+            &staging_dir.join("workspace"),
+        )
+        .await?;
+        if persist_home {
+            let home = resolve_sandbox_home(set.sandbox.as_ref(), &handle).await?;
+            copy_sandbox_path_out(
+                set.sandbox.as_ref(),
+                &handle,
+                &home,
+                &staging_dir.join("home"),
+            )
+            .await?;
+        }
+
+        let sanitizer_report = crate::snapshot::sanitize_snapshot_tree(&staging_dir)?;
+        let manifest = crate::snapshot::manifest_for_snapshot_dir(
+            &staging_dir,
+            env_name.as_str(),
+            credential_requirements,
+            sanitizer_report.stripped,
+        )?;
+        let signing_key = options.root.join("snapshot-signing.key");
+        crate::snapshot::write_signed_manifest(&staging_dir, &signing_key, &manifest)?;
+        let verified = crate::snapshot::verify_snapshot_dir(&staging_dir)?;
+        Ok::<crate::snapshot::SnapshotManifest, RuntimeError>(verified)
+    }
+    .await;
+
+    let manifest = match result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(error);
+        }
+    };
+
+    finalize_snapshot_dir_no_clobber(&staging_dir, &args.output)?;
+
+    Ok(SnapshotEnvResult {
+        path: args.output,
+        file_count: manifest.files.len(),
+        merkle_root: manifest.merkle_root,
+    })
+}
+
+pub fn verify_snapshot(path: &Path) -> RuntimeResult<SnapshotVerifyResult> {
+    let manifest = crate::snapshot::verify_snapshot_dir(path)?;
+    verify_snapshot_contents(path, &manifest)?;
+    Ok(SnapshotVerifyResult {
+        path: path.to_path_buf(),
+        file_count: manifest.files.len(),
+        merkle_root: manifest.merkle_root,
+    })
+}
+
+fn verify_snapshot_contents(
+    snapshot: &Path,
+    manifest: &crate::snapshot::SnapshotManifest,
+) -> RuntimeResult<()> {
+    verify_snapshot_manifest_compatibility(manifest)?;
+
+    let snapshot_policy = read_snapshot_policy(&snapshot.join("policy.yaml"))?;
+    let lock_path = snapshot.join("lock.yaml");
+    let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| crate::env::EnvError::Io {
+        path: lock_path,
+        source,
+    })?;
+    let lockfile = verify_snapshot_lockfile(&lock_yaml)?;
+    if lockfile.policy.resolved != snapshot_policy {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: "snapshot policy.yaml does not match lock.yaml resolved policy".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn verify_snapshot_manifest_compatibility(
+    manifest: &crate::snapshot::SnapshotManifest,
+) -> RuntimeResult<()> {
+    let min_agentenv_version =
+        semver::Version::parse(&manifest.min_agentenv_version).map_err(|source| {
+            RuntimeError::PortableLockfileVerification {
+                details: format!(
+                    "snapshot min_agentenv_version `{}` is invalid: {source}",
+                    manifest.min_agentenv_version
+                ),
+            }
+        })?;
+    let current_agentenv_version =
+        semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version must be semver");
+    if min_agentenv_version > current_agentenv_version {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: format!(
+                "snapshot min_agentenv_version `{}` is newer than current agentenv version `{}`",
+                manifest.min_agentenv_version,
+                env!("CARGO_PKG_VERSION")
+            ),
+        });
+    }
+
+    agentenv_proto::assert_compatible_schema_version(&manifest.driver_protocol_version).map_err(
+        |_| RuntimeError::PortableLockfileVerification {
+            details: format!(
+                "snapshot driver protocol version `{}` is incompatible with `{SCHEMA_VERSION}`",
+                manifest.driver_protocol_version
+            ),
+        },
+    )?;
+
+    Ok(())
+}
+
+fn verify_snapshot_lockfile(lock_yaml: &str) -> RuntimeResult<crate::lockfile::PortableLockfile> {
+    let document = crate::lockfile::LockfileDocument::from_yaml(lock_yaml)?;
+    let crate::lockfile::LockfileDocument::Portable(lockfile) = document else {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: "snapshot lock.yaml must be a portable 0.2.0 lockfile".to_owned(),
+        });
+    };
+
+    if lockfile.policy.declared != lockfile.composition.policy {
+        return Err(RuntimeError::PortableLockfileVerification {
+            details: "lock.yaml policy.declared does not match composition.policy".to_owned(),
+        });
+    }
+
+    Ok(lockfile)
+}
+
+pub async fn restore_snapshot_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    credentials: &mut dyn CredentialProvider,
+    args: SnapshotRestoreArgs,
+) -> RuntimeResult<SnapshotRestoreResult> {
+    let manifest = crate::snapshot::verify_snapshot_dir(&args.snapshot)?;
+    verify_snapshot_contents(&args.snapshot, &manifest)?;
+    let name = args.name.unwrap_or_else(|| manifest.source_env.clone());
+    let env_name = crate::env::validate_env_name(&name)?;
+    let paths = crate::env::EnvPaths::new(options.root.clone(), env_name.clone());
+    if paths.env_dir().exists() {
+        return Err(crate::env::EnvError::AlreadyExists { name }.into());
+    }
+    check_snapshot_credentials(credentials, &manifest)?;
+
+    let policy_path = args.snapshot.join("policy.yaml");
+    let snapshot_policy = read_snapshot_policy(&policy_path)?;
+    let lock_path = args.snapshot.join("lock.yaml");
+    let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| crate::env::EnvError::Io {
+        path: lock_path,
+        source,
+    })?;
+    let lock_yaml = restore_lock_yaml_with_snapshot_policy(&lock_yaml, snapshot_policy)?;
+
+    let staging_dir = create_temp_snapshot_dir(&options.root, env_name.as_str());
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir).map_err(|source| crate::env::EnvError::Io {
+            path: staging_dir.clone(),
+            source,
+        })?;
+    }
+    let _staging_cleanup = SnapshotStagingCleanup::new(staging_dir.clone());
+    copy_verified_snapshot_to_staging(&args.snapshot, &staging_dir)?;
+    crate::snapshot::sanitize_snapshot_tree(&staging_dir)?;
+    validate_restore_payload_symlinks(&staging_dir)?;
+
+    let result = async {
+        reproduce_env(options, factory, credentials, env_name.as_str(), &lock_yaml).await?;
+
+        let description = describe_env(options, env_name.as_str())?;
+        let selection = selection_from_state(&description.state);
+        let handle = required_sandbox_handle(&description.state, env_name.as_str())?;
+        let events: Arc<dyn EventEmitter> = Arc::new(NoopEventEmitter);
+        let mut set = factory.build_for_env_observed(
+            &selection,
+            env_name.as_str(),
+            Arc::clone(&events),
+            Some(approval_coordinator_for_env(
+                options,
+                env_name.as_str(),
+                Arc::clone(&events),
+            )?),
+        )?;
+        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+
+        copy_host_path_into_sandbox(
+            set.sandbox.as_ref(),
+            &handle,
+            &staging_dir.join("workspace"),
+            "/sandbox",
+        )
+        .await?;
+
+        let home_path = staging_dir.join("home");
+        if home_path.is_dir() {
+            let home = resolve_sandbox_home(set.sandbox.as_ref(), &handle).await?;
+            copy_host_path_into_sandbox(set.sandbox.as_ref(), &handle, &home_path, &home).await?;
+        }
+
+        Ok::<(), RuntimeError>(())
+    }
+    .await;
+
+    result?;
+
+    Ok(SnapshotRestoreResult {
+        name: env_name.as_str().to_owned(),
+        snapshot: args.snapshot,
+    })
+}
+
+struct SnapshotStagingCleanup {
+    path: PathBuf,
+}
+
+impl SnapshotStagingCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for SnapshotStagingCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn read_snapshot_policy(path: &Path) -> RuntimeResult<agentenv_proto::NetworkPolicy> {
+    let policy_yaml = fs::read_to_string(path).map_err(|source| crate::env::EnvError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_yaml::from_str(&policy_yaml)
+        .map_err(|source| RuntimeError::Snapshot(crate::snapshot::SnapshotError::Yaml(source)))
+}
+
+fn restore_lock_yaml_with_snapshot_policy(
+    lock_yaml: &str,
+    snapshot_policy: agentenv_proto::NetworkPolicy,
+) -> RuntimeResult<String> {
+    let document = crate::lockfile::LockfileDocument::from_yaml(lock_yaml)?;
+    let mut lockfile = match document {
+        crate::lockfile::LockfileDocument::Legacy(_) => {
+            return Err(RuntimeError::LegacyLockfileReproduce);
+        }
+        crate::lockfile::LockfileDocument::Portable(lockfile) => lockfile,
+    };
+    lockfile.policy.resolved = snapshot_policy;
+    Ok(lockfile.to_yaml_deterministic()?)
+}
+
+fn copy_verified_snapshot_to_staging(snapshot: &Path, staging_dir: &Path) -> RuntimeResult<()> {
+    fs::create_dir_all(staging_dir).map_err(|source| crate::env::EnvError::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    for entry in fs::read_dir(snapshot).map_err(|source| crate::env::EnvError::Io {
+        path: snapshot.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| crate::env::EnvError::Io {
+            path: snapshot.to_path_buf(),
+            source,
+        })?;
+        let src = entry.path();
+        let dst = staging_dir.join(entry.file_name());
+        copy_host_tree_entry(&src, &dst)?;
+    }
+    Ok(())
+}
+
+fn validate_restore_payload_symlinks(root: &Path) -> RuntimeResult<()> {
+    validate_restore_payload_symlinks_inner(root, root)
+}
+
+fn validate_restore_payload_symlinks_inner(root: &Path, current: &Path) -> RuntimeResult<()> {
+    for entry in fs::read_dir(current).map_err(|source| crate::env::EnvError::Io {
+        path: current.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| crate::env::EnvError::Io {
+            path: current.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| crate::env::EnvError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            validate_restore_payload_symlinks_inner(root, &path)?;
+            continue;
+        }
+
+        if file_type.is_symlink() {
+            let target = fs::read_link(&path).map_err(|source| crate::env::EnvError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if symlink_target_escapes_restore_payload(&target) {
+                let relative = path
+                    .strip_prefix(root)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| path.display().to_string());
+                return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                    message: format!(
+                        "unsafe snapshot symlink `{relative}` points outside restore payload"
+                    ),
+                }));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn symlink_target_escapes_restore_payload(target: &Path) -> bool {
+    target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+}
+
+fn copy_host_tree_entry(src: &Path, dst: &Path) -> RuntimeResult<()> {
+    let metadata = fs::symlink_metadata(src).map_err(|source| crate::env::EnvError::Io {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        fs::create_dir_all(dst).map_err(|source| crate::env::EnvError::Io {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+        for entry in fs::read_dir(src).map_err(|source| crate::env::EnvError::Io {
+            path: src.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| crate::env::EnvError::Io {
+                path: src.to_path_buf(),
+                source,
+            })?;
+            copy_host_tree_entry(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|source| crate::env::EnvError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    if file_type.is_file() {
+        fs::copy(src, dst).map_err(|source| crate::env::EnvError::Io {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    if file_type.is_symlink() {
+        let target = fs::read_link(src).map_err(|source| crate::env::EnvError::Io {
+            path: src.to_path_buf(),
+            source,
+        })?;
+        create_host_symlink(&target, dst).map_err(|source| crate::env::EnvError::Io {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    Err(RuntimeError::Driver(DriverError::InvalidInput {
+        message: format!("unsupported snapshot payload path `{}`", src.display()),
+    }))
+}
+
+#[cfg(unix)]
+fn create_host_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_host_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
 }
 
 pub async fn reproduce_env(
@@ -1601,30 +2213,51 @@ fn check_required_lockfile_credentials(
     lockfile: &crate::lockfile::PortableLockfile,
 ) -> RuntimeResult<()> {
     for (name, credential) in &lockfile.credentials {
-        if credential.required == Some(false) {
-            continue;
-        }
-
-        let reference = credential.reference.as_deref().unwrap_or(name);
-        match credential.source.as_str() {
-            "env" if std::env::var_os(reference).is_none() => {
-                return Err(RuntimeError::MissingCredential {
-                    name: reference.to_owned(),
-                });
-            }
-            "credstore" => match credentials.backend_name(reference)? {
-                Some(backend) if is_credstore_backend(&backend) => {}
-                _ => {
-                    return Err(RuntimeError::MissingCredential {
-                        name: reference.to_owned(),
-                    });
-                }
-            },
-            _ => {}
+        let requirement = credential_requirement_from_lockfile_ref(name, credential);
+        if credentials.resolve(&requirement)?.is_none() && requirement.required {
+            return Err(RuntimeError::MissingCredential {
+                name: requirement.name,
+            });
         }
     }
 
     Ok(())
+}
+
+fn credential_requirement_from_lockfile_ref(
+    name: &str,
+    credential: &crate::lockfile::CredentialRef,
+) -> agentenv_proto::CredentialRequirement {
+    let reference = credential.reference.as_deref().unwrap_or(name);
+    credential_requirement(reference, credential.required.unwrap_or(true))
+}
+
+fn check_snapshot_credentials(
+    credentials: &mut dyn CredentialProvider,
+    manifest: &crate::snapshot::SnapshotManifest,
+) -> RuntimeResult<()> {
+    for credential in &manifest.credential_requirements {
+        let reference = credential.reference.as_deref().unwrap_or(&credential.name);
+        let required = credential.required.unwrap_or(true);
+        let requirement = credential_requirement(reference, required);
+        if credentials.resolve(&requirement)?.is_none() && required {
+            return Err(RuntimeError::MissingCredential {
+                name: requirement.name,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn credential_requirement(name: &str, required: bool) -> agentenv_proto::CredentialRequirement {
+    agentenv_proto::CredentialRequirement {
+        name: name.to_owned(),
+        description: String::new(),
+        kind: Default::default(),
+        required,
+        validator: None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1673,13 +2306,7 @@ impl CredentialProvider for ReproducedCredentialProvider<'_> {
         let mut aliased_requirement = requirement.clone();
         aliased_requirement.name = binding.reference.clone();
         match binding.source.as_str() {
-            "env" => match std::env::var(&binding.reference) {
-                Ok(value) => Ok(Some(RuntimeSecret::new(value))),
-                Err(_) if requirement.required => Err(RuntimeError::MissingCredential {
-                    name: binding.reference.clone(),
-                }),
-                Err(_) => Ok(None),
-            },
+            "env" => self.inner.resolve(&aliased_requirement),
             "credstore" => match self.inner.backend_name(&binding.reference)? {
                 Some(backend) if is_credstore_backend(&backend) => {
                     self.inner.resolve(&aliased_requirement)
@@ -1754,14 +2381,98 @@ fn blueprint_component_from_portable(
     }
 }
 
+#[derive(Serialize)]
+struct BuildOneflightSeed<'a> {
+    version: &'static str,
+    blueprint_yaml: &'a str,
+    lock_yaml: &'a str,
+    sandbox_driver: &'a str,
+    sandbox_driver_version: String,
+    agent_driver: &'a str,
+    agent_driver_version: String,
+    context_driver: &'a str,
+    context_driver_version: String,
+    inference_driver: Option<&'a str>,
+    inference_driver_version: Option<String>,
+    metadata: BTreeMap<&'static str, String>,
+}
+
+fn build_oneflight_seed_for_byo(
+    blueprint_yaml: &str,
+    lock_yaml: &str,
+    selection: &DriverSelection,
+    resolved: &crate::lifecycle::ResolvedBlueprint,
+    context_endpoint: &agentenv_proto::McpEndpoint,
+    sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
+) -> RuntimeResult<Option<String>> {
+    if !sandbox_image_is_byo(sandbox_extra) {
+        return Ok(None);
+    }
+
+    let metadata = BTreeMap::from([
+        ("agentenv_version", env!("CARGO_PKG_VERSION").to_owned()),
+        ("agentenv_agent", selection.agent.clone()),
+        (
+            "agentenv_mcp_port",
+            mcp_endpoint_port(context_endpoint).unwrap_or_default(),
+        ),
+        ("agentenv_workspace_mount", "/sandbox".to_owned()),
+    ]);
+    let seed = BuildOneflightSeed {
+        version: BUILD_ONEFLIGHT_SEED_VERSION,
+        blueprint_yaml,
+        lock_yaml,
+        sandbox_driver: &selection.sandbox,
+        sandbox_driver_version: resolved.sandbox.version.to_string(),
+        agent_driver: &selection.agent,
+        agent_driver_version: resolved.agent.version.to_string(),
+        context_driver: &selection.context,
+        context_driver_version: resolved.context.version.to_string(),
+        inference_driver: selection.inference.as_deref(),
+        inference_driver_version: resolved
+            .inference
+            .as_ref()
+            .map(|driver| driver.version.to_string()),
+        metadata,
+    };
+    let bytes = serde_json::to_vec(&seed).map_err(|source| {
+        RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!("failed to serialize build oneflight seed: {source}"),
+        })
+    })?;
+    Ok(Some(format!(
+        "sha256:{}",
+        crate::digest::sha256_hex(&bytes)
+    )))
+}
+
+fn sandbox_image_is_byo(sandbox_extra: &BTreeMap<String, serde_yaml::Value>) -> bool {
+    sandbox_extra
+        .get("image")
+        .and_then(serde_yaml::Value::as_mapping)
+        .is_some_and(|image| yaml_mapping_string(image, "source") == Some("byo"))
+}
+
+struct SandboxSpecCreateOptions<'a> {
+    env: BTreeMap<String, String>,
+    policy: Option<agentenv_proto::NetworkPolicy>,
+    build_oneflight_seed: Option<String>,
+    resolved_hardening: Option<&'a crate::hardening::ResolvedHardening>,
+}
+
 fn sandbox_spec_for_create(
     name: &str,
     selection: &DriverSelection,
     sandbox_extra: &BTreeMap<String, serde_yaml::Value>,
     context_endpoint: &agentenv_proto::McpEndpoint,
-    env: BTreeMap<String, String>,
-    policy: Option<agentenv_proto::NetworkPolicy>,
+    options: SandboxSpecCreateOptions<'_>,
 ) -> RuntimeResult<agentenv_proto::SandboxSpec> {
+    let SandboxSpecCreateOptions {
+        env,
+        policy,
+        build_oneflight_seed,
+        resolved_hardening,
+    } = options;
     let mut metadata = BTreeMap::from([
         ("name".to_owned(), serde_json::json!(name)),
         (
@@ -1782,7 +2493,7 @@ fn sandbox_spec_for_create(
         ),
     ]);
     for (key, value) in sandbox_extra {
-        if key == "image" {
+        if matches!(key.as_str(), "image" | "hardening") {
             continue;
         }
         if is_reserved_sandbox_metadata_key(key) {
@@ -1797,6 +2508,9 @@ fn sandbox_spec_for_create(
             }
         })?;
         metadata.insert(key.clone(), value);
+    }
+    if let Some(resolved_hardening) = resolved_hardening {
+        metadata.extend(resolved_hardening.metadata.clone());
     }
     let image = match sandbox_extra.get("image") {
         Some(serde_yaml::Value::String(image)) => Some(image.clone()),
@@ -1836,6 +2550,18 @@ fn sandbox_spec_for_create(
         }
         None => None,
     };
+
+    if let Some(seed) = build_oneflight_seed {
+        metadata.insert(
+            "agentenv_build_oneflight".to_owned(),
+            serde_json::json!(BUILD_ONEFLIGHT_KIND),
+        );
+        metadata.insert("agentenv_build_seed".to_owned(), serde_json::json!(seed));
+        metadata.insert(
+            "agentenv_build_seed_version".to_owned(),
+            serde_json::json!(BUILD_ONEFLIGHT_SEED_VERSION),
+        );
+    }
 
     Ok(agentenv_proto::SandboxSpec {
         image,
@@ -1907,99 +2633,6 @@ fn byo_image_needs_computed_digest(sandbox_extra: &BTreeMap<String, serde_yaml::
             yaml_mapping_string(image, "source") == Some("byo")
                 && yaml_mapping_string(image, "expected_digest").is_none()
         })
-}
-
-fn byo_dockerfile_path(sandbox_extra: &BTreeMap<String, serde_yaml::Value>) -> Option<PathBuf> {
-    let image = sandbox_extra.get("image")?.as_mapping()?;
-    if yaml_mapping_string(image, "source") != Some("byo") {
-        return None;
-    }
-    yaml_mapping_string(image, "dockerfile").map(PathBuf::from)
-}
-
-fn dockerfile_preflight_warnings(path: &Path) -> Vec<agentenv_proto::PreflightIssue> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(source) => {
-            return vec![preflight_warning(
-                "byo_dockerfile_unreadable",
-                format!(
-                    "could not read BYO Dockerfile `{}`: {source}",
-                    path.display()
-                ),
-                Some("Check the Dockerfile path and permissions before creating the environment"),
-            )];
-        }
-    };
-
-    let mut saw_privileged = false;
-    let mut saw_cap_add = false;
-    let mut final_user = None;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.contains("--privileged") {
-            saw_privileged = true;
-        }
-        if lower.contains("cap_add") || lower.contains("cap-add") {
-            saw_cap_add = true;
-        }
-        if let Some(rest) = lower.strip_prefix("user ") {
-            final_user = rest
-                .split_whitespace()
-                .next()
-                .map(|user| user.split(':').next().unwrap_or(user).to_owned());
-        }
-    }
-
-    let mut issues = Vec::new();
-    if saw_privileged {
-        issues.push(preflight_warning(
-            "byo_dockerfile_privileged",
-            format!(
-                "BYO Dockerfile `{}` references `--privileged`, which conflicts with sandbox isolation expectations",
-                path.display()
-            ),
-            Some("Remove privileged container nesting from the sandbox image build"),
-        ));
-    }
-    if saw_cap_add {
-        issues.push(preflight_warning(
-            "byo_dockerfile_cap_add",
-            format!(
-                "BYO Dockerfile `{}` references `cap_add`, which may conflict with sandbox capability policy",
-                path.display()
-            ),
-            Some("Move Linux capability requirements into agentenv policy instead of the image"),
-        ));
-    }
-    if matches!(final_user.as_deref(), Some("root" | "0")) {
-        issues.push(preflight_warning(
-            "byo_dockerfile_user_root",
-            format!(
-                "BYO Dockerfile `{}` leaves the final image user as root",
-                path.display()
-            ),
-            Some("Set a non-root final USER that matches the sandbox policy"),
-        ));
-    }
-    issues
-}
-
-fn preflight_warning(
-    code: &str,
-    message: String,
-    remediation: Option<&str>,
-) -> agentenv_proto::PreflightIssue {
-    agentenv_proto::PreflightIssue {
-        severity: agentenv_proto::IssueSeverity::Warning,
-        code: code.to_owned(),
-        message,
-        remediation: remediation.map(ToOwned::to_owned),
-    }
 }
 
 fn sanitize_byo_build_name(name: &str) -> String {
@@ -2841,6 +3474,239 @@ fn required_sandbox_handle(state: &crate::env::EnvStateFile, name: &str) -> Runt
         })
 }
 
+async fn copy_sandbox_path_out(
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+    src_sandbox_path: &str,
+    dst_host_path: &Path,
+) -> RuntimeResult<()> {
+    sandbox
+        .copy_out(agentenv_proto::CopyOutParams {
+            handle: handle.to_owned(),
+            src_sandbox_path: src_sandbox_path.to_owned(),
+            dst_host_path: dst_host_path.display().to_string(),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn copy_host_path_into_sandbox(
+    sandbox: &dyn SandboxDriver,
+    handle: &str,
+    src_host_path: &Path,
+    dst_sandbox_path: &str,
+) -> RuntimeResult<()> {
+    sandbox
+        .copy_in(agentenv_proto::CopyInParams {
+            handle: handle.to_owned(),
+            src_host_path: src_host_path.display().to_string(),
+            dst_sandbox_path: dst_sandbox_path.to_owned(),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn resolve_sandbox_home(sandbox: &dyn SandboxDriver, handle: &str) -> RuntimeResult<String> {
+    let command = r#"printf %s "$HOME""#;
+    let result = sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle: handle.to_owned(),
+            cmd: command.to_owned(),
+            tty: false,
+            env: BTreeMap::new(),
+        })
+        .await?;
+    ensure_command_success(command, &result, &[0])?;
+
+    let home = result.stdout.trim().to_owned();
+    if home.is_empty() {
+        return Err(RuntimeError::Driver(DriverError::InvalidInput {
+            message: "sandbox HOME resolved to an empty path".to_owned(),
+        }));
+    }
+    Ok(home)
+}
+
+fn blueprint_persist_home(
+    blueprint_yaml: &str,
+    lockfile: Option<&crate::lockfile::PortableLockfile>,
+) -> bool {
+    if lockfile
+        .and_then(|lockfile| lockfile.composition.state.as_ref())
+        .and_then(|state| state.persist_home)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    serde_yaml::from_str::<serde_yaml::Value>(blueprint_yaml)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("state")
+                .and_then(|state| state.get("persist_home"))
+                .and_then(serde_yaml::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn snapshot_credential_requirements(
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> Vec<crate::snapshot::SnapshotCredentialRequirement> {
+    lockfile
+        .credentials
+        .iter()
+        .map(
+            |(name, credential)| crate::snapshot::SnapshotCredentialRequirement {
+                name: name.clone(),
+                source: credential.source.clone(),
+                reference: credential.reference.clone(),
+                required: credential.required,
+            },
+        )
+        .collect()
+}
+
+fn portable_snapshot_lockfile(
+    lock_yaml: &str,
+) -> RuntimeResult<Option<crate::lockfile::PortableLockfile>> {
+    match crate::lockfile::LockfileDocument::from_yaml(lock_yaml)? {
+        crate::lockfile::LockfileDocument::Portable(lockfile) => Ok(Some(lockfile)),
+        crate::lockfile::LockfileDocument::Legacy(_) => Ok(None),
+    }
+}
+
+fn reject_existing_snapshot_output(output: &Path) -> RuntimeResult<()> {
+    match fs::symlink_metadata(output) {
+        Ok(_) => Err(snapshot_output_exists_error(output)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(crate::env::EnvError::Io {
+            path: output.to_path_buf(),
+            source,
+        }
+        .into()),
+    }
+}
+
+fn finalize_snapshot_dir_no_clobber(staging_dir: &Path, output: &Path) -> RuntimeResult<()> {
+    match fs::create_dir(output) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(snapshot_output_exists_error(output));
+        }
+        Err(source) => {
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(crate::env::EnvError::Io {
+                path: output.to_path_buf(),
+                source,
+            }
+            .into());
+        }
+    }
+
+    let result = move_snapshot_entries(staging_dir, output);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_dir_all(output);
+            let _ = fs::remove_dir_all(staging_dir);
+            Err(error)
+        }
+    }
+}
+
+fn move_snapshot_entries(staging_dir: &Path, output: &Path) -> RuntimeResult<()> {
+    let entries = fs::read_dir(staging_dir).map_err(|source| crate::env::EnvError::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| crate::env::EnvError::Io {
+            path: staging_dir.to_path_buf(),
+            source,
+        })?;
+        let file_name = entry.file_name();
+        let destination = output.join(file_name);
+        fs::rename(entry.path(), &destination).map_err(|source| crate::env::EnvError::Io {
+            path: destination,
+            source,
+        })?;
+    }
+    fs::remove_dir(staging_dir).map_err(|source| crate::env::EnvError::Io {
+        path: staging_dir.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn snapshot_output_exists_error(output: &Path) -> RuntimeError {
+    RuntimeError::Driver(DriverError::InvalidInput {
+        message: format!("snapshot output `{}` already exists", output.display()),
+    })
+}
+
+fn write_snapshot_registry_files(
+    options: &RuntimeOptions,
+    env: &str,
+    staging_dir: &Path,
+    blueprint_yaml: &str,
+    lock_yaml: &str,
+    policy: &agentenv_proto::NetworkPolicy,
+) -> RuntimeResult<()> {
+    fs::write(staging_dir.join("blueprint.yaml"), blueprint_yaml).map_err(|source| {
+        crate::env::EnvError::Io {
+            path: staging_dir.join("blueprint.yaml"),
+            source,
+        }
+    })?;
+    fs::write(staging_dir.join("lock.yaml"), lock_yaml).map_err(|source| {
+        crate::env::EnvError::Io {
+            path: staging_dir.join("lock.yaml"),
+            source,
+        }
+    })?;
+    let rendered_policy =
+        serde_yaml::to_string(policy).map_err(RuntimeError::lockfile_serialize)?;
+    fs::write(staging_dir.join("policy.yaml"), rendered_policy).map_err(|source| {
+        crate::env::EnvError::Io {
+            path: staging_dir.join("policy.yaml"),
+            source,
+        }
+    })?;
+
+    let paths =
+        crate::env::EnvPaths::new(options.root.clone(), crate::env::validate_env_name(env)?);
+    let events_db = paths.env_dir().join("events.db");
+    match fs::symlink_metadata(&events_db) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::copy(&events_db, staging_dir.join("events.db")).map_err(|source| {
+                crate::env::EnvError::Io {
+                    path: events_db.clone(),
+                    source,
+                }
+            })?;
+        }
+        Ok(_) => {
+            return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                message: format!(
+                    "events database `{}` is not a regular file",
+                    events_db.display()
+                ),
+            }));
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(crate::env::EnvError::Io {
+                path: events_db,
+                source,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn missing_inference_driver(state: &crate::env::EnvStateFile) -> RuntimeError {
     let name = state
         .drivers
@@ -2864,6 +3730,18 @@ fn create_temp_workspace(root: &Path, name: &str) -> PathBuf {
 
     root.join(".agentenv-tmp")
         .join(format!("create-{name}-{pid}-{nanos}-{seq}"))
+}
+
+fn create_temp_snapshot_dir(root: &Path, name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let seq = CREATE_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+
+    root.join(".agentenv-tmp")
+        .join(format!("snapshot-{name}-{pid}-{nanos}-{seq}"))
 }
 
 fn env_phase_status(phase: crate::env::EnvPhase) -> String {
@@ -3361,6 +4239,9 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::Lifecycle(_)
         | RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
+        | RuntimeError::Snapshot(_)
+        | RuntimeError::Blueprint(_)
+        | RuntimeError::Hardening(_)
         | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }
@@ -3648,7 +4529,7 @@ mod tests {
         fs,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex,
+            Arc, Mutex, MutexGuard, OnceLock,
         },
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3706,6 +4587,272 @@ mod tests {
         fs::create_dir_all(env_dir).unwrap();
         let rendered = serde_json::to_string_pretty(&state).unwrap();
         fs::write(env_dir.join("state.json"), rendered).unwrap();
+    }
+
+    trait StateFixtureExt {
+        fn with_sandbox_handle(self, handle: &str) -> Self;
+    }
+
+    impl StateFixtureExt for crate::env::EnvStateFile {
+        fn with_sandbox_handle(mut self, handle: &str) -> Self {
+            self.handles.sandbox = Some(handle.to_owned());
+            self
+        }
+    }
+
+    fn snapshot_blueprint_yaml() -> &'static str {
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#
+    }
+
+    fn snapshot_persist_home_blueprint_yaml() -> &'static str {
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+state:
+  persist_home: true
+"#
+    }
+
+    fn snapshot_credential_blueprint_yaml() -> &'static str {
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#
+    }
+
+    fn snapshot_lockfile_yaml(root: &std::path::Path, name: &str, blueprint_yaml: &str) -> String {
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: name.to_owned(),
+                blueprint_yaml: blueprint_yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.to_yaml_deterministic().expect("render lockfile")
+    }
+
+    fn snapshot_lockfile_yaml_with_policy(
+        root: &std::path::Path,
+        name: &str,
+        blueprint_yaml: &str,
+        policy: agentenv_proto::NetworkPolicy,
+    ) -> String {
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: name.to_owned(),
+                blueprint_yaml: blueprint_yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.policy.resolved = policy;
+        lockfile.to_yaml_deterministic().expect("render lockfile")
+    }
+
+    fn write_snapshot_env_fixture(root: &std::path::Path, name: &str, blueprint_yaml: &str) {
+        let env_dir = root.join("envs").join(name);
+        let lock_yaml = snapshot_lockfile_yaml(root, name, blueprint_yaml);
+        fs::create_dir_all(&env_dir).unwrap();
+        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+        fs::write(env_dir.join("lock.yaml"), lock_yaml).unwrap();
+        let _store = agentenv_approvals::ApprovalStore::open(env_dir.join("events.db")).unwrap();
+        write_state_json(
+            &env_dir,
+            state_fixture(name).with_sandbox_handle("sb-snapshot"),
+        );
+    }
+
+    fn write_signed_snapshot_fixture(
+        root: &std::path::Path,
+        source_env: &str,
+        credential_requirements: Vec<crate::snapshot::SnapshotCredentialRequirement>,
+    ) -> std::path::PathBuf {
+        write_signed_snapshot_fixture_with(
+            root,
+            source_env,
+            credential_requirements,
+            super::empty_policy_override(),
+            |_| {},
+        )
+    }
+
+    fn write_signed_snapshot_fixture_with(
+        root: &std::path::Path,
+        source_env: &str,
+        credential_requirements: Vec<crate::snapshot::SnapshotCredentialRequirement>,
+        policy: agentenv_proto::NetworkPolicy,
+        populate: impl FnOnce(&std::path::Path),
+    ) -> std::path::PathBuf {
+        write_signed_snapshot_fixture_with_blueprint(
+            root,
+            source_env,
+            credential_requirements,
+            policy,
+            snapshot_blueprint_yaml(),
+            populate,
+        )
+    }
+
+    fn write_signed_snapshot_fixture_with_blueprint(
+        root: &std::path::Path,
+        source_env: &str,
+        credential_requirements: Vec<crate::snapshot::SnapshotCredentialRequirement>,
+        policy: agentenv_proto::NetworkPolicy,
+        blueprint_yaml: &str,
+        populate: impl FnOnce(&std::path::Path),
+    ) -> std::path::PathBuf {
+        let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
+        fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+        fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+        populate(&snapshot_dir);
+        fs::write(snapshot_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+        fs::write(
+            snapshot_dir.join("lock.yaml"),
+            snapshot_lockfile_yaml_with_policy(root, source_env, blueprint_yaml, policy.clone()),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("policy.yaml"),
+            serde_yaml::to_string(&policy).unwrap(),
+        )
+        .unwrap();
+        let manifest = crate::snapshot::manifest_for_snapshot_dir(
+            &snapshot_dir,
+            source_env,
+            credential_requirements,
+            Vec::new(),
+        )
+        .expect("manifest");
+        crate::snapshot::write_signed_manifest(
+            &snapshot_dir,
+            &root.join("snapshot-signing.key"),
+            &manifest,
+        )
+        .expect("write signed manifest");
+        snapshot_dir
+    }
+
+    fn write_custom_signed_snapshot(
+        root: &std::path::Path,
+        source_env: &str,
+        lock_yaml: &str,
+        policy_yaml: &str,
+    ) -> std::path::PathBuf {
+        write_custom_signed_snapshot_with_manifest(root, source_env, lock_yaml, policy_yaml, |_| {})
+    }
+
+    fn write_custom_signed_snapshot_with_manifest(
+        root: &std::path::Path,
+        source_env: &str,
+        lock_yaml: &str,
+        policy_yaml: &str,
+        mutate_manifest: impl FnOnce(&mut crate::snapshot::SnapshotManifest),
+    ) -> std::path::PathBuf {
+        let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
+        fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+        fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+        fs::write(
+            snapshot_dir.join("blueprint.yaml"),
+            snapshot_blueprint_yaml(),
+        )
+        .unwrap();
+        fs::write(snapshot_dir.join("lock.yaml"), lock_yaml).unwrap();
+        fs::write(snapshot_dir.join("policy.yaml"), policy_yaml).unwrap();
+        let mut manifest = crate::snapshot::manifest_for_snapshot_dir(
+            &snapshot_dir,
+            source_env,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("manifest");
+        mutate_manifest(&mut manifest);
+        crate::snapshot::write_signed_manifest(
+            &snapshot_dir,
+            &root.join("snapshot-signing.key"),
+            &manifest,
+        )
+        .expect("write signed manifest");
+        snapshot_dir
+    }
+
+    struct EnvVarGuard {
+        _lock: MutexGuard<'static, ()>,
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env var test lock");
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self {
+                _lock: lock,
+                name,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
     }
 
     #[test]
@@ -3801,6 +4948,253 @@ mod tests {
                 context: Box::new(TinyContextDriver),
                 inference: None,
             })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SnapshotFactory {
+        copied_out: Arc<Mutex<Vec<(String, String)>>>,
+        copied_in: Arc<Mutex<Vec<(String, String)>>>,
+        copied_in_entries: SnapshotCopyInEntries,
+        execs: Arc<Mutex<Vec<String>>>,
+        env_builds: Arc<Mutex<Vec<String>>>,
+        output_race: Arc<Mutex<Option<SnapshotOutputRace>>>,
+    }
+
+    impl DriverFactory for SnapshotFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            self.build_snapshot_driver_set()
+        }
+
+        fn build_for_env_observed(
+            &self,
+            _selection: &super::DriverSelection,
+            env: &str,
+            _events: Arc<dyn EventEmitter>,
+            _approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+        ) -> super::RuntimeResult<DriverSet> {
+            self.env_builds
+                .lock()
+                .expect("env build tracker")
+                .push(env.to_owned());
+            self.build_snapshot_driver_set()
+        }
+    }
+
+    impl SnapshotFactory {
+        fn build_snapshot_driver_set(&self) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(SnapshotSandbox {
+                    copied_out: Arc::clone(&self.copied_out),
+                    copied_in: Arc::clone(&self.copied_in),
+                    copied_in_entries: Arc::clone(&self.copied_in_entries),
+                    execs: Arc::clone(&self.execs),
+                    output_race: Arc::clone(&self.output_race),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    enum SnapshotOutputRace {
+        File(std::path::PathBuf),
+        Directory(std::path::PathBuf),
+    }
+
+    type SnapshotCopyInEntry = (String, String, Vec<String>);
+    type SnapshotCopyInEntries = Arc<Mutex<Vec<SnapshotCopyInEntry>>>;
+
+    struct SnapshotSandbox {
+        copied_out: Arc<Mutex<Vec<(String, String)>>>,
+        copied_in: Arc<Mutex<Vec<(String, String)>>>,
+        copied_in_entries: SnapshotCopyInEntries,
+        execs: Arc<Mutex<Vec<String>>>,
+        output_race: Arc<Mutex<Option<SnapshotOutputRace>>>,
+    }
+
+    fn snapshot_copy_in_entries(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+        let mut entries = Vec::new();
+        if path.is_dir() {
+            snapshot_copy_in_entries_inner(path, path, &mut entries)?;
+        } else if path.exists() {
+            entries.push(String::new());
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    fn snapshot_copy_in_entries_inner(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        entries: &mut Vec<String>,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(current)? {
+            let path = entry?.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(std::io::Error::other)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.push(relative);
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                snapshot_copy_in_entries_inner(root, &path, entries)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[async_trait]
+    impl SandboxDriver for SnapshotSandbox {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            TinySandboxDriver.initialize(params).await
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            self.execs
+                .lock()
+                .expect("exec tracker")
+                .push(params.cmd.clone());
+            if params.cmd == r#"printf %s "$HOME""# {
+                return Ok(agentenv_proto::ExecResult {
+                    status: 0,
+                    stdout: "/home/agent".to_owned(),
+                    stderr: String::new(),
+                });
+            }
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            self.copied_in.lock().expect("copy in tracker").push((
+                params.src_host_path.clone(),
+                params.dst_sandbox_path.clone(),
+            ));
+            let entries = snapshot_copy_in_entries(std::path::Path::new(&params.src_host_path))
+                .map_err(|source| crate::driver::DriverError::InvalidInput {
+                    message: format!("read copy-in source entries: {source}"),
+                })?;
+            self.copied_in_entries
+                .lock()
+                .expect("copy in entry tracker")
+                .push((
+                    params.src_host_path.clone(),
+                    params.dst_sandbox_path.clone(),
+                    entries,
+                ));
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            self.copied_out.lock().expect("copy out tracker").push((
+                params.src_sandbox_path.clone(),
+                params.dst_host_path.clone(),
+            ));
+            if let Some(race) = self.output_race.lock().expect("output race tracker").take() {
+                match race {
+                    SnapshotOutputRace::File(path) => {
+                        fs::write(path, "existing output\n").map_err(|source| {
+                            crate::driver::DriverError::InvalidInput {
+                                message: format!("create raced output file: {source}"),
+                            }
+                        })?;
+                    }
+                    SnapshotOutputRace::Directory(path) => {
+                        fs::create_dir_all(&path).map_err(|source| {
+                            crate::driver::DriverError::InvalidInput {
+                                message: format!("create raced output dir: {source}"),
+                            }
+                        })?;
+                    }
+                }
+            }
+            let dst = std::path::PathBuf::from(&params.dst_host_path);
+            fs::create_dir_all(&dst).map_err(|source| {
+                crate::driver::DriverError::InvalidInput {
+                    message: format!("create copy-out dir `{}`: {source}", dst.display()),
+                }
+            })?;
+            fs::write(
+                dst.join("copied.txt"),
+                format!("copied from {}\n", params.src_sandbox_path),
+            )
+            .map_err(|source| crate::driver::DriverError::InvalidInput {
+                message: format!("write copied file under `{}`: {source}", dst.display()),
+            })?;
+            Ok(EmptyResult {})
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.shutdown(params).await
         }
     }
 
@@ -4074,6 +5468,38 @@ mod tests {
 
         fn backend_name(&self, _name: &str) -> super::RuntimeResult<Option<String>> {
             Ok(self.backend.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct ResolvingCredentialProvider {
+        values: BTreeMap<String, String>,
+        resolved: Vec<agentenv_proto::CredentialRequirement>,
+    }
+
+    impl ResolvingCredentialProvider {
+        fn with_value(name: &str, value: &str) -> Self {
+            Self {
+                values: BTreeMap::from([(name.to_owned(), value.to_owned())]),
+                resolved: Vec::new(),
+            }
+        }
+    }
+
+    impl super::CredentialProvider for ResolvingCredentialProvider {
+        fn resolve(
+            &mut self,
+            requirement: &agentenv_proto::CredentialRequirement,
+        ) -> super::RuntimeResult<Option<RuntimeSecret>> {
+            self.resolved.push(requirement.clone());
+            Ok(self
+                .values
+                .get(&requirement.name)
+                .map(|value| RuntimeSecret::new(value.clone())))
+        }
+
+        fn backend_name(&self, _name: &str) -> super::RuntimeResult<Option<String>> {
+            Ok(None)
         }
     }
 
@@ -5913,6 +7339,206 @@ policy:
             )
         );
         assert_eq!(metadata["agentenv_agent"], serde_json::json!("codex"));
+        assert_eq!(
+            metadata["agentenv_build_oneflight"],
+            serde_json::json!("byo-openshell-v1")
+        );
+        assert_eq!(
+            metadata["agentenv_build_seed_version"],
+            serde_json::json!("1")
+        );
+        let seed = metadata["agentenv_build_seed"]
+            .as_str()
+            .expect("seed metadata is a string");
+        crate::digest::parse_sha256_digest(seed).expect("seed is a sha256 digest");
+    }
+
+    #[tokio::test]
+    async fn create_env_omits_build_oneflight_metadata_for_non_byo_image() {
+        let root = unique_root("agentenv-create-non-byo-no-build-seed");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  image: openclaw
+  digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        let metadata = &specs[0].metadata;
+        assert!(!metadata.contains_key("agentenv_build_oneflight"));
+        assert!(!metadata.contains_key("agentenv_build_seed"));
+        assert!(!metadata.contains_key("agentenv_build_seed_version"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_spec_defaults_to_baseline_hardening_metadata() {
+        let root = unique_root("agentenv-create-baseline-hardening");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].metadata["hardening_profile"],
+            serde_json::json!("baseline")
+        );
+        assert!(specs[0]
+            .metadata
+            .contains_key("hardening_dockerfile_fragment"));
+    }
+
+    #[tokio::test]
+    async fn sandbox_spec_propagates_strict_hardening_metadata() {
+        let root = unique_root("agentenv-create-strict-hardening");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  hardening: strict
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].metadata["hardening_profile"],
+            serde_json::json!("strict")
+        );
+        assert_eq!(
+            specs[0].metadata["hardening_ulimit_nproc"],
+            serde_json::json!(512)
+        );
+    }
+
+    #[test]
+    fn portable_lockfile_records_default_hardening_profile() {
+        let root = unique_root("agentenv-portable-default-hardening");
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+
+        assert_eq!(
+            lockfile.composition.sandbox.extra["hardening"],
+            serde_yaml::Value::String("baseline".to_owned())
+        );
+        assert!(lockfile
+            .policy
+            .resolved
+            .filesystem
+            .read_only
+            .contains(&"/etc".to_owned()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -6169,19 +7795,25 @@ USER root
 
         super::add_byo_dockerfile_preflight_warnings(&mut report, &sandbox_extra);
 
-        assert_eq!(report.status, crate::admission::AdmissionStatus::Accepted);
+        assert_eq!(report.status, crate::admission::AdmissionStatus::Rejected);
+        assert_eq!(
+            report.reason_code,
+            crate::admission::ReasonCode::PreflightFailed
+        );
         let codes = report.checks[0]
             .issues
             .iter()
             .map(|issue| issue.code.as_str())
             .collect::<Vec<_>>();
-        assert!(codes.contains(&"byo_dockerfile_privileged"));
-        assert!(codes.contains(&"byo_dockerfile_cap_add"));
-        assert!(codes.contains(&"byo_dockerfile_user_root"));
+        assert!(codes.contains(&"dockerfile_privileged"));
+        assert!(codes.contains(&"dockerfile_cap_add"));
+        assert!(codes.contains(&"dockerfile_user_root"));
+        assert!(codes.contains(&"dockerfile_missing_hardening_marker"));
         assert!(report.checks[0]
             .issues
             .iter()
-            .all(|issue| issue.severity == agentenv_proto::IssueSeverity::Warning));
+            .any(|issue| issue.code == "dockerfile_user_root"
+                && issue.severity == agentenv_proto::IssueSeverity::Error));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6595,6 +8227,968 @@ policy:
     }
 
     #[tokio::test]
+    async fn snapshot_env_copies_workspace_and_writes_signed_manifest() {
+        let root = unique_root("agentenv-runtime-snapshot");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let blueprint_yaml = snapshot_blueprint_yaml();
+        write_snapshot_env_fixture(&root, "demo", blueprint_yaml);
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+
+        let result = super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect("snapshot env");
+
+        assert_eq!(result.path, output);
+        assert!(result.file_count > 0);
+        assert!(!result.merkle_root.is_empty());
+        assert!(output.join("manifest.json").is_file());
+        assert!(output.join("signatures.json").is_file());
+        assert!(output.join("blueprint.yaml").is_file());
+        assert!(output.join("lock.yaml").is_file());
+        assert!(output.join("policy.yaml").is_file());
+        assert!(output.join("events.db").is_file());
+        assert!(output.join("workspace").join("copied.txt").is_file());
+        let manifest =
+            crate::snapshot::verify_snapshot_dir(&output).expect("snapshot should verify");
+        assert_eq!(manifest.source_env, "demo");
+        assert_eq!(manifest.files.len(), result.file_count);
+        assert_eq!(manifest.merkle_root, result.merkle_root);
+        let copied_out = factory.copied_out.lock().expect("copy out tracker").clone();
+        assert!(copied_out.iter().any(|(src, dst)| {
+            src == "/sandbox" && std::path::Path::new(dst).ends_with("workspace")
+        }));
+        assert_eq!(
+            *factory.env_builds.lock().expect("env build tracker"),
+            vec!["demo".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_rejects_output_file_created_during_finalize_without_clobbering() {
+        let root = unique_root("agentenv-runtime-snapshot-output-file");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+        *factory.output_race.lock().expect("output race tracker") =
+            Some(SnapshotOutputRace::File(output.clone()));
+
+        let err = super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect_err("snapshot must reject raced output file");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Driver(crate::driver::DriverError::InvalidInput { .. })
+        ));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "existing output\n");
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_rejects_output_directory_created_during_finalize_without_clobbering() {
+        let root = unique_root("agentenv-runtime-snapshot-output-dir");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+        *factory.output_race.lock().expect("output race tracker") =
+            Some(SnapshotOutputRace::Directory(output.clone()));
+
+        let err = super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect_err("snapshot must reject raced output directory");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Driver(crate::driver::DriverError::InvalidInput { .. })
+        ));
+        assert!(output.is_dir());
+        assert!(!output.join("manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_persist_home_resolves_home_and_copies_it_out() {
+        let root = unique_root("agentenv-runtime-snapshot-home");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_persist_home_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+
+        super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect("snapshot env");
+
+        assert!(factory
+            .execs
+            .lock()
+            .expect("exec tracker")
+            .contains(&r#"printf %s "$HOME""#.to_owned()));
+        let copied_out = factory.copied_out.lock().expect("copy out tracker").clone();
+        assert!(copied_out.iter().any(|(src, dst)| {
+            src == "/home/agent" && std::path::Path::new(dst).ends_with("home")
+        }));
+        let manifest = crate::snapshot::verify_snapshot_dir(&output).expect("verify snapshot");
+        assert!(manifest.sections.contains_key("home"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_env_manifest_includes_portable_lockfile_credential_requirements() {
+        let root = unique_root("agentenv-runtime-snapshot-credentials");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        write_snapshot_env_fixture(&root, "demo", snapshot_credential_blueprint_yaml());
+        let output = root.join("demo.agentenvsnap");
+        let factory = SnapshotFactory::default();
+
+        super::snapshot_env(
+            &options,
+            &factory,
+            super::SnapshotEnvArgs {
+                env: "demo".to_owned(),
+                output: output.clone(),
+            },
+        )
+        .await
+        .expect("snapshot env");
+
+        let manifest = crate::snapshot::verify_snapshot_dir(&output).expect("verify snapshot");
+        assert_eq!(manifest.credential_requirements.len(), 1);
+        assert_eq!(manifest.credential_requirements[0].name, "OPENAI_API_KEY");
+        assert_eq!(manifest.credential_requirements[0].source, "env");
+        assert_eq!(
+            manifest.credential_requirements[0].reference.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(manifest.credential_requirements[0].required, Some(true));
+
+        let lock_yaml = fs::read_to_string(output.join("lock.yaml")).unwrap();
+        let crate::lockfile::LockfileDocument::Portable(lockfile) =
+            crate::lockfile::LockfileDocument::from_yaml(&lock_yaml)
+                .expect("snapshot lockfile should remain parseable")
+        else {
+            panic!("snapshot lockfile should be portable");
+        };
+        assert_eq!(
+            lockfile.credentials["OPENAI_API_KEY"].reference.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            lockfile.composition.agent.credentials["OPENAI_API_KEY"]
+                .reference
+                .as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_returns_manifest_summary() {
+        let root = unique_root("agentenv-runtime-verify-snapshot");
+        let snapshot_dir = root.join("minimal.agentenvsnap");
+        fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+        fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+        fs::write(
+            snapshot_dir.join("blueprint.yaml"),
+            snapshot_blueprint_yaml(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("lock.yaml"),
+            snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("policy.yaml"),
+            serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+        )
+        .unwrap();
+        let manifest = crate::snapshot::manifest_for_snapshot_dir(
+            &snapshot_dir,
+            "demo",
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("manifest");
+        crate::snapshot::write_signed_manifest(
+            &snapshot_dir,
+            &root.join("snapshot-signing.key"),
+            &manifest,
+        )
+        .expect("write signed manifest");
+
+        let result = super::verify_snapshot(&snapshot_dir).expect("verify snapshot");
+
+        assert_eq!(result.path, snapshot_dir);
+        assert_eq!(result.file_count, manifest.files.len());
+        assert_eq!(result.merkle_root, manifest.merkle_root);
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_malformed_embedded_lockfile() {
+        let root = unique_root("agentenv-runtime-verify-malformed-lock");
+        let snapshot_dir = write_custom_signed_snapshot(
+            &root,
+            "demo",
+            "version: 0.2.0\ncredentials: '[redacted]'\n",
+            &serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with malformed lockfile must fail verification");
+
+        assert!(
+            err.to_string().contains("lockfile") || err.to_string().contains("credentials"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_malformed_snapshot_policy() {
+        let root = unique_root("agentenv-runtime-verify-malformed-policy");
+        let snapshot_dir = write_custom_signed_snapshot(
+            &root,
+            "demo",
+            &snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+            "filesystem: [\n",
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with malformed policy must fail verification");
+
+        assert!(
+            err.to_string().contains("YAML") || err.to_string().contains("policy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_incompatible_min_agentenv_version() {
+        let root = unique_root("agentenv-runtime-verify-min-version");
+        let snapshot_dir = write_custom_signed_snapshot_with_manifest(
+            &root,
+            "demo",
+            &snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+            &serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+            |manifest| {
+                manifest.min_agentenv_version = "999.0.0".to_owned();
+            },
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with future min_agentenv_version must fail");
+
+        assert!(
+            err.to_string().contains("min_agentenv_version")
+                || err.to_string().contains("agentenv version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_rejects_incompatible_driver_protocol_version() {
+        let root = unique_root("agentenv-runtime-verify-driver-protocol");
+        let snapshot_dir = write_custom_signed_snapshot_with_manifest(
+            &root,
+            "demo",
+            &snapshot_lockfile_yaml_with_policy(
+                &root,
+                "demo",
+                snapshot_blueprint_yaml(),
+                super::empty_policy_override(),
+            ),
+            &serde_yaml::to_string(&super::empty_policy_override()).unwrap(),
+            |manifest| {
+                manifest.driver_protocol_version = "999.0".to_owned();
+            },
+        );
+
+        let err = super::verify_snapshot(&snapshot_dir)
+            .expect_err("signed snapshot with incompatible driver protocol must fail");
+
+        assert!(
+            err.to_string().contains("driver protocol"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_refuses_missing_credentials_before_create() {
+        let root = unique_root("agentenv-runtime-restore-missing-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("restore must fail before creating env");
+
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+        assert!(
+            !root.join("envs").join("restored").exists(),
+            "credential failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_refuses_existing_target_before_credentials() {
+        let root = unique_root("agentenv-runtime-restore-existing-before-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        write_snapshot_env_fixture(&root, "restored", snapshot_blueprint_yaml());
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("restore must reject existing target before credentials");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Env(crate::env::EnvError::AlreadyExists { ref name }) if name == "restored"
+        ));
+        assert!(!err.to_string().contains("OPENAI_API_KEY"));
+        assert!(
+            factory
+                .env_builds
+                .lock()
+                .expect("env build tracker")
+                .is_empty(),
+            "restore must not reproduce an existing env"
+        );
+        assert!(
+            factory
+                .copied_in
+                .lock()
+                .expect("copy in tracker")
+                .is_empty(),
+            "restore must not copy into an existing env"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_resolves_manifest_credentials_through_provider() {
+        let root = unique_root("agentenv-runtime-restore-provider-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("OPENAI_API_KEY", "sk-test-provider");
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore should use provider-resolved snapshot credential");
+
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert_eq!(credentials.resolved.len(), 1);
+        assert_eq!(credentials.resolved[0].name, "OPENAI_API_KEY");
+        assert!(credentials.resolved[0].required);
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_resolves_lockfile_credentials_through_provider_without_env() {
+        let root = unique_root("agentenv-runtime-restore-provider-lockfile-credential");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture_with_blueprint(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+            super::empty_policy_override(),
+            snapshot_credential_blueprint_yaml(),
+            |_| {},
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("OPENAI_API_KEY", "sk-test-provider");
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore should use provider-resolved lockfile credential");
+
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert!(
+            credentials
+                .resolved
+                .iter()
+                .filter(|requirement| requirement.name == "OPENAI_API_KEY")
+                .count()
+                >= 2,
+            "restore should resolve both manifest and lockfile credential requirements"
+        );
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+        let copied_in = factory.copied_in.lock().expect("copy in tracker").clone();
+        assert!(copied_in.iter().any(|(src, dst)| {
+            std::path::Path::new(src).ends_with("workspace") && dst == "/sandbox"
+        }));
+        let copied_in_entries = factory
+            .copied_in_entries
+            .lock()
+            .expect("copy in entry tracker")
+            .clone();
+        let (_, _, workspace_entries) = copied_in_entries
+            .iter()
+            .find(|(_, dst, _)| dst == "/sandbox")
+            .expect("workspace copy-in should be recorded");
+        assert!(
+            workspace_entries.iter().any(|entry| entry == "README.md"),
+            "workspace staging directory must remain populated until copy-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_rejects_required_manifest_credential_when_provider_returns_none() {
+        let root = unique_root("agentenv-runtime-restore-provider-missing");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(true),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = ResolvingCredentialProvider::default();
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("restore should reject unresolved required snapshot credential");
+
+        assert!(matches!(
+            err,
+            RuntimeError::MissingCredential { ref name } if name == "OPENAI_API_KEY"
+        ));
+        assert_eq!(credentials.resolved.len(), 1);
+        assert!(
+            factory
+                .env_builds
+                .lock()
+                .expect("env build tracker")
+                .is_empty(),
+            "credential failure must happen before env reproduction"
+        );
+        assert!(
+            !root.join("envs").join("restored").exists(),
+            "credential failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_allows_optional_unresolved_manifest_credential() {
+        let root = unique_root("agentenv-runtime-restore-provider-optional");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let _env_guard = EnvVarGuard::unset("OPENAI_API_KEY");
+        let snapshot_dir = write_signed_snapshot_fixture(
+            &root,
+            "demo",
+            vec![crate::snapshot::SnapshotCredentialRequirement {
+                name: "OPENAI_API_KEY".to_owned(),
+                source: "env".to_owned(),
+                reference: Some("OPENAI_API_KEY".to_owned()),
+                required: Some(false),
+            }],
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = ResolvingCredentialProvider::default();
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("optional unresolved snapshot credential should not block restore");
+
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert_eq!(credentials.resolved.len(), 1);
+        assert!(!credentials.resolved[0].required);
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_reproduces_then_copies_workspace() {
+        let root = unique_root("agentenv-runtime-restore-workspace");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let snapshot_dir = write_signed_snapshot_fixture(&root, "demo", Vec::new());
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore snapshot");
+
+        assert_eq!(result.name, "restored");
+        assert_eq!(result.snapshot, snapshot_dir);
+        assert!(root
+            .join("envs")
+            .join("restored")
+            .join("state.json")
+            .is_file());
+        let copied_in = factory.copied_in.lock().expect("copy in tracker").clone();
+        assert!(copied_in.iter().any(|(src, dst)| {
+            std::path::Path::new(src).ends_with("workspace") && dst == "/sandbox"
+        }));
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_persists_snapshot_policy_yaml() {
+        let root = unique_root("agentenv-runtime-restore-policy");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let distinctive_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "snapshot-policy.example".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        };
+        let mut snapshot_policy = super::empty_policy_override();
+        snapshot_policy.network.allow.push(distinctive_rule.clone());
+        let snapshot_dir =
+            write_signed_snapshot_fixture_with(&root, "demo", Vec::new(), snapshot_policy, |_| {});
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore snapshot");
+
+        let description = super::describe_env(&options, "restored").expect("describe restored env");
+        let restored_policy = description
+            .state
+            .resolved_policy
+            .expect("restored policy should be persisted");
+        assert!(restored_policy.network.allow.contains(&distinctive_rule));
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_sanitizes_workspace_before_copying() {
+        let root = unique_root("agentenv-runtime-restore-sanitize-workspace");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let snapshot_dir = write_signed_snapshot_fixture_with(
+            &root,
+            "demo",
+            Vec::new(),
+            super::empty_policy_override(),
+            |snapshot_dir| {
+                fs::write(
+                    snapshot_dir.join("workspace").join("credentials.local"),
+                    "credential payload\n",
+                )
+                .unwrap();
+            },
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir.clone(),
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore snapshot");
+
+        assert!(snapshot_dir
+            .join("workspace")
+            .join("credentials.local")
+            .is_file());
+        let copied_in_entries = factory
+            .copied_in_entries
+            .lock()
+            .expect("copy in entry tracker")
+            .clone();
+        let workspace_entries = copied_in_entries
+            .iter()
+            .find(|(_, dst, _)| dst == "/sandbox")
+            .expect("workspace copied into sandbox");
+        assert!(workspace_entries.2.contains(&"README.md".to_owned()));
+        assert!(!workspace_entries
+            .2
+            .contains(&"credentials.local".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_rejects_leaked_secret_before_create() {
+        let root = unique_root("agentenv-runtime-restore-leaked-secret");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let leaked_secret = "sk-testMALFORMEDSECRET";
+        let snapshot_dir = write_signed_snapshot_fixture_with(
+            &root,
+            "demo",
+            Vec::new(),
+            super::empty_policy_override(),
+            |snapshot_dir| {
+                fs::write(
+                    snapshot_dir.join("workspace").join("leak.txt"),
+                    format!("token={leaked_secret}\n"),
+                )
+                .unwrap();
+            },
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect_err("leaked snapshot secret should fail restore");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("secret patterns"));
+        assert!(rendered.contains("workspace/leak.txt"));
+        assert!(
+            !rendered.contains(leaked_secret),
+            "restore error leaked secret: {rendered}"
+        );
+        assert!(
+            !root.join("envs").join("restored").exists(),
+            "sanitizer failure must happen before env creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_strips_unsafe_symlink_before_copying() {
+        let root = unique_root("agentenv-runtime-restore-unsafe-symlink");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let snapshot_dir = write_signed_snapshot_fixture_with(
+            &root,
+            "demo",
+            Vec::new(),
+            super::empty_policy_override(),
+            |snapshot_dir| {
+                super::create_host_symlink(
+                    std::path::Path::new("../outside"),
+                    &snapshot_dir.join("workspace").join("escape"),
+                )
+                .expect("create unsafe workspace symlink");
+            },
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("unsafe snapshot symlink should be stripped before restore copy-in");
+
+        assert_eq!(result.name, "restored");
+        assert!(
+            root.join("envs").join("restored").exists(),
+            "restore should create the target env after stripping unsafe symlinks"
+        );
+        let copied_in_entries = factory
+            .copied_in_entries
+            .lock()
+            .expect("copy in entry tracker")
+            .clone();
+        let (_, _, workspace_entries) = copied_in_entries
+            .iter()
+            .find(|(_, dst, _)| dst == "/sandbox")
+            .expect("workspace copy-in should be recorded");
+        assert!(workspace_entries.iter().any(|entry| entry == "README.md"));
+        assert!(
+            !workspace_entries.iter().any(|entry| entry == "escape"),
+            "unsafe symlink must not be copied into the restored sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_sanitizes_home_before_copying() {
+        let root = unique_root("agentenv-runtime-restore-sanitize-home");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let snapshot_dir = write_signed_snapshot_fixture_with(
+            &root,
+            "demo",
+            Vec::new(),
+            super::empty_policy_override(),
+            |snapshot_dir| {
+                fs::create_dir_all(snapshot_dir.join("home").join(".codex")).unwrap();
+                fs::write(
+                    snapshot_dir
+                        .join("home")
+                        .join(".codex")
+                        .join("credentials.json"),
+                    "{}\n",
+                )
+                .unwrap();
+                fs::write(snapshot_dir.join("home").join("notes.txt"), "safe\n").unwrap();
+            },
+        );
+        let factory = SnapshotFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::restore_snapshot_env(
+            &options,
+            &factory,
+            &mut credentials,
+            super::SnapshotRestoreArgs {
+                snapshot: snapshot_dir,
+                name: Some("restored".to_owned()),
+            },
+        )
+        .await
+        .expect("restore snapshot");
+
+        let copied_in_entries = factory
+            .copied_in_entries
+            .lock()
+            .expect("copy in entry tracker")
+            .clone();
+        let home_entries = copied_in_entries
+            .iter()
+            .find(|(_, dst, _)| dst == "/home/agent")
+            .expect("home copied into sandbox");
+        assert!(home_entries.2.contains(&"notes.txt".to_owned()));
+        assert!(!home_entries
+            .2
+            .contains(&".codex/credentials.json".to_owned()));
+    }
+
+    #[tokio::test]
     async fn create_env_installs_agent_config_entrypoint_and_probe() {
         let root = unique_root("agentenv-agent-setup");
         let options = RuntimeOptions {
@@ -6787,6 +9381,10 @@ version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
 sandbox:
   driver: openshell
+  image:
+    source: byo
+    dockerfile: /tmp/legacy-sandbox/Dockerfile
+    expected_digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 agent:
   driver: codex
 context:
@@ -6809,6 +9407,17 @@ policy:
             },
         )
         .expect("build portable lockfile");
+        lockfile.composition.sandbox.extra.remove("hardening");
+        lockfile.blueprint_hash = crate::lifecycle::portable_blueprint_hash(&lockfile.composition)
+            .expect("recompute legacy blueprint hash");
+        let registry = agentenv_policy::PresetRegistry::load_builtin().expect("load presets");
+        lockfile.policy.resolved = agentenv_policy::compose_policy(
+            agentenv_policy::Tier::Restricted,
+            &[],
+            None,
+            &registry,
+        )
+        .expect("compose legacy policy");
         let pinned_rule = agentenv_proto::NetworkRule {
             target: NetworkTarget::Host {
                 host: "pinned.example".to_owned(),
@@ -6858,6 +9467,26 @@ policy:
         assert!(
             !create_policies[0].network.allow.contains(&context_rule),
             "sandbox create policy should not add context-required rules during reproduce"
+        );
+        let create_specs = tracker
+            .create_specs
+            .lock()
+            .expect("create spec tracker")
+            .clone();
+        assert_eq!(create_specs.len(), 1);
+        assert_eq!(
+            create_specs[0].metadata["byo_dockerfile"],
+            serde_json::json!("/tmp/legacy-sandbox/Dockerfile")
+        );
+        assert!(
+            !create_specs[0]
+                .metadata
+                .contains_key("hardening_dockerfile_fragment"),
+            "legacy lockfiles without sandbox.hardening must not inject image hardening"
+        );
+        assert!(
+            !create_specs[0].metadata.contains_key("hardening_profile"),
+            "legacy lockfiles without sandbox.hardening must not default hardening metadata"
         );
         let applied_policies = tracker
             .applied_policies
@@ -7148,6 +9777,89 @@ policy:
         assert!(frozen.contains("name: renamed-demo"));
         assert!(frozen.contains("resolved:"));
         assert!(frozen.contains("frozen-pinned.example"));
+    }
+
+    #[tokio::test]
+    async fn freeze_after_reproduce_accepts_legacy_lockfile_without_hardening() {
+        let root = unique_root("agentenv-freeze-legacy-no-hardening");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "source-demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.composition.sandbox.extra.remove("hardening");
+        lockfile.blueprint_hash = crate::lifecycle::portable_blueprint_hash(&lockfile.composition)
+            .expect("recompute legacy blueprint hash");
+        let registry = agentenv_policy::PresetRegistry::load_builtin().expect("load presets");
+        lockfile.policy.resolved = agentenv_policy::compose_policy(
+            agentenv_policy::Tier::Restricted,
+            &[],
+            None,
+            &registry,
+        )
+        .expect("compose legacy policy");
+        lockfile
+            .policy
+            .resolved
+            .network
+            .allow
+            .push(agentenv_proto::NetworkRule {
+                target: NetworkTarget::Host {
+                    host: "legacy-pinned.example".to_owned(),
+                    port: Some(443),
+                    scheme: Some("https".to_owned()),
+                    http_access: None,
+                },
+            });
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(
+            &options,
+            &TinyFactory,
+            &mut credentials,
+            "legacy-demo",
+            &lockfile_yaml,
+        )
+        .await
+        .expect("reproduce env");
+
+        let frozen = super::freeze_env_lockfile(&options, "legacy-demo").expect("freeze env");
+
+        assert!(frozen.contains("legacy-pinned.example"));
+        assert!(
+            !frozen.contains("hardening: baseline"),
+            "freezing a reproduced legacy lockfile should preserve absent hardening"
+        );
     }
 
     #[tokio::test]

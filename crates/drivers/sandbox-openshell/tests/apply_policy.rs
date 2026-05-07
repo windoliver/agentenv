@@ -249,28 +249,57 @@ fn default_translation_skips_non_executable_shadow_paths() {
 }
 
 #[test]
-#[ignore = "requires openshell CLI on PATH and OPENSHELL_TEST_SANDBOX to be set"]
+#[ignore = "requires openshell CLI on PATH and a working gateway"]
 fn translated_policy_is_accepted_by_real_openshell_cli() {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let sandbox = std::env::var("OPENSHELL_TEST_SANDBOX").expect("sandbox name");
     let registry = agentenv_policy::PresetRegistry::load_builtin().expect("load presets");
     let policy =
         agentenv_policy::compose_policy(agentenv_policy::Tier::Balanced, &[], None, &registry)
             .expect("compose");
 
     let translated = sandbox_openshell::translate_for_openshell(&policy).expect("translate");
-    let tempdir = std::env::temp_dir().join(format!(
-        "sandbox-openshell-test-{}-{}",
+    let suffix = format!(
+        "{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after unix epoch")
             .as_nanos()
-    ));
+    );
+    let tempdir = std::env::temp_dir().join(format!("sandbox-openshell-test-{suffix}"));
     std::fs::create_dir_all(&tempdir).expect("create tempdir");
     let policy_path = tempdir.join("policy.yaml");
     std::fs::write(&policy_path, translated.policy_yaml).expect("write policy");
+
+    let sandbox = format!("agentenv-policy-test-{suffix}");
+    let create_output = std::process::Command::new("openshell")
+        .args([
+            "sandbox",
+            "create",
+            "--name",
+            &sandbox,
+            "--no-auto-providers",
+            "--from",
+            "openclaw",
+            "--policy",
+        ])
+        .arg(&policy_path)
+        .args(["--", "true"])
+        .output()
+        .expect("create openshell sandbox");
+
+    if !create_output.status.success() {
+        let _ = std::process::Command::new("openshell")
+            .args(["sandbox", "delete", &sandbox])
+            .output();
+    }
+    assert!(
+        create_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&create_output.stdout),
+        String::from_utf8_lossy(&create_output.stderr)
+    );
 
     let output = std::process::Command::new("openshell")
         .args(["policy", "set", &sandbox, "--policy"])
@@ -278,6 +307,17 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
         .arg("--wait")
         .output()
         .expect("run openshell");
+
+    let cleanup_output = std::process::Command::new("openshell")
+        .args(["sandbox", "delete", &sandbox])
+        .output()
+        .expect("delete openshell sandbox");
+    assert!(
+        cleanup_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&cleanup_output.stdout),
+        String::from_utf8_lossy(&cleanup_output.stderr)
+    );
 
     assert!(
         output.status.success(),

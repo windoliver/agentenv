@@ -28,6 +28,24 @@ image ID and fails before sandbox creation on mismatch. If omitted, the computed
 digest is written to `~/.agentenv/build/<env>/image-digest` for the core to
 record in `lock.yaml`.
 
+## Hardening
+
+OpenShell consumes `SandboxSpec.metadata` during `create`. When BYO Dockerfile
+metadata includes a selected hardening profile, the driver appends the
+corresponding hardening marker and Dockerfile fragment to the staged Dockerfile
+before `docker build`. Digest verification and digest recording use the built
+image after that fragment is injected, so `sandbox.image.expected_digest` must
+match the hardened image.
+
+The driver parses and validates runtime hardening metadata such as ulimits,
+core-dump disabling, and user-namespace disabling, but the current OpenShell
+implementation does not add unsupported runtime CLI arguments to
+`openshell sandbox create`; valid runtime metadata is not currently enforced by
+the OpenShell CLI integration. Blueprint lint and preflight currently catch BYO
+Dockerfile conflicts such as a root final user, privileged or `cap-add`
+references, missing hardening marker, and reintroduction of packages stripped by
+the selected profile.
+
 Integration test command:
 
 ```bash

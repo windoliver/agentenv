@@ -136,6 +136,13 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `stop` | `{handle}` | `{}` |
 | `destroy` | `{handle}` | `{}` |
 
+Image hardening profiles are create-time sandbox configuration in schema 1.1.
+Core resolves `sandbox.hardening`, merges supported filesystem settings into
+`SandboxSpec.policy`, and sends process, runtime, and image settings through
+`SandboxSpec.metadata` keys prefixed with `hardening_`. Sandbox drivers may
+consume that metadata during `create`; schema 1.1 does not define a separate
+`apply_hardening` method.
+
 Persistent sessions are optional. Core checks `supports_persistent_sessions`
 before calling session methods. Drivers that cannot provide durable attach,
 detach, resume, and single-session kill semantics return `CapabilityMissing`

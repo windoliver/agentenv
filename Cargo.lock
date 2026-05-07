@@ -134,8 +134,10 @@ dependencies = [
  "agentenv-proto",
  "async-trait",
  "dirs",
+ "ed25519-dalek",
  "hex",
  "ipnet",
+ "rand_core",
  "schemars",
  "semver",
  "serde",
@@ -224,6 +226,7 @@ dependencies = [
  "agentenv-proto",
  "once_cell",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
 ]
@@ -2856,11 +2859,13 @@ name = "sandbox-openshell"
 version = "0.0.1-alpha0"
 dependencies = [
  "agentenv-core",
+ "agentenv-events",
  "agentenv-policy",
  "agentenv-proto",
  "async-trait",
  "driver-conformance",
  "semver",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "time",
