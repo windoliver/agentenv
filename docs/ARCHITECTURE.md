@@ -57,7 +57,7 @@
 
 ### `SandboxDriver` — how do we create and run an isolated environment?
 
-Concrete: OpenShell (first-class), Docker (post-MVP), E2B (post-MVP), Firecracker (post-MVP).
+Concrete: OpenShell (first-class), microVM/Firecracker (first-class hardening path), Docker (post-MVP), E2B (post-MVP).
 
 Responsibilities:
 - Preflight checks (runtime installed, versions compatible)
@@ -373,6 +373,7 @@ agentenv/
 │   ├── agentenv-plugin/        # subprocess driver host
 │   ├── drivers/
 │   │   ├── sandbox-openshell/  # built-in, first-class
+│   │   ├── sandbox-microvm/    # built-in, Firecracker first
 │   │   ├── sandbox-docker/     # built-in, post-MVP
 │   │   ├── agent-claude/       # built-in
 │   │   ├── agent-codex/        # built-in
