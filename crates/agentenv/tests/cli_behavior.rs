@@ -2756,11 +2756,19 @@ fn reference_blueprint_skip_reason(stderr: &str) -> bool {
         "openshell_missing",
         "preflight_failed",
         "gateway",
+        "missing environment variable",
         "missing credential",
         "missing_credential",
     ]
     .iter()
     .any(|needle| stderr.contains(needle))
+}
+
+#[test]
+fn reference_blueprint_skip_reason_accepts_missing_env_vars() {
+    assert!(reference_blueprint_skip_reason(
+        "create failed: missing environment variable `MCP_URL`"
+    ));
 }
 
 fn make_temp_dir(prefix: &str) -> PathBuf {

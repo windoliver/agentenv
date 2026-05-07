@@ -25,7 +25,10 @@ async fn remote_ssh_create_exec_copy_status_destroy_flow() {
     let identity_file = env::var("AGENTENV_REMOTE_SSH_IDENTITY_FILE").ok();
     let jump_host = env::var("AGENTENV_REMOTE_SSH_JUMP_HOST").ok();
 
+    let marker = format!("agentenv-remote-ssh-{}", Uuid::new_v4());
+    let env_name = format!("remote-ssh-{}", Uuid::new_v4());
     let mut metadata = BTreeMap::from([
+        ("name".to_owned(), serde_json::json!(env_name)),
         ("host".to_owned(), serde_json::json!(host)),
         ("user".to_owned(), serde_json::json!(user)),
         ("port".to_owned(), serde_json::json!(port)),
@@ -41,7 +44,7 @@ async fn remote_ssh_create_exec_copy_status_destroy_flow() {
     let handle = driver
         .create(SandboxSpec {
             image: None,
-            env: BTreeMap::new(),
+            env: BTreeMap::from([("AGENTENV_REMOTE_SSH_MARKER".to_owned(), marker.clone())]),
             policy: None,
             metadata,
         })
@@ -49,11 +52,10 @@ async fn remote_ssh_create_exec_copy_status_destroy_flow() {
         .expect("create remote ssh sandbox")
         .handle;
 
-    let marker = format!("agentenv-remote-ssh-{}", Uuid::new_v4());
     let exec = driver
         .exec(ExecParams {
             handle: handle.clone(),
-            cmd: format!("printf '%s\\n' {marker}"),
+            cmd: "printf '%s\\n' \"$AGENTENV_REMOTE_SSH_MARKER\"".to_owned(),
             tty: false,
             env: BTreeMap::new(),
         })

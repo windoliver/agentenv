@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, io, path::PathBuf, process::Command, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io::{self, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
 use agentenv_core::driver::{
     persistent_sessions_missing, DriverError, DriverResult, SandboxDriver,
@@ -20,11 +26,13 @@ use url::Url;
 const DRIVER_NAME: &str = "remote-ssh";
 const REMOTE_LOGS_CAPABILITY: &str = "remote_logs";
 const POLICY_CAPABILITY: &str = "supports_hot_reload_policy";
+const REMOTE_ENV_DIR: &str = "/sandbox/.agentenv/env";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandRequest {
     args: Vec<String>,
     env: BTreeMap<String, String>,
+    stdin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,10 +56,26 @@ struct ProcessCommandRunner;
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput> {
-        let output = Command::new(program)
-            .args(&request.args)
-            .envs(&request.env)
-            .output()?;
+        let mut command = Command::new(program);
+        command.args(&request.args).envs(&request.env);
+        if request.stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(stdin) = request.stdin.as_deref() {
+            let mut child_stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin unavailable"))?;
+            if let Err(err) = child_stdin.write_all(stdin.as_bytes()) {
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+        let output = child.wait_with_output()?;
         Ok(CommandOutput {
             status: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -60,6 +84,7 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     fn status(&self, program: &str, request: &CommandRequest) -> io::Result<Option<i32>> {
+        debug_assert!(request.stdin.is_none());
         Command::new(program)
             .args(&request.args)
             .envs(&request.env)
@@ -72,6 +97,7 @@ fn command_request(args: &[&str]) -> CommandRequest {
     CommandRequest {
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         env: BTreeMap::new(),
+        stdin: None,
     }
 }
 
@@ -155,13 +181,26 @@ fn ssh_base_args(target: &RemoteSshTarget) -> Vec<String> {
     args
 }
 
-fn remote_shell_command(cmd: &str, env: &BTreeMap<String, String>) -> DriverResult<String> {
+fn remote_shell_command(
+    cmd: &str,
+    env_file: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> DriverResult<String> {
     for key in env.keys() {
         validate_remote_env_key(key)?;
     }
+    if let Some(env_file) = env_file {
+        validate_remote_env_file_path(env_file)?;
+    }
+
+    let mut prefix = "cd /sandbox".to_owned();
+    if let Some(env_file) = env_file {
+        prefix.push_str(" && . ");
+        prefix.push_str(&shell_single_quote(env_file));
+    }
 
     if env.is_empty() {
-        return Ok(format!("cd /sandbox && {cmd}"));
+        return Ok(format!("{prefix} && {cmd}"));
     }
 
     let assignments = env
@@ -170,7 +209,7 @@ fn remote_shell_command(cmd: &str, env: &BTreeMap<String, String>) -> DriverResu
         .collect::<Vec<_>>()
         .join(" ");
     Ok(format!(
-        "cd /sandbox && env {assignments} sh -lc {}",
+        "{prefix} && env {assignments} sh -lc {}",
         shell_single_quote(cmd)
     ))
 }
@@ -195,6 +234,56 @@ fn validate_remote_env_key(key: &str) -> DriverResult<()> {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_env_file_content(env: &BTreeMap<String, String>) -> DriverResult<String> {
+    let mut content = String::new();
+    for (key, value) in env {
+        validate_remote_env_key(key)?;
+        content.push_str("export ");
+        content.push_str(key);
+        content.push('=');
+        content.push_str(&shell_single_quote(value));
+        content.push('\n');
+    }
+    Ok(content)
+}
+
+fn remote_env_file_path(name: &str) -> DriverResult<String> {
+    validate_remote_env_name(name)?;
+    Ok(format!("{REMOTE_ENV_DIR}/{name}.env"))
+}
+
+fn validate_remote_env_name(name: &str) -> DriverResult<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || name.starts_with('-')
+        || name
+            .chars()
+            .any(|ch| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(DriverError::InvalidInput {
+            message: "metadata.name contains unsupported characters for a remote env file"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_remote_env_file_path(path: &str) -> DriverResult<()> {
+    let Some(name) = path.strip_prefix("/sandbox/.agentenv/env/") else {
+        return Err(DriverError::InvalidInput {
+            message: "remote-ssh env_file must be under /sandbox/.agentenv/env".to_owned(),
+        });
+    };
+    let Some(name) = name.strip_suffix(".env") else {
+        return Err(DriverError::InvalidInput {
+            message: "remote-ssh env_file must end with .env".to_owned(),
+        });
+    };
+    validate_remote_env_name(name)
 }
 
 fn remote_ssh_command(shell_body: &str) -> String {
@@ -260,6 +349,7 @@ fn ssh_request(target: &RemoteSshTarget, remote_args: &[&str]) -> CommandRequest
     CommandRequest {
         args,
         env: BTreeMap::new(),
+        stdin: None,
     }
 }
 
@@ -312,6 +402,7 @@ struct RemoteSshTarget {
     port: u16,
     identity_file: Option<String>,
     jump_host: Option<String>,
+    env_file: Option<String>,
     enforce_remote_firewall: bool,
 }
 
@@ -328,6 +419,9 @@ impl RemoteSshTarget {
         if let Some(jump_host) = jump_host.as_deref() {
             validate_remote_ssh_host(jump_host, "metadata.jump_host")?;
         }
+        let env_file = optional_metadata_string(metadata, "name")?
+            .map(|name| remote_env_file_path(&name))
+            .transpose()?;
         let enforce_remote_firewall =
             optional_metadata_bool(metadata, "enforce_remote_firewall")?.unwrap_or(false);
 
@@ -337,6 +431,7 @@ impl RemoteSshTarget {
             port,
             identity_file,
             jump_host,
+            env_file,
             enforce_remote_firewall,
         })
     }
@@ -351,13 +446,16 @@ impl RemoteSshTarget {
         let mut url = Url::parse(&base).map_err(|source| DriverError::InvalidInput {
             message: format!("failed to build remote-ssh handle: {source}"),
         })?;
-        if self.identity_file.is_some() || self.jump_host.is_some() {
+        if self.identity_file.is_some() || self.jump_host.is_some() || self.env_file.is_some() {
             let mut pairs = url.query_pairs_mut();
             if let Some(identity_file) = self.identity_file.as_deref() {
                 pairs.append_pair("identity_file", identity_file);
             }
             if let Some(jump_host) = self.jump_host.as_deref() {
                 pairs.append_pair("jump_host", jump_host);
+            }
+            if let Some(env_file) = self.env_file.as_deref() {
+                pairs.append_pair("env_file", env_file);
             }
         }
         Ok(url.to_string())
@@ -404,6 +502,7 @@ impl RemoteSshTarget {
             .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
         let mut identity_file = None;
         let mut jump_host = None;
+        let mut env_file = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "identity_file" => identity_file = Some(value.into_owned()),
@@ -412,6 +511,12 @@ impl RemoteSshTarget {
                     validate_remote_ssh_host(&value, "jump_host")
                         .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
                     jump_host = Some(value);
+                }
+                "env_file" => {
+                    let value = value.into_owned();
+                    validate_remote_env_file_path(&value)
+                        .map_err(|err| invalid_handle(handle.to_owned(), err.to_string()))?;
+                    env_file = Some(value);
                 }
                 _ => {
                     return Err(invalid_handle(
@@ -435,6 +540,7 @@ impl RemoteSshTarget {
             port,
             identity_file,
             jump_host,
+            env_file,
             enforce_remote_firewall: false,
         })
     }
@@ -609,9 +715,15 @@ impl SandboxDriver for RemoteSshDriver {
 
     async fn create(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle> {
         let target = RemoteSshTarget::from_metadata(&spec.metadata)?;
-        if target.enforce_remote_firewall {
+        if target.enforce_remote_firewall || spec.policy.is_some() {
             return Err(policy_missing());
         }
+        if !spec.env.is_empty() && target.env_file.is_none() {
+            return Err(DriverError::InvalidInput {
+                message: "metadata.name is required when SandboxSpec.env is non-empty".to_owned(),
+            });
+        }
+        let env_file_content = remote_env_file_content(&spec.env)?;
         ensure_identity_file_exists(&target)?;
 
         for remote_command in [
@@ -619,6 +731,25 @@ impl SandboxDriver for RemoteSshDriver {
             remote_ssh_command("mkdir -p /sandbox/.agentenv/bin && test -w /sandbox"),
         ] {
             let request = ssh_request(&target, &[remote_command.as_str()]);
+            let output = self
+                .runner
+                .run(&self.ssh_binary, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command_string(&self.ssh_binary, &request.args),
+                    source,
+                })?;
+            if output.status != Some(0) {
+                return Err(command_failed(&self.ssh_binary, &request, output));
+            }
+        }
+
+        if let Some(env_file) = target.env_file.as_deref() {
+            let quoted_env_file = shell_single_quote(env_file);
+            let remote_command = remote_ssh_command(&format!(
+                "mkdir -p {REMOTE_ENV_DIR} && umask 077 && cat > {quoted_env_file} && chmod 600 {quoted_env_file}"
+            ));
+            let mut request = ssh_request(&target, &[remote_command.as_str()]);
+            request.stdin = Some(env_file_content);
             let output = self
                 .runner
                 .run(&self.ssh_binary, &request)
@@ -675,7 +806,8 @@ impl SandboxDriver for RemoteSshDriver {
 
     async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult> {
         let target = RemoteSshTarget::from_handle(&params.handle)?;
-        let remote_cmd = remote_shell_command(&params.cmd, &params.env)?;
+        let remote_cmd =
+            remote_shell_command(&params.cmd, target.env_file.as_deref(), &params.env)?;
         let request = CommandRequest {
             args: {
                 let mut args = ssh_base_args(&target);
@@ -687,6 +819,7 @@ impl SandboxDriver for RemoteSshDriver {
                 args
             },
             env: BTreeMap::new(),
+            stdin: None,
         };
         let command = command_string(&self.ssh_binary, &request.args);
 
@@ -730,6 +863,7 @@ impl SandboxDriver for RemoteSshDriver {
         let request = CommandRequest {
             args,
             env: BTreeMap::new(),
+            stdin: None,
         };
         let output = self
             .runner
@@ -756,6 +890,7 @@ impl SandboxDriver for RemoteSshDriver {
         let request = CommandRequest {
             args,
             env: BTreeMap::new(),
+            stdin: None,
         };
         let output = self
             .runner
@@ -829,8 +964,9 @@ mod tests {
     use agentenv_core::driver::{DriverError, SandboxDriver};
     use agentenv_proto::{
         Capabilities, ConnectParams, CopyInParams, CopyOutParams, DriverKind, ExecParams,
-        InitializeParams, LogLevel, PreflightParams, SandboxSpec, SandboxStatusParams,
-        SCHEMA_VERSION,
+        FilesystemPolicy, InferencePolicy, InitializeParams, LogLevel, NetworkAccessPolicy,
+        NetworkPolicy, PolicyReloadability, PreflightParams, ProcessPolicy, SandboxSpec,
+        SandboxStatusParams, SCHEMA_VERSION,
     };
 
     use serde_json::json;
@@ -841,6 +977,7 @@ mod tests {
     struct CommandRequest {
         args: Vec<String>,
         env: BTreeMap<String, String>,
+        stdin: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -895,6 +1032,7 @@ mod tests {
         CommandRequest {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             env: BTreeMap::new(),
+            stdin: None,
         }
     }
 
@@ -909,6 +1047,29 @@ mod tests {
             Self {
                 program: program.to_owned(),
                 request: command_request(args),
+                result: CommandScriptResult::Output(CommandOutput {
+                    status,
+                    stdout: stdout.to_owned(),
+                    stderr: stderr.to_owned(),
+                }),
+            }
+        }
+
+        fn output_with_stdin(
+            program: &str,
+            args: &[&str],
+            stdin: &str,
+            status: Option<i32>,
+            stdout: &str,
+            stderr: &str,
+        ) -> Self {
+            Self {
+                program: program.to_owned(),
+                request: CommandRequest {
+                    args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                    env: BTreeMap::new(),
+                    stdin: Some(stdin.to_owned()),
+                },
                 result: CommandScriptResult::Output(CommandOutput {
                     status,
                     stdout: stdout.to_owned(),
@@ -940,6 +1101,7 @@ mod tests {
                 request: CommandRequest {
                     args: request.args.clone(),
                     env: request.env.clone(),
+                    stdin: request.stdin.clone(),
                 },
             });
             let script = self
@@ -951,6 +1113,7 @@ mod tests {
             assert_eq!(script.program, program);
             assert_eq!(script.request.args, request.args);
             assert_eq!(script.request.env, request.env);
+            assert_eq!(script.request.stdin, request.stdin);
             match script.result {
                 CommandScriptResult::Output(output) => Ok(super::CommandOutput {
                     status: output.status,
@@ -984,6 +1147,7 @@ mod tests {
         assert_eq!(target.port, 22);
         assert_eq!(target.identity_file, None);
         assert_eq!(target.jump_host, None);
+        assert_eq!(target.env_file, None);
         assert!(!target.enforce_remote_firewall);
     }
 
@@ -1007,6 +1171,22 @@ mod tests {
             .expect("identity")
             .ends_with(".ssh/id_ed25519"));
         assert_eq!(target.jump_host.as_deref(), Some("bastion.example.com"));
+    }
+
+    #[test]
+    fn target_from_metadata_derives_env_file_from_env_name() {
+        let metadata = BTreeMap::from([
+            ("name".to_owned(), json!("demo")),
+            ("host".to_owned(), json!("dev-vm.example.com")),
+            ("user".to_owned(), json!("alice")),
+        ]);
+
+        let target = RemoteSshTarget::from_metadata(&metadata).expect("target");
+
+        assert_eq!(
+            target.env_file.as_deref(),
+            Some("/sandbox/.agentenv/env/demo.env")
+        );
     }
 
     #[test]
@@ -1106,6 +1286,7 @@ mod tests {
             port: 2222,
             identity_file: Some("/Users/alice/.ssh/id_ed25519".to_owned()),
             jump_host: Some("bastion.example.com".to_owned()),
+            env_file: Some("/sandbox/.agentenv/env/demo.env".to_owned()),
             enforce_remote_firewall: false,
         };
 
@@ -1123,6 +1304,7 @@ mod tests {
             port: 22,
             identity_file: None,
             jump_host: None,
+            env_file: None,
             enforce_remote_firewall: false,
         };
 
@@ -1191,6 +1373,7 @@ mod tests {
             port: 22,
             identity_file: None,
             jump_host: Some("bastion:2222".to_owned()),
+            env_file: None,
             enforce_remote_firewall: false,
         };
 
@@ -1411,6 +1594,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_rejects_policy_before_running_ssh() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output("ssh", &["unused"], Some(0), "", ""),
+            CommandScript::output("ssh", &["unused"], Some(0), "", ""),
+        ]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let err = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::new(),
+                policy: Some(sample_policy()),
+                metadata: BTreeMap::from([
+                    ("host".to_owned(), json!("dev-vm.example.com")),
+                    ("user".to_owned(), json!("alice")),
+                ]),
+            })
+            .await
+            .expect_err("remote ssh must not silently accept unenforced policies");
+
+        match err {
+            DriverError::CapabilityMissing { capability } => {
+                assert_eq!(capability, POLICY_CAPABILITY)
+            }
+            other => panic!("expected CapabilityMissing, got {other:?}"),
+        }
+        assert!(runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_writes_spec_env_and_returns_env_file_handle() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "ssh",
+                &[
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=2",
+                    "-p",
+                    "22",
+                    "alice@dev-vm.example.com",
+                    "--",
+                    "true",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+            CommandScript::output(
+                "ssh",
+                &[
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=2",
+                    "-p",
+                    "22",
+                    "alice@dev-vm.example.com",
+                    "--",
+                    "sh -lc 'mkdir -p /sandbox/.agentenv/bin && test -w /sandbox'",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+            CommandScript::output_with_stdin(
+                "ssh",
+                &[
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=2",
+                    "-p",
+                    "22",
+                    "alice@dev-vm.example.com",
+                    "--",
+                    "sh -lc 'mkdir -p /sandbox/.agentenv/env && umask 077 && cat > '\\''/sandbox/.agentenv/env/demo.env'\\'' && chmod 600 '\\''/sandbox/.agentenv/env/demo.env'\\'''",
+                ],
+                "export OPENAI_API_KEY='sk test'\nexport QUOTE='a'\\''b'\n",
+                Some(0),
+                "",
+                "",
+            ),
+        ]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let handle = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::from([
+                    ("OPENAI_API_KEY".to_owned(), "sk test".to_owned()),
+                    ("QUOTE".to_owned(), "a'b".to_owned()),
+                ]),
+                policy: None,
+                metadata: BTreeMap::from([
+                    ("name".to_owned(), json!("demo")),
+                    ("host".to_owned(), json!("dev-vm.example.com")),
+                    ("user".to_owned(), json!("alice")),
+                ]),
+            })
+            .await
+            .expect("create remote ssh sandbox")
+            .handle;
+
+        assert!(handle.contains("env_file="), "handle: {handle}");
+        assert_eq!(runner.calls().len(), 3);
+    }
+
+    #[tokio::test]
     async fn connect_probes_remote_and_returns_sandbox_working_dir() {
         let handle = "remote-ssh://alice@dev-vm.example.com:22";
         let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
@@ -1540,6 +1845,74 @@ mod tests {
         assert!(remote_args[0].starts_with("sh -lc '"));
         assert!(remote_args[0].contains("env FOO='\\''bar baz'\\''"));
         assert!(remote_args[0].contains("sh -lc '\\''echo \"$FOO\"'\\''"));
+    }
+
+    #[tokio::test]
+    async fn exec_sources_create_env_file_before_per_command_env() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "ssh",
+            &[
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-p",
+                "22",
+                "alice@dev-vm.example.com",
+                "--",
+                "sh -lc 'cd /sandbox && . '\\''/sandbox/.agentenv/env/demo.env'\\'' && env OPENAI_API_KEY='\\''override'\\'' sh -lc '\\''printf \"%s\" \"$OPENAI_API_KEY\"'\\'''",
+            ],
+            Some(0),
+            "override",
+            "",
+        )]));
+        let driver = RemoteSshDriver::with_command_runner(runner.clone());
+
+        let result = driver
+            .exec(ExecParams {
+                handle: "remote-ssh://alice@dev-vm.example.com:22?env_file=%2Fsandbox%2F.agentenv%2Fenv%2Fdemo.env".to_owned(),
+                cmd: "printf \"%s\" \"$OPENAI_API_KEY\"".to_owned(),
+                tty: false,
+                env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "override".to_owned())]),
+            })
+            .await
+            .expect("exec");
+
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, "override");
+        assert!(runner.calls()[0].request.env.is_empty());
+    }
+
+    fn sample_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            network: NetworkAccessPolicy {
+                reloadability: PolicyReloadability::HotReload,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                approval_required: Vec::new(),
+            },
+            filesystem: FilesystemPolicy {
+                reloadability: PolicyReloadability::LockedAtCreate,
+                read_only: vec!["/usr".to_owned()],
+                read_write: vec!["/sandbox".to_owned()],
+            },
+            process: ProcessPolicy {
+                reloadability: PolicyReloadability::LockedAtCreate,
+                run_as_user: "sandbox".to_owned(),
+                run_as_group: "sandbox".to_owned(),
+                profile: "restricted".to_owned(),
+                allow_syscalls: Vec::new(),
+                deny_syscalls: Vec::new(),
+            },
+            inference: InferencePolicy {
+                reloadability: PolicyReloadability::HotReload,
+                routes: Vec::new(),
+            },
+        }
     }
 
     #[tokio::test]
