@@ -19,6 +19,7 @@ pub mod registry;
 pub mod runtime;
 pub mod security;
 pub mod sessions;
+pub mod skills;
 pub mod snapshot;
 
 /// Placeholder surface for the M1 workspace scaffold.
