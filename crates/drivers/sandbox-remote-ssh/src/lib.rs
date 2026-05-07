@@ -614,15 +614,11 @@ impl SandboxDriver for RemoteSshDriver {
         }
         ensure_identity_file_exists(&target)?;
 
-        for remote_args in [
-            vec!["true"],
-            vec![
-                "sh",
-                "-lc",
-                "mkdir -p /sandbox/.agentenv/bin && test -w /sandbox",
-            ],
+        for remote_command in [
+            "true".to_owned(),
+            remote_ssh_command("mkdir -p /sandbox/.agentenv/bin && test -w /sandbox"),
         ] {
-            let request = ssh_request(&target, &remote_args);
+            let request = ssh_request(&target, &[remote_command.as_str()]);
             let output = self
                 .runner
                 .run(&self.ssh_binary, &request)
@@ -1356,9 +1352,7 @@ mod tests {
                     "bastion.example.com",
                     "alice@dev-vm.example.com",
                     "--",
-                    "sh",
-                    "-lc",
-                    "mkdir -p /sandbox/.agentenv/bin && test -w /sandbox",
+                    "sh -lc 'mkdir -p /sandbox/.agentenv/bin && test -w /sandbox'",
                 ],
                 Some(0),
                 "",
