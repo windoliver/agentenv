@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use agentenv_proto::{assert_compatible_schema_version, NetworkPolicy};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -59,6 +59,8 @@ pub struct PortableLockfile {
     pub composition: PortableComposition,
     pub policy: PortablePolicy,
     pub drivers: BTreeMap<String, PortableDriverPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillPin>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub artifacts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -130,6 +132,17 @@ pub struct PortableDriverPin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPin {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DriverSourcePin {
     BuiltIn,
@@ -165,6 +178,12 @@ pub enum LockfileError {
         name: String,
         #[source]
         source: DigestError,
+    },
+    #[error("duplicate skill pin `{name}` version `{version}` from `{skill_source}`")]
+    DuplicateSkillPin {
+        name: String,
+        version: String,
+        skill_source: String,
     },
     #[error("unsupported lockfile version `{version}`")]
     UnsupportedVersion { version: String },
@@ -260,8 +279,15 @@ impl LockfileDocument {
 
 impl PortableLockfile {
     pub fn to_yaml_deterministic(&self) -> Result<String, LockfileError> {
-        self.validate()?;
-        serde_yaml::to_string(self).map_err(LockfileError::Serialize)
+        let mut lockfile = self.clone();
+        lockfile.skills.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.version.cmp(&right.version))
+                .then_with(|| left.source.cmp(&right.source))
+        });
+        lockfile.validate()?;
+        serde_yaml::to_string(&lockfile).map_err(LockfileError::Serialize)
     }
 
     pub fn validate(&self) -> Result<(), LockfileError> {
@@ -304,6 +330,8 @@ impl PortableLockfile {
             })?;
         }
 
+        validate_skill_pins(&self.skills)?;
+
         validate_credentials(&self.composition.sandbox.credentials)?;
         validate_credentials(&self.composition.agent.credentials)?;
         validate_credentials(&self.composition.context.credentials)?;
@@ -313,6 +341,31 @@ impl PortableLockfile {
 
         validate_credentials(&self.credentials)
     }
+}
+
+fn validate_skill_pins(skills: &[SkillPin]) -> Result<(), LockfileError> {
+    let mut seen = BTreeSet::new();
+    for skill in skills {
+        parse_sha256_digest(&skill.digest).map_err(|source| {
+            LockfileError::InvalidArtifactDigest {
+                name: format!("skill:{}:{}", skill.name, skill.version),
+                source,
+            }
+        })?;
+        let key = (
+            skill.name.clone(),
+            skill.version.clone(),
+            skill.source.clone(),
+        );
+        if !seen.insert(key) {
+            return Err(LockfileError::DuplicateSkillPin {
+                name: skill.name.clone(),
+                version: skill.version.clone(),
+                skill_source: skill.source.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_credentials(
