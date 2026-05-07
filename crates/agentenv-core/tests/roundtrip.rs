@@ -298,3 +298,35 @@ policy:
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
 }
+
+#[test]
+fn roundtrip_rejects_unknown_hardening_profile() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  hardening: hardened-like-fort-knox
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+policy:
+  tier: balanced
+  presets: []
+"#;
+
+    let err = agentenv_core::lifecycle::verify_blueprint_yaml(yaml).unwrap_err();
+    let message = err.to_string();
+
+    assert!(
+        message.contains("sandbox.hardening"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("hardened-like-fort-knox"),
+        "unexpected error: {message}"
+    );
+    assert!(message.contains("hardening"), "unexpected error: {message}");
+}

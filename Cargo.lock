@@ -133,8 +133,10 @@ dependencies = [
  "agentenv-proto",
  "async-trait",
  "dirs",
+ "ed25519-dalek",
  "hex",
  "ipnet",
+ "rand_core",
  "schemars",
  "semver",
  "serde",
@@ -223,6 +225,7 @@ dependencies = [
  "agentenv-proto",
  "once_cell",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
 ]

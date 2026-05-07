@@ -12,6 +12,10 @@ pub enum PolicyError {
     RequiresRecreate { domains: String },
     #[error("failed to load preset registry: {message}")]
     PresetRegistry { message: String },
+    #[error("unknown hardening profile `{name}`. available profiles: {available}")]
+    UnknownHardeningProfile { name: String, available: String },
+    #[error("invalid hardening profile `{name}`: {message}")]
+    HardeningProfile { name: String, message: String },
     #[error("translator `{translator}` does not support this policy: {message}")]
     TranslationUnsupported {
         translator: &'static str,

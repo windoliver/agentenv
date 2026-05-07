@@ -1,0 +1,52 @@
+name: strict
+description: Sensitive-work hardening for legal, financial, PHI, and other high-risk sandboxes.
+packages:
+  strip:
+    - gcc
+    - g++
+    - make
+    - nc
+    - tcpdump
+    - nmap
+    - strace
+    - gdb
+    - curl
+    - wget
+    - git
+mounts:
+  read_only:
+    - /etc
+    - /usr
+    - /opt
+  read_write:
+    - /workspace
+    - /var/tmp
+  tmpfs:
+    - path: /tmp
+      size: 256m
+ulimits:
+  nproc: 512
+  nofile: 4096
+capabilities:
+  drop:
+    - NET_RAW
+    - SYS_ADMIN
+    - SYS_PTRACE
+dockerfile:
+  marker: AGENTENV_HARDENING_PROFILE=strict
+  fragment: |
+    RUN set -eu; \
+        if command -v apt-get >/dev/null 2>&1; then \
+          apt-get purge -y gcc g++ make netcat-openbsd netcat-traditional tcpdump nmap strace gdb curl wget git || true; \
+          apt-get autoremove -y || true; \
+          rm -rf /var/lib/apt/lists/*; \
+        elif command -v apk >/dev/null 2>&1; then \
+          apk del gcc g++ make netcat-openbsd tcpdump nmap strace gdb curl wget git || true; \
+        else \
+          echo "agentenv hardening: unsupported package manager" >&2; \
+          exit 78; \
+        fi; \
+        find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true; \
+        printf '* hard core 0\n* soft core 0\n' >/etc/security/limits.d/agentenv-core.conf
+disable_core_dumps: true
+disable_user_namespaces: true

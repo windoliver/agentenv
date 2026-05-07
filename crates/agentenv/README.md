@@ -25,6 +25,26 @@ computed digest is recorded in the environment lockfile. After local digest
 verification, the staged context is handed to OpenShell so its gateway can build
 and materialize the sandbox image.
 
+## Snapshots
+
+`agentenv snapshot <env> [--output <dir.agentenvsnap>]` captures a stateful
+backup of an environment as an unpacked `.agentenvsnap` directory. The snapshot
+includes the frozen blueprint, lockfile, workspace state, persisted home when
+enabled, resolved policy, event database, a manifest, and an Ed25519 signature.
+Credential files and credential-looking values are stripped before the manifest
+is written.
+
+`agentenv snapshot verify <dir.agentenvsnap>` recomputes payload digests, checks
+the Merkle root, checks the manifest hash, verifies the Ed25519 signature, and
+verifies the embedded lockfile.
+
+`agentenv snapshot restore <dir.agentenvsnap> [--as <name>]` verifies the
+snapshot, resolves required credentials through the normal env var/keyring
+provider path, reproduces the env from the embedded lockfile, and copies the
+sanitized workspace and persisted home state into the new sandbox. Use
+`--non-interactive` or `AGENTENV_NON_INTERACTIVE=1` to fail cleanly instead of
+prompting when required credentials are missing.
+
 Day-2 operations:
 
 - `agentenv logs --env <name> --kind <kind> [--follow] [--json]`

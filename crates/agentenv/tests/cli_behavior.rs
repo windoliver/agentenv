@@ -248,6 +248,89 @@ fn verify_blueprint_succeeds_on_reference_blueprint() {
 }
 
 #[test]
+fn cli_includes_commands() {
+    let output = Command::new(agentenv_bin()).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let blueprint = stdout
+        .find("blueprint")
+        .unwrap_or_else(|| panic!("stdout was: {stdout}"));
+    let credentials = stdout
+        .find("credentials")
+        .unwrap_or_else(|| panic!("stdout was: {stdout}"));
+    assert!(
+        blueprint < credentials,
+        "`blueprint` should be listed before `credentials`; stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn blueprint_lint_reports_json_diagnostics() {
+    let temp_dir = make_temp_dir("blueprint-lint-json-diagnostics");
+    let dockerfile = temp_dir.join("Dockerfile");
+    fs::write(
+        &dockerfile,
+        r#"
+FROM alpine:3.20
+RUN apk add --no-cache curl
+USER root
+"#,
+    )
+    .unwrap();
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  hardening: strict
+  image:
+    source: byo
+    dockerfile: Dockerfile
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: restricted
+  presets: []
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("blueprint")
+        .arg("lint")
+        .arg(&blueprint)
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(json["profile"], "strict");
+    let codes = json["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array")
+        .iter()
+        .filter_map(|diagnostic| diagnostic["code"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(codes.contains("dockerfile_user_root"), "codes: {codes:?}");
+    assert!(
+        codes.contains("dockerfile_reintroduces_stripped_package"),
+        "codes: {codes:?}"
+    );
+}
+
+#[test]
 fn drivers_list_includes_built_in_drivers() {
     let temp_dir = make_temp_dir("drivers-list-builtins");
 
@@ -482,6 +565,262 @@ fn sessions_help_includes_list_and_kill_commands() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("list"), "stdout was: {stdout}");
     assert!(stdout.contains("kill"), "stdout was: {stdout}");
+}
+
+#[test]
+fn snapshot_help_includes_create_verify_and_restore_usage() {
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[ENV]"), "stdout was: {stdout}");
+    assert!(stdout.contains("--output"), "stdout was: {stdout}");
+    assert!(stdout.contains("verify"), "stdout was: {stdout}");
+    assert!(stdout.contains("restore"), "stdout was: {stdout}");
+}
+
+#[test]
+fn snapshot_verify_missing_dir_fails_cleanly() {
+    let temp_dir = make_temp_dir("snapshot-verify-missing");
+    let missing = temp_dir.join("missing.agentenvsnap");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("verify")
+        .arg(&missing)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("snapshot"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing.agentenvsnap") || stderr.contains("manifest.json"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn snapshot_restore_missing_dir_with_as_fails_before_env_creation() {
+    let temp_dir = make_temp_dir("snapshot-restore-missing");
+    let missing = temp_dir.join("missing.agentenvsnap");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("restore")
+        .arg(&missing)
+        .arg("--as")
+        .arg("restored")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("snapshot"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing.agentenvsnap") || stderr.contains("manifest.json"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state before verifying the missing snapshot"
+    );
+}
+
+#[test]
+fn snapshot_restore_non_interactive_flag_reports_missing_credential() {
+    let temp_dir = make_temp_dir("snapshot-restore-non-interactive-flag");
+    let snapshot_dir =
+        write_minimal_signed_snapshot_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("restore")
+        .arg(&snapshot_dir)
+        .arg("--as")
+        .arg("restored")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPENAI_API_KEY"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing credential") || stderr.contains("missing_credential"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to prompt"),
+        "restore prompted despite --non-interactive: {stderr}"
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state before rejecting missing credential"
+    );
+}
+
+#[test]
+fn snapshot_restore_non_interactive_env_reports_missing_credential() {
+    let temp_dir = make_temp_dir("snapshot-restore-non-interactive-env");
+    let snapshot_dir =
+        write_minimal_signed_snapshot_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("restore")
+        .arg(&snapshot_dir)
+        .arg("--as")
+        .arg("restored")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_NON_INTERACTIVE", "1")
+        .env_remove("OPENAI_API_KEY")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_ne!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPENAI_API_KEY"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("missing credential") || stderr.contains("missing_credential"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to prompt"),
+        "restore prompted despite AGENTENV_NON_INTERACTIVE=1: {stderr}"
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state before rejecting missing credential"
+    );
+}
+
+#[test]
+fn snapshot_output_before_verify_is_rejected_by_parser() {
+    let temp_dir = make_temp_dir("snapshot-output-before-verify");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("--output")
+        .arg("ignored.agentenvsnap")
+        .arg("verify")
+        .arg("missing.agentenvsnap")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output"), "stderr was: {stderr}");
+    assert!(stderr.contains("<ENV>"), "stderr was: {stderr}");
+}
+
+#[test]
+fn snapshot_output_before_restore_is_rejected_by_parser() {
+    let temp_dir = make_temp_dir("snapshot-output-before-restore");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("--output")
+        .arg("-")
+        .arg("restore")
+        .arg("missing.agentenvsnap")
+        .arg("--as")
+        .arg("restored")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output"), "stderr was: {stderr}");
+    assert!(stderr.contains("<ENV>"), "stderr was: {stderr}");
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("restored")
+            .exists(),
+        "restore created env state after parser rejection"
+    );
+}
+
+#[test]
+fn snapshot_create_rejects_stdout_output() {
+    let temp_dir = make_temp_dir("snapshot-output-dash");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("demo")
+        .arg("--output")
+        .arg("-")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output -"), "stderr was: {stderr}");
+    assert!(stderr.contains("not supported"), "stderr was: {stderr}");
+    assert!(!temp_dir.join("-").exists());
+}
+
+#[test]
+fn snapshot_verify_prints_signed_snapshot_summary() {
+    let temp_dir = make_temp_dir("snapshot-verify-success");
+    let snapshot_dir = write_minimal_signed_snapshot(&temp_dir, "demo");
+
+    let output = Command::new(agentenv_bin())
+        .arg("snapshot")
+        .arg("verify")
+        .arg(&snapshot_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Snapshot verified"), "stdout was: {stdout}");
+    assert!(stdout.contains("demo.agentenvsnap"), "stdout was: {stdout}");
+    assert!(stdout.contains("files:"), "stdout was: {stdout}");
+    assert!(stdout.contains("merkle root:"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("signature: verified"),
+        "stdout was: {stdout}"
+    );
 }
 
 #[test]
@@ -765,6 +1104,8 @@ fn logs_context_follow_streams_appended_events_jsonl() {
     let temp_dir = make_temp_dir("logs-context-follow-events");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
     let events_path = env_dir.join("events.jsonl");
+    let stdout_path = temp_dir.join("logs-context-follow.stdout");
+    let stderr_path = temp_dir.join("logs-context-follow.stderr");
     fs::write(&events_path, "").unwrap();
 
     let mut child = Command::new(agentenv_bin())
@@ -774,8 +1115,12 @@ fn logs_context_follow_streams_appended_events_jsonl() {
         .arg("context")
         .arg("--follow")
         .env("HOME", &temp_dir)
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
+        .stdout(process::Stdio::from(
+            fs::File::create(&stdout_path).unwrap(),
+        ))
+        .stderr(process::Stdio::from(
+            fs::File::create(&stderr_path).unwrap(),
+        ))
         .spawn()
         .unwrap();
 
@@ -792,14 +1137,28 @@ fn logs_context_follow_streams_appended_events_jsonl() {
             b"{\"ts\":\"2026-04-21T00:00:01Z\",\"driver\":\"context\",\"level\":\"info\",\"msg\":\"context followed\"}\n",
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(400));
-    let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
 
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stdout = String::new();
+    while Instant::now() < deadline {
+        stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        if stdout.contains("context followed") {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+            panic!(
+                "logs --follow exited before appended event was printed; status: {status}; stdout: {stdout}; stderr: {stderr}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("context followed"),
-        "stdout was: {}",
-        String::from_utf8_lossy(&output.stdout)
+        stdout.contains("context followed"),
+        "stdout was: {stdout}; stderr was: {}",
+        fs::read_to_string(&stderr_path).unwrap_or_default()
     );
 }
 
@@ -2791,6 +3150,84 @@ fn unique_suffix() -> String {
 
 fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
     write_minimal_env_state_with_credentials(home, name, &[])
+}
+
+fn write_minimal_signed_snapshot(root: &Path, source_env: &str) -> PathBuf {
+    write_minimal_signed_snapshot_with_credentials(root, source_env, &[])
+}
+
+fn write_minimal_signed_snapshot_with_credentials(
+    root: &Path,
+    source_env: &str,
+    credential_names: &[&str],
+) -> PathBuf {
+    let snapshot_dir = root.join(format!("{source_env}.agentenvsnap"));
+    fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+    fs::write(snapshot_dir.join("workspace").join("README.md"), "hello\n").unwrap();
+    let blueprint_yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: ~/projects
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+    fs::write(snapshot_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+    let mut discovery_config = agentenv_core::driver_catalog::DriverDiscoveryConfig::from_env();
+    discovery_config.installed_root = root.join("drivers");
+    let driver_artifacts =
+        agentenv_core::driver_artifact::discover_driver_artifacts(discovery_config, None).unwrap();
+    let lockfile = agentenv_core::portable_lockfile::build_portable_lockfile(
+        agentenv_core::portable_lockfile::PortableLockfileInput {
+            name: source_env.to_owned(),
+            blueprint_yaml: blueprint_yaml.to_owned(),
+            driver_artifacts,
+        },
+    )
+    .unwrap();
+    fs::write(
+        snapshot_dir.join("lock.yaml"),
+        lockfile.to_yaml_deterministic().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        snapshot_dir.join("policy.yaml"),
+        serde_yaml::to_string(&lockfile.policy.resolved).unwrap(),
+    )
+    .unwrap();
+    let credential_requirements = credential_names
+        .iter()
+        .map(
+            |name| agentenv_core::snapshot::SnapshotCredentialRequirement {
+                name: (*name).to_owned(),
+                source: "env".to_owned(),
+                reference: Some((*name).to_owned()),
+                required: Some(true),
+            },
+        )
+        .collect();
+    let manifest = agentenv_core::snapshot::manifest_for_snapshot_dir(
+        &snapshot_dir,
+        source_env,
+        credential_requirements,
+        Vec::new(),
+    )
+    .unwrap();
+    agentenv_core::snapshot::write_signed_manifest(
+        &snapshot_dir,
+        &root.join("snapshot-signing.key"),
+        &manifest,
+    )
+    .unwrap();
+    snapshot_dir
 }
 
 fn activity_event(

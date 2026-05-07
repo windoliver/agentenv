@@ -3,10 +3,10 @@
 use std::{collections::BTreeMap, env, sync::Arc};
 
 use agentenv_core::driver::SandboxDriver;
-use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 use agentenv_proto::{
-    ApplyPolicyParams, DestroyParams, ExecParams, HttpAccessLevel, NetworkPolicy, NetworkRule,
-    NetworkTarget, SandboxSpec,
+    ApplyPolicyParams, DestroyParams, ExecParams, FilesystemPolicy, HttpAccessLevel,
+    InferencePolicy, NetworkAccessPolicy, NetworkPolicy, NetworkRule, NetworkTarget,
+    PolicyReloadability, ProcessPolicy, SandboxSpec,
 };
 use sandbox_openshell::OpenShellDriver;
 use tokio::runtime::Builder;
@@ -31,7 +31,7 @@ async fn openshell_create_exec_policy_logs_and_destroy_flow() {
         .create(SandboxSpec {
             image: Some("openclaw".to_owned()),
             env: BTreeMap::new(),
-            policy: Some(restricted_policy()),
+            policy: Some(default_deny_policy()),
             metadata,
         })
         .await
@@ -182,13 +182,8 @@ fn should_run_integration() -> bool {
     )
 }
 
-fn restricted_policy() -> NetworkPolicy {
-    let registry = PresetRegistry::load_builtin().expect("load builtin policy presets");
-    compose_policy(Tier::Restricted, &[], None, &registry).expect("compose restricted policy")
-}
-
 fn github_read_policy() -> NetworkPolicy {
-    let mut policy = restricted_policy();
+    let mut policy = default_deny_policy();
     policy.network.allow.push(NetworkRule {
         target: NetworkTarget::Host {
             host: "api.github.com".to_owned(),
@@ -206,6 +201,50 @@ fn secret_absence_probe_command(marker: &str) -> String {
         shell_single_quote(marker)
     );
     format!("sh -lc {}", shell_single_quote(&script))
+}
+
+fn default_deny_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        network: NetworkAccessPolicy {
+            reloadability: PolicyReloadability::HotReload,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            approval_required: Vec::new(),
+        },
+        filesystem: live_openshell_filesystem_policy(),
+        process: ProcessPolicy {
+            reloadability: PolicyReloadability::LockedAtCreate,
+            run_as_user: "sandbox".to_owned(),
+            run_as_group: "sandbox".to_owned(),
+            profile: String::new(),
+            allow_syscalls: Vec::new(),
+            deny_syscalls: Vec::new(),
+        },
+        inference: InferencePolicy {
+            reloadability: PolicyReloadability::HotReload,
+            routes: Vec::new(),
+        },
+    }
+}
+
+fn live_openshell_filesystem_policy() -> FilesystemPolicy {
+    FilesystemPolicy {
+        reloadability: PolicyReloadability::LockedAtCreate,
+        read_only: vec![
+            "/usr".to_owned(),
+            "/lib".to_owned(),
+            "/proc".to_owned(),
+            "/dev/urandom".to_owned(),
+            "/app".to_owned(),
+            "/etc".to_owned(),
+            "/var/log".to_owned(),
+        ],
+        read_write: vec![
+            "/sandbox".to_owned(),
+            "/tmp".to_owned(),
+            "/dev/null".to_owned(),
+        ],
+    }
 }
 
 fn shell_single_quote(value: &str) -> String {

@@ -70,6 +70,7 @@ const TMUX_AGENTENV_COMMAND_OPTION: &str = "@agentenv_command";
 const TMUX_AGENTENV_SESSION_NAME_OPTION: &str = "@agentenv_session_name";
 const TMUX_SESSION_FORMAT: &str =
     "#{session_name}\t#{session_attached}\t#{session_created}\t#{@agentenv_handle}\t#{@agentenv_session_name}\t#{@agentenv_command}";
+const DEFAULT_HARDENING_DOCKERFILE_MARKER: &str = "AGENTENV_HARDENING_PROFILE=custom";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDisposition {
@@ -389,6 +390,18 @@ struct ByoDockerfileConfig {
     build_seed: Option<String>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenShellHardeningConfig {
+    profile: Option<String>,
+    dockerfile_marker: Option<String>,
+    dockerfile_fragment: Option<String>,
+    ulimit_nproc: Option<u64>,
+    ulimit_nofile: Option<u64>,
+    disable_core_dumps: Option<bool>,
+    disable_user_namespaces: Option<bool>,
+}
+
 struct LogStream {
     handle: String,
     command: Box<dyn SpawnedCommand>,
@@ -687,8 +700,9 @@ impl SandboxDriver for OpenShellDriver {
                 });
             }
         };
+        let hardening = openshell_hardening_config(&spec.metadata)?;
         let image = match byo_dockerfile_config(&spec.metadata)? {
-            Some(config) => self.prepare_byo_dockerfile_context(&name, &config)?,
+            Some(config) => self.prepare_byo_dockerfile_context(&name, &config, &hardening)?,
             None => spec.image.unwrap_or_else(|| "openclaw".to_owned()),
         };
         let remote = match spec.metadata.get("remote") {
@@ -1058,6 +1072,7 @@ impl OpenShellDriver {
         &self,
         name: &str,
         config: &ByoDockerfileConfig,
+        hardening: &OpenShellHardeningConfig,
     ) -> DriverResult<String> {
         let dockerfile =
             fs::canonicalize(&config.dockerfile).map_err(|source| DriverError::InvalidInput {
@@ -1091,6 +1106,7 @@ impl OpenShellDriver {
             .join(format!("{build_name}-key"));
         stage_build_context(context_dir, &dockerfile, &key_stage_dir)?;
         let mut stage_guard = TempBuildStage::new(key_stage_dir.clone());
+        append_hardening_fragment(&key_stage_dir.join("Dockerfile"), hardening)?;
         let context_digest = build_cache::BuildCache::digest_staged_context(&key_stage_dir)?;
         let input = build_cache::BuildInput {
             env_name: name.to_owned(),
@@ -1823,6 +1839,32 @@ fn byo_dockerfile_config(
     }))
 }
 
+fn openshell_hardening_config(
+    metadata: &BTreeMap<String, Value>,
+) -> DriverResult<OpenShellHardeningConfig> {
+    let dockerfile_fragment = optional_metadata_string(metadata, "hardening_dockerfile_fragment")?;
+    let dockerfile_marker =
+        optional_metadata_comment_string(metadata, "hardening_dockerfile_marker")?;
+    let dockerfile_marker = if dockerfile_fragment.is_some() && dockerfile_marker.is_none() {
+        Some(DEFAULT_HARDENING_DOCKERFILE_MARKER.to_owned())
+    } else {
+        dockerfile_marker
+    };
+
+    Ok(OpenShellHardeningConfig {
+        profile: optional_metadata_comment_string(metadata, "hardening_profile")?,
+        dockerfile_marker,
+        dockerfile_fragment,
+        ulimit_nproc: optional_metadata_unsigned_integer(metadata, "hardening_ulimit_nproc")?,
+        ulimit_nofile: optional_metadata_unsigned_integer(metadata, "hardening_ulimit_nofile")?,
+        disable_core_dumps: optional_metadata_bool(metadata, "hardening_disable_core_dumps")?,
+        disable_user_namespaces: optional_metadata_bool(
+            metadata,
+            "hardening_disable_user_namespaces",
+        )?,
+    })
+}
+
 fn optional_metadata_string(
     metadata: &BTreeMap<String, Value>,
     key: &str,
@@ -1832,6 +1874,52 @@ fn optional_metadata_string(
         Some(Value::Null) | None => Ok(None),
         Some(_) => Err(DriverError::InvalidInput {
             message: format!("metadata.{key} must be a string when set"),
+        }),
+    }
+}
+
+fn optional_metadata_comment_string(
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> DriverResult<Option<String>> {
+    let Some(value) = optional_metadata_string(metadata, key)? else {
+        return Ok(None);
+    };
+    if value.contains(['\r', '\n']) {
+        return Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must not contain CR or LF characters"),
+        });
+    }
+    Ok(Some(value))
+}
+
+fn optional_metadata_unsigned_integer(
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> DriverResult<Option<u64>> {
+    match metadata.get(key) {
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(value) if value > 0 => Ok(Some(value)),
+            _ => Err(DriverError::InvalidInput {
+                message: format!("metadata.{key} must be a positive unsigned integer when set"),
+            }),
+        },
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must be a positive unsigned integer when set"),
+        }),
+    }
+}
+
+fn optional_metadata_bool(
+    metadata: &BTreeMap<String, Value>,
+    key: &str,
+) -> DriverResult<Option<bool>> {
+    match metadata.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(DriverError::InvalidInput {
+            message: format!("metadata.{key} must be a boolean when set"),
         }),
     }
 }
@@ -1890,6 +1978,91 @@ fn stage_build_context(
         }
     })?;
     Ok(())
+}
+
+fn append_hardening_fragment(
+    staged_dockerfile: &Path,
+    hardening: &OpenShellHardeningConfig,
+) -> DriverResult<()> {
+    let Some(fragment) = hardening.dockerfile_fragment.as_deref() else {
+        return Ok(());
+    };
+
+    let mut contents =
+        fs::read_to_string(staged_dockerfile).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to read staged BYO Dockerfile `{}` before hardening: {source}",
+                staged_dockerfile.display()
+            ),
+        })?;
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push('\n');
+    contents.push_str("# agentenv hardening");
+    if let Some(profile) = hardening.profile.as_deref() {
+        contents.push_str(" profile=");
+        contents.push_str(profile);
+    }
+    contents.push('\n');
+    if let Some(marker) = hardening.dockerfile_marker.as_deref() {
+        contents.push_str("# ");
+        contents.push_str(marker);
+        contents.push('\n');
+    }
+    let final_user = final_stage_user(&contents);
+    let restore_user = final_user.filter(|user| !dockerfile_user_is_root(user));
+    if restore_user.is_some() {
+        contents.push_str("USER root\n");
+    }
+    contents.push_str(fragment);
+    if !fragment.ends_with('\n') {
+        contents.push('\n');
+    }
+    if let Some(user) = restore_user {
+        contents.push_str("USER ");
+        contents.push_str(&user);
+        contents.push('\n');
+    }
+
+    fs::write(staged_dockerfile, contents).map_err(|source| DriverError::InvalidInput {
+        message: format!(
+            "failed to append hardening fragment to staged BYO Dockerfile `{}`: {source}",
+            staged_dockerfile.display()
+        ),
+    })
+}
+
+fn final_stage_user(contents: &str) -> Option<String> {
+    let mut user = None;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (instruction, rest) = split_dockerfile_instruction(line);
+        if instruction.eq_ignore_ascii_case("FROM") {
+            user = None;
+        } else if instruction.eq_ignore_ascii_case("USER") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                user = Some(rest.to_owned());
+            }
+        }
+    }
+    user
+}
+
+fn split_dockerfile_instruction(line: &str) -> (&str, &str) {
+    match line.find(char::is_whitespace) {
+        Some(index) => (&line[..index], &line[index..]),
+        None => (line, ""),
+    }
+}
+
+fn dockerfile_user_is_root(user: &str) -> bool {
+    let user = user.split(':').next().unwrap_or(user).trim();
+    matches!(user, "root" | "0")
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> io::Result<()> {
@@ -6669,6 +6842,17 @@ mod driver_tests {
         let key_stage_dir = workdir.join("build").join("devbox-key");
         super::stage_build_context(&context_dir, &dockerfile, &key_stage_dir)
             .expect("stage key context");
+        let hardening = super::OpenShellHardeningConfig {
+            profile: Some("strict".to_owned()),
+            dockerfile_marker: Some("AGENTENV_HARDENING_PROFILE=strict".to_owned()),
+            dockerfile_fragment: Some("RUN apk del build-base\n".to_owned()),
+            ulimit_nproc: Some(256),
+            ulimit_nofile: Some(1024),
+            disable_core_dumps: Some(true),
+            disable_user_namespaces: Some(true),
+        };
+        super::append_hardening_fragment(&key_stage_dir.join("Dockerfile"), &hardening)
+            .expect("append hardening fragment");
         let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
             .expect("context digest");
         let noop = agentenv_events::NoopEventEmitter;
@@ -6785,6 +6969,274 @@ mod driver_tests {
                                 "agentenv_version".to_owned(),
                                 json!(env!("CARGO_PKG_VERSION")),
                             ),
+                            ("hardening_profile".to_owned(), json!("strict")),
+                            (
+                                "hardening_dockerfile_marker".to_owned(),
+                                json!("AGENTENV_HARDENING_PROFILE=strict"),
+                            ),
+                            (
+                                "hardening_dockerfile_fragment".to_owned(),
+                                json!("RUN apk del build-base\n"),
+                            ),
+                            ("hardening_ulimit_nproc".to_owned(), json!(256)),
+                            ("hardening_ulimit_nofile".to_owned(), json!(1024)),
+                            ("hardening_disable_core_dumps".to_owned(), json!(true)),
+                            ("hardening_disable_user_namespaces".to_owned(), json!(true)),
+                        ]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert_eq!(result.handle, "devbox");
+        assert_eq!(runner.calls().len(), 3);
+        let staged_dockerfile = std::fs::read_to_string(final_context_dir.join("Dockerfile"))
+            .expect("staged Dockerfile");
+        assert!(staged_dockerfile
+            .starts_with(&std::fs::read_to_string(&dockerfile).expect("source Dockerfile")));
+        assert!(staged_dockerfile.contains("agentenv hardening"));
+        assert!(staged_dockerfile.contains("AGENTENV_HARDENING_PROFILE=strict"));
+        assert!(staged_dockerfile.contains("RUN apk del build-base"));
+        assert!(final_context_dir.join("internal-cli").is_file());
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.join("image-digest")).expect("digest file"),
+            format!("{digest}\n")
+        );
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn append_hardening_fragment_runs_as_root_and_restores_final_user() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-hardening-user");
+        let staged_dockerfile = tempdir.join("Dockerfile");
+        std::fs::write(
+            &staged_dockerfile,
+            "FROM alpine:3.20\nRUN adduser -D sandbox\nUSER sandbox\n",
+        )
+        .expect("write staged Dockerfile");
+        let hardening = super::OpenShellHardeningConfig {
+            profile: Some("strict".to_owned()),
+            dockerfile_marker: Some("AGENTENV_HARDENING_PROFILE=strict".to_owned()),
+            dockerfile_fragment: Some("RUN echo hardening\n".to_owned()),
+            ulimit_nproc: None,
+            ulimit_nofile: None,
+            disable_core_dumps: None,
+            disable_user_namespaces: None,
+        };
+
+        super::append_hardening_fragment(&staged_dockerfile, &hardening)
+            .expect("append hardening fragment");
+
+        let contents = std::fs::read_to_string(&staged_dockerfile).expect("staged Dockerfile");
+        let user_root = contents.find("USER root\n").expect("root user switch");
+        let run_fragment = contents
+            .find("RUN echo hardening\n")
+            .expect("hardening fragment");
+        let restore_user = contents.rfind("USER sandbox\n").expect("restored user");
+        assert!(user_root < run_fragment);
+        assert!(run_fragment < restore_user);
+        assert!(contents.trim_end().ends_with("USER sandbox"));
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_rejects_invalid_hardening_metadata_before_build() {
+        let tempdir = unique_tempdir("sandbox-openshell-invalid-hardening");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&context_dir).expect("create context");
+        let dockerfile = context_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+        let workdir = tempdir.join(".agentenv");
+        let runner = Arc::new(RecordingCommandRunner::new(vec![]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("hardening_ulimit_nproc".to_owned(), json!(0)),
+                        ]),
+                    })
+                    .await
+            })
+            .expect_err("invalid hardening metadata should reject create");
+
+        let message = err.to_string();
+        assert!(message.contains("hardening_ulimit_nproc"));
+        assert!(message.contains("positive"));
+        assert!(runner.calls().is_empty());
+        assert!(!workdir.join("build").join("devbox").exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_rejects_newline_hardening_comment_metadata_before_build() {
+        for (key, value) in [
+            ("hardening_profile", "strict\nRUN apk add curl"),
+            (
+                "hardening_dockerfile_marker",
+                "AGENTENV_HARDENING_PROFILE=strict\rRUN apk add curl",
+            ),
+        ] {
+            let tempdir = unique_tempdir("sandbox-openshell-newline-hardening");
+            let context_dir = tempdir.join("enterprise-sandbox");
+            std::fs::create_dir_all(&context_dir).expect("create context");
+            let dockerfile = context_dir.join("Dockerfile");
+            std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+            let workdir = tempdir.join(".agentenv");
+            let runner = Arc::new(RecordingCommandRunner::new(vec![]));
+            let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let err = runtime
+                .block_on(async {
+                    driver
+                        .create(SandboxSpec {
+                            image: None,
+                            env: BTreeMap::new(),
+                            policy: None,
+                            metadata: BTreeMap::from([
+                                ("name".to_owned(), json!("devbox")),
+                                (
+                                    "byo_dockerfile".to_owned(),
+                                    json!(dockerfile.display().to_string()),
+                                ),
+                                (key.to_owned(), json!(value)),
+                                (
+                                    "hardening_dockerfile_fragment".to_owned(),
+                                    json!("RUN apk del build-base\n"),
+                                ),
+                            ]),
+                        })
+                        .await
+                })
+                .expect_err("newline hardening metadata should reject create");
+
+            let message = err.to_string();
+            assert!(message.contains(key));
+            assert!(runner.calls().is_empty());
+            assert!(!workdir.join("build").join("devbox").exists());
+            std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+        }
+    }
+
+    #[test]
+    fn create_keeps_byo_dockerfile_unchanged_when_hardening_fragment_absent() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-no-hardening-fragment");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&context_dir).expect("create context");
+        let dockerfile = context_dir.join("Containerfile.agentenv");
+        let dockerfile_contents =
+            "FROM alpine:3.20\nARG AGENTENV_VERSION\nRUN test -n \"$AGENTENV_VERSION\"\n";
+        std::fs::write(&dockerfile, dockerfile_contents).expect("write Dockerfile");
+        let workdir = tempdir.join(".agentenv");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&context_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir.clone(),
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: String::new(),
+            mcp_port: String::new(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: None,
+        };
+        let cache_key = cache.build_key(&input).expect("build key");
+        std::fs::remove_dir_all(&key_stage_dir).expect("remove key stage setup");
+        let cache_dir = cache.cache_dir(&cache_key);
+        let final_context_dir = cache_dir.join("context");
+        let final_context_arg = final_context_dir.display().to_string();
+        let tag = super::build_cache::tag_for_key(&cache_key);
+        let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success("docker", |_| {}, "", ""),
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                },
+                &format!("{digest}\n"),
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--no-auto-providers",
+                            "--from",
+                            &final_context_arg,
+                            "--",
+                            "true",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            ("hardening_profile".to_owned(), json!("strict")),
+                            (
+                                "hardening_dockerfile_marker".to_owned(),
+                                json!("AGENTENV_HARDENING_PROFILE=strict"),
+                            ),
                         ]),
                     })
                     .await
@@ -6796,12 +7248,10 @@ mod driver_tests {
         assert_eq!(
             std::fs::read_to_string(final_context_dir.join("Dockerfile"))
                 .expect("staged Dockerfile"),
-            std::fs::read_to_string(&dockerfile).expect("source Dockerfile")
+            dockerfile_contents
         );
-        assert!(final_context_dir.join("internal-cli").is_file());
         assert_eq!(
-            std::fs::read_to_string(workdir.join("build").join("devbox").join("image-digest"))
-                .expect("digest file"),
+            std::fs::read_to_string(cache_dir.join("image-digest")).expect("digest file"),
             format!("{digest}\n")
         );
         let metadata_files = std::fs::read_dir(workdir.join("build-cache"))
@@ -6824,6 +7274,154 @@ mod driver_tests {
             .as_str()
             .expect("metadata build key")
             .starts_with("sha256:"));
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_uses_default_hardening_marker_when_fragment_marker_absent() {
+        let tempdir = unique_tempdir("sandbox-openshell-byo-default-hardening-marker");
+        let context_dir = tempdir.join("enterprise-sandbox");
+        std::fs::create_dir_all(&context_dir).expect("create context");
+        let dockerfile = context_dir.join("Dockerfile");
+        std::fs::write(&dockerfile, "FROM alpine:3.20\n").expect("write Dockerfile");
+        let workdir = tempdir.join(".agentenv");
+        let key_stage_dir = workdir.join("build").join("devbox-key");
+        super::stage_build_context(&context_dir, &dockerfile, &key_stage_dir)
+            .expect("stage key context");
+        let hardening = super::OpenShellHardeningConfig {
+            profile: None,
+            dockerfile_marker: Some(super::DEFAULT_HARDENING_DOCKERFILE_MARKER.to_owned()),
+            dockerfile_fragment: Some("RUN apk del build-base\n".to_owned()),
+            ulimit_nproc: None,
+            ulimit_nofile: None,
+            disable_core_dumps: None,
+            disable_user_namespaces: None,
+        };
+        super::append_hardening_fragment(&key_stage_dir.join("Dockerfile"), &hardening)
+            .expect("append hardening fragment");
+        let context_digest = super::build_cache::BuildCache::digest_staged_context(&key_stage_dir)
+            .expect("context digest");
+        let noop = agentenv_events::NoopEventEmitter;
+        let cache = super::build_cache::BuildCache::new(workdir.clone(), &noop);
+        let input = super::build_cache::BuildInput {
+            env_name: "devbox".to_owned(),
+            dockerfile: dockerfile.clone(),
+            staged_context: key_stage_dir.clone(),
+            context_digest,
+            expected_digest: None,
+            agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: String::new(),
+            mcp_port: String::new(),
+            workspace_mount: "/sandbox".to_owned(),
+            seed: None,
+        };
+        let cache_key = cache.build_key(&input).expect("build key");
+        std::fs::remove_dir_all(&key_stage_dir).expect("remove key stage setup");
+        let cache_dir = cache.cache_dir(&cache_key);
+        let stage_dir = cache_dir.join("context.tmp");
+        let final_context_dir = cache_dir.join("context");
+        let stage_dockerfile = stage_dir.join("Dockerfile");
+        let stage_dir_arg = stage_dir.display().to_string();
+        let final_context_arg = final_context_dir.display().to_string();
+        let tag = super::build_cache::tag_for_key(&cache_key);
+        let expected_build_args = vec![
+            "build".to_owned(),
+            "--file".to_owned(),
+            stage_dockerfile.display().to_string(),
+            "--tag".to_owned(),
+            tag.to_owned(),
+            "--build-arg".to_owned(),
+            format!("AGENTENV_VERSION={}", env!("CARGO_PKG_VERSION")),
+            "--build-arg".to_owned(),
+            "AGENTENV_AGENT=".to_owned(),
+            "--build-arg".to_owned(),
+            "AGENTENV_MCP_PORT=".to_owned(),
+            "--build-arg".to_owned(),
+            "AGENTENV_WORKSPACE_MOUNT=/sandbox".to_owned(),
+            stage_dir_arg,
+        ];
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(call.request.args, expected_build_args);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "docker",
+                move |call| {
+                    assert_eq!(
+                        call.request.args,
+                        vec![
+                            "image".to_owned(),
+                            "inspect".to_owned(),
+                            "--format".to_owned(),
+                            "{{.Id}}".to_owned(),
+                            tag.to_owned(),
+                        ]
+                    );
+                },
+                &format!("{digest}\n"),
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                move |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&[
+                            "sandbox",
+                            "create",
+                            "--name",
+                            "devbox",
+                            "--no-auto-providers",
+                            "--from",
+                            &final_context_arg,
+                            "--",
+                            "true",
+                        ])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner_and_workdir(runner.clone(), &workdir);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([
+                            ("name".to_owned(), json!("devbox")),
+                            (
+                                "byo_dockerfile".to_owned(),
+                                json!(dockerfile.display().to_string()),
+                            ),
+                            (
+                                "hardening_dockerfile_fragment".to_owned(),
+                                json!("RUN apk del build-base\n"),
+                            ),
+                        ]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        let staged_dockerfile = std::fs::read_to_string(final_context_dir.join("Dockerfile"))
+            .expect("staged Dockerfile");
+        assert!(staged_dockerfile.contains("AGENTENV_HARDENING_PROFILE=custom"));
+        assert!(staged_dockerfile.contains("RUN apk del build-base"));
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
