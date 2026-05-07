@@ -4808,7 +4808,7 @@ policy:
     struct SnapshotFactory {
         copied_out: Arc<Mutex<Vec<(String, String)>>>,
         copied_in: Arc<Mutex<Vec<(String, String)>>>,
-        copied_in_entries: Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
+        copied_in_entries: SnapshotCopyInEntries,
         execs: Arc<Mutex<Vec<String>>>,
         env_builds: Arc<Mutex<Vec<String>>>,
         output_race: Arc<Mutex<Option<SnapshotOutputRace>>>,
@@ -4857,10 +4857,13 @@ policy:
         Directory(std::path::PathBuf),
     }
 
+    type SnapshotCopyInEntry = (String, String, Vec<String>);
+    type SnapshotCopyInEntries = Arc<Mutex<Vec<SnapshotCopyInEntry>>>;
+
     struct SnapshotSandbox {
         copied_out: Arc<Mutex<Vec<(String, String)>>>,
         copied_in: Arc<Mutex<Vec<(String, String)>>>,
-        copied_in_entries: Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
+        copied_in_entries: SnapshotCopyInEntries,
         execs: Arc<Mutex<Vec<String>>>,
         output_race: Arc<Mutex<Option<SnapshotOutputRace>>>,
     }
