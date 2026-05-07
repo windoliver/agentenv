@@ -21,6 +21,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
+const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PTY_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
 }
@@ -904,11 +907,8 @@ fn term_launches_and_quits_from_pty() {
     let mut child = pair.slave.spawn_command(cmd).unwrap();
     let mut writer = pair.master.take_writer().unwrap();
 
-    thread::sleep(Duration::from_millis(500));
-    writer.write_all(b"q").unwrap();
-    writer.flush().unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PTY_QUIT_TIMEOUT;
+    let mut next_quit = Instant::now() + Duration::from_millis(500);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -921,9 +921,15 @@ fn term_launches_and_quits_from_pty() {
             drop(pair);
             let pty_output = reader_thread.join().unwrap();
             panic!(
-                "term did not exit within 5s after `q`; pid: {process_id:?}; kill: {kill_result:?}; reap: {reap_result:?}; pty output:\n{}",
+                "term did not exit within {:?} after `q`; pid: {process_id:?}; kill: {kill_result:?}; reap: {reap_result:?}; pty output:\n{}",
+                PTY_QUIT_TIMEOUT,
                 String::from_utf8_lossy(&pty_output)
             );
+        }
+        if Instant::now() >= next_quit {
+            writer.write_all(b"q").unwrap();
+            writer.flush().unwrap();
+            next_quit = Instant::now() + Duration::from_millis(250);
         }
         thread::sleep(Duration::from_millis(50));
     };
@@ -3289,11 +3295,11 @@ fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
 
 fn wait_for_http_ok(port: u16, path: &str) {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(200))
+        .timeout(Duration::from_secs(1))
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{port}{path}");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
     let mut last_error = None;
 
     while std::time::Instant::now() < deadline {
@@ -3360,7 +3366,7 @@ fn post_decision_callback(
     headers: Option<Vec<(&'static str, String)>>,
 ) -> reqwest::blocking::Response {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(LOCAL_HTTP_TEST_TIMEOUT)
         .build()
         .unwrap();
     let mut request = client

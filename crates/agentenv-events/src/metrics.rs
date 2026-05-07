@@ -85,6 +85,9 @@ pub struct MetricsSnapshot {
     pub sandbox_latency: Vec<LatencyBucketMetric>,
     pub sandbox_latency_summary: Vec<LatencySummaryMetric>,
     pub approvals_pending_total: u64,
+    pub build_oneflight_hits_total: u64,
+    pub build_oneflight_misses_total: u64,
+    pub build_queue_depth: u64,
     pub event_drops_total: Vec<SinkCounterMetric>,
     pub event_sink_errors_total: Vec<SinkCounterMetric>,
 }
@@ -126,6 +129,11 @@ impl MetricsSnapshot {
         let (sandbox_latency, sandbox_latency_summary) =
             latency_metrics(store.sandbox_latency_rows()?);
         let approvals_pending_total = store.approvals_pending_count()?;
+        let build_oneflight_hits_total =
+            store.count_events_by_kind(ActivityKind::BuildOneflightHit)?;
+        let build_oneflight_misses_total =
+            store.count_events_by_kind(ActivityKind::BuildOneflightMiss)?;
+        let build_queue_depth = store.latest_build_queue_depth()?;
 
         Ok(Self {
             envs_by_status: envs_by_status.to_vec(),
@@ -135,6 +143,9 @@ impl MetricsSnapshot {
             sandbox_latency,
             sandbox_latency_summary,
             approvals_pending_total,
+            build_oneflight_hits_total,
+            build_oneflight_misses_total,
+            build_queue_depth,
             event_drops_total: Vec::new(),
             event_sink_errors_total: Vec::new(),
         })
@@ -264,6 +275,42 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
         &mut output,
         "agentenv_approvals_pending_total",
         snapshot.approvals_pending_total,
+    );
+
+    render_help_type(
+        &mut output,
+        "agentenv_build_oneflight_hits_total",
+        "Total build oneflight cache hits and waiters.",
+        "counter",
+    );
+    render_scalar(
+        &mut output,
+        "agentenv_build_oneflight_hits_total",
+        snapshot.build_oneflight_hits_total,
+    );
+
+    render_help_type(
+        &mut output,
+        "agentenv_build_oneflight_misses_total",
+        "Total build oneflight builder requests.",
+        "counter",
+    );
+    render_scalar(
+        &mut output,
+        "agentenv_build_oneflight_misses_total",
+        snapshot.build_oneflight_misses_total,
+    );
+
+    render_help_type(
+        &mut output,
+        "agentenv_build_queue_depth",
+        "Latest observed number of build oneflight waiters.",
+        "gauge",
+    );
+    render_scalar(
+        &mut output,
+        "agentenv_build_queue_depth",
+        snapshot.build_queue_depth,
     );
 
     render_help_type(
@@ -528,6 +575,66 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_render_includes_build_oneflight_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        store
+            .append_many(&[
+                event(
+                    "2026-05-06T12:00:00Z",
+                    ActivityKind::BuildOneflightHit,
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-05-06T12:00:01Z",
+                    ActivityKind::BuildOneflightHit,
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-05-06T12:00:02Z",
+                    ActivityKind::BuildOneflightMiss,
+                    ActivityResult::Ok,
+                ),
+                event(
+                    "2026-05-06T12:00:03Z",
+                    ActivityKind::BuildQueueDepth,
+                    ActivityResult::Ok,
+                )
+                .with_extra("depth", serde_json::json!(3)),
+                event(
+                    "2026-05-06T12:00:04Z",
+                    ActivityKind::BuildQueueDepth,
+                    ActivityResult::Ok,
+                )
+                .with_extra("depth", serde_json::json!(1)),
+            ])
+            .unwrap();
+
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+        let rendered = render_prometheus(&snapshot);
+
+        assert!(rendered.contains("# HELP agentenv_build_oneflight_hits_total "));
+        assert!(rendered.contains("# TYPE agentenv_build_oneflight_hits_total counter"));
+        assert!(rendered.contains("agentenv_build_oneflight_hits_total 2"));
+        assert!(rendered.contains("# HELP agentenv_build_oneflight_misses_total "));
+        assert!(rendered.contains("# TYPE agentenv_build_oneflight_misses_total counter"));
+        assert!(rendered.contains("agentenv_build_oneflight_misses_total 1"));
+        assert!(rendered.contains("# HELP agentenv_build_queue_depth "));
+        assert!(rendered.contains("# TYPE agentenv_build_queue_depth gauge"));
+        assert!(rendered.contains("agentenv_build_queue_depth 1"));
+    }
+
+    #[test]
+    fn build_queue_depth_defaults_to_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+        let rendered = render_prometheus(&snapshot);
+
+        assert!(rendered.contains("agentenv_build_queue_depth 0"));
+    }
+
+    #[test]
     fn prometheus_render_escapes_label_values() {
         let snapshot = MetricsSnapshot {
             envs_by_status: vec![EnvMetricRow {
@@ -540,6 +647,9 @@ mod tests {
             sandbox_latency: Vec::new(),
             sandbox_latency_summary: Vec::new(),
             approvals_pending_total: 0,
+            build_oneflight_hits_total: 0,
+            build_oneflight_misses_total: 0,
+            build_queue_depth: 0,
             event_drops_total: Vec::new(),
             event_sink_errors_total: Vec::new(),
         };

@@ -148,13 +148,7 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
     let output = driver
         .exec(ExecParams {
             handle: handle.clone(),
-            cmd: format!(
-                "sh -lc {}",
-                shell_single_quote(&format!(
-                    "if grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root 2>/dev/null; then exit 10; else exit 0; fi",
-                    shell_single_quote(&marker)
-                ))
-            ),
+            cmd: secret_absence_probe_command(&marker),
             tty: false,
             env: BTreeMap::new(),
         })
@@ -199,6 +193,14 @@ fn github_read_policy() -> NetworkPolicy {
         },
     });
     policy
+}
+
+fn secret_absence_probe_command(marker: &str) -> String {
+    let script = format!(
+        "matches=$(mktemp); trap 'rm -f \"$matches\"' EXIT; grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root >\"$matches\" 2>/dev/null || true; if [ -s \"$matches\" ]; then cat \"$matches\"; exit 10; fi",
+        shell_single_quote(marker)
+    );
+    format!("sh -lc {}", shell_single_quote(&script))
 }
 
 fn default_deny_policy() -> NetworkPolicy {

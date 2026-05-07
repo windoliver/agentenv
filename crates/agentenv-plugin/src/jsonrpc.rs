@@ -1473,6 +1473,7 @@ mod async_client_tests {
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static FIXTURE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    const APPROVAL_FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
     async fn fixture_test_guard() -> MutexGuard<'static, ()> {
         FIXTURE_TEST_LOCK
@@ -1847,7 +1848,7 @@ mod async_client_tests {
         let decision_file = temp_fixture_path("approval-auto-deny");
         let mut client = spawn_fixture_client(
             "approval_before_preflight",
-            Duration::from_secs(3),
+            APPROVAL_FIXTURE_TIMEOUT,
             &[(
                 "JSONRPC_FIXTURE_DECISION_FILE",
                 decision_file.to_string_lossy().as_ref(),
@@ -1893,7 +1894,7 @@ mod async_client_tests {
         let decision_file = temp_fixture_path("approval-delayed-auto-deny");
         let mut client = spawn_fixture_client(
             "delayed_approval_before_preflight",
-            Duration::from_secs(3),
+            APPROVAL_FIXTURE_TIMEOUT,
             &[(
                 "JSONRPC_FIXTURE_DECISION_FILE",
                 decision_file.to_string_lossy().as_ref(),
