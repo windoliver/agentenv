@@ -3,10 +3,10 @@
 use std::{collections::BTreeMap, env, sync::Arc};
 
 use agentenv_core::driver::SandboxDriver;
+use agentenv_policy::{compose_policy, PresetRegistry, Tier};
 use agentenv_proto::{
-    ApplyPolicyParams, DestroyParams, ExecParams, FilesystemPolicy, HttpAccessLevel,
-    InferencePolicy, NetworkAccessPolicy, NetworkPolicy, NetworkRule, NetworkTarget,
-    PolicyReloadability, ProcessPolicy, SandboxSpec,
+    ApplyPolicyParams, DestroyParams, ExecParams, HttpAccessLevel, NetworkPolicy, NetworkRule,
+    NetworkTarget, SandboxSpec,
 };
 use sandbox_openshell::OpenShellDriver;
 use tokio::runtime::Builder;
@@ -31,7 +31,7 @@ async fn openshell_create_exec_policy_logs_and_destroy_flow() {
         .create(SandboxSpec {
             image: Some("openclaw".to_owned()),
             env: BTreeMap::new(),
-            policy: None,
+            policy: Some(restricted_policy()),
             metadata,
         })
         .await
@@ -148,13 +148,7 @@ async fn credentials_do_not_appear_in_sandbox_filesystem() {
     let output = driver
         .exec(ExecParams {
             handle: handle.clone(),
-            cmd: format!(
-                "sh -lc {}",
-                shell_single_quote(&format!(
-                    "grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root; status=$?; if [ $status -eq 0 ]; then exit 10; elif [ $status -eq 1 ]; then exit 0; else exit $status; fi",
-                    shell_single_quote(&marker)
-                ))
-            ),
+            cmd: secret_absence_probe_command(&marker),
             tty: false,
             env: BTreeMap::new(),
         })
@@ -188,39 +182,30 @@ fn should_run_integration() -> bool {
     )
 }
 
+fn restricted_policy() -> NetworkPolicy {
+    let registry = PresetRegistry::load_builtin().expect("load builtin policy presets");
+    compose_policy(Tier::Restricted, &[], None, &registry).expect("compose restricted policy")
+}
+
 fn github_read_policy() -> NetworkPolicy {
-    NetworkPolicy {
-        network: NetworkAccessPolicy {
-            reloadability: PolicyReloadability::HotReload,
-            allow: vec![NetworkRule {
-                target: NetworkTarget::Host {
-                    host: "api.github.com".to_owned(),
-                    port: Some(443),
-                    scheme: Some("https".to_owned()),
-                    http_access: Some(HttpAccessLevel::ReadOnly),
-                },
-            }],
-            deny: Vec::new(),
-            approval_required: Vec::new(),
+    let mut policy = restricted_policy();
+    policy.network.allow.push(NetworkRule {
+        target: NetworkTarget::Host {
+            host: "api.github.com".to_owned(),
+            port: Some(443),
+            scheme: Some("https".to_owned()),
+            http_access: Some(HttpAccessLevel::ReadOnly),
         },
-        filesystem: FilesystemPolicy {
-            reloadability: PolicyReloadability::LockedAtCreate,
-            read_only: Vec::new(),
-            read_write: Vec::new(),
-        },
-        process: ProcessPolicy {
-            reloadability: PolicyReloadability::LockedAtCreate,
-            run_as_user: String::new(),
-            run_as_group: String::new(),
-            profile: String::new(),
-            allow_syscalls: Vec::new(),
-            deny_syscalls: Vec::new(),
-        },
-        inference: InferencePolicy {
-            reloadability: PolicyReloadability::HotReload,
-            routes: Vec::new(),
-        },
-    }
+    });
+    policy
+}
+
+fn secret_absence_probe_command(marker: &str) -> String {
+    let script = format!(
+        "matches=$(mktemp); trap 'rm -f \"$matches\"' EXIT; grep -R --fixed-strings --line-number -- {} /sandbox /tmp /var/tmp /var/log /root >\"$matches\" 2>/dev/null || true; if [ -s \"$matches\" ]; then cat \"$matches\"; exit 10; fi",
+        shell_single_quote(marker)
+    );
+    format!("sh -lc {}", shell_single_quote(&script))
 }
 
 fn shell_single_quote(value: &str) -> String {
