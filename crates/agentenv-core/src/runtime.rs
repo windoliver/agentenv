@@ -1003,7 +1003,7 @@ async fn create_env_with_input(
     );
 
     let result = async {
-        initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+        let sandbox_init = initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
         initialize_agent_driver(options, set.agent.as_mut()).await?;
         initialize_context_driver(options, set.context.as_mut()).await?;
         if let Some(inference) = set.inference.as_mut() {
@@ -1162,8 +1162,13 @@ async fn create_env_with_input(
             policy.network.allow.extend(context_network_rules.rules);
         }
 
-        let create_policy = create_policy_for_agent_install(&policy, &agent_setup);
-        let restore_policy_after_install = create_policy != policy;
+        let supports_hot_reload_policy = supports_hot_reload_policy(&sandbox_init.capabilities);
+        let create_policy = if supports_hot_reload_policy {
+            create_policy_for_agent_install(&policy, &agent_setup)
+        } else {
+            policy.clone()
+        };
+        let restore_policy_after_install = supports_hot_reload_policy && create_policy != policy;
 
         let build_oneflight_seed = build_oneflight_seed_for_byo(
             blueprint_yaml,
@@ -2487,6 +2492,23 @@ fn sandbox_spec_for_create(
             serde_json::json!("/sandbox"),
         ),
     ]);
+    for (key, value) in sandbox_extra {
+        if matches!(key.as_str(), "image" | "hardening") {
+            continue;
+        }
+        if is_reserved_sandbox_metadata_key(key) {
+            return Err(RuntimeError::Driver(DriverError::InvalidInput {
+                message: format!("sandbox.{key} is reserved metadata and cannot be set directly"),
+            }));
+        }
+        let value = serde_json::to_value(value).map_err(|source| {
+            RuntimeError::ComponentConfigConversion {
+                key: key.clone(),
+                source,
+            }
+        })?;
+        metadata.insert(key.clone(), value);
+    }
     if let Some(resolved_hardening) = resolved_hardening {
         metadata.extend(resolved_hardening.metadata.clone());
     }
@@ -2547,6 +2569,12 @@ fn sandbox_spec_for_create(
         policy,
         metadata,
     })
+}
+
+fn is_reserved_sandbox_metadata_key(key: &str) -> bool {
+    key == "name"
+        || key.starts_with("agentenv_")
+        || matches!(key, "byo_dockerfile" | "byo_expected_digest")
 }
 
 fn record_computed_byo_image_digest(
@@ -3333,6 +3361,16 @@ fn supports_persistent_sessions(capabilities: &Capabilities) -> bool {
         capabilities,
         Capabilities::Sandbox(agentenv_proto::SandboxCapabilities {
             supports_persistent_sessions: true,
+            ..
+        })
+    )
+}
+
+fn supports_hot_reload_policy(capabilities: &Capabilities) -> bool {
+    matches!(
+        capabilities,
+        Capabilities::Sandbox(agentenv_proto::SandboxCapabilities {
+            supports_hot_reload_policy: true,
             ..
         })
     )
@@ -5259,6 +5297,27 @@ policy:
             Ok(DriverSet {
                 sandbox: Box::new(AgentSetupSandboxDriver {
                     tracker: Arc::clone(&self.tracker),
+                    supports_hot_reload_policy: true,
+                }),
+                agent: Box::new(AgentSetupAgentDriver {
+                    tracker: Arc::clone(&self.tracker),
+                }),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct NoHotReloadAgentSetupFactory {
+        tracker: Arc<AgentSetupTracker>,
+    }
+
+    impl DriverFactory for NoHotReloadAgentSetupFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(AgentSetupSandboxDriver {
+                    tracker: Arc::clone(&self.tracker),
+                    supports_hot_reload_policy: false,
                 }),
                 agent: Box::new(AgentSetupAgentDriver {
                     tracker: Arc::clone(&self.tracker),
@@ -5279,6 +5338,7 @@ policy:
             Ok(DriverSet {
                 sandbox: Box::new(AgentSetupSandboxDriver {
                     tracker: Arc::clone(&self.tracker),
+                    supports_hot_reload_policy: true,
                 }),
                 agent: Box::new(AgentSetupAgentDriver {
                     tracker: Arc::clone(&self.tracker),
@@ -5536,13 +5596,18 @@ policy:
 
     struct AgentSetupSandboxDriver {
         tracker: Arc<AgentSetupTracker>,
+        supports_hot_reload_policy: bool,
     }
 
     #[async_trait]
     impl SandboxDriver for AgentSetupSandboxDriver {
         async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
             let mut inner = TinySandboxDriver;
-            inner.initialize(params).await
+            let mut result = inner.initialize(params).await?;
+            if let Capabilities::Sandbox(capabilities) = &mut result.capabilities {
+                capabilities.supports_hot_reload_policy = self.supports_hot_reload_policy;
+            }
+            Ok(result)
         }
 
         async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
@@ -5655,6 +5720,11 @@ policy:
                 .lock()
                 .expect("apply policy tracker")
                 .push(params.policy.clone());
+            if !self.supports_hot_reload_policy {
+                return Err(crate::driver::DriverError::CapabilityMissing {
+                    capability: "supports_hot_reload_policy".to_owned(),
+                });
+            }
             TinySandboxDriver.apply_policy(params).await
         }
 
@@ -7472,6 +7542,169 @@ policy:
     }
 
     #[tokio::test]
+    async fn create_env_rejects_direct_byo_dockerfile_sandbox_metadata_extra() {
+        let root = unique_root("agentenv-create-direct-byo-dockerfile");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+  byo_dockerfile: /tmp/evil
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("sandbox.byo_dockerfile"),
+            "unexpected error: {err}"
+        );
+        assert!(tracker
+            .create_specs
+            .lock()
+            .expect("create spec tracker")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_env_rejects_agentenv_prefixed_sandbox_metadata_extra() {
+        let root = unique_root("agentenv-create-agentenv-metadata-extra");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: remote-ssh
+  agentenv_agent: evil
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("sandbox.agentenv_agent"),
+            "unexpected error: {err}"
+        );
+        assert!(tracker
+            .create_specs
+            .lock()
+            .expect("create spec tracker")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_env_passes_generic_sandbox_extra_metadata_to_sandbox() {
+        let root = unique_root("agentenv-create-remote-ssh-metadata");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: remote-ssh
+  host: dev-vm.example.com
+  user: alice
+  port: 2222
+  identity_file: ~/.ssh/id_ed25519
+  jump_host: bastion.example.com
+  enforce_remote_firewall: false
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(
+            &options,
+            &AgentSetupFactory {
+                tracker: Arc::clone(&tracker),
+            },
+            &mut credentials,
+            "demo",
+            yaml,
+        )
+        .await
+        .unwrap();
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(specs.len(), 1);
+        let metadata = &specs[0].metadata;
+        assert_eq!(metadata["name"], serde_json::json!("demo"));
+        assert_eq!(metadata["host"], serde_json::json!("dev-vm.example.com"));
+        assert_eq!(metadata["user"], serde_json::json!("alice"));
+        assert_eq!(metadata["port"], serde_json::json!(2222));
+        assert_eq!(
+            metadata["identity_file"],
+            serde_json::json!("~/.ssh/id_ed25519")
+        );
+        assert_eq!(
+            metadata["jump_host"],
+            serde_json::json!("bastion.example.com")
+        );
+        assert_eq!(
+            metadata["enforce_remote_firewall"],
+            serde_json::json!(false)
+        );
+        assert!(!metadata.contains_key("image"));
+    }
+
+    #[tokio::test]
     async fn create_env_records_computed_byo_digest_in_lockfile() {
         let root = unique_root("agentenv-create-byo-digest-lock");
         let options = RuntimeOptions {
@@ -9028,6 +9261,66 @@ policy:
                 .join("agent")
                 .exists(),
             "rendered agent files can contain credentials and must not persist in the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_does_not_restore_policy_when_sandbox_lacks_hot_reload() {
+        let root = unique_root("agentenv-agent-setup-no-hot-reload");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: remote-ssh
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = NoHotReloadAgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect("create env");
+
+        let exec_cmds = tracker.exec_cmds.lock().expect("exec tracker").clone();
+        assert!(exec_cmds
+            .iter()
+            .any(|cmd| cmd.contains("printf agent-installed")));
+        let create_policies = tracker
+            .create_policies
+            .lock()
+            .expect("create policy tracker")
+            .clone();
+        assert_eq!(create_policies.len(), 1);
+        assert!(
+            !create_policies[0]
+                .network
+                .allow
+                .contains(&super::agent_install_npm_registry_rule()),
+            "sandbox create should use final policy when hot reload is unavailable"
+        );
+        let applied_policies = tracker
+            .applied_policies
+            .lock()
+            .expect("apply policy tracker")
+            .clone();
+        assert!(
+            applied_policies.is_empty(),
+            "sandbox policy restore should not be attempted without hot reload"
         );
     }
 

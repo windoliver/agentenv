@@ -40,6 +40,7 @@ inference-openai = { path = "../drivers/inference-openai" }
 inference-passthrough = { path = "../drivers/inference-passthrough" }
 rpassword = "7"
 sandbox-openshell = { path = "../drivers/sandbox-openshell" }
+sandbox-remote-ssh = { path = "../drivers/sandbox-remote-ssh" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

@@ -102,6 +102,9 @@ fn build_driver_set_with_context(
                 sandbox_openshell::OpenShellDriver::default()
                     .with_event_emitter(Arc::clone(&events)),
             ),
+            "remote-ssh" | "sandbox-remote-ssh" => {
+                Box::new(sandbox_remote_ssh::RemoteSshDriver::default())
+            }
             other => {
                 return Err(RuntimeError::UnsupportedDriver {
                     kind: "sandbox",
@@ -218,6 +221,15 @@ fn build_pinned_sandbox(
             Ok(Box::new(
                 sandbox_openshell::OpenShellDriver::default().with_event_emitter(events),
             ))
+        }
+        "remote-ssh" | "sandbox-remote-ssh" => {
+            validate_builtin_pin(
+                "sandbox",
+                agentenv_proto::DriverKind::Sandbox,
+                &["remote-ssh", "sandbox-remote-ssh"],
+                pin,
+            )?;
+            Ok(Box::new(sandbox_remote_ssh::RemoteSshDriver::default()))
         }
         other => Err(RuntimeError::UnsupportedDriver {
             kind: "sandbox",
@@ -590,6 +602,21 @@ mod tests {
 
         let set = BuiltInDriverFactory.build(&selection).unwrap();
         drop(set);
+    }
+
+    #[test]
+    fn builds_remote_ssh_sandbox_aliases() {
+        for sandbox in ["remote-ssh", "sandbox-remote-ssh"] {
+            let selection = DriverSelection {
+                sandbox: sandbox.to_owned(),
+                agent: "codex".to_owned(),
+                context: "filesystem".to_owned(),
+                inference: Some("passthrough".to_owned()),
+            };
+
+            let set = BuiltInDriverFactory.build(&selection).unwrap();
+            drop(set);
+        }
     }
 
     #[test]
@@ -1033,6 +1060,28 @@ mod tests {
             .expect_err("non-built-in sandbox pin cannot be materialized");
 
         assert!(err.to_string().contains("unsupported driver"));
+    }
+
+    #[test]
+    fn pinned_build_accepts_remote_ssh_sandbox_alias() {
+        let selection = DriverSelection {
+            sandbox: "remote-ssh".to_owned(),
+            agent: "codex".to_owned(),
+            context: "filesystem".to_owned(),
+            inference: None,
+        };
+        let pins = pin_set(
+            "sandbox",
+            ProtoDriverKind::Sandbox,
+            "remote-ssh",
+            env!("CARGO_PKG_VERSION"),
+            DriverSourcePin::BuiltIn,
+        );
+
+        let set = BuiltInDriverFactory
+            .build_pinned(&selection, &pins)
+            .unwrap();
+        drop(set);
     }
 
     #[test]

@@ -12,6 +12,7 @@ members = [
     "crates/agentenv-plugin",
     "crates/tui",
     "crates/drivers/sandbox-openshell",
+    "crates/drivers/sandbox-remote-ssh",
     "crates/drivers/agent-claude",
     "crates/drivers/agent-codex",
     "crates/drivers/agent-openclaw",

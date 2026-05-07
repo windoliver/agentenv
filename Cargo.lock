@@ -86,6 +86,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "sandbox-openshell",
+ "sandbox-remote-ssh",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2869,6 +2870,20 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "sandbox-remote-ssh"
+version = "0.0.1-alpha0"
+dependencies = [
+ "agentenv-core",
+ "agentenv-proto",
+ "async-trait",
+ "driver-conformance",
+ "serde_json",
+ "tokio",
+ "url",
  "uuid",
 ]
 
