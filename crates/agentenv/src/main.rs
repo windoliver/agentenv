@@ -3857,6 +3857,7 @@ mod tests {
                 "blueprint".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
+                "skills".to_string(),
                 "verify-blueprint".to_string(),
                 "verify".to_string(),
                 "freeze".to_string(),
