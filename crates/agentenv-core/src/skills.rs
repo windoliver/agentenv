@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     thread,
     time::{Duration, Instant},
 };
@@ -225,6 +227,11 @@ struct SkillFrontmatter {
     version: String,
 }
 
+struct VerifiedSkill {
+    entry: SkillVerifyEntry,
+    index_entry: Option<SkillIndexEntry>,
+}
+
 impl SkillVerifyReport {
     pub fn is_ok(&self) -> bool {
         self.skills
@@ -256,6 +263,7 @@ pub fn verify_all_installed_skills(
     options: SkillVerifyOptions,
 ) -> SkillCacheResult<SkillVerifyReport> {
     let mut report = SkillVerifyReport::default();
+    let mut index_entries = Vec::new();
     let skills_dir = layout.skills_dir();
 
     if skills_dir.is_dir() {
@@ -285,13 +293,17 @@ pub fn verify_all_installed_skills(
                 }
 
                 let version = version_entry.file_name().to_string_lossy().to_string();
-                report.skills.push(verify_installed_skill(
+                let verified = verify_installed_skill(
                     layout,
                     &version_entry.path(),
                     &name,
                     &version,
                     &options,
-                ));
+                );
+                if let Some(index_entry) = verified.index_entry {
+                    index_entries.push(index_entry);
+                }
+                report.skills.push(verified.entry);
             }
         }
     }
@@ -299,7 +311,10 @@ pub fn verify_all_installed_skills(
     report
         .skills
         .sort_by(|left, right| (&left.name, &left.version).cmp(&(&right.name, &right.version)));
-    rebuild_skill_index(layout)?;
+    index_entries.sort_by(|left, right| {
+        (&left.name, &left.version, &left.source).cmp(&(&right.name, &right.version, &right.source))
+    });
+    write_index(layout, index_entries)?;
     Ok(report)
 }
 
@@ -384,19 +399,22 @@ fn verify_installed_skill(
     dir_name: &str,
     dir_version: &str,
     options: &SkillVerifyOptions,
-) -> SkillVerifyEntry {
+) -> VerifiedSkill {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let manifest_path = skill_dir.join(".agentenv").join("manifest.json");
     let manifest = match read_manifest_file(&manifest_path) {
         Ok(manifest) => manifest,
         Err(error) => {
-            return SkillVerifyEntry {
-                name: dir_name.to_owned(),
-                version: dir_version.to_owned(),
-                status: SkillVerifyStatus::Failed,
-                warnings,
-                errors: vec![error.to_string()],
+            return VerifiedSkill {
+                entry: SkillVerifyEntry {
+                    name: dir_name.to_owned(),
+                    version: dir_version.to_owned(),
+                    status: SkillVerifyStatus::Failed,
+                    warnings,
+                    errors: vec![error.to_string()],
+                },
+                index_entry: None,
             };
         }
     };
@@ -413,12 +431,25 @@ fn verify_installed_skill(
     } else {
         SkillVerifyStatus::Failed
     };
-    SkillVerifyEntry {
+
+    let index_entry = (status == SkillVerifyStatus::Passed).then(|| SkillIndexEntry {
+        path: format!("skills/{dir_name}/{dir_version}"),
         name: dir_name.to_owned(),
         version: dir_version.to_owned(),
-        status,
-        warnings,
-        errors,
+        source: manifest.source.clone(),
+        digest: manifest.digest.clone(),
+        current: false,
+    });
+
+    VerifiedSkill {
+        entry: SkillVerifyEntry {
+            name: dir_name.to_owned(),
+            version: dir_version.to_owned(),
+            status,
+            warnings,
+            errors,
+        },
+        index_entry,
     }
 }
 
@@ -862,15 +893,9 @@ fn run_self_test_command(skill_dir: &Path, cmd: &str, timeout: Duration) -> Resu
             }
             Ok(None) => {
                 if started_at.elapsed() >= timeout {
-                    if let Err(source) = child.kill() {
+                    if let Err(error) = terminate_timed_out_self_test(&mut child) {
                         return Err(format!(
-                            "self-test command timed out after {}s and could not be killed: {source}",
-                            timeout.as_secs()
-                        ));
-                    }
-                    if let Err(source) = child.wait() {
-                        return Err(format!(
-                            "self-test command timed out after {}s and wait failed: {source}",
+                            "self-test command timed out after {}s and {error}",
                             timeout.as_secs()
                         ));
                     }
@@ -894,6 +919,7 @@ fn run_self_test_command(skill_dir: &Path, cmd: &str, timeout: Duration) -> Resu
 fn shell_command(cmd: &str) -> Command {
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd);
+    command.process_group(0);
     command
 }
 
@@ -902,6 +928,65 @@ fn shell_command(cmd: &str) -> Command {
     let mut command = Command::new("cmd");
     command.arg("/C").arg(cmd);
     command
+}
+
+#[cfg(unix)]
+fn terminate_timed_out_self_test(child: &mut Child) -> Result<(), String> {
+    let process_group_id = child.id() as i32;
+    let kill_status = Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{process_group_id}"))
+        .status()
+        .map_err(|source| format!("could not start process-group kill: {source}"))?;
+
+    let pkill_status = Command::new("pkill")
+        .arg("-KILL")
+        .arg("-g")
+        .arg(process_group_id.to_string())
+        .status();
+
+    let pkill_succeeded = matches!(pkill_status, Ok(status) if status.success());
+    if !kill_status.success() && !pkill_succeeded {
+        child.kill().map_err(|source| {
+            format!("process-group kill failed with {kill_status}; direct kill failed: {source}")
+        })?;
+    }
+    child
+        .wait()
+        .map_err(|source| format!("wait failed: {source}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_timed_out_self_test(child: &mut Child) -> Result<(), String> {
+    let status = Command::new("taskkill")
+        .arg("/PID")
+        .arg(child.id().to_string())
+        .arg("/T")
+        .arg("/F")
+        .status()
+        .map_err(|source| format!("could not start taskkill: {source}"))?;
+    if !status.success() {
+        child.kill().map_err(|source| {
+            format!("taskkill failed with {status}; direct kill failed: {source}")
+        })?;
+    }
+    child
+        .wait()
+        .map_err(|source| format!("wait failed: {source}"))?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_timed_out_self_test(child: &mut Child) -> Result<(), String> {
+    child
+        .kill()
+        .map_err(|source| format!("could not kill child: {source}"))?;
+    child
+        .wait()
+        .map_err(|source| format!("wait failed: {source}"))?;
+    Ok(())
 }
 
 fn read_manifest_file(path: &Path) -> SkillCacheResult<SkillManifest> {

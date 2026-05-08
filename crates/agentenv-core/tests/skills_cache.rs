@@ -253,6 +253,37 @@ fn verify_all_reports_manifest_identity_mismatch_under_installed_path() {
 }
 
 #[test]
+fn verify_all_reports_malformed_manifest_without_failing_the_report() {
+    let root = unique_root("verify-malformed-manifest");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "malformed",
+        "1.0.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let skill_dir = layout
+        .installed_skill_dir("malformed", "1.0.0")
+        .expect("skill dir");
+    fs::write(skill_dir.join(".agentenv/manifest.json"), "{not json").expect("break manifest");
+
+    let report =
+        verify_all_installed_skills(&layout, SkillVerifyOptions::default()).expect("verify skills");
+
+    assert!(!report.is_ok(), "{report:#?}");
+    assert_eq!(report.skills[0].name, "malformed");
+    assert!(report.skills[0]
+        .errors
+        .iter()
+        .any(|error| error.contains("failed to parse")));
+
+    let index = fs::read_to_string(layout.index_path()).expect("index written");
+    let index: SkillIndex = serde_json::from_str(&index).expect("index parses");
+    assert!(index.skills.is_empty(), "{index:#?}");
+}
+
+#[test]
 fn verify_all_verifies_ed25519_signature_with_trust_key() {
     let root = unique_root("verify-signature-valid");
     let layout = SkillCacheLayout::new(root.join(".agentenv"));
@@ -438,6 +469,41 @@ fn verify_all_reports_self_test_timeout() {
         .errors
         .iter()
         .any(|error| error.contains("timed out")));
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_all_timeout_kills_self_test_descendants() {
+    let root = unique_root("verify-self-test-timeout-tree");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "timeout-tree",
+        "1.0.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let skill_dir = layout
+        .installed_skill_dir("timeout-tree", "1.0.0")
+        .expect("skill dir");
+    let mut manifest = read_manifest(&skill_dir);
+    manifest.self_test = Some(SkillSelfTest {
+        timeout_seconds: 1,
+        assertions: vec![SkillSelfTestAssertion::CommandExitsZero {
+            cmd: "(sleep 2; touch leaked-marker) & wait".to_owned(),
+        }],
+    });
+    write_manifest(&skill_dir, &manifest);
+
+    let report =
+        verify_all_installed_skills(&layout, SkillVerifyOptions::default()).expect("verify skills");
+    assert!(!report.is_ok(), "{report:#?}");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        !skill_dir.join("leaked-marker").exists(),
+        "timed-out self-test descendant survived verification"
+    );
 }
 
 fn write_installed_skill(layout: &SkillCacheLayout, name: &str, version: &str, digest: &str) {
