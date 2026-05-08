@@ -2077,6 +2077,7 @@ pub async fn reproduce_env(
         return Err(RuntimeError::PortableLockfileVerification { details });
     }
 
+    verify_reproduce_skill_pins(options, &lockfile)?;
     check_required_lockfile_credentials(credentials, &lockfile)?;
     let credential_bindings = credential_bindings_from_portable_lockfile(&lockfile);
     let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
@@ -2109,6 +2110,53 @@ pub async fn reproduce_env(
         Arc::new(NoopEventEmitter),
     )
     .await
+}
+
+fn verify_reproduce_skill_pins(
+    options: &RuntimeOptions,
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> RuntimeResult<()> {
+    if lockfile.skills.is_empty() {
+        return Ok(());
+    }
+
+    let layout = crate::skills::SkillCacheLayout::new(&options.root);
+    let trust_keys = crate::skills::load_skill_trust_keys(&layout).map_err(|error| {
+        RuntimeError::PortableLockfileVerification {
+            details: error.to_string(),
+        }
+    })?;
+    let report = crate::skills::verify_skill_pins(
+        &layout,
+        &lockfile.skills,
+        crate::skills::SkillVerifyOptions { trust_keys },
+    )
+    .map_err(|error| RuntimeError::PortableLockfileVerification {
+        details: error.to_string(),
+    })?;
+
+    if report.is_ok() {
+        return Ok(());
+    }
+
+    let details = report
+        .skills
+        .iter()
+        .filter(|entry| entry.status == crate::skills::SkillVerifyStatus::Failed)
+        .map(|entry| {
+            let errors = if entry.errors.is_empty() {
+                "unknown error".to_owned()
+            } else {
+                entry.errors.join("; ")
+            };
+            format!(
+                "skill `{}` version `{}`: {errors}",
+                entry.name, entry.version
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(RuntimeError::PortableLockfileVerification { details })
 }
 
 fn registry_from_driver_artifacts(
@@ -9174,6 +9222,70 @@ policy:
                 .as_slice(),
             &[None],
             "portable driver pins must not be forwarded as agent package versions"
+        );
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_rejects_missing_skill_pin_before_driver_materialization() {
+        let root = unique_root("agentenv-reproduce-missing-skill");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.skills.push(crate::lockfile::SkillPin {
+            name: "code-review".to_owned(),
+            version: "1.2.0".to_owned(),
+            source: "file:///skills/code-review".to_owned(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            signatures: Vec::new(),
+        });
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err =
+            super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+                .await
+                .expect_err("missing skill pin should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("missing skill pin"), "{message}");
+        assert_eq!(
+            factory.normal_builds.load(Ordering::SeqCst)
+                + factory.pinned_builds.load(Ordering::SeqCst),
+            0,
+            "skill pin verification should fail before driver materialization"
         );
     }
 

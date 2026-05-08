@@ -1,9 +1,10 @@
 use std::{fs, path::PathBuf};
 
+use agentenv_core::lockfile::SkillPin;
 use agentenv_core::skills::{
     execute_skill_prune, plan_skill_prune, rebuild_skill_index, verify_all_installed_skills,
-    SkillArchive, SkillCacheLayout, SkillIndex, SkillManifest, SkillProvenance, SkillSelfTest,
-    SkillSelfTestAssertion, SkillTrustKey, SkillVerifyOptions, SkillVerifyStatus,
+    verify_skill_pins, SkillArchive, SkillCacheLayout, SkillIndex, SkillManifest, SkillProvenance,
+    SkillSelfTest, SkillSelfTestAssertion, SkillTrustKey, SkillVerifyOptions, SkillVerifyStatus,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -84,6 +85,162 @@ fn skill_index_rebuilds_in_deterministic_order() {
     let rendered = fs::read_to_string(layout.index_path()).expect("index written");
     let reparsed: SkillIndex = serde_json::from_str(&rendered).expect("index parses");
     assert_eq!(reparsed, index);
+}
+
+#[test]
+fn skill_index_marks_current_symlink_version() {
+    let root = unique_root("skill-index-current");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.1.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    create_current_symlink(&layout.skills_dir().join("code-review/current"), "1.2.0");
+
+    let index = rebuild_skill_index(&layout).expect("rebuild index");
+
+    let current_entries = index
+        .skills
+        .iter()
+        .filter(|entry| entry.current)
+        .map(|entry| (entry.name.as_str(), entry.version.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(current_entries, vec![("code-review", "1.2.0")]);
+}
+
+#[test]
+fn skill_index_rebuilds_without_current_symlink() {
+    let root = unique_root("skill-index-no-current");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+
+    let index = rebuild_skill_index(&layout).expect("rebuild index");
+
+    assert!(index.skills.iter().all(|entry| !entry.current));
+}
+
+#[test]
+fn skill_index_rejects_invalid_current_symlink_target() {
+    let root = unique_root("skill-index-invalid-current");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    create_current_symlink(
+        &layout.skills_dir().join("code-review/current"),
+        "../escape",
+    );
+
+    let err = rebuild_skill_index(&layout).expect_err("invalid current target should fail");
+
+    assert!(err.to_string().contains("invalid skill current target"));
+}
+
+#[test]
+fn verify_all_rebuilds_index_with_current_symlink_version() {
+    let root = unique_root("verify-index-current");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    create_current_symlink(&layout.skills_dir().join("code-review/current"), "1.2.0");
+
+    let report =
+        verify_all_installed_skills(&layout, SkillVerifyOptions::default()).expect("verify skills");
+
+    assert!(report.is_ok(), "{report:#?}");
+    let rendered = fs::read_to_string(layout.index_path()).expect("index written");
+    let index: SkillIndex = serde_json::from_str(&rendered).expect("index parses");
+    assert_eq!(index.skills.len(), 1);
+    assert!(index.skills[0].current);
+}
+
+#[test]
+fn verify_skill_pins_accepts_matching_cached_archive() {
+    let root = unique_root("verify-pinned-skill");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let skill_dir = layout
+        .installed_skill_dir("code-review", "1.2.0")
+        .expect("skill dir");
+    let manifest = read_manifest(&skill_dir);
+    write_archive(&layout, &manifest.digest, b"pinned archive bytes");
+    rewrite_digest_to_actual_archive(&layout, &skill_dir);
+    let manifest = read_manifest(&skill_dir);
+    let pin = SkillPin {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        source: manifest.source.clone(),
+        digest: manifest.digest.clone(),
+        signatures: Vec::new(),
+    };
+
+    let report = verify_skill_pins(&layout, &[pin], SkillVerifyOptions::default())
+        .expect("verify pinned skill");
+
+    assert!(report.is_ok(), "{report:#?}");
+}
+
+#[test]
+fn verify_skill_pins_rejects_pins_without_cached_archive_digest() {
+    let root = unique_root("verify-pinned-skill-missing-archive");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let skill_dir = layout
+        .installed_skill_dir("code-review", "1.2.0")
+        .expect("skill dir");
+    let manifest = read_manifest(&skill_dir);
+    let pin = SkillPin {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        source: manifest.source.clone(),
+        digest: manifest.digest.clone(),
+        signatures: Vec::new(),
+    };
+
+    let report = verify_skill_pins(&layout, &[pin], SkillVerifyOptions::default())
+        .expect("verify pinned skill");
+
+    assert!(!report.is_ok(), "{report:#?}");
+    assert!(report.skills[0]
+        .errors
+        .iter()
+        .any(|error| error.contains("verification warning")));
 }
 
 #[test]
@@ -738,6 +895,16 @@ skills:
         ),
     )
     .unwrap();
+}
+
+#[cfg(unix)]
+fn create_current_symlink(link: &std::path::Path, target: &str) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn create_current_symlink(link: &std::path::Path, target: &str) {
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
 }
 
 fn unique_root(prefix: &str) -> PathBuf {

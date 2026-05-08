@@ -3,6 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeSet,
     fs,
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -236,6 +237,7 @@ struct SkillFrontmatter {
 struct VerifiedSkill {
     entry: SkillVerifyEntry,
     index_entry: Option<SkillIndexEntry>,
+    manifest: Option<SkillManifest>,
 }
 
 impl SkillVerifyReport {
@@ -286,7 +288,9 @@ pub fn verify_all_installed_skills(
             }
 
             let name = name_entry.file_name().to_string_lossy().to_string();
-            for version_entry in read_dir_sorted(&name_entry.path())? {
+            let name_path = name_entry.path();
+            let current_version = current_version_for_skill_dir(&name_path)?;
+            for version_entry in read_dir_sorted(&name_path)? {
                 if !version_entry
                     .file_type()
                     .map_err(|source| SkillCacheError::Io {
@@ -306,7 +310,9 @@ pub fn verify_all_installed_skills(
                     &version,
                     &options,
                 );
-                if let Some(index_entry) = verified.index_entry {
+                if let Some(mut index_entry) = verified.index_entry {
+                    index_entry.current =
+                        current_version.as_deref() == Some(index_entry.version.as_str());
                     index_entries.push(index_entry);
                 }
                 report.skills.push(verified.entry);
@@ -321,6 +327,23 @@ pub fn verify_all_installed_skills(
         (&left.name, &left.version, &left.source).cmp(&(&right.name, &right.version, &right.source))
     });
     write_index(layout, index_entries)?;
+    Ok(report)
+}
+
+pub fn verify_skill_pins(
+    layout: &SkillCacheLayout,
+    pins: &[crate::lockfile::SkillPin],
+    options: SkillVerifyOptions,
+) -> SkillCacheResult<SkillVerifyReport> {
+    let mut report = SkillVerifyReport::default();
+
+    for pin in pins {
+        report.skills.push(verify_skill_pin(layout, pin, &options)?);
+    }
+
+    report
+        .skills
+        .sort_by(|left, right| (&left.name, &left.version).cmp(&(&right.name, &right.version)));
     Ok(report)
 }
 
@@ -409,7 +432,9 @@ pub fn rebuild_skill_index(layout: &SkillCacheLayout) -> SkillCacheResult<SkillI
             continue;
         }
 
-        for version_entry in read_dir_sorted(&name_entry.path())? {
+        let name_path = name_entry.path();
+        let current_version = current_version_for_skill_dir(&name_path)?;
+        for version_entry in read_dir_sorted(&name_path)? {
             if !version_entry
                 .file_type()
                 .map_err(|source| SkillCacheError::Io {
@@ -428,13 +453,14 @@ pub fn rebuild_skill_index(layout: &SkillCacheLayout) -> SkillCacheResult<SkillI
             }
 
             let manifest = read_manifest_file(&manifest_path)?;
+            let current = current_version.as_deref() == Some(version.as_str());
             entries.push(SkillIndexEntry {
                 path: format!("skills/{name}/{version}"),
                 name: name.clone(),
                 version,
                 source: manifest.source,
                 digest: manifest.digest,
-                current: false,
+                current,
             });
         }
     }
@@ -518,6 +544,7 @@ fn verify_installed_skill(
                     errors: vec![error.to_string()],
                 },
                 index_entry: None,
+                manifest: None,
             };
         }
     };
@@ -553,6 +580,132 @@ fn verify_installed_skill(
             errors,
         },
         index_entry,
+        manifest: Some(manifest),
+    }
+}
+
+fn verify_skill_pin(
+    layout: &SkillCacheLayout,
+    pin: &crate::lockfile::SkillPin,
+    options: &SkillVerifyOptions,
+) -> SkillCacheResult<SkillVerifyEntry> {
+    let skill_dir = match layout.installed_skill_dir(&pin.name, &pin.version) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(failed_skill_pin_entry(pin, vec![error.to_string()]));
+        }
+    };
+
+    if !skill_dir.is_dir() {
+        return Ok(failed_skill_pin_entry(
+            pin,
+            vec![format!(
+                "missing skill pin `{}` version `{}` from `{}`",
+                pin.name, pin.version, pin.source
+            )],
+        ));
+    }
+
+    let verified = verify_installed_skill(layout, &skill_dir, &pin.name, &pin.version, options);
+    let mut entry = verified.entry;
+
+    if let Some(manifest) = verified.manifest {
+        verify_skill_pin_manifest(pin, &manifest, &mut entry.errors);
+    }
+    for warning in &entry.warnings {
+        entry.errors.push(format!(
+            "skill pin `{}` version `{}` has verification warning: {warning}",
+            pin.name, pin.version
+        ));
+    }
+    if !entry.errors.is_empty() {
+        entry.status = SkillVerifyStatus::Failed;
+    }
+
+    Ok(entry)
+}
+
+fn failed_skill_pin_entry(
+    pin: &crate::lockfile::SkillPin,
+    errors: Vec<String>,
+) -> SkillVerifyEntry {
+    SkillVerifyEntry {
+        name: pin.name.clone(),
+        version: pin.version.clone(),
+        status: SkillVerifyStatus::Failed,
+        warnings: Vec::new(),
+        errors,
+    }
+}
+
+fn verify_skill_pin_manifest(
+    pin: &crate::lockfile::SkillPin,
+    manifest: &SkillManifest,
+    errors: &mut Vec<String>,
+) {
+    if manifest.source != pin.source {
+        errors.push(format!(
+            "skill pin source mismatch for `{}` version `{}`: lockfile `{}`, manifest `{}`",
+            pin.name, pin.version, pin.source, manifest.source
+        ));
+    }
+    if manifest.digest != pin.digest {
+        errors.push(format!(
+            "skill pin digest mismatch for `{}` version `{}`: lockfile `{}`, manifest `{}`",
+            pin.name, pin.version, pin.digest, manifest.digest
+        ));
+    }
+    if !pin.signatures.is_empty() {
+        let pinned = pin.signatures.iter().collect::<BTreeSet<_>>();
+        let installed = manifest.signatures.iter().collect::<BTreeSet<_>>();
+        if pinned != installed {
+            errors.push(format!(
+                "skill pin signatures mismatch for `{}` version `{}`",
+                pin.name, pin.version
+            ));
+        }
+    }
+}
+
+fn current_version_for_skill_dir(skill_name_dir: &Path) -> SkillCacheResult<Option<String>> {
+    let current_path = skill_name_dir.join("current");
+    let metadata = match fs::symlink_metadata(&current_path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SkillCacheError::Io {
+                path: current_path,
+                source,
+            });
+        }
+    };
+
+    if !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+
+    let target = fs::read_link(&current_path).map_err(|source| SkillCacheError::Io {
+        path: current_path.clone(),
+        source,
+    })?;
+    let mut components = target.components();
+    let Some(Component::Normal(version)) = components.next() else {
+        return Err(invalid_current_target(&target));
+    };
+    if components.next().is_some() {
+        return Err(invalid_current_target(&target));
+    }
+    let Some(version) = version.to_str() else {
+        return Err(invalid_current_target(&target));
+    };
+    validate_segment("skill current target", version)?;
+    Ok(Some(version.to_owned()))
+}
+
+fn invalid_current_target(target: &Path) -> SkillCacheError {
+    SkillCacheError::InvalidPathSegment {
+        kind: "skill current target",
+        value: target.display().to_string(),
     }
 }
 
