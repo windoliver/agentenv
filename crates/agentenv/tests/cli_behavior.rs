@@ -263,6 +263,103 @@ fn cli_includes_commands() {
 }
 
 #[test]
+fn cli_help_includes_skills_command() {
+    let output = Command::new(agentenv_bin()).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("skills"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_help_lists_lifecycle_subcommands() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "search", "add", "install", "list", "info", "remove", "publish", "verify",
+    ] {
+        assert!(
+            stdout.contains(command),
+            "missing {command}; stdout was: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn skills_install_list_info_verify_and_remove_local_bundle() {
+    let temp_dir = make_temp_dir("skills-cli-local");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# CLI Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+
+    let list = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", output_summary(&list));
+    let json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(json["skills"][0]["name"], "cli-skill");
+
+    let info = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("cli-skill")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", output_summary(&info));
+    let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(info_json["name"], "cli-skill");
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("cli-skill")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{}", output_summary(&verify));
+
+    let remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("cli-skill")
+        .arg("--yes")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(remove.status.success(), "{}", output_summary(&remove));
+}
+
+#[test]
 fn blueprint_lint_reports_json_diagnostics() {
     let temp_dir = make_temp_dir("blueprint-lint-json-diagnostics");
     let dockerfile = temp_dir.join("Dockerfile");
