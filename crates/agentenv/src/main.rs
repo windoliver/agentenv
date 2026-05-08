@@ -77,6 +77,7 @@ enum Commands {
     Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
+    Skills(SkillsArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -497,10 +498,36 @@ struct DriversArgs {
     command: DriverCommand,
 }
 
+#[derive(Debug, Args)]
+struct SkillsArgs {
+    #[command(subcommand)]
+    command: SkillsCommand,
+}
+
 #[derive(Debug, Subcommand)]
 enum DriverCommand {
     /// Lists built-in and discovered subprocess drivers.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCommand {
+    /// Verifies locally installed skills.
+    Verify(SkillsVerifyArgs),
+    /// Removes unreferenced skill archives from the local cache.
+    Prune(SkillsPruneArgs),
+}
+
+#[derive(Debug, Args)]
+struct SkillsVerifyArgs {
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct SkillsPruneArgs {
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -576,6 +603,7 @@ async fn run() -> Result<()> {
         Some(Commands::Blueprint(command)) => run_blueprint(command),
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
+        Some(Commands::Skills(args)) => run_skills(args),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
         Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
@@ -3526,6 +3554,75 @@ fn run_drivers(args: DriversArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_skills(args: SkillsArgs) -> Result<()> {
+    match args.command {
+        SkillsCommand::Verify(args) => run_skills_verify(args),
+        SkillsCommand::Prune(args) => run_skills_prune(args),
+    }
+}
+
+fn run_skills_verify(args: SkillsVerifyArgs) -> Result<()> {
+    if !args.all {
+        bail!("`agentenv skills verify` currently requires `--all`");
+    }
+
+    let options = runtime_options(true)?;
+    let layout = agentenv_core::skills::SkillCacheLayout::new(options.root);
+    let trust_keys = agentenv_core::skills::load_skill_trust_keys(&layout)
+        .context("failed to load skill trust keys")?;
+    let report = agentenv_core::skills::verify_all_installed_skills(
+        &layout,
+        agentenv_core::skills::SkillVerifyOptions { trust_keys },
+    )
+    .context("failed to verify installed skills")?;
+
+    for skill in &report.skills {
+        match skill.status {
+            agentenv_core::skills::SkillVerifyStatus::Passed => {
+                println!("verified {} {}", skill.name, skill.version);
+            }
+            agentenv_core::skills::SkillVerifyStatus::Failed => {
+                eprintln!("failed {} {}", skill.name, skill.version);
+                for error in &skill.errors {
+                    eprintln!("  error: {error}");
+                }
+                for warning in &skill.warnings {
+                    eprintln!("  warning: {warning}");
+                }
+            }
+        }
+    }
+
+    if !report.is_ok() {
+        bail!("skill verification failed");
+    }
+
+    Ok(())
+}
+
+fn run_skills_prune(args: SkillsPruneArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    let layout = agentenv_core::skills::SkillCacheLayout::new(options.root);
+    let plan =
+        agentenv_core::skills::plan_skill_prune(&layout).context("failed to plan skill prune")?;
+
+    if args.dry_run {
+        for path in &plan.removed_archives {
+            println!("would remove {}", path.display());
+        }
+        println!(
+            "{} archive(s) would be removed",
+            plan.removed_archives.len()
+        );
+        return Ok(());
+    }
+
+    agentenv_core::skills::execute_skill_prune(&plan).context("failed to prune skill cache")?;
+    agentenv_core::skills::rebuild_skill_index(&layout).context("failed to rebuild skill index")?;
+    println!("removed {} archive(s)", plan.removed_archives.len());
+    Ok(())
 }
 
 fn print_driver_table(entries: &[DiscoveredDriver]) {
