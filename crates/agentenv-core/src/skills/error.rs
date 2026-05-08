@@ -16,8 +16,17 @@ pub enum SkillError {
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("failed to parse skills config TOML: {source}")]
+    Toml {
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("invalid skill name `{name}`")]
     InvalidSkillName { name: String },
+    #[error("registry `{name}` was not found")]
+    RegistryNotFound { name: String },
+    #[error("invalid skills config: {message}")]
+    InvalidConfig { message: String },
     #[error("invalid skill version `{version}`: {source}")]
     InvalidVersion {
         version: String,

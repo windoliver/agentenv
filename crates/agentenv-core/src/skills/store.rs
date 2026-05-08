@@ -467,6 +467,9 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::AmbiguousInstalledVersion { .. }
         | SkillError::AlreadyInstalledDifferentDigest { .. }
         | SkillError::Serde { .. }
+        | SkillError::Toml { .. }
+        | SkillError::RegistryNotFound { .. }
+        | SkillError::InvalidConfig { .. }
         | SkillError::SelfTestFailed { .. } => false,
     }
 }

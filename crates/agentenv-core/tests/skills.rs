@@ -4,9 +4,10 @@ use std::{
 };
 
 use agentenv_core::skills::{
-    compute_bundle_digest, install_local_skill, list_installed_skills, load_skill_manifest,
-    validate_skill_name, verify_installed_skill, InstalledSkillSelector, SkillError,
-    SkillInstallOptions,
+    compute_bundle_digest, install_local_skill, list_installed_skills, load_project_skills_config,
+    load_skill_manifest, load_user_skills_config, merge_skills_config, validate_skill_name,
+    verify_installed_skill, InstalledSkillSelector, RegistryKind, SkillError, SkillInstallOptions,
+    SkillsConfig, SkillsConfigOverride,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -870,6 +871,292 @@ fn installed_verify_runs_self_test_command() {
     .expect("self-test command should pass");
 
     assert_eq!(verified.name, "self-test-demo");
+}
+
+#[test]
+fn skills_config_loads_project_yaml_section() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox: { driver: openshell }
+agent: { driver: codex }
+context: { driver: filesystem, mount: . }
+policy: { tier: balanced, presets: [] }
+skills:
+  registries:
+    - name: local-dev
+      type: filesystem
+      path: /tmp/skills
+"#;
+
+    let config = load_project_skills_config(yaml).unwrap();
+
+    assert_eq!(config.registries.len(), 1);
+    assert_eq!(config.registries[0].name, "local-dev");
+    assert_eq!(config.registries[0].kind, RegistryKind::Filesystem);
+}
+
+#[test]
+fn skills_config_loads_user_toml() {
+    let toml = r#"
+[skills]
+registry_order = ["corp"]
+
+[[skills.registries]]
+name = "corp"
+type = "http"
+url = "https://skills.example.test"
+auth = "bearer-from-credstore:CORP_SKILLS_TOKEN"
+"#;
+
+    let config = load_user_skills_config(toml).unwrap();
+
+    assert_eq!(config.registry_order, vec!["corp"]);
+    assert_eq!(
+        config.registries[0].auth.as_deref(),
+        Some("bearer-from-credstore:CORP_SKILLS_TOKEN")
+    );
+}
+
+#[test]
+fn cli_registry_override_wins_over_project_and_user_config() {
+    let user = SkillsConfig {
+        registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
+            "user-local",
+            PathBuf::from("/user"),
+        )],
+        registry_order: vec!["user-local".to_owned()],
+    };
+    let project = SkillsConfig {
+        registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
+            "project-local",
+            PathBuf::from("/project"),
+        )],
+        registry_order: vec!["project-local".to_owned()],
+    };
+
+    let merged = merge_skills_config(
+        user,
+        Some(project),
+        SkillsConfigOverride {
+            registry: Some("file:///override".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries.len(), 1);
+    assert_eq!(merged.registries[0].name, "cli");
+    assert_eq!(merged.registry_order, vec!["cli"]);
+}
+
+#[test]
+fn cli_registry_override_selects_named_registry() {
+    let user = SkillsConfig {
+        registries: vec![
+            agentenv_core::skills::RegistryConfig::filesystem("local", PathBuf::from("/local")),
+            agentenv_core::skills::RegistryConfig::http(
+                "corp",
+                "https://skills.example.test",
+                None,
+            ),
+        ],
+        registry_order: vec!["local".to_owned(), "corp".to_owned()],
+    };
+
+    let merged = merge_skills_config(
+        user,
+        None,
+        SkillsConfigOverride {
+            registry: Some("corp".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries.len(), 1);
+    assert_eq!(merged.registries[0].name, "corp");
+    assert_eq!(merged.registry_order, vec!["corp"]);
+}
+
+#[test]
+fn project_config_overrides_user_registries_by_name_without_erasing_others() {
+    let user = SkillsConfig {
+        registries: vec![
+            agentenv_core::skills::RegistryConfig::filesystem("local", PathBuf::from("/user")),
+            agentenv_core::skills::RegistryConfig::http(
+                "corp",
+                "https://skills.example.test",
+                None,
+            ),
+        ],
+        registry_order: vec!["local".to_owned(), "corp".to_owned()],
+    };
+    let project = SkillsConfig {
+        registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
+            "local",
+            PathBuf::from("/project"),
+        )],
+        registry_order: vec!["local".to_owned()],
+    };
+
+    let merged = merge_skills_config(
+        user,
+        Some(project),
+        SkillsConfigOverride {
+            registry: Some("corp".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries.len(), 1);
+    assert_eq!(merged.registries[0].name, "corp");
+}
+
+#[test]
+fn cli_registry_override_reports_missing_named_registry() {
+    let user = SkillsConfig {
+        registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
+            "local",
+            PathBuf::from("/local"),
+        )],
+        registry_order: vec!["local".to_owned()],
+    };
+
+    let error = merge_skills_config(
+        user,
+        None,
+        SkillsConfigOverride {
+            registry: Some("corp".to_owned()),
+        },
+    )
+    .expect_err("missing named registry must be reported");
+
+    assert!(matches!(error, SkillError::RegistryNotFound { name } if name == "corp"));
+}
+
+#[test]
+fn cli_registry_override_parses_http_and_oci_sources() {
+    let http = merge_skills_config(
+        SkillsConfig::default(),
+        None,
+        SkillsConfigOverride {
+            registry: Some("https://skills.example.test".to_owned()),
+        },
+    )
+    .unwrap();
+    let oci = merge_skills_config(
+        SkillsConfig::default(),
+        None,
+        SkillsConfigOverride {
+            registry: Some("oci://ghcr.io/agentenv-community".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(http.registries[0].kind, RegistryKind::Http);
+    assert_eq!(oci.registries[0].kind, RegistryKind::Oci);
+}
+
+#[test]
+fn cli_registry_override_parses_bare_oci_reference() {
+    let merged = merge_skills_config(
+        SkillsConfig::default(),
+        None,
+        SkillsConfigOverride {
+            registry: Some("ghcr.io/agentenv-community".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries[0].kind, RegistryKind::Oci);
+    assert_eq!(
+        merged.registries[0].url.as_deref(),
+        Some("ghcr.io/agentenv-community")
+    );
+}
+
+#[test]
+fn cli_registry_override_parses_bare_oci_reference_with_port() {
+    let merged = merge_skills_config(
+        SkillsConfig::default(),
+        None,
+        SkillsConfigOverride {
+            registry: Some("ghcr.io:5000/agentenv-community".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries[0].kind, RegistryKind::Oci);
+    assert_eq!(
+        merged.registries[0].url.as_deref(),
+        Some("ghcr.io:5000/agentenv-community")
+    );
+}
+
+#[test]
+fn skills_config_rejects_missing_required_registry_fields() {
+    let yaml = r#"
+skills:
+  registries:
+    - name: missing-url
+      type: http
+"#;
+
+    let error = load_project_skills_config(yaml).expect_err("http registry requires url");
+
+    assert!(matches!(error, SkillError::InvalidConfig { .. }));
+}
+
+#[test]
+fn skills_config_rejects_invalid_http_registry_url() {
+    let yaml = r#"
+skills:
+  registries:
+    - name: bad-http
+      type: http
+      url: ftp://skills.example.test
+"#;
+
+    let error = load_project_skills_config(yaml).expect_err("http URL scheme must be validated");
+
+    assert!(matches!(error, SkillError::InvalidConfig { .. }));
+}
+
+#[test]
+fn skills_config_rejects_invalid_oci_registry_reference() {
+    let yaml = r#"
+skills:
+  registries:
+    - name: bad-oci
+      type: oci
+      url: not-a-reference
+"#;
+
+    let error = load_project_skills_config(yaml).expect_err("OCI reference must be validated");
+
+    assert!(matches!(error, SkillError::InvalidConfig { .. }));
+}
+
+#[test]
+fn skills_config_rejects_oci_reference_with_invalid_parts() {
+    for reference in [
+        "ghcr.io/bad$path",
+        "oci://user:pass@ghcr.io/agentenv-community",
+        "oci://ghcr.io/agentenv-community?tag=latest",
+        "oci://ghcr.io/agentenv-community#frag",
+        "ghcr.io:abc/agentenv-community",
+        "ghcr.io:5000:extra/agentenv-community",
+    ] {
+        let error = merge_skills_config(
+            SkillsConfig::default(),
+            None,
+            SkillsConfigOverride {
+                registry: Some(reference.to_owned()),
+            },
+        )
+        .expect_err(reference);
+
+        assert!(matches!(error, SkillError::InvalidConfig { .. }));
+    }
 }
 
 #[cfg(windows)]
