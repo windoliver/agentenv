@@ -49,6 +49,24 @@ sandbox:
   ssh_user: root
 ```
 
+## Snapshot and fork
+
+The Firecracker runtime implements the schema 1.2 sandbox snapshot/fork
+primitive used by:
+
+```bash
+agentenv fork <sandbox-handle> --name experiment
+```
+
+The driver pauses the source VM, calls Firecracker's snapshot API, resumes the
+source VM, clones the rootfs with a reflink/sparse copy when the host supports
+it, starts a child Firecracker process, and loads the snapshot into the child VM.
+The fork inherits the source SSH metadata and tap name unless the caller uses
+`ForkSpec.metadata` to override them.
+
+Apple Container and Kata runtimes return explicit capability errors for
+snapshot/fork until their host-specific implementations are designed.
+
 Run live integration tests with:
 
 ```bash

@@ -26,6 +26,7 @@ First-class Rust drivers for the critical path.
 
 - **M2-1** — `sandbox-openshell` (built-in)
 - **H-2** — `sandbox-microvm` (built-in, Firecracker on Linux/KVM; Apple Container on macOS; Kata reserved)
+- **H-3** — Snapshot/fork primitive for fast Firecracker env branching
 - **M2-2** — Built-in agent drivers: Claude, Codex, OpenClaw
 - **M2-3** — Built-in context drivers: filesystem, mcp-generic, none
 - **M2-4** — Built-in inference drivers: openai, anthropic, ollama, passthrough

@@ -96,6 +96,8 @@ fn handle_request(request: RpcRequestEnvelope) -> Result<RpcResponseEnvelope> {
                             supports_native_inference_routing: false,
                             supports_remote_host: false,
                             supports_persistent_sessions: false,
+                            supports_snapshots: false,
+                            supports_fork: false,
                         }),
                     },
                 )?,

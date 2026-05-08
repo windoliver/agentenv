@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ForkFromSnapshotParams",
+  "type": "object",
+  "required": [
+    "snapshot",
+    "spec"
+  ],
+  "properties": {
+    "snapshot": {
+      "$ref": "#/definitions/SnapshotId"
+    },
+    "spec": {
+      "$ref": "#/definitions/ForkSpec"
+    }
+  },
+  "definitions": {
+    "ForkSpec": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "SnapshotId": {
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

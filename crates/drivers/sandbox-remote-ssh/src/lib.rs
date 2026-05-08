@@ -674,6 +674,8 @@ impl SandboxDriver for RemoteSshDriver {
                 supports_native_inference_routing: false,
                 supports_remote_host: true,
                 supports_persistent_sessions: false,
+                supports_snapshots: false,
+                supports_fork: false,
             }),
         })
     }
