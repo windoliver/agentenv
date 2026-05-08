@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -918,7 +918,9 @@ fn run_self_test_command(skill_dir: &Path, cmd: &str, timeout: Duration) -> Resu
 #[cfg(unix)]
 fn shell_command(cmd: &str) -> Command {
     let mut command = Command::new("sh");
-    command.arg("-c").arg(cmd);
+    command.arg("-c").arg(format!(
+        "trap 'jobs -p | xargs kill -KILL 2>/dev/null || true' EXIT\n{cmd}"
+    ));
     command.process_group(0);
     command
 }
@@ -933,29 +935,160 @@ fn shell_command(cmd: &str) -> Command {
 #[cfg(unix)]
 fn terminate_timed_out_self_test(child: &mut Child) -> Result<(), String> {
     let process_group_id = child.id() as i32;
-    let kill_status = Command::new("kill")
-        .arg("-KILL")
-        .arg("--")
-        .arg(format!("-{process_group_id}"))
-        .status()
-        .map_err(|source| format!("could not start process-group kill: {source}"))?;
+    let mut descendant_pids = unix_descendant_pids(process_group_id).unwrap_or_default();
+    let _ = unix_signal_process_group(process_group_id, "STOP");
+    unix_signal_pids(&descendant_pids, "STOP");
+    thread::sleep(Duration::from_millis(25));
 
-    let pkill_status = Command::new("pkill")
+    if let Ok(mut discovered_pids) = unix_descendant_pids(process_group_id) {
+        descendant_pids.append(&mut discovered_pids);
+        descendant_pids.sort_unstable();
+        descendant_pids.dedup();
+    }
+
+    let group_signal_error = unix_kill_process_group(process_group_id).err();
+    unix_kill_pids(&descendant_pids);
+
+    let _ = Command::new("pkill")
         .arg("-KILL")
         .arg("-g")
         .arg(process_group_id.to_string())
         .status();
 
-    let pkill_succeeded = matches!(pkill_status, Ok(status) if status.success());
-    if !kill_status.success() && !pkill_succeeded {
-        child.kill().map_err(|source| {
-            format!("process-group kill failed with {kill_status}; direct kill failed: {source}")
-        })?;
-    }
     child
         .wait()
         .map_err(|source| format!("wait failed: {source}"))?;
-    Ok(())
+
+    let started_at = Instant::now();
+    loop {
+        let survivor_pids = unix_process_group_pids(process_group_id)?;
+        if survivor_pids.is_empty() {
+            return Ok(());
+        }
+
+        unix_kill_pids(&survivor_pids);
+        if started_at.elapsed() >= Duration::from_secs(2) {
+            let group_signal_error = group_signal_error
+                .as_deref()
+                .unwrap_or("process-group signal started successfully");
+            return Err(format!(
+                "process group {process_group_id} still has survivor pids {survivor_pids:?}; {group_signal_error}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn unix_kill_process_group(process_group_id: i32) -> Result<(), String> {
+    unix_signal_process_group(process_group_id, "KILL")
+}
+
+#[cfg(unix)]
+fn unix_signal_process_group(process_group_id: i32, signal: &str) -> Result<(), String> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{process_group_id}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| format!("could not start process-group signal: {source}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "process-group signal {signal} exited with {status}"
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn unix_kill_pids(pids: &[i32]) {
+    unix_signal_pids(pids, "KILL");
+}
+
+#[cfg(unix)]
+fn unix_signal_pids(pids: &[i32], signal: &str) {
+    for pid in pids {
+        let _ = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg("--")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_group_pids(process_group_id: i32) -> Result<Vec<i32>, String> {
+    let output = Command::new("pgrep")
+        .arg("-g")
+        .arg(process_group_id.to_string())
+        .output()
+        .map_err(|source| format!("could not list process group {process_group_id}: {source}"))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    parse_pid_lines(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(unix)]
+fn unix_descendant_pids(root_pid: i32) -> Result<Vec<i32>, String> {
+    let output = Command::new("ps")
+        .arg("-axo")
+        .arg("pid=,ppid=")
+        .output()
+        .map_err(|source| format!("could not list processes: {source}"))?;
+    if !output.status.success() {
+        return Err(format!("process listing exited with {}", output.status));
+    }
+
+    let mut processes = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(parent_pid)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(parent_pid)) = (pid.parse::<i32>(), parent_pid.parse::<i32>()) else {
+            continue;
+        };
+        processes.push((pid, parent_pid));
+    }
+
+    let mut descendants = Vec::new();
+    let mut stack = vec![root_pid];
+    while let Some(parent_pid) = stack.pop() {
+        for (pid, candidate_parent_pid) in &processes {
+            if *candidate_parent_pid == parent_pid {
+                descendants.push(*pid);
+                stack.push(*pid);
+            }
+        }
+    }
+
+    descendants.sort_unstable();
+    descendants.dedup();
+    Ok(descendants)
+}
+
+#[cfg(unix)]
+fn parse_pid_lines(stdout: &str) -> Result<Vec<i32>, String> {
+    let mut pids = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let pid = trimmed
+            .parse::<i32>()
+            .map_err(|source| format!("failed to parse pid `{trimmed}`: {source}"))?;
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
 }
 
 #[cfg(windows)]
