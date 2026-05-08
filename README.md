@@ -47,15 +47,15 @@ The key insight: **every axis is pluggable**.
      │ drivers │   │ drivers │  │ drivers │ │ drivers │  │   adapters   │
      ├─────────┤   ├─────────┤  ├─────────┤ ├─────────┤  ├──────────────┤
      │OpenShell│   │ Claude  │  │  Nexus  │ │NVIDIA   │  │ stdio        │
-     │Docker*  │   │ Codex   │  │ mcp-gen │ │OpenAI   │  │ http         │
-     │E2B*     │   │ Hermes* │  │ fs      │ │Anthropic│  │ http+sse     │
-     │         │   │OpenClaw │  │ none    │ │Ollama   │  │ ssh+http     │
+     │MicroVM  │   │ Codex   │  │ mcp-gen │ │OpenAI   │  │ http         │
+     │Docker*  │   │ Hermes* │  │ fs      │ │Anthropic│  │ http+sse     │
+     │E2B*     │   │OpenClaw │  │ none    │ │Ollama   │  │ ssh+http     │
      └─────────┘   └─────────┘  └─────────┘ └─────────┘  └──────────────┘
 
                                                              * post-MVP
 ```
 
-- **Sandbox** — the isolated runtime (OpenShell, Docker, E2B, Firecracker, ...)
+- **Sandbox** — the isolated runtime (OpenShell, Firecracker microVMs on Linux/KVM, Apple Container microVMs on macOS, Docker, E2B, ...)
 - **Agent** — the AI program that runs inside (Claude Code, Codex, Hermes, OpenClaw, ...)
 - **Context** — the knowledge backend the agent calls via MCP (Nexus, any MCP server, filesystem-only, none)
 - **Inference** — how model calls are routed (provider + credentials stay on the host)

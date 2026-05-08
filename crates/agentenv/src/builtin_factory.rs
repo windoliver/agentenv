@@ -105,6 +105,7 @@ fn build_driver_set_with_context(
             "remote-ssh" | "sandbox-remote-ssh" => {
                 Box::new(sandbox_remote_ssh::RemoteSshDriver::default())
             }
+            "microvm" | "sandbox-microvm" => Box::new(sandbox_microvm::MicroVmDriver::default()),
             other => {
                 return Err(RuntimeError::UnsupportedDriver {
                     kind: "sandbox",
@@ -230,6 +231,15 @@ fn build_pinned_sandbox(
                 pin,
             )?;
             Ok(Box::new(sandbox_remote_ssh::RemoteSshDriver::default()))
+        }
+        "microvm" | "sandbox-microvm" => {
+            validate_builtin_pin(
+                "sandbox",
+                agentenv_proto::DriverKind::Sandbox,
+                &["microvm", "sandbox-microvm"],
+                pin,
+            )?;
+            Ok(Box::new(sandbox_microvm::MicroVmDriver::default()))
         }
         other => Err(RuntimeError::UnsupportedDriver {
             kind: "sandbox",
@@ -607,6 +617,21 @@ mod tests {
     #[test]
     fn builds_remote_ssh_sandbox_aliases() {
         for sandbox in ["remote-ssh", "sandbox-remote-ssh"] {
+            let selection = DriverSelection {
+                sandbox: sandbox.to_owned(),
+                agent: "codex".to_owned(),
+                context: "filesystem".to_owned(),
+                inference: Some("passthrough".to_owned()),
+            };
+
+            let set = BuiltInDriverFactory.build(&selection).unwrap();
+            drop(set);
+        }
+    }
+
+    #[test]
+    fn builds_microvm_sandbox_aliases() {
+        for sandbox in ["microvm", "sandbox-microvm"] {
             let selection = DriverSelection {
                 sandbox: sandbox.to_owned(),
                 agent: "codex".to_owned(),

@@ -1,0 +1,27 @@
+[package]
+name = "sandbox-microvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+description = "MicroVM sandbox driver for agentenv"
+
+[features]
+integration = []
+
+[dependencies]
+agentenv-core = { path = "../../agentenv-core" }
+agentenv-proto = { path = "../../agentenv-proto" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+driver-conformance = { path = "../../../tests/driver-conformance" }
+tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = "=3.16.0"
