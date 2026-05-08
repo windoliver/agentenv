@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -191,6 +192,7 @@ policy:
         missing_stderr.contains("CUSTOM_OPENAI_KEY"),
         "stderr was: {missing_stderr}"
     );
+    write_failing_openshell_cli(&temp_dir);
 
     let present = Command::new(agentenv_bin())
         .arg("reproduce")
@@ -3274,6 +3276,29 @@ fn make_executable(path: &Path) {
     }
 }
 
+fn write_failing_openshell_cli(home: &Path) {
+    let bin_dir = home.join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let openshell = bin_dir.join("openshell");
+    fs::write(
+        &openshell,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'openshell 0.0.30\n'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  printf 'gateway down\n' >&2
+  exit 1
+fi
+printf 'unexpected openshell test command: %s\n' "$*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    make_executable(&openshell);
+}
+
 fn agentenv_uninstall_temp_dirs(root: &Path) -> BTreeSet<PathBuf> {
     fs::read_dir(root)
         .unwrap()
@@ -3423,7 +3448,10 @@ fn reserve_tcp_port() -> u16 {
 
 struct ApprovalsServerChild {
     child: process::Child,
+    _guard: MutexGuard<'static, ()>,
 }
+
+static APPROVALS_SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 impl Drop for ApprovalsServerChild {
     fn drop(&mut self) {
@@ -3433,12 +3461,16 @@ impl Drop for ApprovalsServerChild {
 }
 
 fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
+    let guard = APPROVALS_SERVER_TEST_LOCK.lock().unwrap();
     let child = Command::new(agentenv_bin())
         .env("HOME", home)
         .args(["approvals", "serve", "--addr", &format!("127.0.0.1:{port}")])
         .spawn()
         .unwrap();
-    ApprovalsServerChild { child }
+    ApprovalsServerChild {
+        child,
+        _guard: guard,
+    }
 }
 
 fn wait_for_http_ok(port: u16, path: &str) {
