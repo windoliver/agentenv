@@ -470,6 +470,10 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::Serde { .. }
         | SkillError::Toml { .. }
         | SkillError::RegistryNotFound { .. }
+        | SkillError::RegistryUrlBlocked { .. }
+        | SkillError::HttpRegistry { .. }
+        | SkillError::HttpStatus { .. }
+        | SkillError::CredentialReferenceUnavailable { .. }
         | SkillError::InvalidConfig { .. }
         | SkillError::SelfTestFailed { .. } => false,
     }

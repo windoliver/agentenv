@@ -25,6 +25,25 @@ pub enum SkillError {
     InvalidSkillName { name: String },
     #[error("registry `{name}` was not found")]
     RegistryNotFound { name: String },
+    #[error("registry URL `{url}` was blocked by SSRF policy: {source}")]
+    RegistryUrlBlocked {
+        url: String,
+        #[source]
+        source: Box<crate::security::ssrf::SsrfBlocked>,
+    },
+    #[error("HTTP registry request failed for `{url}`: {source}")]
+    HttpRegistry {
+        url: String,
+        #[source]
+        source: Box<reqwest::Error>,
+    },
+    #[error("HTTP registry `{url}` returned status {status}")]
+    HttpStatus {
+        url: String,
+        status: reqwest::StatusCode,
+    },
+    #[error("credential reference `{name}` is not available")]
+    CredentialReferenceUnavailable { name: String },
     #[error("invalid skills config: {message}")]
     InvalidConfig { message: String },
     #[error("invalid skill version `{version}`: {source}")]

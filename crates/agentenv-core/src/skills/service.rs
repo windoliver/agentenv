@@ -1,21 +1,29 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use semver::Version;
 
+use crate::security::ssrf::SsrfOptions;
+
 use super::{
     info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
-    remove_installed_skill, validate_skill_name, verify_installed_skill, InstalledSkill,
-    InstalledSkillSelector, RegistryAdapter, RegistryConfig, RegistryKind, SkillError,
-    SkillInstallOptions, SkillSearchHit, SkillsConfig,
+    registry_http, remove_installed_skill, validate_skill_name, verify_installed_skill,
+    InstalledSkill, InstalledSkillSelector, RegistryAdapter, RegistryConfig, RegistryKind,
+    SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
 };
 
-#[derive(Debug, Clone)]
+pub type SkillCredentialResolver =
+    Arc<dyn Fn(&str) -> Result<Option<String>, SkillError> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct SkillService {
     root: PathBuf,
     config: SkillsConfig,
+    credential_resolver: SkillCredentialResolver,
+    ssrf_options: SsrfOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +45,19 @@ impl SkillService {
         Self {
             root: root.into(),
             config,
+            credential_resolver: Arc::new(|_| Ok(None)),
+            ssrf_options: SsrfOptions::default(),
         }
+    }
+
+    pub fn with_credential_resolver(mut self, resolver: SkillCredentialResolver) -> Self {
+        self.credential_resolver = resolver;
+        self
+    }
+
+    pub fn with_ssrf_options(mut self, options: SsrfOptions) -> Self {
+        self.ssrf_options = options;
+        self
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SkillSearchHit>, SkillError> {
@@ -165,7 +185,7 @@ impl SkillService {
     fn adapter_for(
         &self,
         registry: &RegistryConfig,
-    ) -> Result<registry_filesystem::FilesystemRegistryAdapter, SkillError> {
+    ) -> Result<Box<dyn RegistryAdapter + Send + Sync>, SkillError> {
         match registry.kind {
             RegistryKind::Filesystem => {
                 let path = registry
@@ -174,18 +194,67 @@ impl SkillService {
                     .ok_or_else(|| SkillError::InvalidConfig {
                         message: format!("filesystem registry `{}` requires path", registry.name),
                     })?;
-                Ok(registry_filesystem::FilesystemRegistryAdapter::new(
-                    registry.name.clone(),
-                    path,
+                Ok(Box::new(
+                    registry_filesystem::FilesystemRegistryAdapter::new(
+                        registry.name.clone(),
+                        path,
+                    ),
                 ))
             }
-            RegistryKind::Http | RegistryKind::Oci => Err(SkillError::InvalidConfig {
+            RegistryKind::Http => {
+                let url = registry
+                    .url
+                    .clone()
+                    .ok_or_else(|| SkillError::InvalidConfig {
+                        message: format!("http registry `{}` requires url", registry.name),
+                    })?;
+                Ok(Box::new(registry_http::HttpRegistryAdapter::new(
+                    registry.name.clone(),
+                    url,
+                    self.bearer_token_for(registry)?,
+                    self.ssrf_options.clone(),
+                )?))
+            }
+            RegistryKind::Oci => Err(SkillError::InvalidConfig {
                 message: format!(
                     "registry `{}` uses unsupported adapter kind `{:?}`",
                     registry.name, registry.kind
                 ),
             }),
         }
+    }
+
+    fn bearer_token_for(&self, registry: &RegistryConfig) -> Result<Option<String>, SkillError> {
+        let Some(auth) = registry.auth.as_deref() else {
+            return Ok(None);
+        };
+
+        let credential_name = if auth == "bearer-from-credstore" {
+            default_bearer_credential_name(&registry.name)
+        } else if let Some(name) = auth.strip_prefix("bearer-from-credstore:") {
+            if name.is_empty() {
+                return Err(SkillError::InvalidConfig {
+                    message: format!(
+                        "http registry `{}` has an empty bearer credential reference",
+                        registry.name
+                    ),
+                });
+            }
+            name.to_owned()
+        } else {
+            return Err(SkillError::InvalidConfig {
+                message: format!(
+                    "http registry `{}` uses unsupported auth `{auth}`",
+                    registry.name
+                ),
+            });
+        };
+
+        (self.credential_resolver)(&credential_name)?
+            .ok_or_else(|| SkillError::CredentialReferenceUnavailable {
+                name: credential_name,
+            })
+            .map(Some)
     }
 }
 
@@ -250,4 +319,18 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
         (Ok(left), Ok(right)) => left.cmp(&right),
         _ => left.cmp(right),
     }
+}
+
+fn default_bearer_credential_name(registry_name: &str) -> String {
+    let normalized = registry_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("AGENTENV_SKILLS_{normalized}_TOKEN")
 }

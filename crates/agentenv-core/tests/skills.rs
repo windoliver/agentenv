@@ -1,8 +1,12 @@
 use std::{
+    collections::BTreeMap,
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
+use agentenv_core::security::ssrf::SsrfOptions;
 use agentenv_core::skills::{
     compute_bundle_digest, install_local_skill, list_installed_skills, load_project_skills_config,
     load_skill_manifest, load_user_skills_config, merge_skills_config, validate_skill_name,
@@ -1434,6 +1438,124 @@ async fn skill_service_add_records_registry_source_with_resolved_version() {
     );
 }
 
+#[tokio::test]
+async fn http_registry_rejects_unsafe_url_before_request() {
+    let home = temp_dir("skill-http-unsafe-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::http(
+                "unsafe",
+                "http://127.0.0.1:9",
+                None,
+            )],
+            registry_order: vec!["unsafe".to_owned()],
+        },
+    );
+
+    let error = service
+        .search("demo")
+        .await
+        .expect_err("loopback URL must be blocked");
+
+    assert!(matches!(error, SkillError::RegistryUrlBlocked { .. }));
+}
+
+#[tokio::test]
+async fn http_registry_search_reads_static_index() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response(
+            "GET",
+            "/index.yaml",
+            "skills:\n  - name: http-demo\n    version: 0.1.0\n    description: HTTP demo\n    registry: ignored\n",
+        )
+        .await;
+    let home = temp_dir("skill-http-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let hits = service.search("http").await.expect("search should succeed");
+
+    assert_eq!(hits[0].name, "http-demo");
+    assert_eq!(hits[0].registry, "http-dev");
+}
+
+#[tokio::test]
+async fn http_registry_publish_and_add_round_trip() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response("GET", "/index.yaml", "skills: []\n")
+        .await;
+    let home = temp_dir("skill-http-round-trip-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("http-skill", "0.1.0", "HTTP skill"),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should upload files");
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "http-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should download uploaded files");
+
+    assert_eq!(installed.name, "http-skill");
+    assert_eq!(installed.source_type, "http");
+    assert_eq!(installed.source_label, "http:http-dev:http-skill@0.1.0");
+}
+
+#[tokio::test]
+async fn http_registry_uses_bearer_token_from_credential_resolver() {
+    let server = TestHttpRegistry::start().await;
+    server.require_authorization("secret-token").await;
+    server
+        .add_response(
+            "GET",
+            "/index.yaml",
+            "skills:\n  - name: auth-demo\n    version: 0.1.0\n    registry: ignored\n",
+        )
+        .await;
+    let home = temp_dir("skill-http-auth-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::http(
+                "http-dev",
+                server.base_url(),
+                Some("bearer-from-credstore:CUSTOM_SKILLS_TOKEN".to_owned()),
+            )],
+            registry_order: vec!["http-dev".to_owned()],
+        },
+    )
+    .with_ssrf_options(test_http_registry_ssrf_options())
+    .with_credential_resolver(Arc::new(|name| {
+        assert_eq!(name, "CUSTOM_SKILLS_TOKEN");
+        Ok(Some("secret-token".to_owned()))
+    }));
+
+    let hits = service
+        .search("auth")
+        .await
+        .expect("authenticated search should succeed");
+
+    assert_eq!(hits[0].name, "auth-demo");
+    assert!(server
+        .authorization_headers()
+        .await
+        .iter()
+        .any(|header| header.as_deref() == Some("Bearer secret-token")));
+}
+
 #[cfg(windows)]
 fn self_test_file_exists_command() -> &'static str {
     "if exist SKILL.md (exit /B 0) else (exit /B 1)"
@@ -1486,6 +1608,28 @@ async fn publish_test_skill(service: &SkillService, name: &str, version: &str, c
         .expect("publish should succeed");
 }
 
+fn http_skill_service(home: &Path, server: &TestHttpRegistry) -> SkillService {
+    SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::http(
+                "http-dev",
+                server.base_url(),
+                None,
+            )],
+            registry_order: vec!["http-dev".to_owned()],
+        },
+    )
+}
+
+fn test_http_registry_ssrf_options() -> SsrfOptions {
+    SsrfOptions {
+        allow_private: true,
+        allow_loopback: true,
+        ..SsrfOptions::default()
+    }
+}
+
 fn skill_bundle(name: &str, version: &str, content: &str) -> PathBuf {
     let bundle = temp_dir(&format!("skill-fs-bundle-{name}-{version}"));
     write_file(&bundle.join("SKILL.md"), &format!("# {content}\n"));
@@ -1496,6 +1640,192 @@ fn skill_bundle(name: &str, version: &str, content: &str) -> PathBuf {
         ),
     );
     bundle
+}
+
+#[derive(Clone)]
+struct TestHttpRegistry {
+    addr: SocketAddr,
+    state: Arc<Mutex<TestHttpRegistryState>>,
+}
+
+#[derive(Default)]
+struct TestHttpRegistryState {
+    responses: BTreeMap<(String, String), Vec<u8>>,
+    requests: Vec<TestHttpRegistryRequest>,
+    required_authorization: Option<String>,
+}
+
+struct TestHttpRegistryRequest {
+    authorization: Option<String>,
+}
+
+impl TestHttpRegistry {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(TestHttpRegistryState::default()));
+        let server = Self {
+            addr,
+            state: state.clone(),
+        };
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    handle_test_http_registry_connection(stream, state).await;
+                });
+            }
+        });
+
+        server
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    async fn add_response(&self, method: &str, path: &str, body: &str) {
+        self.state.lock().unwrap().responses.insert(
+            (method.to_owned(), path.to_owned()),
+            body.as_bytes().to_vec(),
+        );
+    }
+
+    async fn require_authorization(&self, token: &str) {
+        self.state.lock().unwrap().required_authorization = Some(format!("Bearer {token}"));
+    }
+
+    async fn authorization_headers(&self) -> Vec<Option<String>> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .map(|request| request.authorization.clone())
+            .collect()
+    }
+}
+
+async fn handle_test_http_registry_connection(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<Mutex<TestHttpRegistryState>>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let Some((method, path, headers, body)) = read_test_http_request(&mut stream).await else {
+        return;
+    };
+    let authorization = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.clone());
+
+    let (status, response_body) = {
+        let mut state = state.lock().unwrap();
+        state.requests.push(TestHttpRegistryRequest {
+            authorization: authorization.clone(),
+        });
+
+        if let Some(required) = state.required_authorization.as_deref() {
+            if authorization.as_deref() != Some(required) {
+                (401, Vec::new())
+            } else {
+                test_http_registry_response(&mut state, &method, &path, body)
+            }
+        } else {
+            test_http_registry_response(&mut state, &method, &path, body)
+        }
+    };
+
+    let status_text = match status {
+        200 => "OK",
+        204 => "No Content",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response_body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.write_all(&response_body).await;
+}
+
+fn test_http_registry_response(
+    state: &mut TestHttpRegistryState,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    match method {
+        "GET" => state
+            .responses
+            .get(&(method.to_owned(), path.to_owned()))
+            .cloned()
+            .map(|body| (200, body))
+            .unwrap_or_else(|| (404, Vec::new())),
+        "PUT" => {
+            state
+                .responses
+                .insert(("GET".to_owned(), path.to_owned()), body);
+            (204, Vec::new())
+        }
+        _ => (404, Vec::new()),
+    }
+}
+
+async fn read_test_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(String, String, Vec<(String, String)>, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+
+    let header = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next()?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next()?.to_owned();
+    let path = request_parts.next()?.to_owned();
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+
+    Some((method, path, headers, body))
 }
 
 fn unique_nanos() -> u128 {

@@ -54,16 +54,34 @@ pub fn load_skill_manifest(root: impl AsRef<Path>) -> Result<SkillManifest, Skil
     let root = root.as_ref();
     let manifest_path = root.join(MANIFEST_FILE);
     let content = read_manifest_file(&manifest_path)?;
-    let raw: RawSkillManifest =
-        serde_yaml::from_str(&content).map_err(|source| SkillError::Yaml {
-            path: manifest_path.clone(),
-            source,
-        })?;
+    let raw = parse_raw_manifest(&content, &manifest_path)?;
+    manifest_from_raw(raw, &manifest_path, Some(root))
+}
 
-    let name = required(raw.name, &manifest_path, "name")?;
+pub(crate) fn load_remote_skill_manifest(
+    content: &str,
+    manifest_path: &Path,
+) -> Result<SkillManifest, SkillError> {
+    let raw = parse_raw_manifest(content, manifest_path)?;
+    manifest_from_raw(raw, manifest_path, None)
+}
+
+fn parse_raw_manifest(content: &str, manifest_path: &Path) -> Result<RawSkillManifest, SkillError> {
+    serde_yaml::from_str(content).map_err(|source| SkillError::Yaml {
+        path: manifest_path.to_path_buf(),
+        source,
+    })
+}
+
+fn manifest_from_raw(
+    raw: RawSkillManifest,
+    manifest_path: &Path,
+    root: Option<&Path>,
+) -> Result<SkillManifest, SkillError> {
+    let name = required(raw.name, manifest_path, "name")?;
     validate_skill_name(&name)?;
 
-    let version = required(raw.version, &manifest_path, "version")?;
+    let version = required(raw.version, manifest_path, "version")?;
     let version = version
         .parse::<Version>()
         .map_err(|source| SkillError::InvalidVersion {
@@ -71,15 +89,20 @@ pub fn load_skill_manifest(root: impl AsRef<Path>) -> Result<SkillManifest, Skil
             source,
         })?;
 
-    let entry = required(raw.entry, &manifest_path, "entry")?;
+    let entry = required(raw.entry, manifest_path, "entry")?;
     let entry = normalize_bundle_path(Path::new(&entry))?;
-    ensure_declared_file(root, &entry)?;
+    if let Some(root) = root {
+        ensure_declared_file(root, &entry)?;
+    }
 
     let files = raw.files.ok_or_else(|| SkillError::MissingManifestField {
-        path: manifest_path.clone(),
+        path: manifest_path.to_path_buf(),
         field: "files",
     })?;
-    let declared_files = expand_declared_files(root, files)?;
+    let declared_files = match root {
+        Some(root) => expand_declared_files(root, files)?,
+        None => normalize_explicit_declared_files(files)?,
+    };
     if !declared_files.contains(&entry) {
         return Err(SkillError::MissingDeclaredFile { path: entry });
     }
@@ -227,6 +250,21 @@ fn expand_declared_files(root: &Path, patterns: Vec<String>) -> Result<Vec<PathB
         }
     }
 
+    Ok(files.into_iter().collect())
+}
+
+fn normalize_explicit_declared_files(patterns: Vec<String>) -> Result<Vec<PathBuf>, SkillError> {
+    let mut files = BTreeSet::new();
+    for pattern in patterns {
+        if pattern.ends_with("/**") {
+            return Err(SkillError::InvalidConfig {
+                message: format!(
+                    "HTTP registry fetch requires explicit file entries; recursive pattern `{pattern}` is not fetchable"
+                ),
+            });
+        }
+        files.insert(normalize_bundle_path(Path::new(&pattern))?);
+    }
     Ok(files.into_iter().collect())
 }
 
