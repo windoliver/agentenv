@@ -3574,7 +3574,10 @@ fn run_skills_verify(args: SkillsVerifyArgs) -> Result<()> {
         .context("failed to load skill trust keys")?;
     let report = agentenv_core::skills::verify_all_installed_skills(
         &layout,
-        agentenv_core::skills::SkillVerifyOptions { trust_keys },
+        agentenv_core::skills::SkillVerifyOptions {
+            trust_keys,
+            ..Default::default()
+        },
     )
     .context("failed to verify installed skills")?;
 

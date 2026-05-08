@@ -182,9 +182,19 @@ pub struct SkillIndexEntry {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillVerifyOptions {
     pub trust_keys: Vec<SkillTrustKey>,
+    pub run_self_tests: bool,
+}
+
+impl Default for SkillVerifyOptions {
+    fn default() -> Self {
+        Self {
+            trust_keys: Vec::new(),
+            run_self_tests: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,7 +565,9 @@ fn verify_installed_skill(
     verify_skill_provenance(skill_dir, &manifest, &mut errors);
     verify_archive(layout, skill_dir, &manifest, &mut warnings, &mut errors);
     verify_signatures(&manifest, options, &mut errors);
-    verify_self_tests(skill_dir, &manifest, &mut errors);
+    if options.run_self_tests {
+        verify_self_tests(skill_dir, &manifest, &mut errors);
+    }
 
     let status = if errors.is_empty() {
         SkillVerifyStatus::Passed

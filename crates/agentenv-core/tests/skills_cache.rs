@@ -537,6 +537,7 @@ fn verify_all_verifies_ed25519_signature_with_trust_key() {
                 id: "test-key".to_owned(),
                 public_key: hex::encode(signing_key.verifying_key().to_bytes()),
             }],
+            ..Default::default()
         },
     )
     .expect("verify skills");
@@ -582,6 +583,7 @@ fn verify_all_fails_invalid_ed25519_signature() {
                 id: "test-key".to_owned(),
                 public_key: hex::encode(wrong_key.verifying_key().to_bytes()),
             }],
+            ..Default::default()
         },
     )
     .expect("verify skills");

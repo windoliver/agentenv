@@ -2129,7 +2129,10 @@ fn verify_reproduce_skill_pins(
     let report = crate::skills::verify_skill_pins(
         &layout,
         &lockfile.skills,
-        crate::skills::SkillVerifyOptions { trust_keys },
+        crate::skills::SkillVerifyOptions {
+            trust_keys,
+            run_self_tests: false,
+        },
     )
     .map_err(|error| RuntimeError::PortableLockfileVerification {
         details: error.to_string(),
@@ -4466,6 +4469,14 @@ mod tests {
         root: &std::path::Path,
         manifest_schema_version: &str,
     ) -> crate::lockfile::SkillPin {
+        write_runtime_skill_pin_with_self_test(root, manifest_schema_version, None)
+    }
+
+    fn write_runtime_skill_pin_with_self_test(
+        root: &std::path::Path,
+        manifest_schema_version: &str,
+        self_test: Option<crate::skills::SkillSelfTest>,
+    ) -> crate::lockfile::SkillPin {
         let skill_dir = root.join("skills").join("code-review").join("1.2.0");
         fs::create_dir_all(skill_dir.join(".agentenv")).expect("create skill metadata dir");
         fs::write(
@@ -4496,7 +4507,7 @@ mod tests {
                 digest: digest.clone(),
                 cache_key: format!("{archive_hex}.tar.zst"),
             }),
-            self_test: None,
+            self_test,
         };
         fs::write(
             skill_dir.join(".agentenv/manifest.json"),
@@ -9415,6 +9426,74 @@ policy:
                 + factory.pinned_builds.load(Ordering::SeqCst),
             0,
             "skill pin verification should fail before driver materialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_skips_pinned_skill_self_test_commands() {
+        let root = unique_root("agentenv-reproduce-skill-self-test");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        let self_test = crate::skills::SkillSelfTest {
+            timeout_seconds: 5,
+            assertions: vec![crate::skills::SkillSelfTestAssertion::CommandExitsZero {
+                cmd: "echo marker > host-side-marker".to_owned(),
+            }],
+        };
+        lockfile.skills.push(write_runtime_skill_pin_with_self_test(
+            &options.root,
+            crate::skills::SKILL_METADATA_SCHEMA_VERSION,
+            Some(self_test),
+        ));
+        let marker_path = options
+            .root
+            .join("skills")
+            .join("code-review")
+            .join("1.2.0")
+            .join("host-side-marker");
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+            .await
+            .expect("reproduce env");
+
+        assert!(
+            !marker_path.exists(),
+            "reproduce-time skill pin verification executed a host-side self-test command"
         );
     }
 
