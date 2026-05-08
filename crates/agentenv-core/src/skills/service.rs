@@ -10,9 +10,9 @@ use crate::security::ssrf::SsrfOptions;
 
 use super::{
     info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
-    registry_http, remove_installed_skill, validate_skill_name, verify_installed_skill,
-    InstalledSkill, InstalledSkillSelector, RegistryAdapter, RegistryConfig, RegistryKind,
-    SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
+    registry_http, registry_oci, remove_installed_skill, validate_skill_name,
+    verify_installed_skill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
+    RegistryConfig, RegistryKind, SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
 };
 
 pub type SkillCredentialResolver =
@@ -215,12 +215,20 @@ impl SkillService {
                     self.ssrf_options.clone(),
                 )?))
             }
-            RegistryKind::Oci => Err(SkillError::InvalidConfig {
-                message: format!(
-                    "registry `{}` uses unsupported adapter kind `{:?}`",
-                    registry.name, registry.kind
-                ),
-            }),
+            RegistryKind::Oci => {
+                let reference = registry
+                    .url
+                    .clone()
+                    .ok_or_else(|| SkillError::InvalidConfig {
+                        message: format!("oci registry `{}` requires url", registry.name),
+                    })?;
+                Ok(Box::new(registry_oci::OciRegistryAdapter::new(
+                    registry.name.clone(),
+                    reference,
+                    self.bearer_token_for(registry)?,
+                    self.ssrf_options.clone(),
+                )?))
+            }
         }
     }
 
@@ -242,11 +250,12 @@ impl SkillService {
             }
             name.to_owned()
         } else {
-            return Err(SkillError::InvalidConfig {
-                message: format!(
-                    "http registry `{}` uses unsupported auth `{auth}`",
-                    registry.name
-                ),
+            return Err(SkillError::UnsupportedRegistryAuth {
+                scheme: auth
+                    .split_once(':')
+                    .map(|(scheme, _)| scheme)
+                    .unwrap_or(auth)
+                    .to_owned(),
             });
         };
 

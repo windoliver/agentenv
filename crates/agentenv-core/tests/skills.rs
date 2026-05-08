@@ -1556,6 +1556,49 @@ async fn http_registry_uses_bearer_token_from_credential_resolver() {
         .any(|header| header.as_deref() == Some("Bearer secret-token")));
 }
 
+#[tokio::test]
+async fn oci_registry_search_add_and_publish_use_distribution_api() {
+    let registry = TestOciRegistry::start().await;
+    let home = temp_dir("skill-oci-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::oci(
+                "oci-dev",
+                registry.base_reference("agentenv-test"),
+                None,
+            )],
+            registry_order: vec!["oci-dev".to_owned()],
+        },
+    )
+    .with_ssrf_options(test_http_registry_ssrf_options());
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("oci-skill", "0.1.0", "OCI skill"),
+            registry: Some("oci-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("OCI publish should work against fixture");
+
+    let hits = service.search("oci").await.expect("OCI search should work");
+    assert_eq!(hits[0].name, "oci-skill");
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "oci-skill@0.1.0".to_owned(),
+            registry: Some("oci-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("OCI add should install");
+
+    assert_eq!(installed.name, "oci-skill");
+    assert_eq!(installed.source_type, "oci");
+    assert_eq!(installed.source_label, "oci:oci-dev:oci-skill@0.1.0");
+}
+
 #[cfg(windows)]
 fn self_test_file_exists_command() -> &'static str {
     "if exist SKILL.md (exit /B 0) else (exit /B 1)"
@@ -1659,6 +1702,19 @@ struct TestHttpRegistryRequest {
     authorization: Option<String>,
 }
 
+#[derive(Clone)]
+struct TestOciRegistry {
+    addr: SocketAddr,
+}
+
+#[derive(Default)]
+struct TestOciRegistryState {
+    blobs: BTreeMap<String, Vec<u8>>,
+    manifests: BTreeMap<String, Vec<u8>>,
+    uploads: BTreeMap<String, Vec<u8>>,
+    next_upload: u64,
+}
+
 impl TestHttpRegistry {
     async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1707,6 +1763,35 @@ impl TestHttpRegistry {
             .iter()
             .map(|request| request.authorization.clone())
             .collect()
+    }
+}
+
+impl TestOciRegistry {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(TestOciRegistryState::default()));
+        let registry = Self { addr };
+        let base_url = format!("http://{addr}");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                let base_url = base_url.clone();
+                tokio::spawn(async move {
+                    handle_test_oci_registry_connection(stream, state, base_url).await;
+                });
+            }
+        });
+
+        registry
+    }
+
+    fn base_reference(&self, repository: &str) -> String {
+        format!("{}/{}", self.addr, repository)
     }
 }
 
@@ -1826,6 +1911,101 @@ async fn read_test_http_request(
     body.truncate(content_length);
 
     Some((method, path, headers, body))
+}
+
+async fn handle_test_oci_registry_connection(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<Mutex<TestOciRegistryState>>,
+    base_url: String,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let Some((method, target, _headers, body)) = read_test_http_request(&mut stream).await else {
+        return;
+    };
+    let (status, headers, response_body) =
+        test_oci_registry_response(&state, &base_url, &method, &target, body);
+    let status_text = match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response_body.len()
+    );
+    for (name, value) in headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.write_all(&response_body).await;
+}
+
+fn test_oci_registry_response(
+    state: &Arc<Mutex<TestOciRegistryState>>,
+    base_url: &str,
+    method: &str,
+    target: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut state = state.lock().unwrap();
+    match method {
+        "POST" if path.ends_with("/blobs/uploads/") => {
+            state.next_upload += 1;
+            let upload_path = format!("{path}{}", state.next_upload);
+            state.uploads.insert(upload_path.clone(), Vec::new());
+            (
+                202,
+                vec![("Location".to_owned(), format!("{base_url}{upload_path}"))],
+                Vec::new(),
+            )
+        }
+        "PATCH" if path.contains("/blobs/uploads/") => {
+            state.uploads.insert(path.to_owned(), body);
+            (
+                202,
+                vec![("Location".to_owned(), format!("{base_url}{path}"))],
+                Vec::new(),
+            )
+        }
+        "PUT" if path.contains("/blobs/uploads/") => {
+            let Some(digest) = query.strip_prefix("digest=") else {
+                return (404, Vec::new(), Vec::new());
+            };
+            let digest = digest.replace("%3A", ":");
+            let Some(upload) = state.uploads.remove(path) else {
+                return (404, Vec::new(), Vec::new());
+            };
+            state.blobs.insert(digest, upload);
+            (201, Vec::new(), Vec::new())
+        }
+        "PUT" if path.contains("/manifests/") => {
+            state.manifests.insert(path.to_owned(), body);
+            (201, Vec::new(), Vec::new())
+        }
+        "GET" if path.contains("/manifests/") => state
+            .manifests
+            .get(path)
+            .cloned()
+            .map(|body| (200, Vec::new(), body))
+            .unwrap_or_else(|| (404, Vec::new(), Vec::new())),
+        "GET" if path.contains("/blobs/") => {
+            let Some((_, digest)) = path.rsplit_once("/blobs/") else {
+                return (404, Vec::new(), Vec::new());
+            };
+            state
+                .blobs
+                .get(digest)
+                .cloned()
+                .map(|body| (200, Vec::new(), body))
+                .unwrap_or_else(|| (404, Vec::new(), Vec::new()))
+        }
+        _ => (404, Vec::new(), Vec::new()),
+    }
 }
 
 fn unique_nanos() -> u128 {

@@ -474,6 +474,8 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::HttpRegistry { .. }
         | SkillError::HttpStatus { .. }
         | SkillError::CredentialReferenceUnavailable { .. }
+        | SkillError::UnsupportedRegistryAuth { .. }
+        | SkillError::InvalidOciReference { .. }
         | SkillError::InvalidConfig { .. }
         | SkillError::SelfTestFailed { .. } => false,
     }

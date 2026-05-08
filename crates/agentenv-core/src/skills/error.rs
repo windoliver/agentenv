@@ -44,6 +44,10 @@ pub enum SkillError {
     },
     #[error("credential reference `{name}` is not available")]
     CredentialReferenceUnavailable { name: String },
+    #[error("unsupported registry authentication scheme `{scheme}`")]
+    UnsupportedRegistryAuth { scheme: String },
+    #[error("invalid OCI registry reference `{reference}`")]
+    InvalidOciReference { reference: String },
     #[error("invalid skills config: {message}")]
     InvalidConfig { message: String },
     #[error("invalid skill version `{version}`: {source}")]

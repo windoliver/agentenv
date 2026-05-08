@@ -6,6 +6,7 @@ mod manifest;
 mod registry;
 mod registry_filesystem;
 mod registry_http;
+mod registry_oci;
 mod service;
 mod signature;
 mod store;
