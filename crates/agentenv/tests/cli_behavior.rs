@@ -583,6 +583,166 @@ fn skills_registry_config_precedence_is_user_project_then_cli() {
 }
 
 #[test]
+fn skills_cli_enforces_trust_self_tests_version_selectors_and_remove_confirmation() {
+    let temp_dir = make_temp_dir("skills-cli-lifecycle-matrix");
+    let old_bundle = temp_dir.join("matrix-0.1.0");
+    let new_bundle = temp_dir.join("matrix-0.2.0");
+    write_local_skill_bundle(
+        &old_bundle,
+        "matrix-skill",
+        "0.1.0",
+        "Old matrix skill",
+        Some("test -f SKILL.md"),
+    );
+    write_local_skill_bundle(
+        &new_bundle,
+        "matrix-skill",
+        "0.2.0",
+        "New matrix skill",
+        Some("test -f SKILL.md"),
+    );
+
+    let unsigned_default = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&old_bundle)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!unsigned_default.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsigned_default.stderr).contains("missing Ed25519 signature"),
+        "{}",
+        output_summary(&unsigned_default)
+    );
+
+    for bundle in [&old_bundle, &new_bundle] {
+        let install = Command::new(agentenv_bin())
+            .arg("skills")
+            .arg("install")
+            .arg("--from")
+            .arg(bundle)
+            .arg("--allow-unsigned")
+            .arg("--json")
+            .env("HOME", &temp_dir)
+            .current_dir(&temp_dir)
+            .output()
+            .unwrap();
+        assert!(install.status.success(), "{}", output_summary(&install));
+        let installed: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+        assert_eq!(installed["name"], "matrix-skill");
+        assert_eq!(installed["signature_status"], "unsigned");
+    }
+
+    let ambiguous_info = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("matrix-skill")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(!ambiguous_info.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous_info.stderr).contains("multiple installed versions"),
+        "{}",
+        output_summary(&ambiguous_info)
+    );
+
+    let info_old = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(info_old.status.success(), "{}", output_summary(&info_old));
+    let info_old_json: serde_json::Value = serde_json::from_slice(&info_old.stdout).unwrap();
+    assert_eq!(info_old_json["version"], "0.1.0");
+
+    let verify_new = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.2.0")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify_new.status.success(),
+        "{}",
+        output_summary(&verify_new)
+    );
+    let verify_new_json: serde_json::Value = serde_json::from_slice(&verify_new.stdout).unwrap();
+    assert_eq!(verify_new_json["version"], "0.2.0");
+
+    let remove_without_yes = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(!remove_without_yes.status.success());
+    assert!(
+        String::from_utf8_lossy(&remove_without_yes.stderr).contains("without --yes"),
+        "{}",
+        output_summary(&remove_without_yes)
+    );
+
+    let remove_old = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .arg("--yes")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        remove_old.status.success(),
+        "{}",
+        output_summary(&remove_old)
+    );
+    let remove_old_json: serde_json::Value = serde_json::from_slice(&remove_old.stdout).unwrap();
+    assert_eq!(remove_old_json["version"], "0.1.0");
+
+    let list_after_remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        list_after_remove.status.success(),
+        "{}",
+        output_summary(&list_after_remove)
+    );
+    let list_after_remove_json: serde_json::Value =
+        serde_json::from_slice(&list_after_remove.stdout).unwrap();
+    assert_eq!(
+        list_after_remove_json["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|skill| skill["version"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["0.2.0"]
+    );
+}
+
+#[test]
 fn blueprint_lint_reports_json_diagnostics() {
     let temp_dir = make_temp_dir("blueprint-lint-json-diagnostics");
     let dockerfile = temp_dir.join("Dockerfile");
@@ -3438,6 +3598,27 @@ fn make_executable(path: &Path) {
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
     }
+}
+
+fn write_local_skill_bundle(
+    bundle: &Path,
+    name: &str,
+    version: &str,
+    description: &str,
+    self_test: Option<&str>,
+) {
+    fs::create_dir_all(bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), format!("# {description}\n")).unwrap();
+    let self_test_yaml = self_test
+        .map(|command| format!("self_test:\n  command: {command}\n"))
+        .unwrap_or_default();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n{self_test_yaml}"
+        ),
+    )
+    .unwrap();
 }
 
 fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, description: &str) {
