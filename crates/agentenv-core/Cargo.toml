@@ -31,6 +31,7 @@ hex.workspace = true
 rand_core.workspace = true
 dirs.workspace = true
 libc.workspace = true
+windows-sys.workspace = true
 time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true }
 uuid.workspace = true

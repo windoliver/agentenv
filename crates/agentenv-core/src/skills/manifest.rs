@@ -21,6 +21,7 @@ pub struct SkillManifest {
     pub declared_files: Vec<PathBuf>,
     pub self_test_command: Option<String>,
     pub signature_ed25519: Option<String>,
+    pub signature_public_key_ed25519: Option<String>,
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -45,6 +46,8 @@ struct RawSelfTest {
 #[derive(Debug, Deserialize)]
 struct RawSignatures {
     ed25519: Option<String>,
+    public_key: Option<String>,
+    public_key_ed25519: Option<String>,
 }
 
 pub fn load_skill_manifest(root: impl AsRef<Path>) -> Result<SkillManifest, SkillError> {
@@ -88,7 +91,13 @@ pub fn load_skill_manifest(root: impl AsRef<Path>) -> Result<SkillManifest, Skil
         entry,
         declared_files,
         self_test_command: raw.self_test.and_then(|self_test| self_test.command),
-        signature_ed25519: raw.signatures.and_then(|signatures| signatures.ed25519),
+        signature_ed25519: raw
+            .signatures
+            .as_ref()
+            .and_then(|signatures| signatures.ed25519.clone()),
+        signature_public_key_ed25519: raw
+            .signatures
+            .and_then(|signatures| signatures.public_key_ed25519.or(signatures.public_key)),
         extra: raw.extra,
     })
 }

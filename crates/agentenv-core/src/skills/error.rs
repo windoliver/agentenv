@@ -34,4 +34,34 @@ pub enum SkillError {
     MissingManifestField { path: PathBuf, field: &'static str },
     #[error("skill digest mismatch: expected `{expected}`, found `{actual}`")]
     DigestMismatch { expected: String, actual: String },
+    #[error("missing Ed25519 signature for skill `{name}` version `{version}`")]
+    MissingSignature { name: String, version: String },
+    #[error("invalid Ed25519 signature for skill `{name}` version `{version}`: {message}")]
+    InvalidSignature {
+        name: String,
+        version: String,
+        message: String,
+    },
+    #[error("skill `{name}` is not installed")]
+    SkillNotInstalled { name: String },
+    #[error("skill `{name}` has multiple installed versions: {versions}")]
+    AmbiguousInstalledVersion { name: String, versions: String },
+    #[error("skill `{name}` version `{version}` is already installed with digest `{existing}`")]
+    AlreadyInstalledDifferentDigest {
+        name: String,
+        version: String,
+        existing: String,
+    },
+    #[error("failed to parse or serialize installed skill YAML at `{path}`: {source}")]
+    Serde {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error("skill `{name}` version `{version}` self-test failed with status {status}")]
+    SelfTestFailed {
+        name: String,
+        version: String,
+        status: i32,
+    },
 }
