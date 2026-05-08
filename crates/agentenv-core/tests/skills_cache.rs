@@ -540,6 +540,24 @@ fn prune_removes_only_unreferenced_archives() {
         .exists());
 }
 
+#[test]
+fn prune_ignores_malformed_env_lockfiles() {
+    let root = unique_root("skill-prune-malformed-lockfile");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+    let unreferenced = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    write_archive(&layout, unreferenced, b"unreferenced");
+    let lock_path = root.join(".agentenv/envs/broken/lock.yaml");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    fs::write(lock_path, "version: definitely-not-supported\n").unwrap();
+
+    let plan = plan_skill_prune(&layout).expect("plan prune");
+
+    assert_eq!(plan.removed_archives.len(), 1);
+    assert!(plan.removed_archives[0]
+        .ends_with("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.tar.zst"));
+}
+
 fn write_installed_skill(layout: &SkillCacheLayout, name: &str, version: &str, digest: &str) {
     let skill_dir = layout
         .installed_skill_dir(name, version)

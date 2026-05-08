@@ -42,8 +42,6 @@ pub enum SkillCacheError {
     },
     #[error("invalid skill manifest `{path}`: {message}")]
     InvalidSkillManifest { path: PathBuf, message: String },
-    #[error("invalid skill lockfile `{path}`: {message}")]
-    InvalidSkillLockfile { path: PathBuf, message: String },
 }
 
 pub type SkillCacheResult<T> = Result<T, SkillCacheError>;
@@ -478,20 +476,13 @@ fn collect_env_lockfile_skill_refs(
             path: lock_path.clone(),
             source,
         })?;
-        match crate::lockfile::LockfileDocument::from_yaml(&lock_yaml) {
-            Ok(crate::lockfile::LockfileDocument::Portable(lockfile)) => {
-                for skill in lockfile.skills {
-                    if let Some(hex) = valid_digest_hex(&skill.digest) {
-                        referenced.insert(hex);
-                    }
+        if let Ok(crate::lockfile::LockfileDocument::Portable(lockfile)) =
+            crate::lockfile::LockfileDocument::from_yaml(&lock_yaml)
+        {
+            for skill in lockfile.skills {
+                if let Some(hex) = valid_digest_hex(&skill.digest) {
+                    referenced.insert(hex);
                 }
-            }
-            Ok(crate::lockfile::LockfileDocument::Legacy(_)) => {}
-            Err(source) => {
-                return Err(SkillCacheError::InvalidSkillLockfile {
-                    path: lock_path,
-                    message: source.to_string(),
-                });
             }
         }
     }
