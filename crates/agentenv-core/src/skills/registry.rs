@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use super::SkillError;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RegistryConfig {
@@ -55,4 +57,35 @@ pub enum RegistryKind {
     Filesystem,
     Http,
     Oci,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillSearchHit {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub registry: String,
+    pub digest: Option<String>,
+    pub signature_ed25519: Option<String>,
+    pub public_key_ed25519: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchedSkill {
+    pub staging_path: PathBuf,
+    pub registry: String,
+    pub source_type: String,
+    pub name: String,
+    pub version: String,
+}
+
+#[async_trait::async_trait]
+pub trait RegistryAdapter {
+    async fn search(&self, query: &str) -> Result<Vec<SkillSearchHit>, SkillError>;
+    async fn fetch(&self, name: &str, version: Option<&str>) -> Result<FetchedSkill, SkillError>;
+    async fn publish(
+        &self,
+        bundle_path: &Path,
+        allow_unsigned: bool,
+    ) -> Result<SkillSearchHit, SkillError>;
 }

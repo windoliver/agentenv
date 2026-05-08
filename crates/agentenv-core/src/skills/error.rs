@@ -55,13 +55,13 @@ pub enum SkillError {
     SkillNotInstalled { name: String },
     #[error("skill `{name}` has multiple installed versions: {versions}")]
     AmbiguousInstalledVersion { name: String, versions: String },
-    #[error("skill `{name}` version `{version}` is already installed with digest `{existing}`")]
+    #[error("skill `{name}` version `{version}` already exists with digest `{existing}`")]
     AlreadyInstalledDifferentDigest {
         name: String,
         version: String,
         existing: String,
     },
-    #[error("failed to parse or serialize installed skill YAML at `{path}`: {source}")]
+    #[error("failed to parse or serialize skill YAML at `{path}`: {source}")]
     Serde {
         path: PathBuf,
         #[source]

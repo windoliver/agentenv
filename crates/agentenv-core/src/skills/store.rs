@@ -41,6 +41,7 @@ pub struct InstalledSkill {
 #[derive(Debug, Clone)]
 pub struct SkillInstallOptions {
     pub allow_unsigned: bool,
+    pub source_type: String,
     pub source_label: String,
 }
 
@@ -112,7 +113,7 @@ pub fn install_local_skill(
     let installed = InstalledSkill {
         name: manifest.name.clone(),
         version: version.clone(),
-        source_type: "local".to_owned(),
+        source_type: options.source_type,
         source_label: options.source_label,
         digest,
         signature_status,

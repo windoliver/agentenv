@@ -6,8 +6,8 @@ use std::{
 use agentenv_core::skills::{
     compute_bundle_digest, install_local_skill, list_installed_skills, load_project_skills_config,
     load_skill_manifest, load_user_skills_config, merge_skills_config, validate_skill_name,
-    verify_installed_skill, InstalledSkillSelector, RegistryKind, SkillError, SkillInstallOptions,
-    SkillsConfig, SkillsConfigOverride,
+    verify_installed_skill, InstalledSkillSelector, RegistryKind, SkillAddRequest, SkillError,
+    SkillInstallOptions, SkillPublishRequest, SkillService, SkillsConfig, SkillsConfigOverride,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -379,6 +379,7 @@ fn local_install_writes_cache_and_index() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -404,6 +405,7 @@ fn local_reinstall_same_digest_keeps_existing_record() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "first-source".to_owned(),
         },
     )
@@ -414,6 +416,7 @@ fn local_reinstall_same_digest_keeps_existing_record() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "second-source".to_owned(),
         },
     )
@@ -437,6 +440,7 @@ fn local_reinstall_repairs_tampered_cached_content() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -448,6 +452,7 @@ fn local_reinstall_repairs_tampered_cached_content() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -489,6 +494,7 @@ fn local_reinstall_rejects_symlinked_existing_version_directory() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -513,6 +519,7 @@ fn local_reinstall_rejects_symlinked_cached_content_directory() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -526,6 +533,7 @@ fn local_reinstall_rejects_symlinked_cached_content_directory() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -550,6 +558,7 @@ fn local_reinstall_rejects_symlinked_cached_content_with_missing_files() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -562,6 +571,7 @@ fn local_reinstall_rejects_symlinked_cached_content_with_missing_files() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -591,6 +601,7 @@ fn local_install_treats_manifest_public_key_as_untrusted() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -613,6 +624,7 @@ fn installed_verify_detects_content_tampering() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -642,6 +654,7 @@ fn installed_verify_rejects_signed_record_without_public_key() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -677,6 +690,7 @@ fn installed_verify_rejects_symlinked_cached_content_directory() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -708,6 +722,7 @@ fn installed_verify_rejects_record_entry_tamper() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -753,6 +768,7 @@ fn installed_verify_rejects_signature_status_downgrade() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -825,6 +841,7 @@ fn installed_index_ignores_stale_staging_directories() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -859,6 +876,7 @@ fn installed_verify_runs_self_test_command() {
         &bundle,
         SkillInstallOptions {
             allow_unsigned: true,
+            source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
         },
     )
@@ -1159,6 +1177,263 @@ fn skills_config_rejects_oci_reference_with_invalid_parts() {
     }
 }
 
+#[tokio::test]
+async fn filesystem_registry_search_add_and_publish_work() {
+    let home = temp_dir("skill-fs-home");
+    let registry = temp_dir("skill-fs-registry");
+    let bundle = temp_dir("skill-fs-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Searchable Skill\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: searchable-skill\nversion: 0.1.0\ndescription: Searchable demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
+                "local-dev",
+                registry.clone(),
+            )],
+            registry_order: vec!["local-dev".to_owned()],
+        },
+    );
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle,
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should succeed");
+    let hits = service
+        .search("searchable")
+        .await
+        .expect("search should work");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "searchable-skill");
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "searchable-skill@0.1.0".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should install");
+
+    assert_eq!(installed.name, "searchable-skill");
+}
+
+#[tokio::test]
+async fn skill_service_add_without_version_installs_highest_semver() {
+    let home = temp_dir("skill-fs-highest-home");
+    let registry = temp_dir("skill-fs-highest-registry");
+    let service = filesystem_skill_service(&home, &registry);
+
+    publish_test_skill(&service, "versioned-skill", "0.1.0", "Old release").await;
+    publish_test_skill(&service, "versioned-skill", "0.3.0", "New release").await;
+    publish_test_skill(&service, "versioned-skill", "0.2.0", "Middle release").await;
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "versioned-skill".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add without version should install highest semver");
+
+    assert_eq!(installed.version, "0.3.0");
+}
+
+#[tokio::test]
+async fn skill_service_rejects_invalid_handle_before_registry_access() {
+    let home = temp_dir("skill-fs-invalid-handle-home");
+    let missing_registry = temp_dir("skill-fs-invalid-handle-missing-registry").join("missing");
+    let service = filesystem_skill_service(&home, &missing_registry);
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "../bad@0.1.0".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("invalid handles must fail before registry access");
+
+    assert!(matches!(error, SkillError::InvalidSkillName { .. }));
+}
+
+#[tokio::test]
+async fn filesystem_registry_refuses_same_version_with_different_digest() {
+    let home = temp_dir("skill-fs-overwrite-home");
+    let registry = temp_dir("skill-fs-overwrite-registry");
+    let service = filesystem_skill_service(&home, &registry);
+    publish_test_skill(&service, "overwrite-skill", "0.1.0", "First content").await;
+
+    let changed = skill_bundle("overwrite-skill", "0.1.0", "Changed content");
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: changed,
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("publishing a different digest over the same version must fail");
+
+    assert!(matches!(
+        error,
+        SkillError::AlreadyInstalledDifferentDigest {
+            name,
+            version,
+            ..
+        } if name == "overwrite-skill" && version == "0.1.0"
+    ));
+}
+
+#[tokio::test]
+async fn skill_service_publish_uses_first_ordered_registry_when_unspecified() {
+    let home = temp_dir("skill-fs-publish-default-home");
+    let registry = temp_dir("skill-fs-publish-default-registry");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let published = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("default-registry-skill", "0.1.0", "Default registry"),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish without registry should use configured registry order");
+
+    assert_eq!(published.registry, "local-dev");
+    assert!(registry
+        .join("bundles/default-registry-skill/0.1.0/SKILL.md")
+        .is_file());
+}
+
+#[tokio::test]
+async fn filesystem_registry_rejects_index_hit_with_mismatched_manifest_identity() {
+    let home = temp_dir("skill-fs-mismatched-manifest-home");
+    let registry = temp_dir("skill-fs-mismatched-manifest-registry");
+    let service = filesystem_skill_service(&home, &registry);
+    write_file(
+        &registry.join("index.yaml"),
+        "skills:\n  - name: requested-skill\n    version: 0.1.0\n    registry: local-dev\n",
+    );
+    write_file(
+        &registry.join("bundles/requested-skill/0.1.0/SKILL.md"),
+        "# Other skill\n",
+    );
+    write_file(
+        &registry.join("bundles/requested-skill/0.1.0/skill.yaml"),
+        "name: other-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "requested-skill@0.1.0".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("index identity must match fetched manifest identity");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsafeBundlePath { .. } | SkillError::InvalidConfig { .. }
+    ));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filesystem_registry_rejects_symlinked_bundles_directory() {
+    let home = temp_dir("skill-fs-symlink-bundles-home");
+    let registry = temp_dir("skill-fs-symlink-bundles-registry");
+    let outside = temp_dir("skill-fs-symlink-bundles-outside");
+    let service = filesystem_skill_service(&home, &registry);
+    write_file(
+        &registry.join("index.yaml"),
+        "skills:\n  - name: symlinked-skill\n    version: 0.1.0\n    registry: local-dev\n",
+    );
+    std::os::unix::fs::symlink(&outside, registry.join("bundles")).unwrap();
+    write_file(
+        &outside.join("symlinked-skill/0.1.0/SKILL.md"),
+        "# Symlinked skill\n",
+    );
+    write_file(
+        &outside.join("symlinked-skill/0.1.0/skill.yaml"),
+        "name: symlinked-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "symlinked-skill@0.1.0".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("symlinked registry bundle parents must be rejected");
+
+    assert!(matches!(error, SkillError::UnsafeBundlePath { .. }));
+}
+
+#[tokio::test]
+async fn filesystem_registry_publish_repairs_stale_index_without_bundle() {
+    let home = temp_dir("skill-fs-stale-index-home");
+    let registry = temp_dir("skill-fs-stale-index-registry");
+    let service = filesystem_skill_service(&home, &registry);
+    let bundle = skill_bundle("stale-index-skill", "0.1.0", "Stale index");
+    let manifest = load_skill_manifest(&bundle).unwrap();
+    let digest = compute_bundle_digest(&bundle, &manifest).unwrap();
+    write_file(
+        &registry.join("index.yaml"),
+        &format!(
+            "skills:\n  - name: stale-index-skill\n    version: 0.1.0\n    registry: local-dev\n    digest: {digest}\n"
+        ),
+    );
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle,
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should repair stale index entries whose bundle is missing");
+
+    assert!(registry
+        .join("bundles/stale-index-skill/0.1.0/SKILL.md")
+        .is_file());
+}
+
+#[tokio::test]
+async fn skill_service_add_records_registry_source_with_resolved_version() {
+    let home = temp_dir("skill-fs-provenance-home");
+    let registry = temp_dir("skill-fs-provenance-registry");
+    let service = filesystem_skill_service(&home, &registry);
+    publish_test_skill(&service, "provenance-skill", "0.1.0", "Old release").await;
+    publish_test_skill(&service, "provenance-skill", "0.4.0", "New release").await;
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "provenance-skill".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should install from registry");
+
+    assert_eq!(installed.version, "0.4.0");
+    assert_eq!(installed.source_type, "filesystem");
+    assert_eq!(
+        installed.source_label,
+        "filesystem:local-dev:provenance-skill@0.4.0"
+    );
+}
+
 #[cfg(windows)]
 fn self_test_file_exists_command() -> &'static str {
     "if exist SKILL.md (exit /B 0) else (exit /B 1)"
@@ -1185,6 +1460,42 @@ fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn filesystem_skill_service(home: &Path, registry: &Path) -> SkillService {
+    SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
+                "local-dev",
+                registry.to_path_buf(),
+            )],
+            registry_order: vec!["local-dev".to_owned()],
+        },
+    )
+}
+
+async fn publish_test_skill(service: &SkillService, name: &str, version: &str, content: &str) {
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle(name, version, content),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should succeed");
+}
+
+fn skill_bundle(name: &str, version: &str, content: &str) -> PathBuf {
+    let bundle = temp_dir(&format!("skill-fs-bundle-{name}-{version}"));
+    write_file(&bundle.join("SKILL.md"), &format!("# {content}\n"));
+    write_file(
+        &bundle.join("skill.yaml"),
+        &format!(
+            "name: {name}\nversion: {version}\ndescription: {content}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+        ),
+    );
+    bundle
 }
 
 fn unique_nanos() -> u128 {
