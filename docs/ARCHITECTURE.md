@@ -62,11 +62,12 @@ Concrete: OpenShell (first-class), microVM/Firecracker on Linux/KVM and Apple Co
 Responsibilities:
 - Preflight checks (runtime installed, versions compatible)
 - `create` / `connect` / `exec` / `copy_in/out` / `status` / `stop` / `destroy`
+- Optionally `snapshot` a running sandbox and `fork_from_snapshot` into a new env
 - Translate a generic `NetworkPolicy` into its native policy format
 - Apply, update, and optionally hot-reload policy
 - Surface egress denials into the approvals queue
 
-Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`.
+Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`, `supports_persistent_sessions`, `supports_snapshots`, `supports_fork`.
 
 ### `AgentDriver` — what runs inside the sandbox?
 

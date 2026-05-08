@@ -58,6 +58,143 @@ fn freeze_persisted_env_writes_default_lockfile() {
 }
 
 #[test]
+fn fork_reports_capability_missing_for_openshell() {
+    let temp_dir = make_temp_dir("fork-openshell-unsupported");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    let state_path = env_dir.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["handles"]["sandbox"] = serde_json::Value::String("openshell://demo".to_owned());
+    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("fork")
+        .arg("demo")
+        .arg("--name")
+        .arg("experiment")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("supports_snapshots"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_microvm_cli_clones_env_with_fake_firecracker_api() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = PathBuf::from(format!("/tmp/ae-fc-{}", unique_suffix()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let agentenv_root = temp_dir.join(".agentenv");
+    let source_workdir = agentenv_root.join("microvm").join("demo");
+    let child_workdir = agentenv_root.join("microvm").join("experiment");
+    fs::create_dir_all(&source_workdir).unwrap();
+    fs::create_dir_all(&child_workdir).unwrap();
+    let source_api_sock = source_workdir.join("api.sock");
+    let child_api_sock = child_workdir.join("api.sock");
+    let source_server = spawn_fake_firecracker_api(&source_api_sock, 3);
+    let child_server = spawn_fake_firecracker_api(&child_api_sock, 1);
+
+    let rootfs = temp_dir.join("rootfs.ext4");
+    fs::write(&rootfs, "rootfs").unwrap();
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: microvm
+  runtime: firecracker
+  kernel: /var/lib/agentenv/kernel/vmlinux
+  rootfs: /var/lib/agentenv/rootfs.ext4
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#,
+    )
+    .unwrap();
+    let state_path = env_dir.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["drivers"]["sandbox"]["name"] = serde_json::Value::String("microvm".to_owned());
+    let source_handle = format!(
+        "microvm://firecracker/demo?workdir={}&api_sock={}&pid_file={}&rootfs={}&tap=tap-source",
+        source_workdir.display(),
+        source_api_sock.display(),
+        source_workdir.join("firecracker.pid").display(),
+        rootfs.display(),
+    );
+    state["handles"]["sandbox"] = serde_json::Value::String(source_handle.clone());
+    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let fake_bin = temp_dir.join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let firecracker = fake_bin.join("firecracker");
+    fs::write(&firecracker, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = fs::metadata(&firecracker).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&firecracker, perms).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let test_path = format!("{}:{}", fake_bin.display(), original_path.to_string_lossy());
+
+    let output = Command::new(agentenv_bin())
+        .arg("fork")
+        .arg(&source_handle)
+        .arg("--name")
+        .arg("experiment")
+        .env("HOME", &temp_dir)
+        .env("PATH", test_path)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Environment `experiment` forked from `demo`"));
+    assert!(stdout.contains("snapshot: microvm-snapshot://firecracker/demo/experiment"));
+
+    let target_state_path = temp_dir
+        .join(".agentenv")
+        .join("envs")
+        .join("experiment")
+        .join("state.json");
+    let target: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(target_state_path).unwrap()).unwrap();
+    assert_eq!(target["name"], "experiment");
+    let handle = target["handles"]["sandbox"].as_str().unwrap();
+    assert!(handle.starts_with("microvm://firecracker/experiment?"));
+    assert!(handle.contains("tap=tap-source"));
+    assert!(child_workdir.join("rootfs.ext4").is_file());
+
+    let source_requests = source_server.join().unwrap();
+    let child_requests = child_server.join().unwrap();
+    assert_eq!(source_requests.len(), 3);
+    assert!(source_requests[0].starts_with("PATCH /vm "));
+    assert!(source_requests[1].starts_with("PUT /snapshot/create "));
+    assert!(source_requests[2].starts_with("PATCH /vm "));
+    assert_eq!(child_requests.len(), 1);
+    assert!(child_requests[0].starts_with("PUT /snapshot/load "));
+}
+
+#[test]
 fn reproduce_portable_lockfile_reports_missing_required_credential() {
     let temp_dir = make_temp_dir("reproduce-portable-missing-credential");
     let env_dir = write_minimal_env_state_with_credentials(&temp_dir, "demo", &["OPENAI_API_KEY"]);
@@ -3158,6 +3295,72 @@ fn unique_suffix() -> String {
 
 fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
     write_minimal_env_state_with_credentials(home, name, &[])
+}
+
+#[cfg(unix)]
+fn spawn_fake_firecracker_api(
+    path: &Path,
+    expected_requests: usize,
+) -> thread::JoinHandle<Vec<String>> {
+    use std::os::unix::net::UnixListener;
+
+    if path.exists() {
+        fs::remove_file(path).unwrap();
+    }
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.len() < expected_requests && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_fake_firecracker_request(&mut stream);
+                    requests.push(request);
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("fake Firecracker API accept failed: {err}"),
+            }
+        }
+        requests
+    })
+}
+
+#[cfg(unix)]
+fn read_fake_firecracker_request(stream: &mut std::os::unix::net::UnixStream) -> String {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).unwrap();
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if fake_http_request_complete(&buffer) {
+            break;
+        }
+    }
+    String::from_utf8(buffer).unwrap()
+}
+
+#[cfg(unix)]
+fn fake_http_request_complete(buffer: &[u8]) -> bool {
+    let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    buffer.len() >= header_end + 4 + content_length
 }
 
 fn write_minimal_signed_snapshot(root: &Path, source_env: &str) -> PathBuf {

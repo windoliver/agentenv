@@ -554,6 +554,8 @@ impl SandboxDriver for OpenShellDriver {
                 supports_native_inference_routing: true,
                 supports_remote_host: true,
                 supports_persistent_sessions: true,
+                supports_snapshots: false,
+                supports_fork: false,
             }),
         })
     }

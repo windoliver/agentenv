@@ -8,7 +8,8 @@ use agentenv_proto::{
     McpConfigPathParams, McpConfigPathResult, McpEndpoint, PreflightParams, PreflightResult,
     RenderEntrypointResult, RenderMcpConfigParams, RenderMcpConfigResult,
     RequiredNetworkRulesResult, SandboxHandle, SandboxSpec, SandboxStatus, SandboxStatusParams,
-    SchemaVersionError, SessionHandle, ShellHandle, ShutdownParams, StopParams,
+    SchemaVersionError, SessionHandle, ShellHandle, ShutdownParams, SnapshotId, SnapshotParams,
+    StopParams,
 };
 use async_trait::async_trait;
 use std::{fmt, time::Duration};
@@ -84,6 +85,18 @@ pub fn require_capability(capability: &str, supported: bool) -> DriverResult<()>
 pub fn persistent_sessions_missing() -> DriverError {
     DriverError::CapabilityMissing {
         capability: "supports_persistent_sessions".to_owned(),
+    }
+}
+
+pub fn snapshots_missing() -> DriverError {
+    DriverError::CapabilityMissing {
+        capability: "supports_snapshots".to_owned(),
+    }
+}
+
+pub fn fork_missing() -> DriverError {
+    DriverError::CapabilityMissing {
+        capability: "supports_fork".to_owned(),
     }
 }
 
@@ -195,6 +208,15 @@ pub trait SandboxDriver: Send + Sync {
     async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult>;
     async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult>;
     async fn create(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle>;
+    async fn snapshot(&self, _params: SnapshotParams) -> DriverResult<SnapshotId> {
+        Err(snapshots_missing())
+    }
+    async fn fork_from_snapshot(
+        &self,
+        _params: agentenv_proto::ForkFromSnapshotParams,
+    ) -> DriverResult<SandboxHandle> {
+        Err(fork_missing())
+    }
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle>;
     async fn create_session(&self, _params: CreateSessionParams) -> DriverResult<SessionHandle> {
         Err(persistent_sessions_missing())
@@ -404,6 +426,8 @@ mod tests {
                     supports_native_inference_routing: true,
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
+                    supports_snapshots: false,
+                    supports_fork: false,
                 }),
             })
         }
@@ -502,6 +526,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sandbox_snapshot_methods_default_to_capability_missing() {
+        let driver = MinimalSandboxDriver;
+        let err = driver
+            .snapshot(agentenv_proto::SnapshotParams {
+                handle: "sb-1".to_owned(),
+                name: Some("before-risky-command".to_owned()),
+            })
+            .await
+            .expect_err("default snapshot implementation should reject");
+
+        assert!(
+            matches!(err, DriverError::CapabilityMissing { capability } if capability == "supports_snapshots")
+        );
+
+        let err = driver
+            .fork_from_snapshot(agentenv_proto::ForkFromSnapshotParams {
+                snapshot: agentenv_proto::SnapshotId {
+                    id: "snapshot://demo".to_owned(),
+                },
+                spec: agentenv_proto::ForkSpec {
+                    name: "experiment-1".to_owned(),
+                    metadata: Default::default(),
+                },
+            })
+            .await
+            .expect_err("default fork implementation should reject");
+
+        assert!(
+            matches!(err, DriverError::CapabilityMissing { capability } if capability == "supports_fork")
+        );
+    }
+
     #[test]
     fn compatibility_guard_rejects_mismatched_protocol_major() {
         let mismatched_protocol_version = format!(
@@ -522,6 +579,8 @@ mod tests {
                 supports_native_inference_routing: true,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_snapshots: false,
+                supports_fork: false,
             }),
         };
 
@@ -545,6 +604,8 @@ mod tests {
                 supports_native_inference_routing: true,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_snapshots: false,
+                supports_fork: false,
             }),
         };
 
