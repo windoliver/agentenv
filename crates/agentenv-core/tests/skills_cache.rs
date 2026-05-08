@@ -179,6 +179,66 @@ fn verify_all_rebuilds_index_with_current_symlink_version() {
 }
 
 #[test]
+fn verify_all_rejects_unsupported_manifest_schema_version() {
+    let root = unique_root("verify-manifest-schema-version");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let skill_dir = layout
+        .installed_skill_dir("code-review", "1.2.0")
+        .expect("skill dir");
+    let mut manifest = read_manifest(&skill_dir);
+    manifest.schema_version = "9.9".to_owned();
+    write_manifest(&skill_dir, &manifest);
+
+    let report =
+        verify_all_installed_skills(&layout, SkillVerifyOptions::default()).expect("verify skills");
+
+    assert!(!report.is_ok(), "{report:#?}");
+    assert!(report.skills[0]
+        .errors
+        .iter()
+        .any(|error| error.contains("unsupported skill manifest schema version")));
+}
+
+#[test]
+fn verify_all_rejects_unsupported_provenance_schema_version() {
+    let root = unique_root("verify-provenance-schema-version");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+
+    write_installed_skill(
+        &layout,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let skill_dir = layout
+        .installed_skill_dir("code-review", "1.2.0")
+        .expect("skill dir");
+    write_provenance_with_schema(
+        &skill_dir,
+        "9.9",
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+
+    let report =
+        verify_all_installed_skills(&layout, SkillVerifyOptions::default()).expect("verify skills");
+
+    assert!(!report.is_ok(), "{report:#?}");
+    assert!(report.skills[0]
+        .errors
+        .iter()
+        .any(|error| error.contains("unsupported skill provenance schema version")));
+}
+
+#[test]
 fn verify_skill_pins_accepts_matching_cached_archive() {
     let root = unique_root("verify-pinned-skill");
     let layout = SkillCacheLayout::new(root.join(".agentenv"));
@@ -800,8 +860,18 @@ fn rewrite_digest_to_actual_archive(layout: &SkillCacheLayout, skill_dir: &std::
 }
 
 fn write_provenance(skill_dir: &std::path::Path, name: &str, version: &str, digest: &str) {
+    write_provenance_with_schema(skill_dir, "0.1", name, version, digest);
+}
+
+fn write_provenance_with_schema(
+    skill_dir: &std::path::Path,
+    schema_version: &str,
+    name: &str,
+    version: &str,
+    digest: &str,
+) {
     let provenance = SkillProvenance {
-        schema_version: "0.1".to_owned(),
+        schema_version: schema_version.to_owned(),
         subject: agentenv_core::skills::SkillProvenanceSubject {
             name: name.to_owned(),
             version: version.to_owned(),

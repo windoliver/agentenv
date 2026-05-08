@@ -549,6 +549,7 @@ fn verify_installed_skill(
         }
     };
 
+    verify_manifest_schema(&manifest, &mut errors);
     verify_manifest_identity(&manifest, dir_name, dir_version, &mut errors);
     verify_skill_frontmatter(skill_dir, &manifest, &mut errors);
     verify_skill_provenance(skill_dir, &manifest, &mut errors);
@@ -664,6 +665,15 @@ fn verify_skill_pin_manifest(
                 pin.name, pin.version
             ));
         }
+    }
+}
+
+fn verify_manifest_schema(manifest: &SkillManifest, errors: &mut Vec<String>) {
+    if manifest.schema_version != SKILL_METADATA_SCHEMA_VERSION {
+        errors.push(format!(
+            "unsupported skill manifest schema version `{}`; expected `{SKILL_METADATA_SCHEMA_VERSION}`",
+            manifest.schema_version
+        ));
     }
 }
 
@@ -812,6 +822,12 @@ fn verify_skill_provenance(skill_dir: &Path, manifest: &SkillManifest, errors: &
         }
     };
 
+    if provenance.schema_version != SKILL_METADATA_SCHEMA_VERSION {
+        errors.push(format!(
+            "unsupported skill provenance schema version `{}`; expected `{SKILL_METADATA_SCHEMA_VERSION}`",
+            provenance.schema_version
+        ));
+    }
     if provenance.subject.name != manifest.name {
         errors.push(format!(
             "provenance name mismatch: manifest `{}`, provenance `{}`",

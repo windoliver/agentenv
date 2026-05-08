@@ -4462,6 +4462,72 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 
+    fn write_runtime_skill_pin(
+        root: &std::path::Path,
+        manifest_schema_version: &str,
+    ) -> crate::lockfile::SkillPin {
+        let skill_dir = root.join("skills").join("code-review").join("1.2.0");
+        fs::create_dir_all(skill_dir.join(".agentenv")).expect("create skill metadata dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: code-review\nversion: 1.2.0\n---\n# code-review\n",
+        )
+        .expect("write skill");
+
+        let archive_bytes = b"runtime pinned skill archive";
+        let archive_hex = crate::digest::sha256_hex(archive_bytes);
+        let digest = format!("sha256:{archive_hex}");
+        let archive_dir = root.join("cache").join("skills");
+        fs::create_dir_all(&archive_dir).expect("create skill archive dir");
+        fs::write(
+            archive_dir.join(format!("{archive_hex}.tar.zst")),
+            archive_bytes,
+        )
+        .expect("write skill archive");
+
+        let manifest = crate::skills::SkillManifest {
+            schema_version: manifest_schema_version.to_owned(),
+            name: "code-review".to_owned(),
+            version: "1.2.0".to_owned(),
+            source: "file:///skills/code-review".to_owned(),
+            digest: digest.clone(),
+            signatures: Vec::new(),
+            archive: Some(crate::skills::SkillArchive {
+                digest: digest.clone(),
+                cache_key: format!("{archive_hex}.tar.zst"),
+            }),
+            self_test: None,
+        };
+        fs::write(
+            skill_dir.join(".agentenv/manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("render manifest"),
+        )
+        .expect("write skill manifest");
+
+        let provenance = crate::skills::SkillProvenance {
+            schema_version: crate::skills::SKILL_METADATA_SCHEMA_VERSION.to_owned(),
+            subject: crate::skills::SkillProvenanceSubject {
+                name: "code-review".to_owned(),
+                version: "1.2.0".to_owned(),
+                digest: digest.clone(),
+            },
+            attestations: Vec::new(),
+        };
+        fs::write(
+            skill_dir.join(".agentenv/provenance.json"),
+            serde_json::to_string_pretty(&provenance).expect("render provenance"),
+        )
+        .expect("write skill provenance");
+
+        crate::lockfile::SkillPin {
+            name: manifest.name,
+            version: manifest.version,
+            source: manifest.source,
+            digest: manifest.digest,
+            signatures: Vec::new(),
+        }
+    }
+
     fn state_fixture(name: &str) -> crate::env::EnvStateFile {
         crate::env::EnvStateFile {
             version: crate::env::STATE_VERSION.to_owned(),
@@ -9281,6 +9347,69 @@ policy:
 
         let message = err.to_string();
         assert!(message.contains("missing skill pin"), "{message}");
+        assert_eq!(
+            factory.normal_builds.load(Ordering::SeqCst)
+                + factory.pinned_builds.load(Ordering::SeqCst),
+            0,
+            "skill pin verification should fail before driver materialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_rejects_unsupported_skill_manifest_schema_before_driver_materialization()
+    {
+        let root = unique_root("agentenv-reproduce-skill-schema");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile
+            .skills
+            .push(write_runtime_skill_pin(&options.root, "9.9"));
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err =
+            super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+                .await
+                .expect_err("unsupported skill manifest schema should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("unsupported skill manifest schema version"),
+            "{message}"
+        );
         assert_eq!(
             factory.normal_builds.load(Ordering::SeqCst)
                 + factory.pinned_builds.load(Ordering::SeqCst),
