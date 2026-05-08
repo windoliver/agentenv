@@ -140,7 +140,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService) -> Result<()> {
             let installed = service
                 .add(SkillAddRequest {
                     handle: args.handle,
-                    registry: args.registry,
+                    registry: None,
                     allow_unsigned: args.allow_unsigned,
                 })
                 .await?;
@@ -183,7 +183,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService) -> Result<()> {
             let hit = service
                 .publish(SkillPublishRequest {
                     bundle_path: args.path,
-                    registry: args.registry,
+                    registry: None,
                     allow_unsigned: args.allow_unsigned,
                 })
                 .await?;
