@@ -360,6 +360,63 @@ fn skills_install_list_info_verify_and_remove_local_bundle() {
 }
 
 #[test]
+fn skills_search_add_and_publish_use_filesystem_registry_config() {
+    let temp_dir = make_temp_dir("skills-cli-registry");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Registry Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.join("agentenv.yaml"),
+        format!(
+            "version: 0.1.0\nmin_agentenv_version: 0.0.1-alpha0\nsandbox: {{ driver: openshell }}\nagent: {{ driver: codex }}\ncontext: {{ driver: filesystem, mount: . }}\npolicy: {{ tier: balanced, presets: [] }}\nskills:\n  registries:\n    - name: local-dev\n      type: filesystem\n      path: {}\n",
+            registry.display()
+        ),
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg("local-dev")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("registry")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    assert!(String::from_utf8_lossy(&search.stdout).contains("registry-skill"));
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("registry-skill@0.1.0")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+}
+
+#[test]
 fn blueprint_lint_reports_json_diagnostics() {
     let temp_dir = make_temp_dir("blueprint-lint-json-diagnostics");
     let dockerfile = temp_dir.join("Dockerfile");
