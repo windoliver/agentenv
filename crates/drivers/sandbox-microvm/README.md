@@ -2,10 +2,14 @@
 
 Built-in `SandboxDriver` for microVM-backed agent environments.
 
-The driver currently implements the Firecracker runtime on Linux/KVM hosts and
-reserves the same driver surface for future Apple Container and Kata support.
-Those runtime names are parsed but return explicit capability errors until their
-host integrations are implemented.
+The driver supports two host-specific runtime paths:
+
+- `runtime: firecracker` on Linux hosts with KVM access through `/dev/kvm`.
+- `runtime: apple-container` on Apple silicon Macs with Apple's `container`
+  CLI installed and `container system start` completed.
+
+`runtime: kata` is reserved and returns an explicit capability error until that
+host integration is implemented.
 
 Example sandbox section:
 
@@ -18,6 +22,17 @@ sandbox:
   memory_mb: 2048
   cpus: 2
   tap: tap-agentenv0
+```
+
+macOS example:
+
+```yaml
+sandbox:
+  driver: microvm
+  runtime: apple-container
+  image: ubuntu:24.04
+  memory_mb: 2048
+  cpus: 2
 ```
 
 Optional SSH metadata enables `connect`, `exec`, `copy_in`, and `copy_out` when
@@ -38,8 +53,19 @@ Run live integration tests with:
 
 ```bash
 AGENTENV_RUN_MICROVM_INTEGRATION=1 \
-cargo test -p sandbox-microvm --features integration -- --ignored
+AGENTENV_MICROVM_KERNEL=/var/lib/agentenv/kernel/vmlinux-6.8 \
+AGENTENV_MICROVM_ROOTFS=/var/lib/agentenv/rootfs.ext4 \
+cargo test -p sandbox-microvm --features integration firecracker_process_lifecycle_on_linux_kvm -- --ignored
 ```
 
-Live tests require Linux, `/dev/kvm`, a `firecracker` binary on `PATH`, and a
-bootable kernel/rootfs pair prepared by the operator.
+For macOS:
+
+```bash
+AGENTENV_RUN_APPLE_CONTAINER_INTEGRATION=1 \
+cargo test -p sandbox-microvm --features integration apple_container_lifecycle_on_macos -- --ignored
+```
+
+The Firecracker test requires Linux, readable/writable `/dev/kvm`, a
+`firecracker` binary on `PATH`, and a bootable kernel/rootfs pair prepared by the
+operator. Docker on macOS does not satisfy this requirement unless its Linux VM
+itself exposes `/dev/kvm`.

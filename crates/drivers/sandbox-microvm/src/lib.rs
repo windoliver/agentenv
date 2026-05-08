@@ -17,9 +17,10 @@ use agentenv_proto::{
     Capabilities, ConnectParams, CopyInParams, CopyOutParams, CreateSessionParams, DestroyParams,
     DriverInfo, DriverKind, EmptyResult, ExecParams, ExecResult, InitializeParams,
     InitializeResult, IssueSeverity, KillSessionParams, ListSessionsParams, ListSessionsResult,
-    LogEntry, LogLevel, LogsParams, LogsResult, LogsStreamParams, PreflightIssue, PreflightParams,
-    PreflightResult, SandboxCapabilities, SandboxHandle, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxStatusParams, SessionHandle, ShellHandle, ShutdownParams, StopParams, SCHEMA_VERSION,
+    LogEntry, LogLevel, LogsParams, LogsResult, LogsStreamParams, NetworkPolicy, PreflightIssue,
+    PreflightParams, PreflightResult, SandboxCapabilities, SandboxHandle, SandboxPhase,
+    SandboxSpec, SandboxStatus, SandboxStatusParams, SessionHandle, ShellHandle, ShutdownParams,
+    StopParams, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,12 +29,16 @@ use url::Url;
 const DRIVER_NAME: &str = "microvm";
 const DEFAULT_RUNTIME: &str = "firecracker";
 const FIRECRACKER_BINARY: &str = "firecracker";
+const APPLE_CONTAINER_BINARY: &str = "container";
 const SSH_BINARY: &str = "ssh";
 const SCP_BINARY: &str = "scp";
 const MICROVM_SSH_CAPABILITY: &str = "microvm_ssh";
 const MICROVM_POLICY_CAPABILITY: &str = "microvm_policy_translation";
 const UNSUPPORTED_RUNTIME_CAPABILITY: &str = "microvm_runtime";
 const DEFAULT_KERNEL_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off";
+const SANDBOX_MOUNT: &str = "/sandbox";
+const GUEST_ENV_DIR: &str = "/sandbox/.agentenv/env";
+const DEFAULT_APPLE_CONTAINER_COMMAND: &str = "trap : TERM INT; sleep infinity & wait";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandRequest {
@@ -137,15 +142,17 @@ fn command_failed(program: &str, request: &CommandRequest, output: CommandOutput
     }
 }
 
-fn preflight_failure(code: &str, message: String, remediation: Option<String>) -> PreflightResult {
-    PreflightResult {
-        ok: false,
-        issues: vec![PreflightIssue {
-            severity: IssueSeverity::Error,
-            code: code.to_owned(),
-            message,
-            remediation,
-        }],
+fn preflight_issue(
+    severity: IssueSeverity,
+    code: &str,
+    message: String,
+    remediation: Option<String>,
+) -> PreflightIssue {
+    PreflightIssue {
+        severity,
+        code: code.to_owned(),
+        message,
+        remediation,
     }
 }
 
@@ -157,6 +164,7 @@ fn capability_missing(capability: &str) -> DriverError {
 
 pub struct MicroVmDriver {
     firecracker_binary: String,
+    apple_container_binary: String,
     ssh_binary: String,
     scp_binary: String,
     runner: Arc<dyn CommandRunner>,
@@ -168,6 +176,7 @@ impl Default for MicroVmDriver {
     fn default() -> Self {
         Self {
             firecracker_binary: FIRECRACKER_BINARY.to_owned(),
+            apple_container_binary: APPLE_CONTAINER_BINARY.to_owned(),
             ssh_binary: SSH_BINARY.to_owned(),
             scp_binary: SCP_BINARY.to_owned(),
             runner: Arc::new(ProcessCommandRunner),
@@ -183,20 +192,215 @@ impl MicroVmDriver {
     where
         T: CommandRunner + 'static,
     {
+        Self::for_tests_host(
+            runner,
+            HostChecks {
+                is_linux,
+                is_macos: false,
+                is_apple_silicon: false,
+                has_kvm,
+            },
+        )
+    }
+
+    fn for_tests_host<T>(runner: Arc<T>, host: HostChecks) -> Self
+    where
+        T: CommandRunner + 'static,
+    {
         Self {
             firecracker_binary: FIRECRACKER_BINARY.to_owned(),
+            apple_container_binary: APPLE_CONTAINER_BINARY.to_owned(),
             ssh_binary: SSH_BINARY.to_owned(),
             scp_binary: SCP_BINARY.to_owned(),
             runner,
-            host: HostChecks { is_linux, has_kvm },
+            host,
             workdir: Mutex::new(None),
         }
+    }
+}
+
+impl MicroVmDriver {
+    fn firecracker_preflight_issue(&self) -> Option<PreflightIssue> {
+        if !self.host.is_linux {
+            return Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_linux_required",
+                "Firecracker microVMs require a Linux host".to_owned(),
+                Some(
+                    "Use a Linux host with KVM, or select runtime: apple-container on macOS"
+                        .to_owned(),
+                ),
+            ));
+        }
+        if !self.host.has_kvm {
+            return Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_kvm_missing",
+                "/dev/kvm is not available on this host".to_owned(),
+                Some(
+                    "Enable KVM virtualization and ensure the current user can access /dev/kvm"
+                        .to_owned(),
+                ),
+            ));
+        }
+        if let Err(source) = self
+            .runner
+            .run(&self.firecracker_binary, &command_request(&["--version"]))
+        {
+            return Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_firecracker_missing",
+                format!(
+                    "Firecracker binary `{}` is not available: {source}",
+                    self.firecracker_binary
+                ),
+                Some("Install Firecracker and ensure it is on PATH".to_owned()),
+            ));
+        }
+        None
+    }
+
+    fn apple_container_preflight_issue(&self) -> Option<PreflightIssue> {
+        if !self.host.is_macos {
+            return Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_apple_container_macos_required",
+                "Apple Container microVMs require macOS".to_owned(),
+                Some("Use runtime: firecracker on a Linux/KVM host".to_owned()),
+            ));
+        }
+        if !self.host.is_apple_silicon {
+            return Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_apple_container_silicon_required",
+                "Apple Container requires Apple silicon".to_owned(),
+                Some(
+                    "Use a Mac with Apple silicon, or use runtime: firecracker on Linux/KVM"
+                        .to_owned(),
+                ),
+            ));
+        }
+
+        let request = command_request(&["system", "status", "--format", "json"]);
+        match self.runner.run(&self.apple_container_binary, &request) {
+            Ok(output) if output.status == Some(0) => None,
+            Ok(output) => Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_apple_container_not_running",
+                "Apple Container system service is not running".to_owned(),
+                Some(format!(
+                    "Run `{} system start` and retry. stdout: {} stderr: {}",
+                    self.apple_container_binary, output.stdout, output.stderr
+                )),
+            )),
+            Err(source) => Some(preflight_issue(
+                IssueSeverity::Error,
+                "microvm_apple_container_missing",
+                format!(
+                    "Apple Container CLI `{}` is not available: {source}",
+                    self.apple_container_binary
+                ),
+                Some("Install Apple Container from https://github.com/apple/container/releases and run `container system start`".to_owned()),
+            )),
+        }
+    }
+
+    fn workdir_parent(&self) -> DriverResult<PathBuf> {
+        self.workdir
+            .lock()
+            .map_err(|_| DriverError::InvalidInput {
+                message: "microvm workdir lock poisoned".to_owned(),
+            })?
+            .clone()
+            .ok_or_else(|| DriverError::InvalidInput {
+                message: "microvm driver must be initialized before create".to_owned(),
+            })
+    }
+
+    fn ensure_firecracker_create_host(&self) -> DriverResult<()> {
+        if let Some(issue) = self.firecracker_preflight_issue() {
+            return Err(DriverError::InvalidInput {
+                message: issue.message,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_apple_container_create_host(&self) -> DriverResult<()> {
+        if let Some(issue) = self.apple_container_preflight_issue() {
+            return Err(DriverError::InvalidInput {
+                message: issue.message,
+            });
+        }
+        Ok(())
+    }
+
+    async fn create_firecracker(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle> {
+        self.ensure_firecracker_create_host()?;
+        let spec = FirecrackerSpec::from_sandbox_spec(spec)?;
+        let parent = self.workdir_parent()?;
+        let workdir = ensure_workdir(&parent, &spec.name)?;
+        let handle = MicroVmHandle::new_firecracker(&spec, workdir.clone());
+        let config_path = workdir.join("firecracker.json");
+        write_json(&config_path, &spec.config())?;
+
+        let request = CommandRequest {
+            args: vec![
+                "--api-sock".to_owned(),
+                handle.api_sock.to_string_lossy().into_owned(),
+                "--config-file".to_owned(),
+                config_path.to_string_lossy().into_owned(),
+            ],
+            env: BTreeMap::new(),
+            stdin: None,
+        };
+        let pid = self
+            .runner
+            .spawn(&self.firecracker_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.firecracker_binary, &request.args),
+                source,
+            })?;
+        write_pid(&handle.pid_file, pid)?;
+
+        Ok(SandboxHandle {
+            handle: handle.to_handle()?,
+        })
+    }
+
+    async fn create_apple_container(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle> {
+        self.ensure_apple_container_create_host()?;
+        let spec = AppleContainerSpec::from_sandbox_spec(spec)?;
+        let parent = self.workdir_parent()?;
+        let workdir = ensure_apple_workdir(&parent, &spec)?;
+        let handle = MicroVmHandle::new_apple_container(&spec, workdir.clone());
+        let request = apple_container_run_request(&spec, &workdir);
+        let output = self
+            .runner
+            .run(&self.apple_container_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.apple_container_binary, &request.args),
+                source,
+            })?;
+        if output.status != Some(0) {
+            return Err(command_failed(
+                &self.apple_container_binary,
+                &request,
+                output,
+            ));
+        }
+
+        Ok(SandboxHandle {
+            handle: handle.to_handle()?,
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct HostChecks {
     is_linux: bool,
+    is_macos: bool,
+    is_apple_silicon: bool,
     has_kvm: bool,
 }
 
@@ -204,6 +408,8 @@ impl HostChecks {
     fn detect() -> Self {
         Self {
             is_linux: std::env::consts::OS == "linux",
+            is_macos: std::env::consts::OS == "macos",
+            is_apple_silicon: std::env::consts::ARCH == "aarch64",
             has_kvm: Path::new("/dev/kvm").exists(),
         }
     }
@@ -249,16 +455,6 @@ impl MicroVmRuntime {
             Self::Kata => "kata",
         }
     }
-
-    fn ensure_implemented(&self) -> DriverResult<()> {
-        match self {
-            Self::Firecracker => Ok(()),
-            Self::AppleContainer | Self::Kata => Err(capability_missing(&format!(
-                "{UNSUPPORTED_RUNTIME_CAPABILITY}:{}",
-                self.label()
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,16 +471,12 @@ struct FirecrackerSpec {
 
 impl FirecrackerSpec {
     fn from_sandbox_spec(spec: SandboxSpec) -> DriverResult<Self> {
-        if spec.policy.is_some() {
-            return Err(capability_missing(MICROVM_POLICY_CAPABILITY));
-        }
+        validate_create_policy(spec.policy.as_ref())?;
         if !spec.env.is_empty() {
             return Err(DriverError::InvalidInput {
                 message: "SandboxSpec.env is not supported by sandbox-microvm without a guest env injection path".to_owned(),
             });
         }
-        let runtime = MicroVmRuntime::parse(spec.metadata.get("runtime"))?;
-        runtime.ensure_implemented()?;
 
         let name = optional_metadata_string(&spec.metadata, "name")?
             .unwrap_or_else(|| format!("agentenv-{}", uuid_like_suffix()));
@@ -346,6 +538,100 @@ impl FirecrackerSpec {
                 })
                 .unwrap_or_default(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AppleContainerSpec {
+    name: String,
+    image: String,
+    command: String,
+    memory_mb: u32,
+    cpus: u8,
+    platform: Option<String>,
+    arch: Option<String>,
+    kernel: Option<String>,
+    env: BTreeMap<String, String>,
+    guest_env_file: Option<String>,
+}
+
+impl AppleContainerSpec {
+    fn from_sandbox_spec(spec: SandboxSpec) -> DriverResult<Self> {
+        validate_create_policy(spec.policy.as_ref())?;
+        let name = optional_metadata_string(&spec.metadata, "name")?
+            .unwrap_or_else(|| format!("agentenv-{}", uuid_like_suffix()));
+        validate_name(&name, "metadata.name")?;
+        let image = optional_metadata_string(&spec.metadata, "image")?
+            .or(spec.image)
+            .ok_or_else(|| DriverError::InvalidInput {
+                message: "SandboxSpec.image or metadata.image is required for apple-container"
+                    .to_owned(),
+            })?;
+        let command = optional_metadata_string(&spec.metadata, "command")?
+            .unwrap_or_else(|| DEFAULT_APPLE_CONTAINER_COMMAND.to_owned());
+        let memory_mb = metadata_u32(&spec.metadata, "memory_mb", 2048)?;
+        let cpus = metadata_u8(&spec.metadata, "cpus", 2)?;
+        let platform = optional_metadata_string(&spec.metadata, "platform")?;
+        let arch = optional_metadata_string(&spec.metadata, "arch")?;
+        let kernel = optional_metadata_string(&spec.metadata, "kernel")?;
+        validate_env(&spec.env)?;
+        let guest_env_file = (!spec.env.is_empty()).then(|| format!("{GUEST_ENV_DIR}/{name}.env"));
+
+        Ok(Self {
+            name,
+            image,
+            command,
+            memory_mb,
+            cpus,
+            platform,
+            arch,
+            kernel,
+            env: spec.env,
+            guest_env_file,
+        })
+    }
+}
+
+fn apple_container_run_request(spec: &AppleContainerSpec, workdir: &Path) -> CommandRequest {
+    let mut args = vec![
+        "run".to_owned(),
+        "--detach".to_owned(),
+        "--name".to_owned(),
+        spec.name.clone(),
+        "--cpus".to_owned(),
+        spec.cpus.to_string(),
+        "--memory".to_owned(),
+        format!("{}M", spec.memory_mb),
+        "--mount".to_owned(),
+        format!(
+            "type=bind,source={},target={SANDBOX_MOUNT}",
+            sandbox_dir(workdir).to_string_lossy()
+        ),
+    ];
+    if !spec.env.is_empty() {
+        args.push("--env-file".to_owned());
+        args.push(workdir.join("container.env").to_string_lossy().into_owned());
+    }
+    if let Some(platform) = spec.platform.as_deref() {
+        args.push("--platform".to_owned());
+        args.push(platform.to_owned());
+    }
+    if let Some(arch) = spec.arch.as_deref() {
+        args.push("--arch".to_owned());
+        args.push(arch.to_owned());
+    }
+    if let Some(kernel) = spec.kernel.as_deref() {
+        args.push("--kernel".to_owned());
+        args.push(kernel.to_owned());
+    }
+    args.push(spec.image.clone());
+    args.push("sh".to_owned());
+    args.push("-lc".to_owned());
+    args.push(spec.command.clone());
+    CommandRequest {
+        args,
+        env: BTreeMap::new(),
+        stdin: None,
     }
 }
 
@@ -445,17 +731,31 @@ struct MicroVmHandle {
     api_sock: PathBuf,
     pid_file: PathBuf,
     ssh: Option<SshTarget>,
+    env_file: Option<String>,
 }
 
 impl MicroVmHandle {
-    fn new(runtime: MicroVmRuntime, spec: &FirecrackerSpec, workdir: PathBuf) -> Self {
+    fn new_firecracker(spec: &FirecrackerSpec, workdir: PathBuf) -> Self {
         Self {
-            runtime,
+            runtime: MicroVmRuntime::Firecracker,
             name: spec.name.clone(),
             api_sock: workdir.join("api.sock"),
             pid_file: workdir.join("firecracker.pid"),
             workdir,
             ssh: spec.ssh.clone(),
+            env_file: None,
+        }
+    }
+
+    fn new_apple_container(spec: &AppleContainerSpec, workdir: PathBuf) -> Self {
+        Self {
+            runtime: MicroVmRuntime::AppleContainer,
+            name: spec.name.clone(),
+            api_sock: workdir.join("api.sock"),
+            pid_file: workdir.join("container.pid"),
+            workdir,
+            ssh: None,
+            env_file: spec.guest_env_file.clone(),
         }
     }
 
@@ -472,6 +772,9 @@ impl MicroVmHandle {
         }
         if let Some(ssh) = self.ssh.as_ref() {
             ssh.to_query(&mut url);
+        }
+        if let Some(env_file) = self.env_file.as_deref() {
+            url.query_pairs_mut().append_pair("env_file", env_file);
         }
         Ok(url.to_string())
     }
@@ -508,6 +811,11 @@ impl MicroVmHandle {
             .map(PathBuf::from)
             .unwrap_or_else(|| workdir.join("firecracker.pid"));
         let ssh = SshTarget::from_query(&url, handle)?;
+        let env_file = query.get("env_file").cloned();
+        if let Some(env_file) = env_file.as_deref() {
+            validate_guest_env_file_path(env_file)
+                .map_err(|err| invalid_handle(handle, err.to_string()))?;
+        }
         Ok(Self {
             runtime,
             name,
@@ -515,6 +823,7 @@ impl MicroVmHandle {
             api_sock,
             pid_file,
             ssh,
+            env_file,
         })
     }
 
@@ -715,6 +1024,55 @@ fn validate_host(host: &str, label: &str) -> DriverResult<()> {
     Ok(())
 }
 
+fn validate_create_policy(policy: Option<&NetworkPolicy>) -> DriverResult<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    if !policy.network.allow.is_empty()
+        || !policy.network.deny.is_empty()
+        || !policy.network.approval_required.is_empty()
+        || !policy.inference.routes.is_empty()
+    {
+        return Err(capability_missing(MICROVM_POLICY_CAPABILITY));
+    }
+    Ok(())
+}
+
+fn validate_env(env: &BTreeMap<String, String>) -> DriverResult<()> {
+    for (key, value) in env {
+        validate_env_key(key)?;
+        if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+            return Err(DriverError::InvalidInput {
+                message: format!("env.{key} must not contain NUL or newline characters"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_key(key: &str) -> DriverResult<()> {
+    let valid = !key.is_empty()
+        && !key.starts_with(|ch: char| ch.is_ascii_digit())
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        return Err(DriverError::InvalidInput {
+            message: format!("env key `{key}` is not a portable shell identifier"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_guest_env_file_path(path: &str) -> DriverResult<()> {
+    if !path.starts_with(GUEST_ENV_DIR) || !path.ends_with(".env") {
+        return Err(DriverError::InvalidInput {
+            message: format!("env_file must be under {GUEST_ENV_DIR} and end with .env"),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_workdir(parent: &Path, name: &str) -> DriverResult<PathBuf> {
     let dir = parent.join(name);
     fs::create_dir_all(&dir).map_err(|source| DriverError::InvalidInput {
@@ -724,6 +1082,61 @@ fn ensure_workdir(parent: &Path, name: &str) -> DriverResult<PathBuf> {
         ),
     })?;
     Ok(dir)
+}
+
+fn sandbox_dir(workdir: &Path) -> PathBuf {
+    workdir.join("sandbox")
+}
+
+fn ensure_apple_workdir(parent: &Path, spec: &AppleContainerSpec) -> DriverResult<PathBuf> {
+    let workdir = ensure_workdir(parent, &spec.name)?;
+    let sandbox = sandbox_dir(&workdir);
+    fs::create_dir_all(&sandbox).map_err(|source| DriverError::InvalidInput {
+        message: format!(
+            "failed to create apple-container sandbox dir `{}`: {source}",
+            sandbox.display()
+        ),
+    })?;
+    if !spec.env.is_empty() {
+        let env_dir = sandbox.join(".agentenv").join("env");
+        fs::create_dir_all(&env_dir).map_err(|source| DriverError::InvalidInput {
+            message: format!(
+                "failed to create apple-container env dir `{}`: {source}",
+                env_dir.display()
+            ),
+        })?;
+        fs::write(
+            env_dir.join(format!("{}.env", spec.name)),
+            shell_env_file(&spec.env)?,
+        )
+        .map_err(|source| DriverError::InvalidInput {
+            message: format!("failed to write guest env file: {source}"),
+        })?;
+        fs::write(
+            workdir.join("container.env"),
+            container_env_file(&spec.env)?,
+        )
+        .map_err(|source| DriverError::InvalidInput {
+            message: format!("failed to write container env file: {source}"),
+        })?;
+    }
+    Ok(workdir)
+}
+
+fn container_env_file(env: &BTreeMap<String, String>) -> DriverResult<String> {
+    validate_env(env)?;
+    Ok(env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect())
+}
+
+fn shell_env_file(env: &BTreeMap<String, String>) -> DriverResult<String> {
+    validate_env(env)?;
+    Ok(env
+        .iter()
+        .map(|(key, value)| format!("export {key}={}\n", shell_single_quote(value)))
+        .collect())
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> DriverResult<()> {
@@ -783,6 +1196,40 @@ fn remote_path(target: &SshTarget, path: &str) -> String {
     format!("{}@{}:{path}", target.user, target.host)
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_command(
+    cmd: &str,
+    env_file: Option<&str>,
+    env: &BTreeMap<String, String>,
+) -> DriverResult<String> {
+    validate_env(env)?;
+    if let Some(env_file) = env_file {
+        validate_guest_env_file_path(env_file)?;
+    }
+
+    let mut prefix = format!("cd {SANDBOX_MOUNT}");
+    if let Some(env_file) = env_file {
+        prefix.push_str(" && . ");
+        prefix.push_str(&shell_single_quote(env_file));
+    }
+    if env.is_empty() {
+        return Ok(format!("{prefix} && {cmd}"));
+    }
+
+    let assignments = env
+        .iter()
+        .map(|(key, value)| format!("{key}={}", shell_single_quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "{prefix} && env {assignments} sh -lc {}",
+        shell_single_quote(cmd)
+    ))
+}
+
 fn validate_copy_path(field: &str, path: &str) -> DriverResult<()> {
     if path.is_empty() || path.starts_with('-') {
         return Err(DriverError::InvalidInput {
@@ -790,6 +1237,33 @@ fn validate_copy_path(field: &str, path: &str) -> DriverResult<()> {
         });
     }
     Ok(())
+}
+
+fn mounted_sandbox_path(handle: &MicroVmHandle, path: &str) -> DriverResult<PathBuf> {
+    validate_copy_path("sandbox_path", path)?;
+    if path != SANDBOX_MOUNT && !path.starts_with("/sandbox/") {
+        return Err(DriverError::InvalidInput {
+            message: format!("apple-container copy paths must be under {SANDBOX_MOUNT}"),
+        });
+    }
+    let relative = path
+        .strip_prefix(SANDBOX_MOUNT)
+        .ok_or_else(|| DriverError::InvalidInput {
+            message: format!("apple-container copy paths must be under {SANDBOX_MOUNT}"),
+        })?
+        .trim_start_matches('/');
+    let relative_path = Path::new(relative);
+    if relative_path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err(DriverError::InvalidInput {
+            message: "apple-container copy paths must not escape /sandbox".to_owned(),
+        });
+    }
+    Ok(sandbox_dir(&handle.workdir).join(relative_path))
 }
 
 fn log_entries_for_handle(handle: &MicroVmHandle) -> Vec<LogEntry> {
@@ -843,103 +1317,72 @@ impl SandboxDriver for MicroVmDriver {
     }
 
     async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
-        if !self.host.is_linux {
-            return Ok(preflight_failure(
-                "microvm_linux_required",
-                "Firecracker microVMs require a Linux host".to_owned(),
-                Some("Use a Linux host with KVM, or select a different sandbox runtime".to_owned()),
-            ));
-        }
-        if !self.host.has_kvm {
-            return Ok(preflight_failure(
-                "microvm_kvm_missing",
-                "/dev/kvm is not available on this host".to_owned(),
-                Some(
-                    "Enable KVM virtualization and ensure the current user can access /dev/kvm"
-                        .to_owned(),
-                ),
-            ));
-        }
-        if let Err(source) = self
-            .runner
-            .run(&self.firecracker_binary, &command_request(&["--version"]))
+        let mut firecracker_issue = self.firecracker_preflight_issue();
+        let mut apple_container_issue = self.apple_container_preflight_issue();
+        let ok = firecracker_issue.is_none() || apple_container_issue.is_none();
+        let mut issues = Vec::new();
+        for issue in [&mut firecracker_issue, &mut apple_container_issue]
+            .into_iter()
+            .flatten()
         {
-            return Ok(preflight_failure(
-                "microvm_firecracker_missing",
-                format!(
-                    "Firecracker binary `{}` is not available: {source}",
-                    self.firecracker_binary
-                ),
-                Some("Install Firecracker and ensure it is on PATH".to_owned()),
-            ));
+            if ok {
+                issue.severity = IssueSeverity::Warning;
+            }
+            issues.push(issue.clone());
         }
-        Ok(PreflightResult {
-            ok: true,
-            issues: Vec::new(),
-        })
+        Ok(PreflightResult { ok, issues })
     }
 
     async fn create(&self, spec: SandboxSpec) -> DriverResult<SandboxHandle> {
-        let spec = FirecrackerSpec::from_sandbox_spec(spec)?;
-        let parent = self
-            .workdir
-            .lock()
-            .map_err(|_| DriverError::InvalidInput {
-                message: "microvm workdir lock poisoned".to_owned(),
-            })?
-            .clone()
-            .ok_or_else(|| DriverError::InvalidInput {
-                message: "microvm driver must be initialized before create".to_owned(),
-            })?;
-        let workdir = ensure_workdir(&parent, &spec.name)?;
-        let handle = MicroVmHandle::new(MicroVmRuntime::Firecracker, &spec, workdir.clone());
-        let config_path = workdir.join("firecracker.json");
-        write_json(&config_path, &spec.config())?;
-
-        let request = CommandRequest {
-            args: vec![
-                "--api-sock".to_owned(),
-                handle.api_sock.to_string_lossy().into_owned(),
-                "--config-file".to_owned(),
-                config_path.to_string_lossy().into_owned(),
-            ],
-            env: BTreeMap::new(),
-            stdin: None,
-        };
-        let pid = self
-            .runner
-            .spawn(&self.firecracker_binary, &request)
-            .map_err(|source| DriverError::CommandSpawn {
-                command: command_string(&self.firecracker_binary, &request.args),
-                source,
-            })?;
-        write_pid(&handle.pid_file, pid)?;
-
-        Ok(SandboxHandle {
-            handle: handle.to_handle()?,
-        })
+        match MicroVmRuntime::parse(spec.metadata.get("runtime"))? {
+            MicroVmRuntime::Firecracker => self.create_firecracker(spec).await,
+            MicroVmRuntime::AppleContainer => self.create_apple_container(spec).await,
+            MicroVmRuntime::Kata => Err(capability_missing(&format!(
+                "{UNSUPPORTED_RUNTIME_CAPABILITY}:kata"
+            ))),
+        }
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
-        let ssh = handle.ssh()?;
-        let mut args = ssh_args(ssh);
-        args.push("--".to_owned());
-        args.push("true".to_owned());
-        let request = CommandRequest {
-            args,
-            env: BTreeMap::new(),
-            stdin: None,
+        let (program, request) = match handle.runtime {
+            MicroVmRuntime::Firecracker => {
+                let ssh = handle.ssh()?;
+                let mut args = ssh_args(ssh);
+                args.push("--".to_owned());
+                args.push("true".to_owned());
+                (
+                    self.ssh_binary.as_str(),
+                    CommandRequest {
+                        args,
+                        env: BTreeMap::new(),
+                        stdin: None,
+                    },
+                )
+            }
+            MicroVmRuntime::AppleContainer => (
+                self.apple_container_binary.as_str(),
+                CommandRequest {
+                    args: vec!["exec".to_owned(), handle.name.clone(), "true".to_owned()],
+                    env: BTreeMap::new(),
+                    stdin: None,
+                },
+            ),
+            MicroVmRuntime::Kata => {
+                return Err(capability_missing(&format!(
+                    "{UNSUPPORTED_RUNTIME_CAPABILITY}:kata"
+                )))
+            }
         };
-        let output = self
-            .runner
-            .run(&self.ssh_binary, &request)
-            .map_err(|source| DriverError::CommandSpawn {
-                command: command_string(&self.ssh_binary, &request.args),
-                source,
-            })?;
+        let output =
+            self.runner
+                .run(program, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command_string(program, &request.args),
+                    source,
+                })?;
         if output.status != Some(0) {
-            return Err(command_failed(&self.ssh_binary, &request, output));
+            return Err(command_failed(program, &request, output));
         }
         Ok(ShellHandle {
             session_id: params.handle,
@@ -966,22 +1409,70 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn exec(&self, params: ExecParams) -> DriverResult<ExecResult> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
-        let ssh = handle.ssh()?;
-        let mut args = ssh_args(ssh);
-        args.push("--".to_owned());
-        args.push(params.cmd);
-        let request = CommandRequest {
-            args,
-            env: params.env,
-            stdin: None,
+        let command = shell_command(&params.cmd, handle.env_file.as_deref(), &params.env)?;
+        let (program, request) = match handle.runtime {
+            MicroVmRuntime::Firecracker => {
+                let ssh = handle.ssh()?;
+                let mut args = ssh_args(ssh);
+                if params.tty {
+                    args.insert(0, "-tt".to_owned());
+                }
+                args.push("--".to_owned());
+                args.push(command);
+                (
+                    self.ssh_binary.as_str(),
+                    CommandRequest {
+                        args,
+                        env: BTreeMap::new(),
+                        stdin: None,
+                    },
+                )
+            }
+            MicroVmRuntime::AppleContainer => {
+                let mut args = vec!["exec".to_owned()];
+                if params.tty {
+                    args.push("--tty".to_owned());
+                    args.push("--interactive".to_owned());
+                }
+                args.push(handle.name.clone());
+                args.push("sh".to_owned());
+                args.push("-lc".to_owned());
+                args.push(command);
+                (
+                    self.apple_container_binary.as_str(),
+                    CommandRequest {
+                        args,
+                        env: BTreeMap::new(),
+                        stdin: None,
+                    },
+                )
+            }
+            MicroVmRuntime::Kata => {
+                return Err(capability_missing(&format!(
+                    "{UNSUPPORTED_RUNTIME_CAPABILITY}:kata"
+                )))
+            }
         };
-        let output = self
-            .runner
-            .run(&self.ssh_binary, &request)
-            .map_err(|source| DriverError::CommandSpawn {
-                command: command_string(&self.ssh_binary, &request.args),
-                source,
+        if params.tty {
+            let status = self.runner.status(program, &request).map_err(|source| {
+                DriverError::CommandSpawn {
+                    command: command_string(program, &request.args),
+                    source,
+                }
             })?;
+            return Ok(ExecResult {
+                status: status.unwrap_or(1),
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        let output =
+            self.runner
+                .run(program, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command_string(program, &request.args),
+                    source,
+                })?;
         Ok(ExecResult {
             status: output.status.unwrap_or(1),
             stdout: output.stdout,
@@ -991,9 +1482,25 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn copy_in(&self, params: CopyInParams) -> DriverResult<EmptyResult> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
-        let ssh = handle.ssh()?;
         validate_copy_path("src_host_path", &params.src_host_path)?;
         validate_copy_path("dst_sandbox_path", &params.dst_sandbox_path)?;
+        if handle.runtime == MicroVmRuntime::AppleContainer {
+            let dst = mounted_sandbox_path(&handle, &params.dst_sandbox_path)?;
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|source| DriverError::InvalidInput {
+                    message: format!("failed to create `{}`: {source}", parent.display()),
+                })?;
+            }
+            fs::copy(&params.src_host_path, &dst).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to copy `{}` to `{}`: {source}",
+                    params.src_host_path,
+                    dst.display()
+                ),
+            })?;
+            return Ok(EmptyResult::default());
+        }
+        let ssh = handle.ssh()?;
         let mut args = scp_args(ssh);
         args.push("--".to_owned());
         args.push(params.src_host_path);
@@ -1018,9 +1525,27 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn copy_out(&self, params: CopyOutParams) -> DriverResult<EmptyResult> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
-        let ssh = handle.ssh()?;
         validate_copy_path("src_sandbox_path", &params.src_sandbox_path)?;
         validate_copy_path("dst_host_path", &params.dst_host_path)?;
+        if handle.runtime == MicroVmRuntime::AppleContainer {
+            let src = mounted_sandbox_path(&handle, &params.src_sandbox_path)?;
+            if let Some(parent) = Path::new(&params.dst_host_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).map_err(|source| DriverError::InvalidInput {
+                        message: format!("failed to create `{}`: {source}", parent.display()),
+                    })?;
+                }
+            }
+            fs::copy(&src, &params.dst_host_path).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to copy `{}` to `{}`: {source}",
+                    src.display(),
+                    params.dst_host_path
+                ),
+            })?;
+            return Ok(EmptyResult::default());
+        }
+        let ssh = handle.ssh()?;
         let mut args = scp_args(ssh);
         args.push("--".to_owned());
         args.push(remote_path(ssh, &params.src_sandbox_path));
@@ -1049,18 +1574,37 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn status(&self, params: SandboxStatusParams) -> DriverResult<SandboxStatus> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
-        handle.runtime.ensure_implemented()?;
-        let pid = read_pid(&handle.pid_file)?;
-        let request = CommandRequest {
-            args: vec!["-0".to_owned(), pid.to_string()],
-            env: BTreeMap::new(),
-            stdin: None,
+        let (program, request) = match handle.runtime {
+            MicroVmRuntime::Firecracker => {
+                let pid = read_pid(&handle.pid_file)?;
+                (
+                    "kill",
+                    CommandRequest {
+                        args: vec!["-0".to_owned(), pid.to_string()],
+                        env: BTreeMap::new(),
+                        stdin: None,
+                    },
+                )
+            }
+            MicroVmRuntime::AppleContainer => (
+                self.apple_container_binary.as_str(),
+                CommandRequest {
+                    args: vec!["exec".to_owned(), handle.name.clone(), "true".to_owned()],
+                    env: BTreeMap::new(),
+                    stdin: None,
+                },
+            ),
+            MicroVmRuntime::Kata => {
+                return Err(capability_missing(&format!(
+                    "{UNSUPPORTED_RUNTIME_CAPABILITY}:kata"
+                )))
+            }
         };
         let status =
             self.runner
-                .status("kill", &request)
+                .status(program, &request)
                 .map_err(|source| DriverError::CommandSpawn {
-                    command: command_string("kill", &request.args),
+                    command: command_string(program, &request.args),
                     source,
                 })?;
         let healthy = status == Some(0);
@@ -1077,6 +1621,38 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn logs(&self, params: LogsParams) -> DriverResult<LogsResult> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
+        if handle.runtime == MicroVmRuntime::AppleContainer {
+            let request = CommandRequest {
+                args: vec!["logs".to_owned(), handle.name.clone()],
+                env: BTreeMap::new(),
+                stdin: None,
+            };
+            let output = self
+                .runner
+                .run(&self.apple_container_binary, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command_string(&self.apple_container_binary, &request.args),
+                    source,
+                })?;
+            if output.status != Some(0) {
+                return Err(command_failed(
+                    &self.apple_container_binary,
+                    &request,
+                    output,
+                ));
+            }
+            return Ok(LogsResult {
+                entries: vec![LogEntry {
+                    level: LogLevel::Info,
+                    ts: String::new(),
+                    msg: output.stdout,
+                    kv: BTreeMap::from([(
+                        "runtime".to_owned(),
+                        Value::String("apple-container".to_owned()),
+                    )]),
+                }],
+            });
+        }
         Ok(LogsResult {
             entries: log_entries_for_handle(&handle),
         })
@@ -1088,21 +1664,41 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn stop(&self, params: StopParams) -> DriverResult<EmptyResult> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
-        let pid = read_pid(&handle.pid_file)?;
-        let request = CommandRequest {
-            args: vec![pid.to_string()],
-            env: BTreeMap::new(),
-            stdin: None,
+        let (program, request) = match handle.runtime {
+            MicroVmRuntime::Firecracker => {
+                let pid = read_pid(&handle.pid_file)?;
+                (
+                    "kill",
+                    CommandRequest {
+                        args: vec![pid.to_string()],
+                        env: BTreeMap::new(),
+                        stdin: None,
+                    },
+                )
+            }
+            MicroVmRuntime::AppleContainer => (
+                self.apple_container_binary.as_str(),
+                CommandRequest {
+                    args: vec!["stop".to_owned(), handle.name.clone()],
+                    env: BTreeMap::new(),
+                    stdin: None,
+                },
+            ),
+            MicroVmRuntime::Kata => {
+                return Err(capability_missing(&format!(
+                    "{UNSUPPORTED_RUNTIME_CAPABILITY}:kata"
+                )))
+            }
         };
         let output =
             self.runner
-                .run("kill", &request)
+                .run(program, &request)
                 .map_err(|source| DriverError::CommandSpawn {
-                    command: command_string("kill", &request.args),
+                    command: command_string(program, &request.args),
                     source,
                 })?;
         if output.status != Some(0) {
-            return Err(command_failed("kill", &request, output));
+            return Err(command_failed(program, &request, output));
         }
         let _ = fs::remove_file(&handle.pid_file);
         Ok(EmptyResult::default())
@@ -1110,6 +1706,29 @@ impl SandboxDriver for MicroVmDriver {
 
     async fn destroy(&self, params: DestroyParams) -> DriverResult<EmptyResult> {
         let handle = MicroVmHandle::from_handle(&params.handle)?;
+        if handle.runtime == MicroVmRuntime::AppleContainer {
+            let request = CommandRequest {
+                args: vec!["delete".to_owned(), "--force".to_owned(), handle.name],
+                env: BTreeMap::new(),
+                stdin: None,
+            };
+            let output = self
+                .runner
+                .run(&self.apple_container_binary, &request)
+                .map_err(|source| DriverError::CommandSpawn {
+                    command: command_string(&self.apple_container_binary, &request.args),
+                    source,
+                })?;
+            if output.status != Some(0) {
+                return Err(command_failed(
+                    &self.apple_container_binary,
+                    &request,
+                    output,
+                ));
+            }
+            let _ = fs::remove_dir_all(handle.workdir);
+            return Ok(EmptyResult::default());
+        }
         if handle.pid_file.exists() {
             let _ = self
                 .stop(StopParams {
@@ -1145,23 +1764,38 @@ mod tests {
 
     use agentenv_core::driver::{DriverError, SandboxDriver};
     use agentenv_proto::{
-        Capabilities, ConnectParams, DriverKind, InitializeParams, LogLevel, PreflightParams,
-        SandboxSpec, SCHEMA_VERSION,
+        Capabilities, ConnectParams, CopyInParams, CopyOutParams, DriverKind, ExecParams,
+        FilesystemPolicy, InferencePolicy, InitializeParams, LogLevel, NetworkAccessPolicy,
+        NetworkPolicy, NetworkRule, NetworkTarget, PolicyReloadability, PreflightParams,
+        ProcessPolicy, SandboxSpec, SCHEMA_VERSION,
     };
     use serde_json::json;
 
-    use super::{CommandOutput, CommandRequest, FirecrackerConfig, MicroVmDriver};
+    use super::{CommandOutput, CommandRequest, FirecrackerConfig, HostChecks, MicroVmDriver};
 
     #[derive(Debug, Default)]
     struct RecordingRunner {
         calls: Mutex<Vec<CommandRequest>>,
+        call_programs: Mutex<Vec<String>>,
         outputs: Mutex<VecDeque<io::Result<CommandOutput>>>,
         spawned: Mutex<Vec<CommandRequest>>,
+        spawn_programs: Mutex<Vec<String>>,
     }
 
     impl RecordingRunner {
+        fn new(outputs: Vec<io::Result<CommandOutput>>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into()),
+                ..Self::default()
+            }
+        }
+
         fn calls(&self) -> Vec<CommandRequest> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn call_programs(&self) -> Vec<String> {
+            self.call_programs.lock().unwrap().clone()
         }
 
         fn spawned(&self) -> Vec<CommandRequest> {
@@ -1170,7 +1804,8 @@ mod tests {
     }
 
     impl super::CommandRunner for RecordingRunner {
-        fn run(&self, _program: &str, request: &CommandRequest) -> io::Result<CommandOutput> {
+        fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput> {
+            self.call_programs.lock().unwrap().push(program.to_owned());
             self.calls.lock().unwrap().push(request.clone());
             self.outputs.lock().unwrap().pop_front().unwrap_or_else(|| {
                 Ok(CommandOutput {
@@ -1181,7 +1816,8 @@ mod tests {
             })
         }
 
-        fn spawn(&self, _program: &str, request: &CommandRequest) -> io::Result<u32> {
+        fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<u32> {
+            self.spawn_programs.lock().unwrap().push(program.to_owned());
             self.spawned.lock().unwrap().push(request.clone());
             Ok(4242)
         }
@@ -1193,6 +1829,43 @@ mod tests {
             core_version: "0.0.1".to_owned(),
             workdir: workdir.to_string_lossy().into_owned(),
             log_level: LogLevel::Info,
+        }
+    }
+
+    fn apple_host() -> HostChecks {
+        HostChecks {
+            is_linux: false,
+            is_macos: true,
+            is_apple_silicon: true,
+            has_kvm: false,
+        }
+    }
+
+    fn restricted_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            network: NetworkAccessPolicy {
+                reloadability: PolicyReloadability::HotReload,
+                allow: Vec::new(),
+                deny: Vec::new(),
+                approval_required: Vec::new(),
+            },
+            filesystem: FilesystemPolicy {
+                reloadability: PolicyReloadability::LockedAtCreate,
+                read_only: vec!["/usr".to_owned(), "/lib".to_owned(), "/etc".to_owned()],
+                read_write: vec!["/sandbox".to_owned(), "/tmp".to_owned()],
+            },
+            process: ProcessPolicy {
+                reloadability: PolicyReloadability::LockedAtCreate,
+                run_as_user: "sandbox".to_owned(),
+                run_as_group: "sandbox".to_owned(),
+                profile: "restricted".to_owned(),
+                allow_syscalls: Vec::new(),
+                deny_syscalls: Vec::new(),
+            },
+            inference: InferencePolicy {
+                reloadability: PolicyReloadability::HotReload,
+                routes: Vec::new(),
+            },
         }
     }
 
@@ -1231,6 +1904,55 @@ mod tests {
         assert!(!preflight.ok);
         assert_eq!(preflight.issues[0].code, "microvm_linux_required");
         assert!(runner.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_accepts_apple_container_on_apple_silicon_macos() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let mut driver = MicroVmDriver::for_tests_host(Arc::clone(&runner), apple_host());
+        driver.initialize(init_params(temp.path())).await.unwrap();
+
+        let preflight = driver.preflight(PreflightParams::default()).await.unwrap();
+
+        assert!(preflight.ok);
+        assert_eq!(
+            preflight.issues[0].severity,
+            agentenv_proto::IssueSeverity::Warning
+        );
+        assert_eq!(runner.call_programs(), vec!["container".to_owned()]);
+        assert_eq!(
+            runner.calls()[0].args,
+            vec![
+                "system".to_owned(),
+                "status".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_macos_when_apple_container_cli_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::new(vec![Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "container missing",
+        ))]));
+        let mut driver = MicroVmDriver::for_tests_host(Arc::clone(&runner), apple_host());
+        driver.initialize(init_params(temp.path())).await.unwrap();
+
+        let preflight = driver.preflight(PreflightParams::default()).await.unwrap();
+
+        assert!(!preflight.ok);
+        assert!(preflight
+            .issues
+            .iter()
+            .any(|issue| issue.code == "microvm_linux_required"));
+        assert!(preflight
+            .issues
+            .iter()
+            .any(|issue| issue.code == "microvm_apple_container_missing"));
     }
 
     #[tokio::test]
@@ -1284,6 +2006,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_apple_container_mounts_sandbox_and_runs_keepalive() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let mut driver = MicroVmDriver::for_tests_host(Arc::clone(&runner), apple_host());
+        driver.initialize(init_params(temp.path())).await.unwrap();
+
+        let handle = driver
+            .create(SandboxSpec {
+                image: Some("ubuntu:24.04".to_owned()),
+                env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "test-key".to_owned())]),
+                policy: Some(restricted_policy()),
+                metadata: BTreeMap::from([
+                    ("name".to_owned(), json!("apple-test")),
+                    ("runtime".to_owned(), json!("apple-container")),
+                    ("memory_mb".to_owned(), json!(1024)),
+                    ("cpus".to_owned(), json!(2)),
+                ]),
+            })
+            .await
+            .unwrap();
+
+        assert!(handle
+            .handle
+            .starts_with("microvm://apple-container/apple-test?"));
+        assert!(handle.handle.contains("env_file="), "handle: {handle:?}");
+        let calls = runner.calls();
+        assert_eq!(
+            runner.call_programs(),
+            vec!["container".to_owned(), "container".to_owned()]
+        );
+        assert_eq!(calls[1].args[0], "run");
+        assert!(calls[1].args.contains(&"--detach".to_owned()));
+        assert!(calls[1].args.contains(&"--env-file".to_owned()));
+        assert!(calls[1]
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("type=bind,source=") && arg.ends_with(",target=/sandbox")));
+        assert_eq!(calls[1].args[calls[1].args.len() - 4], "ubuntu:24.04");
+        assert_eq!(calls[1].args[calls[1].args.len() - 3], "sh");
+        assert_eq!(calls[1].args[calls[1].args.len() - 2], "-lc");
+        assert_eq!(
+            calls[1].args[calls[1].args.len() - 1],
+            "trap : TERM INT; sleep infinity & wait"
+        );
+
+        let env_file = temp
+            .path()
+            .join("microvm")
+            .join("apple-test")
+            .join("sandbox")
+            .join(".agentenv")
+            .join("env")
+            .join("apple-test.env");
+        let env_file_content = std::fs::read_to_string(env_file).unwrap();
+        assert!(env_file_content.contains("export OPENAI_API_KEY='test-key'"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_network_policy_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let mut driver = MicroVmDriver::for_tests_host(Arc::clone(&runner), apple_host());
+        driver.initialize(init_params(temp.path())).await.unwrap();
+        let mut policy = restricted_policy();
+        policy.network.allow.push(NetworkRule {
+            target: NetworkTarget::Host {
+                host: "example.com".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: None,
+            },
+        });
+
+        let err = driver
+            .create(SandboxSpec {
+                image: Some("ubuntu:24.04".to_owned()),
+                env: BTreeMap::new(),
+                policy: Some(policy),
+                metadata: BTreeMap::from([
+                    ("name".to_owned(), json!("apple-test")),
+                    ("runtime".to_owned(), json!("apple-container")),
+                ]),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DriverError::CapabilityMissing { .. }));
+        assert_eq!(runner.calls().len(), 1, "only preflight should run");
+    }
+
+    #[tokio::test]
     async fn create_rejects_non_firecracker_runtime_explicitly() {
         let temp = tempfile::tempdir().unwrap();
         let runner = Arc::new(RecordingRunner::default());
@@ -1305,6 +2118,80 @@ mod tests {
 
         assert!(matches!(err, DriverError::CapabilityMissing { .. }));
         assert!(runner.spawned().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apple_container_exec_sources_env_file_and_runs_in_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let mut driver = MicroVmDriver::for_tests_host(Arc::clone(&runner), apple_host());
+        driver.initialize(init_params(temp.path())).await.unwrap();
+        let handle = format!(
+            "microvm://apple-container/apple-test?workdir={}&env_file=%2Fsandbox%2F.agentenv%2Fenv%2Fapple-test.env",
+            temp.path().join("microvm").join("apple-test").display()
+        );
+
+        let result = driver
+            .exec(ExecParams {
+                handle,
+                cmd: "codex --version".to_owned(),
+                tty: false,
+                env: BTreeMap::from([("EXTRA".to_owned(), "value".to_owned())]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 0);
+        assert_eq!(runner.call_programs(), vec!["container".to_owned()]);
+        let args = &runner.calls()[0].args;
+        assert_eq!(args[0], "exec");
+        assert_eq!(args[1], "apple-test");
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "-lc");
+        assert!(args[4].contains("cd /sandbox && . '/sandbox/.agentenv/env/apple-test.env'"));
+        assert!(args[4].contains("env EXTRA='value' sh -lc 'codex --version'"));
+    }
+
+    #[tokio::test]
+    async fn apple_container_copy_uses_mounted_sandbox_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let mut driver = MicroVmDriver::for_tests_host(Arc::clone(&runner), apple_host());
+        driver.initialize(init_params(temp.path())).await.unwrap();
+        let workdir = temp.path().join("microvm").join("apple-test");
+        let host_src = temp.path().join("entrypoint");
+        std::fs::write(&host_src, "#!/bin/sh\n").unwrap();
+        let handle = format!(
+            "microvm://apple-container/apple-test?workdir={}",
+            workdir.display()
+        );
+
+        driver
+            .copy_in(CopyInParams {
+                handle: handle.clone(),
+                src_host_path: host_src.display().to_string(),
+                dst_sandbox_path: "/sandbox/.agentenv/bin/agentenv-agent".to_owned(),
+            })
+            .await
+            .unwrap();
+        let mounted = workdir
+            .join("sandbox")
+            .join(".agentenv")
+            .join("bin")
+            .join("agentenv-agent");
+        assert_eq!(std::fs::read_to_string(&mounted).unwrap(), "#!/bin/sh\n");
+
+        let host_dst = temp.path().join("copied-out");
+        driver
+            .copy_out(CopyOutParams {
+                handle,
+                src_sandbox_path: "/sandbox/.agentenv/bin/agentenv-agent".to_owned(),
+                dst_host_path: host_dst.display().to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(host_dst).unwrap(), "#!/bin/sh\n");
+        assert!(runner.calls().is_empty());
     }
 
     #[tokio::test]

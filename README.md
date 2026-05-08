@@ -55,7 +55,7 @@ The key insight: **every axis is pluggable**.
                                                              * post-MVP
 ```
 
-- **Sandbox** — the isolated runtime (OpenShell, Firecracker microVMs, Docker, E2B, ...)
+- **Sandbox** — the isolated runtime (OpenShell, Firecracker microVMs on Linux/KVM, Apple Container microVMs on macOS, Docker, E2B, ...)
 - **Agent** — the AI program that runs inside (Claude Code, Codex, Hermes, OpenClaw, ...)
 - **Context** — the knowledge backend the agent calls via MCP (Nexus, any MCP server, filesystem-only, none)
 - **Inference** — how model calls are routed (provider + credentials stay on the host)
