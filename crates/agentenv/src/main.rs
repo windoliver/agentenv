@@ -3588,10 +3588,10 @@ fn run_skills_verify(args: SkillsVerifyArgs) -> Result<()> {
                 for error in &skill.errors {
                     eprintln!("  error: {error}");
                 }
-                for warning in &skill.warnings {
-                    eprintln!("  warning: {warning}");
-                }
             }
+        }
+        for warning in &skill.warnings {
+            eprintln!("  warning: {warning}");
         }
     }
 

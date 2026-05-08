@@ -288,6 +288,35 @@ fn skills_verify_all_succeeds_for_valid_local_cache() {
 }
 
 #[test]
+fn skills_verify_all_prints_warnings_for_passed_skills() {
+    let temp_dir = make_temp_dir("skills-verify-passed-warning");
+    write_cli_skill(
+        &temp_dir,
+        "missing-archive",
+        "1.0.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning:"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("extracted tree digest"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn skills_verify_all_fails_for_broken_local_cache() {
     let temp_dir = make_temp_dir("skills-verify-broken");
     write_cli_skill(
