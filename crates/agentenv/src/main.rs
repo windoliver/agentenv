@@ -38,6 +38,7 @@ use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
 mod render;
+mod skills_cli;
 mod term_backend;
 
 const SELF_ENV_SENTINEL: &str = "__self__";
@@ -77,6 +78,7 @@ enum Commands {
     Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
+    Skills(skills_cli::SkillsArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -576,6 +578,7 @@ async fn run() -> Result<()> {
         Some(Commands::Blueprint(command)) => run_blueprint(command),
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
+        Some(Commands::Skills(args)) => skills_cli::run_skills(args).await,
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
         Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
@@ -3854,6 +3857,7 @@ mod tests {
                 "blueprint".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
+                "skills".to_string(),
                 "verify-blueprint".to_string(),
                 "verify".to_string(),
                 "freeze".to_string(),

@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -194,6 +195,7 @@ policy:
         missing_stderr.contains("CUSTOM_OPENAI_KEY"),
         "stderr was: {missing_stderr}"
     );
+    write_failing_openshell_cli(&temp_dir);
 
     let present = Command::new(agentenv_bin())
         .arg("reproduce")
@@ -262,6 +264,484 @@ fn cli_includes_commands() {
     assert!(
         blueprint < credentials,
         "`blueprint` should be listed before `credentials`; stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn cli_help_includes_skills_command() {
+    let output = Command::new(agentenv_bin()).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("skills"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_help_lists_lifecycle_subcommands() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "search", "add", "install", "list", "info", "remove", "publish", "verify",
+    ] {
+        assert!(
+            stdout.contains(command),
+            "missing {command}; stdout was: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn skills_install_list_info_verify_and_remove_local_bundle() {
+    let temp_dir = make_temp_dir("skills-cli-local");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# CLI Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+
+    let list = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", output_summary(&list));
+    let json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(json["skills"][0]["name"], "cli-skill");
+
+    let info = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("cli-skill")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", output_summary(&info));
+    let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(info_json["name"], "cli-skill");
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("cli-skill")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{}", output_summary(&verify));
+
+    let remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("cli-skill")
+        .arg("--yes")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(remove.status.success(), "{}", output_summary(&remove));
+}
+
+#[test]
+fn skills_search_add_and_publish_use_filesystem_registry_config() {
+    let temp_dir = make_temp_dir("skills-cli-registry");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Registry Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.join("agentenv.yaml"),
+        format!(
+            "version: 0.1.0\nmin_agentenv_version: 0.0.1-alpha0\nsandbox: {{ driver: openshell }}\nagent: {{ driver: codex }}\ncontext: {{ driver: filesystem, mount: . }}\npolicy: {{ tier: balanced, presets: [] }}\nskills:\n  registries:\n    - name: local-dev\n      type: filesystem\n      path: {}\n",
+            registry.display()
+        ),
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg("local-dev")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("registry")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    assert!(String::from_utf8_lossy(&search.stdout).contains("registry-skill"));
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("registry-skill@0.1.0")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+}
+
+#[test]
+fn skills_registry_cli_path_override_publishes_searches_and_adds() {
+    let temp_dir = make_temp_dir("skills-cli-registry-override");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Override Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: override-skill\nversion: 0.1.0\ndescription: Override demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+    let publish_json: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(publish_json["name"], "override-skill");
+    assert_eq!(publish_json["registry"], "cli");
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("override")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(search_json["skills"][0]["name"], "override-skill");
+    assert_eq!(search_json["skills"][0]["registry"], "cli");
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("override-skill@0.1.0")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+    let add_json: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    assert_eq!(add_json["name"], "override-skill");
+    assert_eq!(add_json["source_type"], "filesystem");
+    assert_eq!(
+        add_json["source_label"],
+        "filesystem:cli:override-skill@0.1.0"
+    );
+}
+
+#[test]
+fn skills_registry_config_precedence_is_user_project_then_cli() {
+    let temp_dir = make_temp_dir("skills-cli-registry-precedence");
+    let user_registry = temp_dir.join("user-registry");
+    let project_registry = temp_dir.join("project-registry");
+    let cli_registry = temp_dir.join("cli-registry");
+    write_filesystem_registry_skill(
+        &user_registry,
+        "user-precedence-skill",
+        "0.1.0",
+        "Precedence demo",
+    );
+    write_filesystem_registry_skill(
+        &project_registry,
+        "project-precedence-skill",
+        "0.1.0",
+        "Precedence demo",
+    );
+    write_filesystem_registry_skill(
+        &cli_registry,
+        "cli-precedence-skill",
+        "0.1.0",
+        "Precedence demo",
+    );
+
+    fs::create_dir_all(temp_dir.join(".config/agentenv")).unwrap();
+    fs::write(
+        temp_dir.join(".config/agentenv/config.toml"),
+        format!(
+            "[skills]\nregistry_order = [\"shared\"]\n\n[[skills.registries]]\nname = \"shared\"\ntype = \"filesystem\"\npath = '{}'\n",
+            user_registry.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.join("agentenv.yaml"),
+        format!(
+            "skills:\n  registry_order:\n    - shared\n  registries:\n    - name: shared\n      type: filesystem\n      path: {}\n",
+            project_registry.display()
+        ),
+    )
+    .unwrap();
+    let no_project_dir = temp_dir.join("no-project");
+    fs::create_dir_all(&no_project_dir).unwrap();
+
+    let user_search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("precedence")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&no_project_dir)
+        .output()
+        .unwrap();
+    assert!(
+        user_search.status.success(),
+        "{}",
+        output_summary(&user_search)
+    );
+    assert_skill_search_names(&user_search.stdout, &["user-precedence-skill"]);
+
+    let project_search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("precedence")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        project_search.status.success(),
+        "{}",
+        output_summary(&project_search)
+    );
+    assert_skill_search_names(&project_search.stdout, &["project-precedence-skill"]);
+
+    let cli_search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("precedence")
+        .arg("--registry")
+        .arg(&cli_registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        cli_search.status.success(),
+        "{}",
+        output_summary(&cli_search)
+    );
+    assert_skill_search_names(&cli_search.stdout, &["cli-precedence-skill"]);
+}
+
+#[test]
+fn skills_cli_enforces_trust_self_tests_version_selectors_and_remove_confirmation() {
+    let temp_dir = make_temp_dir("skills-cli-lifecycle-matrix");
+    let old_bundle = temp_dir.join("matrix-0.1.0");
+    let new_bundle = temp_dir.join("matrix-0.2.0");
+    write_local_skill_bundle(
+        &old_bundle,
+        "matrix-skill",
+        "0.1.0",
+        "Old matrix skill",
+        Some("test -f SKILL.md"),
+    );
+    write_local_skill_bundle(
+        &new_bundle,
+        "matrix-skill",
+        "0.2.0",
+        "New matrix skill",
+        Some("test -f SKILL.md"),
+    );
+
+    let unsigned_default = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&old_bundle)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!unsigned_default.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsigned_default.stderr).contains("missing Ed25519 signature"),
+        "{}",
+        output_summary(&unsigned_default)
+    );
+
+    for bundle in [&old_bundle, &new_bundle] {
+        let install = Command::new(agentenv_bin())
+            .arg("skills")
+            .arg("install")
+            .arg("--from")
+            .arg(bundle)
+            .arg("--allow-unsigned")
+            .arg("--json")
+            .env("HOME", &temp_dir)
+            .current_dir(&temp_dir)
+            .output()
+            .unwrap();
+        assert!(install.status.success(), "{}", output_summary(&install));
+        let installed: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+        assert_eq!(installed["name"], "matrix-skill");
+        assert_eq!(installed["signature_status"], "unsigned");
+    }
+
+    let ambiguous_info = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("matrix-skill")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(!ambiguous_info.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous_info.stderr).contains("multiple installed versions"),
+        "{}",
+        output_summary(&ambiguous_info)
+    );
+
+    let info_old = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(info_old.status.success(), "{}", output_summary(&info_old));
+    let info_old_json: serde_json::Value = serde_json::from_slice(&info_old.stdout).unwrap();
+    assert_eq!(info_old_json["version"], "0.1.0");
+
+    let verify_new = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.2.0")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify_new.status.success(),
+        "{}",
+        output_summary(&verify_new)
+    );
+    let verify_new_json: serde_json::Value = serde_json::from_slice(&verify_new.stdout).unwrap();
+    assert_eq!(verify_new_json["version"], "0.2.0");
+
+    let remove_without_yes = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(!remove_without_yes.status.success());
+    assert!(
+        String::from_utf8_lossy(&remove_without_yes.stderr).contains("without --yes"),
+        "{}",
+        output_summary(&remove_without_yes)
+    );
+
+    let remove_old = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .arg("--yes")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        remove_old.status.success(),
+        "{}",
+        output_summary(&remove_old)
+    );
+    let remove_old_json: serde_json::Value = serde_json::from_slice(&remove_old.stdout).unwrap();
+    assert_eq!(remove_old_json["version"], "0.1.0");
+
+    let list_after_remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        list_after_remove.status.success(),
+        "{}",
+        output_summary(&list_after_remove)
+    );
+    let list_after_remove_json: serde_json::Value =
+        serde_json::from_slice(&list_after_remove.stdout).unwrap();
+    assert_eq!(
+        list_after_remove_json["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|skill| skill["version"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["0.2.0"]
     );
 }
 
@@ -3134,6 +3614,90 @@ fn make_executable(path: &Path) {
     }
 }
 
+fn write_local_skill_bundle(
+    bundle: &Path,
+    name: &str,
+    version: &str,
+    description: &str,
+    self_test: Option<&str>,
+) {
+    fs::create_dir_all(bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), format!("# {description}\n")).unwrap();
+    let self_test_yaml = self_test
+        .map(|command| format!("self_test:\n  command: {command}\n"))
+        .unwrap_or_default();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n{self_test_yaml}"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, description: &str) {
+    let bundle = registry.join("bundles").join(name).join(version);
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(
+        bundle.join("SKILL.md"),
+        format!("# {description}\n\n{name}\n"),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        registry.join("index.yaml"),
+        format!(
+            "skills:\n  - name: {name}\n    version: {version}\n    description: {description}\n    registry: local\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_skill_search_names(stdout: &[u8], expected: &[&str]) {
+    let json: serde_json::Value = serde_json::from_slice(stdout).unwrap();
+    let names = json["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|skill| skill["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        expected,
+        "stdout was: {}",
+        String::from_utf8_lossy(stdout)
+    );
+}
+
+fn write_failing_openshell_cli(home: &Path) {
+    let bin_dir = home.join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let openshell = bin_dir.join("openshell");
+    fs::write(
+        &openshell,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'openshell 0.0.30\n'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  printf 'gateway down\n' >&2
+  exit 1
+fi
+printf 'unexpected openshell test command: %s\n' "$*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    make_executable(&openshell);
+}
+
 fn agentenv_uninstall_temp_dirs(root: &Path) -> BTreeSet<PathBuf> {
     fs::read_dir(root)
         .unwrap()
@@ -3283,7 +3847,10 @@ fn reserve_tcp_port() -> u16 {
 
 struct ApprovalsServerChild {
     child: process::Child,
+    _guard: MutexGuard<'static, ()>,
 }
+
+static APPROVALS_SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 impl Drop for ApprovalsServerChild {
     fn drop(&mut self) {
@@ -3293,12 +3860,16 @@ impl Drop for ApprovalsServerChild {
 }
 
 fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
+    let guard = APPROVALS_SERVER_TEST_LOCK.lock().unwrap();
     let child = Command::new(agentenv_bin())
         .env("HOME", home)
         .args(["approvals", "serve", "--addr", &format!("127.0.0.1:{port}")])
         .spawn()
         .unwrap();
-    ApprovalsServerChild { child }
+    ApprovalsServerChild {
+        child,
+        _guard: guard,
+    }
 }
 
 fn wait_for_http_ok(port: u16, path: &str) {
