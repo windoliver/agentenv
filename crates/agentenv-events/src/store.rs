@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags};
@@ -525,7 +526,9 @@ impl SqliteEventStore {
     fn connection(&self) -> StoreResult<Connection> {
         create_private_database_file(&self.path)?;
         let path = database_open_path(&self.path)?;
-        Ok(Connection::open_with_flags(path, database_open_flags())?)
+        let conn = Connection::open_with_flags(path, database_open_flags())?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn)
     }
 }
 
