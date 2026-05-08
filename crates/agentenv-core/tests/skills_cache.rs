@@ -1,9 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use agentenv_core::skills::{
-    rebuild_skill_index, verify_all_installed_skills, SkillArchive, SkillCacheLayout, SkillIndex,
-    SkillManifest, SkillProvenance, SkillSelfTest, SkillSelfTestAssertion, SkillTrustKey,
-    SkillVerifyOptions, SkillVerifyStatus,
+    execute_skill_prune, plan_skill_prune, rebuild_skill_index, verify_all_installed_skills,
+    SkillArchive, SkillCacheLayout, SkillIndex, SkillManifest, SkillProvenance, SkillSelfTest,
+    SkillSelfTestAssertion, SkillTrustKey, SkillVerifyOptions, SkillVerifyStatus,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -506,6 +506,40 @@ fn verify_all_timeout_kills_self_test_descendants() {
     );
 }
 
+#[test]
+fn prune_removes_only_unreferenced_archives() {
+    let root = unique_root("skill-prune");
+    let layout = SkillCacheLayout::new(root.join(".agentenv"));
+    let referenced = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let env_referenced = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let unreferenced = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    write_installed_skill(&layout, "code-review", "1.2.0", referenced);
+    write_archive(&layout, referenced, b"referenced");
+    write_archive(&layout, env_referenced, b"env referenced");
+    write_archive(&layout, unreferenced, b"unreferenced");
+    write_env_lockfile_with_skill(root.join(".agentenv/envs/demo/lock.yaml"), env_referenced);
+
+    let plan = plan_skill_prune(&layout).expect("plan prune");
+    assert_eq!(plan.removed_archives.len(), 1);
+    assert!(plan.removed_archives[0]
+        .ends_with("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.tar.zst"));
+
+    execute_skill_prune(&plan).expect("execute prune");
+    assert!(layout
+        .archive_path(referenced.strip_prefix("sha256:").unwrap())
+        .unwrap()
+        .exists());
+    assert!(layout
+        .archive_path(env_referenced.strip_prefix("sha256:").unwrap())
+        .unwrap()
+        .exists());
+    assert!(!layout
+        .archive_path(unreferenced.strip_prefix("sha256:").unwrap())
+        .unwrap()
+        .exists());
+}
+
 fn write_installed_skill(layout: &SkillCacheLayout, name: &str, version: &str, digest: &str) {
     let skill_dir = layout
         .installed_skill_dir(name, version)
@@ -608,6 +642,84 @@ fn write_provenance(skill_dir: &std::path::Path, name: &str, version: &str, dige
         ),
     )
     .expect("write provenance");
+}
+
+fn write_env_lockfile_with_skill(path: std::path::PathBuf, digest: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        format!(
+            r#"version: 0.2.0
+driver_protocol_version: '1.0'
+name: demo
+blueprint_hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+composition:
+  version: 0.1.0
+  min_agentenv_version: 0.0.1-alpha0
+  sandbox:
+    driver: openshell
+    version: 0.0.1-alpha0
+  agent:
+    driver: codex
+    version: 0.0.1-alpha0
+  context:
+    driver: filesystem
+    version: 0.0.1-alpha0
+  policy:
+    tier: balanced
+    presets: []
+policy:
+  declared:
+    tier: balanced
+    presets: []
+  resolved:
+    network:
+      reloadability: hot_reload
+      allow: []
+      deny: []
+      approval_required: []
+    filesystem:
+      reloadability: locked_at_create
+      read_only: []
+      read_write: []
+    process:
+      reloadability: locked_at_create
+      run_as_user: agent
+      run_as_group: agent
+      profile: default
+      allow_syscalls: []
+      deny_syscalls: []
+    inference:
+      reloadability: hot_reload
+      routes: []
+drivers:
+  sandbox:
+    kind: sandbox
+    name: openshell
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  agent:
+    kind: agent
+    name: codex
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  context:
+    kind: context
+    name: filesystem
+    version: 0.0.1-alpha0
+    source: built-in
+    digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+skills:
+  - name: env-skill
+    version: 1.0.0
+    source: file:///skills/env-skill
+    digest: {digest}
+"#
+        ),
+    )
+    .unwrap();
 }
 
 fn unique_root(prefix: &str) -> PathBuf {

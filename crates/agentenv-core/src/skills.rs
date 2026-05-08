@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -41,6 +42,8 @@ pub enum SkillCacheError {
     },
     #[error("invalid skill manifest `{path}`: {message}")]
     InvalidSkillManifest { path: PathBuf, message: String },
+    #[error("invalid skill lockfile `{path}`: {message}")]
+    InvalidSkillLockfile { path: PathBuf, message: String },
 }
 
 pub type SkillCacheResult<T> = Result<T, SkillCacheError>;
@@ -220,6 +223,11 @@ pub enum SkillVerifyStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillPrunePlan {
+    pub removed_archives: Vec<PathBuf>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SkillFrontmatter {
@@ -333,6 +341,52 @@ pub fn load_skill_trust_keys(layout: &SkillCacheLayout) -> SkillCacheResult<Vec<
     Ok(config.keys)
 }
 
+pub fn plan_skill_prune(layout: &SkillCacheLayout) -> SkillCacheResult<SkillPrunePlan> {
+    let mut referenced = BTreeSet::new();
+    collect_installed_manifest_archive_refs(layout, &mut referenced)?;
+    collect_env_lockfile_skill_refs(layout, &mut referenced)?;
+
+    let mut removed_archives = Vec::new();
+    let cache_dir = layout.cache_skills_dir();
+    if cache_dir.is_dir() {
+        for entry in read_dir_sorted(&cache_dir)? {
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|source| SkillCacheError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+                .is_file()
+            {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(hex) = file_name.strip_suffix(".tar.zst") else {
+                continue;
+            };
+            if parse_sha256_hex(hex).is_ok() && !referenced.contains(hex) {
+                removed_archives.push(path);
+            }
+        }
+    }
+
+    removed_archives.sort();
+    Ok(SkillPrunePlan { removed_archives })
+}
+
+pub fn execute_skill_prune(plan: &SkillPrunePlan) -> SkillCacheResult<()> {
+    for path in &plan.removed_archives {
+        fs::remove_file(path).map_err(|source| SkillCacheError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 pub fn rebuild_skill_index(layout: &SkillCacheLayout) -> SkillCacheResult<SkillIndex> {
     let mut entries = Vec::new();
     let skills_dir = layout.skills_dir();
@@ -391,6 +445,64 @@ pub fn rebuild_skill_index(layout: &SkillCacheLayout) -> SkillCacheResult<SkillI
         (&left.name, &left.version, &left.source).cmp(&(&right.name, &right.version, &right.source))
     });
     write_index(layout, entries)
+}
+
+fn collect_installed_manifest_archive_refs(
+    layout: &SkillCacheLayout,
+    referenced: &mut BTreeSet<String>,
+) -> SkillCacheResult<()> {
+    let index = rebuild_skill_index(layout)?;
+    for entry in index.skills {
+        if let Some(hex) = valid_digest_hex(&entry.digest) {
+            referenced.insert(hex);
+        }
+    }
+    Ok(())
+}
+
+fn collect_env_lockfile_skill_refs(
+    layout: &SkillCacheLayout,
+    referenced: &mut BTreeSet<String>,
+) -> SkillCacheResult<()> {
+    let envs_dir = layout.root().join("envs");
+    if !envs_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in read_dir_sorted(&envs_dir)? {
+        let lock_path = entry.path().join("lock.yaml");
+        if !lock_path.is_file() {
+            continue;
+        }
+        let lock_yaml = fs::read_to_string(&lock_path).map_err(|source| SkillCacheError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+        match crate::lockfile::LockfileDocument::from_yaml(&lock_yaml) {
+            Ok(crate::lockfile::LockfileDocument::Portable(lockfile)) => {
+                for skill in lockfile.skills {
+                    if let Some(hex) = valid_digest_hex(&skill.digest) {
+                        referenced.insert(hex);
+                    }
+                }
+            }
+            Ok(crate::lockfile::LockfileDocument::Legacy(_)) => {}
+            Err(source) => {
+                return Err(SkillCacheError::InvalidSkillLockfile {
+                    path: lock_path,
+                    message: source.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn valid_digest_hex(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:")?;
+    parse_sha256_hex(hex).ok()?;
+    Some(hex.to_owned())
 }
 
 fn verify_installed_skill(
