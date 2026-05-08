@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags};
@@ -299,6 +300,50 @@ impl SqliteEventStore {
         Ok(rows)
     }
 
+    pub fn count_events_by_kind(&self, kind: ActivityKind) -> StoreResult<u64> {
+        let conn = self.connection()?;
+        let kind = enum_to_db_string(kind, "kind")?;
+        let count = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM activity_events
+            WHERE kind = ?1
+            "#,
+            params![kind],
+            |row| row.get::<_, i64>(0),
+        )?;
+        count_to_u64(count)
+    }
+
+    pub fn latest_build_queue_depth(&self) -> StoreResult<u64> {
+        let conn = self.connection()?;
+        let kind = enum_to_db_string(ActivityKind::BuildQueueDepth, "kind")?;
+        let value = conn.query_row(
+            r#"
+            SELECT
+                CASE
+                    WHEN json_type(extras_json, '$.depth') = 'integer'
+                    THEN json_extract(extras_json, '$.depth')
+                    ELSE 0
+                END
+            FROM activity_events
+            WHERE kind = ?1
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+            params![kind],
+            |row| row.get::<_, Option<i64>>(0),
+        );
+
+        match value {
+            Ok(Some(depth)) if depth >= 0 => count_to_u64(depth),
+            Ok(Some(depth)) => Err(StoreError::CountOutOfRange(depth)),
+            Ok(None) => Ok(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn policy_blocks_by_kind_driver(&self) -> StoreResult<Vec<PolicyBlockCount>> {
         self.policy_blocks_by_kind_driver_for_env(None)
     }
@@ -481,7 +526,9 @@ impl SqliteEventStore {
     fn connection(&self) -> StoreResult<Connection> {
         create_private_database_file(&self.path)?;
         let path = database_open_path(&self.path)?;
-        Ok(Connection::open_with_flags(path, database_open_flags())?)
+        let conn = Connection::open_with_flags(path, database_open_flags())?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn)
     }
 }
 

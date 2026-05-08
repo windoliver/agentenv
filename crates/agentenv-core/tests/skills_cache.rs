@@ -1,10 +1,11 @@
 use std::{fs, path::PathBuf};
 
 use agentenv_core::lockfile::SkillPin;
+use agentenv_core::skills::cache::SkillManifest;
 use agentenv_core::skills::{
     execute_skill_prune, plan_skill_prune, rebuild_skill_index, verify_all_installed_skills,
-    verify_skill_pins, SkillArchive, SkillCacheLayout, SkillIndex, SkillManifest, SkillProvenance,
-    SkillSelfTest, SkillSelfTestAssertion, SkillTrustKey, SkillVerifyOptions, SkillVerifyStatus,
+    verify_skill_pins, SkillArchive, SkillCacheLayout, SkillIndex, SkillProvenance, SkillSelfTest,
+    SkillSelfTestAssertion, SkillTrustKey, SkillVerifyOptions, SkillVerifyStatus,
 };
 use ed25519_dalek::{Signer, SigningKey};
 

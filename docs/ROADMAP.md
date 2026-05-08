@@ -25,6 +25,8 @@ Exit criterion: an empty workspace compiles, CI is green, and a mock driver can 
 First-class Rust drivers for the critical path.
 
 - **M2-1** — `sandbox-openshell` (built-in)
+- **H-2** — `sandbox-microvm` (built-in, Firecracker on Linux/KVM; Apple Container on macOS; Kata reserved)
+- **H-3** — Snapshot/fork primitive for fast Firecracker env branching
 - **M2-2** — Built-in agent drivers: Claude, Codex, OpenClaw
 - **M2-3** — Built-in context drivers: filesystem, mcp-generic, none
 - **M2-4** — Built-in inference drivers: openai, anthropic, ollama, passthrough
@@ -81,7 +83,6 @@ Exit criterion: an operator can observe live activity, approve unlisted egress r
 
 - Docker sandbox driver
 - E2B sandbox driver
-- Firecracker sandbox driver
 - Community catalog (`agentenv-community` repo)
 - Web dashboard for multi-env operators
 - Hub-mode approvals with ReBAC

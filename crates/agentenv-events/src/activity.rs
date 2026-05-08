@@ -27,6 +27,9 @@ pub enum ActivityKind {
     SpawnRejected,
     SpawnStarted,
     SpawnReady,
+    BuildOneflightHit,
+    BuildOneflightMiss,
+    BuildQueueDepth,
     Log,
 }
 
@@ -181,6 +184,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ActivityKind::CredentialReset).unwrap(),
             serde_json::json!("credential_reset")
+        );
+        assert_eq!(
+            serde_json::to_value(ActivityKind::BuildOneflightHit).unwrap(),
+            serde_json::json!("build_oneflight_hit")
+        );
+        assert_eq!(
+            serde_json::to_value(ActivityKind::BuildOneflightMiss).unwrap(),
+            serde_json::json!("build_oneflight_miss")
+        );
+        assert_eq!(
+            serde_json::to_value(ActivityKind::BuildQueueDepth).unwrap(),
+            serde_json::json!("build_queue_depth")
         );
     }
 

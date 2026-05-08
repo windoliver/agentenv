@@ -210,4 +210,16 @@ mod tests {
             env!("CARGO_PKG_VERSION")
         );
     }
+
+    #[test]
+    fn default_registry_uses_remote_ssh_builtin_aliases() {
+        let registry = DriverRegistry::default();
+
+        assert!(registry
+            .pin(DriverKind::Sandbox, "remote-ssh", None)
+            .is_ok());
+        assert!(registry
+            .pin(DriverKind::Sandbox, "sandbox-remote-ssh", None)
+            .is_ok());
+    }
 }

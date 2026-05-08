@@ -57,16 +57,17 @@
 
 ### `SandboxDriver` — how do we create and run an isolated environment?
 
-Concrete: OpenShell (first-class), Docker (post-MVP), E2B (post-MVP), Firecracker (post-MVP).
+Concrete: OpenShell (first-class), microVM/Firecracker on Linux/KVM and Apple Container on macOS (first-class hardening path), Docker (post-MVP), E2B (post-MVP).
 
 Responsibilities:
 - Preflight checks (runtime installed, versions compatible)
 - `create` / `connect` / `exec` / `copy_in/out` / `status` / `stop` / `destroy`
+- Optionally `snapshot` a running sandbox and `fork_from_snapshot` into a new env
 - Translate a generic `NetworkPolicy` into its native policy format
 - Apply, update, and optionally hot-reload policy
 - Surface egress denials into the approvals queue
 
-Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`.
+Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`, `supports_persistent_sessions`, `supports_snapshots`, `supports_fork`.
 
 ### `AgentDriver` — what runs inside the sandbox?
 
@@ -373,6 +374,7 @@ agentenv/
 │   ├── agentenv-plugin/        # subprocess driver host
 │   ├── drivers/
 │   │   ├── sandbox-openshell/  # built-in, first-class
+│   │   ├── sandbox-microvm/    # built-in, Firecracker + Apple Container
 │   │   ├── sandbox-docker/     # built-in, post-MVP
 │   │   ├── agent-claude/       # built-in
 │   │   ├── agent-codex/        # built-in

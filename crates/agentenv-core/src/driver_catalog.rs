@@ -23,6 +23,14 @@ const BUILT_IN_DRIVER_SPECS: &[BuiltInDriverSpec] = &[
         names: &["openshell", "sandbox-openshell"],
     },
     BuiltInDriverSpec {
+        kind: DriverKind::Sandbox,
+        names: &["remote-ssh", "sandbox-remote-ssh"],
+    },
+    BuiltInDriverSpec {
+        kind: DriverKind::Sandbox,
+        names: &["microvm", "sandbox-microvm"],
+    },
+    BuiltInDriverSpec {
         kind: DriverKind::Agent,
         names: &["claude", "agent-claude"],
     },
@@ -586,6 +594,9 @@ mod tests {
 
         assert!(specs.iter().any(|spec| {
             spec.kind == DriverKind::Sandbox && spec.names == ["openshell", "sandbox-openshell"]
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.kind == DriverKind::Sandbox && spec.names == ["microvm", "sandbox-microvm"]
         }));
         assert!(specs.iter().any(|spec| {
             spec.kind == DriverKind::Agent && spec.names == ["codex", "agent-codex"]

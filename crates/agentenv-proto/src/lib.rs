@@ -44,8 +44,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_1_1() {
-        assert_eq!(SCHEMA_VERSION, "1.1");
+    fn schema_version_is_1_2() {
+        assert_eq!(SCHEMA_VERSION, "1.2");
     }
 
     #[test]
@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_capabilities_default_missing_persistent_sessions_to_false() {
+    fn sandbox_capabilities_default_missing_optional_flags_to_false() {
         let capabilities: SandboxCapabilities = serde_json::from_value(serde_json::json!({
             "supports_hot_reload_policy": true,
             "supports_filesystem_lockdown": true,
@@ -101,6 +101,8 @@ mod tests {
         .expect("legacy sandbox capabilities should deserialize");
 
         assert!(!capabilities.supports_persistent_sessions);
+        assert!(!capabilities.supports_snapshots);
+        assert!(!capabilities.supports_fork);
     }
 
     #[test]

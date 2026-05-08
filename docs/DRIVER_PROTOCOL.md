@@ -1,4 +1,4 @@
-# agentenv Driver Protocol (v1.1 draft)
+# agentenv Driver Protocol (v1.2 draft)
 
 > JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
 
@@ -34,19 +34,23 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 
 ```json
 {
-  "schema_version": "1.1",
-  "name": "nexus",
-  "kind": "context",
+  "schema_version": "1.2",
+  "name": "microvm",
+  "kind": "sandbox",
   "version": "0.1.0",
-  "description": "Nexus context backend driver",
-  "binary": "./bin/agentenv-driver-nexus",
+  "description": "MicroVM sandbox backend driver",
+  "binary": "./bin/agentenv-driver-microvm",
   "args": [],
   "env": {},
   "capabilities_preview": {
-    "is_remote": true,
-    "is_shared": true,
-    "supports_zones": true,
-    "supports_snapshots": true
+    "supports_hot_reload_policy": false,
+    "supports_filesystem_lockdown": true,
+    "supports_syscall_filter": true,
+    "supports_native_inference_routing": false,
+    "supports_remote_host": false,
+    "supports_persistent_sessions": false,
+    "supports_snapshots": true,
+    "supports_fork": true
   }
 }
 ```
@@ -63,7 +67,7 @@ Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it a
   "id": 1,
   "method": "initialize",
   "params": {
-    "schema_version": "1.1",
+    "schema_version": "1.2",
     "core_version": "0.1.0",
     "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
     "log_level": "info"
@@ -82,7 +86,7 @@ Response:
       "name": "openshell",
       "kind": "sandbox",
       "version": "0.1.0",
-      "protocol_version": "1.1"
+      "protocol_version": "1.2"
     },
     "capabilities": {
       "supports_hot_reload_policy": true,
@@ -90,7 +94,9 @@ Response:
       "supports_syscall_filter": true,
       "supports_native_inference_routing": true,
       "supports_remote_host": true,
-      "supports_persistent_sessions": true
+      "supports_persistent_sessions": true,
+      "supports_snapshots": false,
+      "supports_fork": false
     }
   }
 }
@@ -133,8 +139,18 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `status` | `{handle}` | `SandboxStatus` |
 | `logs` | `{handle, since, follow: false}` | `[LogEntry]` |
 | `logs_stream` | `{handle, since}` | streamed via notifications |
+| `snapshot` | `SnapshotParams {handle, name?}` | `SnapshotId` |
+| `fork_from_snapshot` | `ForkFromSnapshotParams {snapshot, spec}` | `SandboxHandle` |
 | `stop` | `{handle}` | `{}` |
 | `destroy` | `{handle}` | `{}` |
+
+Snapshot and fork are optional sandbox capabilities in schema 1.2. Core checks
+`supports_snapshots` before `snapshot` and `supports_fork` before
+`fork_from_snapshot`; drivers that cannot support them return
+`CapabilityMissing`. `SnapshotId.id` is an opaque driver-owned string. `ForkSpec`
+carries the target env name plus driver-specific metadata overrides such as a
+Firecracker tap or SSH target; credentials still never flow over generic driver
+RPC.
 
 Image hardening profiles are create-time sandbox configuration in schema 1.1.
 Core resolves `sandbox.hardening`, merges supported filesystem settings into

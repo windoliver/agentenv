@@ -38,6 +38,7 @@ use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
 mod render;
+mod skills_cli;
 mod term_backend;
 
 const SELF_ENV_SENTINEL: &str = "__self__";
@@ -73,11 +74,12 @@ enum Commands {
     Approvals(ApprovalsArgs),
     Term(TermArgs),
     Snapshot(SnapshotArgs),
+    Fork(ForkArgs),
     Exec(ExecArgs),
     Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
-    Skills(SkillsArgs),
+    Skills(skills_cli::SkillsArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -469,6 +471,14 @@ struct SnapshotRestoreCliArgs {
 }
 
 #[derive(Debug, Args)]
+struct ForkArgs {
+    #[arg(value_name = "SOURCE")]
+    source: String,
+    #[arg(long, value_name = "NEW_ENV")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
 struct BlueprintArgs {
     #[command(subcommand)]
     command: BlueprintCommand,
@@ -498,36 +508,10 @@ struct DriversArgs {
     command: DriverCommand,
 }
 
-#[derive(Debug, Args)]
-struct SkillsArgs {
-    #[command(subcommand)]
-    command: SkillsCommand,
-}
-
 #[derive(Debug, Subcommand)]
 enum DriverCommand {
     /// Lists built-in and discovered subprocess drivers.
     List,
-}
-
-#[derive(Debug, Subcommand)]
-enum SkillsCommand {
-    /// Verifies locally installed skills.
-    Verify(SkillsVerifyArgs),
-    /// Removes unreferenced skill archives from the local cache.
-    Prune(SkillsPruneArgs),
-}
-
-#[derive(Debug, Args)]
-struct SkillsVerifyArgs {
-    #[arg(long)]
-    all: bool,
-}
-
-#[derive(Debug, Args)]
-struct SkillsPruneArgs {
-    #[arg(long)]
-    dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -598,12 +582,13 @@ async fn run() -> Result<()> {
         Some(Commands::Metrics(args)) => run_metrics(args).await,
         Some(Commands::Approvals(args)) => run_approvals(args, &cli.events_sink).await,
         Some(Commands::Snapshot(args)) => run_snapshot(args).await,
+        Some(Commands::Fork(args)) => run_fork(args).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Term(args)) => run_term(args).await,
         Some(Commands::Blueprint(command)) => run_blueprint(command),
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
-        Some(Commands::Skills(args)) => run_skills(args),
+        Some(Commands::Skills(args)) => skills_cli::run_skills(args).await,
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
         Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
@@ -2459,6 +2444,25 @@ async fn run_snapshot_restore(args: SnapshotRestoreCliArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_fork(args: ForkArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    let result = agentenv_core::runtime::fork_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.source,
+        &args.name,
+    )
+    .await?;
+
+    println!(
+        "Environment `{}` forked from `{}`",
+        result.name, result.source
+    );
+    println!("snapshot: {}", result.snapshot_id);
+    println!("sandbox: {}", result.sandbox_handle);
+    Ok(())
+}
+
 fn reject_snapshot_stdout_output(output: &Path) -> Result<()> {
     if output == Path::new("-") {
         bail!("--output - is not supported for snapshots; choose a directory path");
@@ -3556,78 +3560,6 @@ fn run_drivers(args: DriversArgs) -> Result<()> {
     }
 }
 
-fn run_skills(args: SkillsArgs) -> Result<()> {
-    match args.command {
-        SkillsCommand::Verify(args) => run_skills_verify(args),
-        SkillsCommand::Prune(args) => run_skills_prune(args),
-    }
-}
-
-fn run_skills_verify(args: SkillsVerifyArgs) -> Result<()> {
-    if !args.all {
-        bail!("`agentenv skills verify` currently requires `--all`");
-    }
-
-    let options = runtime_options(true)?;
-    let layout = agentenv_core::skills::SkillCacheLayout::new(options.root);
-    let trust_keys = agentenv_core::skills::load_skill_trust_keys(&layout)
-        .context("failed to load skill trust keys")?;
-    let report = agentenv_core::skills::verify_all_installed_skills(
-        &layout,
-        agentenv_core::skills::SkillVerifyOptions {
-            trust_keys,
-            ..Default::default()
-        },
-    )
-    .context("failed to verify installed skills")?;
-
-    for skill in &report.skills {
-        match skill.status {
-            agentenv_core::skills::SkillVerifyStatus::Passed => {
-                println!("verified {} {}", skill.name, skill.version);
-            }
-            agentenv_core::skills::SkillVerifyStatus::Failed => {
-                eprintln!("failed {} {}", skill.name, skill.version);
-                for error in &skill.errors {
-                    eprintln!("  error: {error}");
-                }
-            }
-        }
-        for warning in &skill.warnings {
-            eprintln!("  warning: {warning}");
-        }
-    }
-
-    if !report.is_ok() {
-        bail!("skill verification failed");
-    }
-
-    Ok(())
-}
-
-fn run_skills_prune(args: SkillsPruneArgs) -> Result<()> {
-    let options = runtime_options(true)?;
-    let layout = agentenv_core::skills::SkillCacheLayout::new(options.root);
-    let plan =
-        agentenv_core::skills::plan_skill_prune(&layout).context("failed to plan skill prune")?;
-
-    if args.dry_run {
-        for path in &plan.removed_archives {
-            println!("would remove {}", path.display());
-        }
-        println!(
-            "{} archive(s) would be removed",
-            plan.removed_archives.len()
-        );
-        return Ok(());
-    }
-
-    agentenv_core::skills::execute_skill_prune(&plan).context("failed to prune skill cache")?;
-    agentenv_core::skills::rebuild_skill_index(&layout).context("failed to rebuild skill index")?;
-    println!("removed {} archive(s)", plan.removed_archives.len());
-    Ok(())
-}
-
 fn print_driver_table(entries: &[DiscoveredDriver]) {
     println!(
         "{:<10} {:<24} {:<14} {:<10} BINARY",
@@ -3950,6 +3882,7 @@ mod tests {
                 "approvals".to_string(),
                 "term".to_string(),
                 "snapshot".to_string(),
+                "fork".to_string(),
                 "exec".to_string(),
                 "blueprint".to_string(),
                 "credentials".to_string(),
