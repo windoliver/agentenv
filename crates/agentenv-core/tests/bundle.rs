@@ -156,6 +156,74 @@ fn emit_skill_bundle_writes_reference_document_when_provided() {
 }
 
 #[test]
+fn emit_skill_bundle_keeps_skill_yaml_and_frontmatter_in_sync() {
+    let root = temp_dir("bundle-parity");
+    let out = root.join("demo-skill");
+    let blueprint_yaml = minimal_blueprint();
+    let driver_artifacts = test_driver_artifacts();
+    let lockfile_yaml = portable_lock_yaml("demo", &blueprint_yaml, &driver_artifacts);
+
+    emit_skill_bundle(SkillBundleInput {
+        source: BundleSource {
+            env_name: "demo".to_owned(),
+            project_path: None,
+            git_commit: None,
+            git_dirty: None,
+        },
+        metadata: SkillBundleMetadata {
+            name: "demo".to_owned(),
+            version: Version::parse("1.0.0").unwrap(),
+            description: "Reproducible dev env for demo".to_owned(),
+            author: None,
+            license: None,
+            tags: vec![
+                "openshell".to_owned(),
+                "codex".to_owned(),
+                "dev-env".to_owned(),
+            ],
+        },
+        blueprint_yaml,
+        lockfile_yaml,
+        reference_document: None,
+        output_dir: out.clone(),
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-09T00:00:00Z".to_owned(),
+        driver_artifacts,
+    })
+    .unwrap();
+
+    let skill_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(out.join("skill.yaml")).unwrap()).unwrap();
+    let skill_md = fs::read_to_string(out.join("SKILL.md")).unwrap();
+    let frontmatter = parse_skill_frontmatter(&skill_md);
+
+    assert_eq!(
+        yaml_string_field(&frontmatter, "name"),
+        yaml_string_field(&skill_yaml, "name")
+    );
+    assert_eq!(
+        yaml_string_field(&frontmatter, "version"),
+        yaml_string_field(&skill_yaml, "version")
+    );
+    assert_eq!(
+        yaml_string_field(&frontmatter, "description"),
+        yaml_string_field(&skill_yaml, "description")
+    );
+    assert_eq!(
+        yaml_string_sequence(&frontmatter, "tags"),
+        yaml_string_sequence(&skill_yaml, "tags")
+    );
+    assert_eq!(
+        yaml_string_field(&frontmatter, "agentenv-schema"),
+        yaml_string_field(&skill_yaml, "agentenv_schema")
+    );
+    assert_eq!(
+        frontmatter["agentenv-bundle"].as_bool(),
+        skill_yaml["agentenv_bundle"].as_bool()
+    );
+}
+
+#[test]
 fn emit_skill_bundle_records_blueprint_lockfile_and_manifest_digests() {
     let root = temp_dir("bundle-digests");
     let out = root.join("demo-skill");
@@ -347,6 +415,32 @@ fn sha256_digest(input: &str) -> String {
         "sha256:{}",
         agentenv_core::digest::sha256_hex(ensure_trailing_newline(input).as_bytes())
     )
+}
+
+fn parse_skill_frontmatter(skill_md: &str) -> serde_yaml::Value {
+    let mut lines = skill_md.lines();
+    assert_eq!(lines.next(), Some("---"));
+    let mut frontmatter = Vec::new();
+    for line in lines {
+        if line == "---" {
+            return serde_yaml::from_str(&frontmatter.join("\n")).unwrap();
+        }
+        frontmatter.push(line);
+    }
+    panic!("SKILL.md frontmatter was not closed");
+}
+
+fn yaml_string_field(value: &serde_yaml::Value, key: &str) -> String {
+    value[key].as_str().unwrap().to_owned()
+}
+
+fn yaml_string_sequence(value: &serde_yaml::Value, key: &str) -> Vec<String> {
+    value[key]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn temp_dir(prefix: &str) -> PathBuf {

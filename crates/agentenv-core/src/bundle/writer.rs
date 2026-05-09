@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -10,7 +11,7 @@ use super::{
     model::{
         BundleManifest, BundleManifestAgentenv, BundleManifestFile, BundleManifestSkill,
         BundleProvenance, BundleProvenanceDigests, BundleProvenanceSource, BundleWarning,
-        SkillBundleInput, SkillBundleOutput,
+        SkillBundleInput, SkillBundleMetadata, SkillBundleOutput,
     },
     render::{
         ensure_trailing_newline, render_bootstrap, render_reference, render_skill_md,
@@ -20,7 +21,9 @@ use super::{
 use crate::{
     digest::sha256_hex,
     portable_lockfile::{verify_portable_lockfile_yaml, PortableLockfileError},
-    skills::{compute_bundle_digest, load_skill_manifest, validate_skill_name, SkillError},
+    skills::{
+        compute_bundle_digest, load_skill_manifest, validate_skill_name, SkillError, SkillManifest,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -274,6 +277,7 @@ fn validate_staging(
     }
 
     let skill_md = read_to_string(staging_dir.join("SKILL.md"))?;
+    validate_metadata_parity(&skill_manifest, &skill_md, metadata)?;
     if !skill_md.contains("agentenv-bundle: true")
         || !skill_md.contains("agentenv-schema: \"0.1\"")
         || !skill_md.contains("agentenv verify agentenv.lock")
@@ -304,6 +308,185 @@ fn validate_staging(
 
     compute_bundle_digest(staging_dir, &skill_manifest)?;
     Ok(())
+}
+
+fn validate_metadata_parity(
+    skill_manifest: &SkillManifest,
+    skill_md: &str,
+    metadata: &SkillBundleMetadata,
+) -> Result<(), BundleError> {
+    let frontmatter = parse_skill_md_frontmatter(skill_md)?;
+
+    let frontmatter_name = required_string(&frontmatter, "name", "SKILL.md frontmatter")?;
+    validate_equal("name", &frontmatter_name, &metadata.name)?;
+    validate_equal("name", &skill_manifest.name, &metadata.name)?;
+
+    let expected_version = metadata.version.to_string();
+    let frontmatter_version = required_string(&frontmatter, "version", "SKILL.md frontmatter")?;
+    validate_equal("version", &frontmatter_version, &expected_version)?;
+    validate_equal(
+        "version",
+        &skill_manifest.version.to_string(),
+        &expected_version,
+    )?;
+
+    let frontmatter_description =
+        required_string(&frontmatter, "description", "SKILL.md frontmatter")?;
+    validate_equal(
+        "description",
+        &frontmatter_description,
+        &metadata.description,
+    )?;
+    let manifest_description =
+        skill_manifest
+            .description
+            .as_deref()
+            .ok_or_else(|| BundleError::Validation {
+                message: "skill.yaml is missing description".to_owned(),
+            })?;
+    validate_equal(
+        "description",
+        manifest_description,
+        metadata.description.as_str(),
+    )?;
+
+    let frontmatter_tags = optional_string_sequence(&frontmatter, "tags", "SKILL.md frontmatter")?;
+    let manifest_tags =
+        optional_string_sequence(&skill_manifest.extra, "tags", "skill.yaml extra metadata")?;
+    validate_equal("tags", &frontmatter_tags, &metadata.tags)?;
+    validate_equal("tags", &manifest_tags, &metadata.tags)?;
+
+    let frontmatter_schema =
+        required_string(&frontmatter, "agentenv-schema", "SKILL.md frontmatter")?;
+    let manifest_schema = required_string(
+        &skill_manifest.extra,
+        "agentenv_schema",
+        "skill.yaml extra metadata",
+    )?;
+    validate_equal(
+        "agentenv schema",
+        frontmatter_schema.as_str(),
+        AGENTENV_BUNDLE_SCHEMA,
+    )?;
+    validate_equal(
+        "agentenv schema",
+        manifest_schema.as_str(),
+        AGENTENV_BUNDLE_SCHEMA,
+    )?;
+
+    let frontmatter_bundle =
+        required_bool(&frontmatter, "agentenv-bundle", "SKILL.md frontmatter")?;
+    let manifest_bundle = required_bool(
+        &skill_manifest.extra,
+        "agentenv_bundle",
+        "skill.yaml extra metadata",
+    )?;
+    if !frontmatter_bundle || !manifest_bundle {
+        return Err(BundleError::Validation {
+            message: "agentenv bundle marker must be true in SKILL.md and skill.yaml".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_skill_md_frontmatter(
+    skill_md: &str,
+) -> Result<BTreeMap<String, serde_yaml::Value>, BundleError> {
+    let mut lines = skill_md.lines();
+    if lines.next() != Some("---") {
+        return Err(BundleError::Validation {
+            message: "SKILL.md is missing frontmatter".to_owned(),
+        });
+    }
+
+    let mut frontmatter = Vec::new();
+    for line in lines {
+        if line == "---" {
+            return serde_yaml::from_str(&frontmatter.join("\n")).map_err(|source| {
+                BundleError::Validation {
+                    message: format!("failed to parse SKILL.md frontmatter: {source}"),
+                }
+            });
+        }
+        frontmatter.push(line);
+    }
+
+    Err(BundleError::Validation {
+        message: "SKILL.md frontmatter is not closed".to_owned(),
+    })
+}
+
+fn required_string(
+    map: &BTreeMap<String, serde_yaml::Value>,
+    key: &str,
+    source: &str,
+) -> Result<String, BundleError> {
+    match map.get(key) {
+        Some(serde_yaml::Value::String(value)) => Ok(value.clone()),
+        Some(value) => Err(BundleError::Validation {
+            message: format!("{source} field `{key}` must be a string, found `{value:?}`"),
+        }),
+        None => Err(BundleError::Validation {
+            message: format!("{source} is missing `{key}`"),
+        }),
+    }
+}
+
+fn required_bool(
+    map: &BTreeMap<String, serde_yaml::Value>,
+    key: &str,
+    source: &str,
+) -> Result<bool, BundleError> {
+    match map.get(key) {
+        Some(serde_yaml::Value::Bool(value)) => Ok(*value),
+        Some(value) => Err(BundleError::Validation {
+            message: format!("{source} field `{key}` must be a boolean, found `{value:?}`"),
+        }),
+        None => Err(BundleError::Validation {
+            message: format!("{source} is missing `{key}`"),
+        }),
+    }
+}
+
+fn optional_string_sequence(
+    map: &BTreeMap<String, serde_yaml::Value>,
+    key: &str,
+    source: &str,
+) -> Result<Vec<String>, BundleError> {
+    let Some(value) = map.get(key) else {
+        return Ok(Vec::new());
+    };
+    let serde_yaml::Value::Sequence(items) = value else {
+        return Err(BundleError::Validation {
+            message: format!("{source} field `{key}` must be a string sequence"),
+        });
+    };
+
+    items
+        .iter()
+        .map(|item| match item {
+            serde_yaml::Value::String(value) => Ok(value.clone()),
+            other => Err(BundleError::Validation {
+                message: format!("{source} field `{key}` contains non-string item `{other:?}`"),
+            }),
+        })
+        .collect()
+}
+
+fn validate_equal<T>(field: &str, actual: &T, expected: &T) -> Result<(), BundleError>
+where
+    T: std::fmt::Debug + PartialEq + ?Sized,
+{
+    if actual == expected {
+        return Ok(());
+    }
+
+    Err(BundleError::Validation {
+        message: format!(
+            "skill metadata `{field}` mismatch: expected `{expected:?}`, found `{actual:?}`"
+        ),
+    })
 }
 
 fn generated_inventory_paths(root: &Path) -> Result<Vec<String>, BundleError> {
@@ -477,4 +660,84 @@ fn set_executable(path: PathBuf) -> Result<(), BundleError> {
 #[cfg(not(unix))]
 fn set_executable(_path: PathBuf) -> Result<(), BundleError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    use semver::Version;
+    use serde_yaml::Value;
+
+    use super::*;
+    use crate::skills::SkillManifest;
+
+    #[test]
+    fn metadata_parity_rejects_frontmatter_description_tags_and_schema_drift() {
+        let metadata = SkillBundleMetadata {
+            name: "demo".to_owned(),
+            version: Version::parse("1.0.0").unwrap(),
+            description: "Reproducible dev env for demo".to_owned(),
+            author: None,
+            license: None,
+            tags: vec!["openshell".to_owned(), "dev-env".to_owned()],
+        };
+        let manifest = skill_manifest_for(&metadata);
+        let skill_md = r#"---
+name: demo
+description: Reproducible dev env for demo
+version: 1.0.0
+tags: [openshell, dev-env]
+agentenv-bundle: true
+agentenv-schema: "0.1"
+---
+
+# demo
+"#;
+
+        validate_metadata_parity(&manifest, skill_md, &metadata).unwrap();
+
+        let description_drift = skill_md.replace(
+            "description: Reproducible dev env for demo",
+            "description: drift",
+        );
+        assert!(validate_metadata_parity(&manifest, &description_drift, &metadata).is_err());
+
+        let tag_drift = skill_md.replace("tags: [openshell, dev-env]", "tags: [other]");
+        assert!(validate_metadata_parity(&manifest, &tag_drift, &metadata).is_err());
+
+        let schema_drift = skill_md.replace("agentenv-schema: \"0.1\"", "agentenv-schema: \"9.9\"");
+        assert!(validate_metadata_parity(&manifest, &schema_drift, &metadata).is_err());
+    }
+
+    fn skill_manifest_for(metadata: &SkillBundleMetadata) -> SkillManifest {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "tags".to_owned(),
+            Value::Sequence(
+                metadata
+                    .tags
+                    .iter()
+                    .map(|tag| Value::String(tag.clone()))
+                    .collect(),
+            ),
+        );
+        extra.insert("agentenv_bundle".to_owned(), Value::Bool(true));
+        extra.insert(
+            "agentenv_schema".to_owned(),
+            Value::String(AGENTENV_BUNDLE_SCHEMA.to_owned()),
+        );
+
+        SkillManifest {
+            name: metadata.name.clone(),
+            version: metadata.version.clone(),
+            description: Some(metadata.description.clone()),
+            entry: PathBuf::from("SKILL.md"),
+            declared_files: vec![PathBuf::from("SKILL.md")],
+            self_test_command: None,
+            signature_ed25519: None,
+            signature_public_key_ed25519: None,
+            extra,
+        }
+    }
 }
