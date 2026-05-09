@@ -990,12 +990,10 @@ impl SandboxDriver for OpenShellDriver {
             env: BTreeMap::new(),
         })?;
         let mut stdout = output.stdout;
-        if self
-            .current_policy_for_handle(&handle)
-            .is_some_and(|policy| policy.network.dns.is_active())
-        {
-            let guard_output = self.run_checked_command(dns_guard_log_command(&handle))?;
-            append_log_stdout(&mut stdout, &guard_output.stdout);
+        if let Ok(guard_output) = self.run_command_request(dns_guard_log_command(&handle)) {
+            if guard_output.status == Some(0) {
+                append_log_stdout(&mut stdout, &guard_output.stdout);
+            }
         }
 
         Ok(LogsResult {
@@ -10377,6 +10375,22 @@ mod driver_tests {
                 "2026-04-19T00:00:00Z WARN action=deny DENIED outbound to api.example.com\nplain info line",
                 "",
             ),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
             CommandScript::success(
                 "openshell",
                 &["logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"],
@@ -10484,6 +10498,19 @@ mod driver_tests {
                 CommandCall {
                     program: "openshell".to_owned(),
                     request: command_request(&["logs", "sb-1", "--since", "2026-04-19T00:00:00Z"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "exec",
+                        "--name",
+                        "sb-1",
+                        "--",
+                        "sh",
+                        "-lc",
+                        "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                    ]),
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
@@ -10603,13 +10630,31 @@ mod driver_tests {
 
     #[test]
     fn logs_denied_lines_set_egress_denied_kv() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
-            "openshell",
-            &["logs", "sb-2"],
-            Some(0),
-            "2026-04-19T00:00:00Z INFO action=deny BLOCKED outbound",
-            "",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "openshell",
+                &["logs", "sb-2"],
+                Some(0),
+                "2026-04-19T00:00:00Z INFO action=deny BLOCKED outbound",
+                "",
+            ),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-2",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -10638,8 +10683,6 @@ mod driver_tests {
 
     #[test]
     fn logs_include_dns_guard_denials_for_active_dns_policy() {
-        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
-
         let runner = Arc::new(RecordingCommandRunner::new(vec![
             CommandScript::output(
                 "openshell",
@@ -10666,10 +10709,6 @@ mod driver_tests {
             ),
         ]));
         let driver = OpenShellDriver::with_command_runner(runner);
-        let registry = PresetRegistry::load_builtin().expect("load presets");
-        let mut policy = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
-        policy.network.dns.resolvers_allowed = vec!["1.1.1.1".to_owned()];
-        driver.store_current_policy("sb-2".to_owned(), policy);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
