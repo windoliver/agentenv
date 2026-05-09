@@ -3891,6 +3891,7 @@ mod tests {
                 "credentials".to_string(),
                 "drivers".to_string(),
                 "skills".to_string(),
+                "bundle".to_string(),
                 "verify-blueprint".to_string(),
                 "verify".to_string(),
                 "freeze".to_string(),
