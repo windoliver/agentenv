@@ -181,6 +181,81 @@ fn bundle_directory_source_loads_architecture_reference() {
 }
 
 #[test]
+fn bundle_as_skill_exports_existing_env_with_project_reference() {
+    let temp_dir = make_temp_dir("bundle-project-reference");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    fs::write(
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+        "# Architecture\n\nProject reference details\n",
+    )
+    .unwrap();
+    run_git(&project_dir, &["init"]);
+    run_git(&project_dir, &["config", "user.name", "Detected Author"]);
+    run_git(
+        &project_dir,
+        &["config", "user.email", "detected@example.com"],
+    );
+    run_git(&project_dir, &["add", "docs/ARCHITECTURE.md"]);
+    run_git(
+        &project_dir,
+        &["commit", "-m", "Add architecture reference"],
+    );
+    let expected_commit = git_stdout(&project_dir, &["rev-parse", "HEAD"]);
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-project-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--author")
+        .arg("Alice Example")
+        .arg("--license")
+        .arg("MIT")
+        .arg("--tag")
+        .arg("rust")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("SKILL.md").is_file());
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("author: Alice Example"),
+        "SKILL.md was: {skill}"
+    );
+    assert!(skill.contains("license: MIT"), "SKILL.md was: {skill}");
+    assert!(skill.contains("- rust"), "SKILL.md was: {skill}");
+    let reference = fs::read_to_string(out_dir.join("references/architecture.md")).unwrap();
+    assert!(reference.contains("Source: `docs/ARCHITECTURE.md`"));
+    assert!(reference.contains("Project reference details"));
+    let provenance: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join(".agentenv/provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        provenance["source"]["project_git_commit"].as_str(),
+        Some(expected_commit.as_str())
+    );
+    assert_eq!(
+        provenance["source"]["project_git_dirty"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
 fn bundle_dot_source_derives_env_from_current_directory() {
     let temp_dir = make_temp_dir("bundle-dot-source");
     write_minimal_env_state(&temp_dir, "demo");
@@ -4081,6 +4156,35 @@ fn unique_suffix() -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+fn run_git(current_dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(current_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
