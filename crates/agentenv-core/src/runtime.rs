@@ -287,6 +287,8 @@ pub enum RuntimeError {
     Blueprint(#[from] crate::error::BlueprintError),
     #[error(transparent)]
     Hardening(#[from] crate::hardening::HardeningError),
+    #[error("invalid DNS policy: {0}")]
+    DnsPolicy(#[from] crate::security::dns_policy::DnsPolicyError),
     #[error(transparent)]
     ApprovalConfig(#[from] agentenv_approvals::ApprovalConfigError),
     #[error(transparent)]
@@ -1168,6 +1170,7 @@ async fn create_env_with_input(
         } else {
             policy.clone()
         };
+        validate_runtime_dns_policy(&create_policy)?;
         let restore_policy_after_install = supports_hot_reload_policy && create_policy != policy;
 
         let build_oneflight_seed = build_oneflight_seed_for_byo(
@@ -1244,6 +1247,7 @@ async fn create_env_with_input(
         )?;
         install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
         if restore_policy_after_install {
+            validate_runtime_dns_policy(&policy)?;
             let apply_policy_start = Instant::now();
             match set
                 .sandbox
@@ -4212,6 +4216,10 @@ fn core_policy_applied_event(
         .with_latency_ms(latency_ms)
 }
 
+fn validate_runtime_dns_policy(policy: &agentenv_proto::NetworkPolicy) -> RuntimeResult<()> {
+    crate::security::dns_policy::validate_dns_policy(&policy.network.dns).map_err(Into::into)
+}
+
 fn policy_json_value(policy: &agentenv_proto::NetworkPolicy) -> serde_json::Value {
     serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
 }
@@ -4242,6 +4250,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::Snapshot(_)
         | RuntimeError::Blueprint(_)
         | RuntimeError::Hardening(_)
+        | RuntimeError::DnsPolicy(_)
         | RuntimeError::ApprovalConfig(_)
         | RuntimeError::LegacyLockfileReproduce
         | RuntimeError::PortableLockfileVerification { .. }

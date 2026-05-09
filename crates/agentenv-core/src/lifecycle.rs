@@ -6,6 +6,7 @@ use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 use url::Url;
 
+use crate::security::dns_policy::{validate_dns_policy, DnsPolicyError};
 use crate::security::ssrf::{
     sanitize_untrusted_url_text, validate_outbound, SsrfBlockReason, SsrfBlocked, SsrfOptions,
 };
@@ -165,6 +166,11 @@ pub enum LifecycleError {
         #[source]
         source: Box<SsrfBlocked>,
     },
+    #[error("invalid blueprint DNS policy: {source}")]
+    DnsPolicy {
+        #[source]
+        source: DnsPolicyError,
+    },
     #[error(transparent)]
     Hardening(#[from] crate::hardening::HardeningError),
     #[error("failed to serialize canonical resolved blueprint: {0}")]
@@ -279,8 +285,24 @@ fn validate_blueprint_urls(blueprint: &Blueprint) -> Result<(), LifecycleError> 
         validate_inference_blueprint_urls(inference, &options)?;
     }
     validate_policy_url_overrides(&blueprint.policy, &options)?;
+    validate_blueprint_dns_policy(&blueprint.policy)?;
 
     Ok(())
+}
+
+fn validate_blueprint_dns_policy(policy: &PolicySection) -> Result<(), LifecycleError> {
+    let Some(dns) = policy.dns.as_ref() else {
+        return Ok(());
+    };
+
+    validate_dns_policy(&agentenv_proto::DnsPolicy {
+        resolvers_allowed: dns.resolvers_allowed.clone(),
+        doh_upstreams_allowed: dns.doh_upstreams_allowed.clone(),
+        dot_upstreams_allowed: dns.dot_upstreams_allowed.clone(),
+        log_all_queries: dns.log_all_queries,
+        pin_resolved_ips: dns.pin_resolved_ips,
+    })
+    .map_err(|source| LifecycleError::DnsPolicy { source })
 }
 
 fn validate_context_blueprint_urls(
