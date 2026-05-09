@@ -60,10 +60,19 @@ struct WrittenBundle {
 }
 
 pub fn emit_skill_bundle(input: SkillBundleInput) -> Result<SkillBundleOutput, BundleError> {
-    if input.output_dir.exists() {
-        return Err(BundleError::OutputExists {
-            path: input.output_dir,
-        });
+    match fs::symlink_metadata(&input.output_dir) {
+        Ok(_) => {
+            return Err(BundleError::OutputExists {
+                path: input.output_dir,
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(BundleError::Io {
+                path: input.output_dir,
+                source,
+            });
+        }
     }
     validate_output_ancestry(&input.output_dir)?;
     validate_skill_name(&input.metadata.name)?;

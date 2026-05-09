@@ -240,6 +240,44 @@ fn emit_skill_bundle_rejects_existing_output_path() {
     assert!(error.to_string().contains("output path already exists"));
 }
 
+#[cfg(unix)]
+#[test]
+fn emit_skill_bundle_rejects_dangling_symlink_output_path() {
+    let root = temp_dir("bundle-existing-symlink");
+    let out = root.join("demo-skill");
+    std::os::unix::fs::symlink(root.join("missing-target"), &out).unwrap();
+    let blueprint_yaml = minimal_blueprint();
+    let driver_artifacts = test_driver_artifacts();
+    let lockfile_yaml = portable_lock_yaml("demo", &blueprint_yaml, &driver_artifacts);
+
+    let error = emit_skill_bundle(SkillBundleInput {
+        source: BundleSource {
+            env_name: "demo".to_owned(),
+            project_path: None,
+            git_commit: None,
+            git_dirty: None,
+        },
+        metadata: SkillBundleMetadata {
+            name: "demo".to_owned(),
+            version: Version::parse("1.0.0").unwrap(),
+            description: "Reproducible dev env for demo".to_owned(),
+            author: None,
+            license: None,
+            tags: vec!["dev-env".to_owned()],
+        },
+        blueprint_yaml,
+        lockfile_yaml,
+        reference_document: None,
+        output_dir: out,
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-09T00:00:00Z".to_owned(),
+        driver_artifacts,
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("output path already exists"));
+}
+
 fn minimal_blueprint() -> String {
     r#"version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
