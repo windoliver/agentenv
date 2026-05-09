@@ -37,6 +37,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
+mod bundle_cli;
 mod render;
 mod skills_cli;
 mod term_backend;
@@ -80,6 +81,7 @@ enum Commands {
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
     Skills(skills_cli::SkillsArgs),
+    Bundle(bundle_cli::BundleArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -589,6 +591,7 @@ async fn run() -> Result<()> {
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::Skills(args)) => skills_cli::run_skills(args).await,
+        Some(Commands::Bundle(args)) => bundle_cli::run_bundle(args),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
         Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
@@ -3888,6 +3891,7 @@ mod tests {
                 "credentials".to_string(),
                 "drivers".to_string(),
                 "skills".to_string(),
+                "bundle".to_string(),
                 "verify-blueprint".to_string(),
                 "verify".to_string(),
                 "freeze".to_string(),

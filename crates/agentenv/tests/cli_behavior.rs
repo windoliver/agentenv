@@ -59,6 +59,501 @@ fn freeze_persisted_env_writes_default_lockfile() {
 }
 
 #[test]
+fn bundle_help_lists_as_skill_and_out_flags() {
+    let temp_dir = make_temp_dir("bundle-help");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("--help")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--as-skill"), "stdout was: {stdout}");
+    assert!(stdout.contains("--out"), "stdout was: {stdout}");
+    assert!(stdout.contains("--env"), "stdout was: {stdout}");
+}
+
+#[test]
+fn bundle_as_skill_requires_out_flag() {
+    let temp_dir = make_temp_dir("bundle-missing-out");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle --as-skill requires --out <dir>"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn bundle_rejects_missing_as_skill_flag() {
+    let temp_dir = make_temp_dir("bundle-missing-as-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--out")
+        .arg(temp_dir.join("bundle-out"))
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle currently supports only --as-skill"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn bundle_as_skill_rejects_missing_env() {
+    let temp_dir = make_temp_dir("bundle-missing-env");
+    let out_dir = temp_dir.join("bundle-out");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("missing-env")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-env"), "stderr was: {stderr}");
+}
+
+#[test]
+fn bundle_directory_source_loads_architecture_reference() {
+    let temp_dir = make_temp_dir("bundle-reference-doc");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    fs::write(
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+        "# Architecture\n\nReference details\n",
+    )
+    .unwrap();
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reference = fs::read_to_string(out_dir.join("references/architecture.md")).unwrap();
+    assert!(reference.contains("Source: `docs/ARCHITECTURE.md`"));
+    assert!(reference.contains("Reference details"));
+}
+
+#[test]
+fn bundle_as_skill_exports_existing_env_with_project_reference() {
+    let temp_dir = make_temp_dir("bundle-project-reference");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    fs::write(
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+        "# Architecture\n\nProject reference details\n",
+    )
+    .unwrap();
+    run_git(&project_dir, &["init"]);
+    run_git(&project_dir, &["config", "user.name", "Detected Author"]);
+    run_git(
+        &project_dir,
+        &["config", "user.email", "detected@example.com"],
+    );
+    run_git(&project_dir, &["add", "docs/ARCHITECTURE.md"]);
+    run_git(
+        &project_dir,
+        &["commit", "-m", "Add architecture reference"],
+    );
+    let expected_commit = git_stdout(&project_dir, &["rev-parse", "HEAD"]);
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-project-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--author")
+        .arg("Alice Example")
+        .arg("--license")
+        .arg("MIT")
+        .arg("--tag")
+        .arg("rust")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("SKILL.md").is_file());
+    assert!(out_dir.join("skill.yaml").is_file());
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("author: Alice Example"),
+        "SKILL.md was: {skill}"
+    );
+    assert!(skill.contains("license: MIT"), "SKILL.md was: {skill}");
+    assert!(skill.contains("- rust"), "SKILL.md was: {skill}");
+    let reference = fs::read_to_string(out_dir.join("references/architecture.md")).unwrap();
+    assert!(reference.contains("Source: `docs/ARCHITECTURE.md`"));
+    assert!(reference.contains("Project reference details"));
+    let provenance: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join(".agentenv/provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        provenance["source"]["project_git_commit"].as_str(),
+        Some(expected_commit.as_str())
+    );
+    assert_eq!(
+        provenance["source"]["project_git_dirty"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn bundle_metadata_detection_uses_local_git_author_and_cargo_license() {
+    let temp_dir = make_temp_dir("bundle-detected-metadata");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname = 'demo'\nversion = '0.1.0'\nlicense = 'Apache-2.0'\n",
+    )
+    .unwrap();
+    run_git(&project_dir, &["init"]);
+    run_git(&project_dir, &["config", "user.name", "Detected Author"]);
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-detected-metadata-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("author: Detected Author"),
+        "SKILL.md was: {skill}"
+    );
+    assert!(
+        skill.contains("license: Apache-2.0"),
+        "SKILL.md was: {skill}"
+    );
+}
+
+#[test]
+fn bundle_metadata_detection_ignores_global_git_author_for_non_git_project() {
+    let temp_dir = make_temp_dir("bundle-ignore-global-git-author");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join("LICENSE-MIT"), "MIT License\n").unwrap();
+    let git_config = Command::new("git")
+        .args(["config", "--global", "user.name", "Global Author"])
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        git_config.status.success(),
+        "git config --global failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&git_config.stdout),
+        String::from_utf8_lossy(&git_config.stderr)
+    );
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-license-file-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(!skill.contains("Global Author"), "SKILL.md was: {skill}");
+    assert!(skill.contains("license: MIT"), "SKILL.md was: {skill}");
+}
+
+#[test]
+fn bundle_dot_source_derives_env_from_current_directory() {
+    let temp_dir = make_temp_dir("bundle-dot-source");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-dot-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(".")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("SKILL.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_directory_source_skips_symlinked_reference_document() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = make_temp_dir("bundle-symlink-reference");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    let outside_reference = temp_dir.join("outside-architecture.md");
+    fs::write(&outside_reference, "# Outside\n\nDo not copy\n").unwrap();
+    symlink(
+        &outside_reference,
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+    )
+    .unwrap();
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-symlink-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!out_dir.join("references/architecture.md").exists());
+}
+
+#[test]
+fn bundle_json_outputs_digest_summary() {
+    let temp_dir = make_temp_dir("bundle-json-summary");
+    write_minimal_env_state(&temp_dir, "demo");
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-json-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        summary["output_dir"].as_str(),
+        Some(out_dir.to_str().unwrap())
+    );
+    assert_eq!(summary["skill_name"].as_str(), Some("demo"));
+    assert_eq!(summary["version"].as_str(), Some("1.0.0"));
+    assert!(summary["bundle_digest"].as_str().is_some());
+    assert!(summary["blueprint_digest"].as_str().is_some());
+    assert!(summary["lockfile_digest"].as_str().is_some());
+}
+
+#[test]
+fn bundle_as_skill_json_output_installs_as_local_skill() {
+    let temp_dir = make_temp_dir("bundle-json-install");
+    write_minimal_env_state(&temp_dir, "demo");
+    let output_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&output_dir)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.stdout.ends_with(b"\n"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let keys = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "blueprint_digest",
+            "bundle_digest",
+            "lockfile_digest",
+            "output_dir",
+            "skill_name",
+            "version",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(json["output_dir"], output_dir.to_str().unwrap());
+    assert_eq!(json["skill_name"], "demo");
+    assert_eq!(json["version"], "1.0.0");
+    assert!(json["bundle_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(json["blueprint_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(json["lockfile_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&output_dir)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("demo")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn fork_reports_capability_missing_for_openshell() {
     let temp_dir = make_temp_dir("fork-openshell-unsupported");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
@@ -4043,6 +4538,35 @@ fn unique_suffix() -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+fn run_git(current_dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(current_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
