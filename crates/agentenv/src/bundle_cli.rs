@@ -10,6 +10,7 @@ use agentenv_core::bundle::{
 use agentenv_core::skills::validate_skill_name;
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[derive(Debug, Args)]
@@ -76,7 +77,8 @@ pub(crate) fn run_bundle(args: BundleArgs) -> Result<()> {
     .context("failed to emit skill bundle")?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let rendered = serde_json::to_string_pretty(&BundleJson::from(output))?;
+        println!("{rendered}");
     } else {
         println!("Skill bundle written: {}", output.output_dir.display());
         println!("bundle digest: {}", output.bundle_digest);
@@ -85,6 +87,29 @@ pub(crate) fn run_bundle(args: BundleArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct BundleJson {
+    output_dir: PathBuf,
+    skill_name: String,
+    version: String,
+    bundle_digest: String,
+    blueprint_digest: String,
+    lockfile_digest: String,
+}
+
+impl From<agentenv_core::bundle::SkillBundleOutput> for BundleJson {
+    fn from(output: agentenv_core::bundle::SkillBundleOutput) -> Self {
+        Self {
+            output_dir: output.output_dir,
+            skill_name: output.skill_name,
+            version: output.version,
+            bundle_digest: output.bundle_digest,
+            blueprint_digest: output.blueprint_digest,
+            lockfile_digest: output.lockfile_digest,
+        }
+    }
 }
 
 fn resolve_source(args: &BundleArgs) -> Result<BundleSource> {
