@@ -167,6 +167,16 @@ pub fn classify_answer(config: &DnsGuardConfig, answer: DnsAnswerSet) -> DnsQuer
             reason_code: Some("dns_query_not_allowed"),
         };
     }
+    if answer
+        .cname_chain
+        .iter()
+        .any(|name| classify_query(config, name, &answer.qtype).action == DnsQueryAction::Deny)
+    {
+        return DnsQueryDecision {
+            action: DnsQueryAction::Deny,
+            reason_code: Some("dns_cname_not_allowed"),
+        };
+    }
     if answer.ips.iter().any(|ip| is_denied_answer_ip(*ip)) {
         return DnsQueryDecision {
             action: DnsQueryAction::Deny,
@@ -190,6 +200,12 @@ pub fn classify_answer_with_pins(
     }
 
     if config.pin_resolved_ips {
+        if !answer.ips.is_empty() && answer.ttl_seconds == 0 {
+            return DnsQueryDecision {
+                action: DnsQueryAction::Deny,
+                reason_code: Some("dns_zero_ttl_denied"),
+            };
+        }
         if pins.answer_rebinds(&answer) {
             return DnsQueryDecision {
                 action: DnsQueryAction::Deny,
@@ -471,6 +487,18 @@ mod tests {
     }
 
     #[test]
+    fn cname_chain_outside_allowlist_is_denied() {
+        let config = config_with_allowed_names(["api.github.com"]);
+        let mut answer = answer_with_ip("api.github.com", "A", "93.184.216.34");
+        answer.cname_chain = vec!["attacker.example".to_owned()];
+
+        let decision = classify_answer(&config, answer);
+
+        assert_eq!(decision.action, DnsQueryAction::Deny);
+        assert_eq!(decision.reason_code, Some("dns_cname_not_allowed"));
+    }
+
+    #[test]
     fn ipv6_ula_answer_is_denied() {
         let config = config_with_allowed_names(["api.github.com"]);
         let answer = answer_with_ip("api.github.com", "AAAA", "fd00::1");
@@ -544,6 +572,20 @@ mod tests {
         assert_eq!(first.action, DnsQueryAction::Allow);
         assert_eq!(second.action, DnsQueryAction::Deny);
         assert_eq!(second.reason_code, Some("dns_rebinding_detected"));
+    }
+
+    #[test]
+    fn pinned_answer_rejects_zero_ttl_public_ip() {
+        let mut config = config_with_allowed_names(["api.github.com"]);
+        config.pin_resolved_ips = true;
+        let mut pins = DnsPinStore::default();
+        let mut answer = answer_with_ip("api.github.com", "A", "93.184.216.34");
+        answer.ttl_seconds = 0;
+
+        let decision = classify_answer_with_pins(&config, &mut pins, answer);
+
+        assert_eq!(decision.action, DnsQueryAction::Deny);
+        assert_eq!(decision.reason_code, Some("dns_zero_ttl_denied"));
     }
 
     #[tokio::test]

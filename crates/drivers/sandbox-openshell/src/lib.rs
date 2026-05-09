@@ -83,6 +83,7 @@ const DNS_GUARD_HOST_BIN_ENV: &str = "AGENTENV_OPEN_SHELL_DNS_GUARD_BIN";
 const DNS_GUARD_LISTENER_NAMESERVER: &str = "127.0.0.1";
 const DNS_GUARD_FALLBACK_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 const DNS_GUARD_PIDFILE: &str = "/etc/agentenv/dns-guard.pid";
+const DNS_GUARD_LOG_PATH: &str = "/var/log/agentenv-openshell-dns-guard.log";
 const DNS_GUARD_RESOLV_BACKUP_PATH: &str = "/etc/agentenv/resolv.conf.pre-agentenv-dns-guard";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,8 +979,9 @@ impl SandboxDriver for OpenShellDriver {
             });
         }
 
-        let mut args = vec!["logs".to_owned(), params.handle];
-        if let Some(since) = params.since {
+        let handle = params.handle;
+        let mut args = vec!["logs".to_owned(), handle.clone()];
+        if let Some(since) = params.since.clone() {
             args.push("--since".to_owned());
             args.push(since);
         }
@@ -987,9 +989,17 @@ impl SandboxDriver for OpenShellDriver {
             args,
             env: BTreeMap::new(),
         })?;
+        let mut stdout = output.stdout;
+        if self
+            .current_policy_for_handle(&handle)
+            .is_some_and(|policy| policy.network.dns.is_active())
+        {
+            let guard_output = self.run_checked_command(dns_guard_log_command(&handle))?;
+            append_log_stdout(&mut stdout, &guard_output.stdout);
+        }
 
         Ok(LogsResult {
-            entries: parse_log_entries(&output.stdout),
+            entries: parse_log_entries(&stdout),
         })
     }
 
@@ -2883,7 +2893,7 @@ fn dns_guard_command(handle: &str) -> CommandRequest {
          fi; \
          rm -f \"$pidfile\"; \
          chmod 0700 {DNS_GUARD_SANDBOX_BIN_PATH}; \
-         nohup {DNS_GUARD_SANDBOX_BIN_PATH} {config_path} >/var/log/agentenv-openshell-dns-guard.log 2>&1 & \
+         nohup {DNS_GUARD_SANDBOX_BIN_PATH} {config_path} >{DNS_GUARD_LOG_PATH} 2>&1 & \
          pid=$!; \
          printf '%s\\n' \"$pid\" > \"$pidfile\"; \
          i=0; \
@@ -2912,6 +2922,23 @@ fn dns_guard_command(handle: &str) -> CommandRequest {
     command_request(&[
         "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
     ])
+}
+
+fn dns_guard_log_command(handle: &str) -> CommandRequest {
+    let script = format!("if [ -r {DNS_GUARD_LOG_PATH} ]; then cat {DNS_GUARD_LOG_PATH}; fi");
+    command_request(&[
+        "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
+    ])
+}
+
+fn append_log_stdout(base: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    if !base.is_empty() && !base.ends_with('\n') {
+        base.push('\n');
+    }
+    base.push_str(extra);
 }
 
 fn dns_guard_stop_command(handle: &str) -> CommandRequest {
@@ -10605,6 +10632,64 @@ mod driver_tests {
         assert_eq!(logs.entries[0].level, LogLevel::Info);
         assert_eq!(
             logs.entries[0].kv.get("egress_denied"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn logs_include_dns_guard_denials_for_active_dns_policy() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "openshell",
+                &["logs", "sb-2"],
+                Some(0),
+                "plain info line",
+                "",
+            ),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-2",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                ],
+                Some(0),
+                "dns_guard sandbox_handle=sb-2 query_name=secret.example qtype=A upstream=1.1.1.1:53 cname_chain=- answers=- ttl=- action=deny reason=dns_query_not_allowed",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner);
+        let registry = PresetRegistry::load_builtin().expect("load presets");
+        let mut policy = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
+        policy.network.dns.resolvers_allowed = vec!["1.1.1.1".to_owned()];
+        driver.store_current_policy("sb-2".to_owned(), policy);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let logs = runtime
+            .block_on(async {
+                driver
+                    .logs(LogsParams {
+                        handle: "sb-2".to_owned(),
+                        since: None,
+                        follow: false,
+                    })
+                    .await
+            })
+            .expect("logs");
+
+        assert_eq!(logs.entries.len(), 2);
+        assert_eq!(
+            logs.entries[1].kv.get("egress_denied"),
             Some(&Value::Bool(true))
         );
     }
