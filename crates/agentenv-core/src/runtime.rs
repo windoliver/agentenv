@@ -414,6 +414,13 @@ pub struct EnvDescription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenEnvBundleSource {
+    pub env_name: String,
+    pub blueprint_yaml: String,
+    pub lockfile_yaml: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverHealthSummary {
     pub healthy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1687,6 +1694,19 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     }
 
     Ok(lockfile.to_yaml_deterministic()?)
+}
+
+pub fn freeze_env_for_bundle(
+    options: &RuntimeOptions,
+    name: &str,
+) -> RuntimeResult<FrozenEnvBundleSource> {
+    let description = describe_env(options, name)?;
+    let lockfile_yaml = freeze_env_lockfile(options, name)?;
+    Ok(FrozenEnvBundleSource {
+        env_name: description.state.name,
+        blueprint_yaml: description.blueprint_yaml,
+        lockfile_yaml,
+    })
 }
 
 fn portable_lockfile_matches_env_blueprint(
@@ -4798,9 +4818,9 @@ mod tests {
 
     use super::{
         approval_coordinator_for_env, component_spec, env_approval_overlay_path,
-        env_approval_proposals_path, env_events_db_path, initialize_context_driver,
-        initialize_sandbox_driver, DriverFactory, DriverSet, RuntimeError, RuntimeOptions,
-        RuntimeSecret,
+        env_approval_proposals_path, env_events_db_path, freeze_env_for_bundle,
+        initialize_context_driver, initialize_sandbox_driver, DriverFactory, DriverSet,
+        RuntimeError, RuntimeOptions, RuntimeSecret,
     };
 
     fn unique_root(prefix: &str) -> std::path::PathBuf {
@@ -4831,6 +4851,65 @@ mod tests {
             health: BTreeMap::new(),
             first_enter_hint_shown: false,
         }
+    }
+
+    #[test]
+    fn freeze_env_for_bundle_returns_persisted_blueprint_and_portable_lockfile() {
+        let root = unique_root("agentenv-runtime-freeze-bundle-source");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let env_dir = root.join("envs").join("demo");
+        fs::create_dir_all(&env_dir).unwrap();
+        let driver_version = env!("CARGO_PKG_VERSION");
+        fs::write(
+            env_dir.join("state.json"),
+            serde_json::json!({
+                "version": "0.1.0",
+                "name": "demo",
+                "phase": "running",
+                "created_at": "2026-05-09T00:00:00Z",
+                "updated_at": "2026-05-09T00:00:00Z",
+                "drivers": {
+                    "sandbox": {"name": "openshell", "version": driver_version},
+                    "agent": {"name": "codex", "version": driver_version},
+                    "context": {"name": "filesystem", "version": driver_version},
+                    "inference": {"name": "passthrough", "version": driver_version}
+                },
+                "handles": {},
+                "endpoints": {},
+                "first_enter_hint_shown": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let blueprint_yaml = r#"version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+        let lock_yaml = crate::lifecycle::freeze_from_blueprint_yaml(blueprint_yaml).unwrap();
+        fs::write(env_dir.join("lock.yaml"), lock_yaml).unwrap();
+
+        let frozen = freeze_env_for_bundle(&options, "demo").unwrap();
+
+        assert_eq!(frozen.env_name, "demo");
+        assert_eq!(frozen.blueprint_yaml, blueprint_yaml);
+        assert!(frozen.lockfile_yaml.contains("version: 0.2.0"));
+        assert!(frozen.lockfile_yaml.contains("name: demo"));
     }
 
     fn write_state_json(env_dir: &std::path::Path, state: crate::env::EnvStateFile) {
