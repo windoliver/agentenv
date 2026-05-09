@@ -42,6 +42,33 @@ uses the supported filesystem policy merge. Runtime hardening metadata is parsed
 and validated for future driver mappings; it is not currently translated into
 extra OpenShell CLI arguments.
 
+## DNS Egress Policy
+
+Blueprints may configure DNS egress under `policy.dns`:
+
+```yaml
+policy:
+  tier: restricted
+  presets: []
+  dns:
+    resolvers_allowed:
+      - 1.1.1.1
+      - 8.8.8.8
+    doh_upstreams_allowed:
+      - https://cloudflare-dns.com/dns-query
+      - https://dns.google/dns-query
+    dot_upstreams_allowed:
+      - 1.1.1.1:853
+    log_all_queries: true
+    pin_resolved_ips: true
+```
+
+`policy.dns` is enforced only by sandbox drivers that report
+`supports_dns_egress_control`. Empty DNS policy preserves legacy behavior.
+When DNS policy is active, the sandbox must use the driver-managed DNS guard,
+and direct DNS, DoT, or DoH bypass traffic must be denied. Drivers that cannot
+enforce those controls must report `supports_dns_egress_control = false`.
+
 ## Getting-Started Filesystem Blueprints
 
 `claude+filesystem+openshell.yaml`, `codex+filesystem+openshell.yaml`, and `openclaw+filesystem+openshell.yaml` mount `~/projects` through the filesystem context driver and expose it over MCP inside OpenShell. They are the lowest-friction templates because they do not require remote context infrastructure.
