@@ -1,9 +1,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use agentenv_core::skills::{
-    load_project_skills_config, load_user_skills_config, merge_skills_config, InstalledSkill,
-    InstalledSkillSelector, SkillAddRequest, SkillError, SkillPublishRequest, SkillSearchHit,
-    SkillService, SkillsConfig, SkillsConfigOverride,
+    execute_skill_prune, load_project_skills_config, load_skill_trust_keys,
+    load_user_skills_config, merge_skills_config, plan_skill_prune, rebuild_skill_index,
+    verify_all_installed_skills, InstalledSkill, InstalledSkillSelector, SkillAddRequest,
+    SkillCacheLayout, SkillError, SkillPublishRequest, SkillSearchHit, SkillService,
+    SkillVerifyOptions, SkillVerifyStatus, SkillsConfig, SkillsConfigOverride,
 };
 use agentenv_credstore::{CredentialStore, CredentialStoreError};
 use agentenv_proto::{CredentialKind, CredentialRequirement};
@@ -27,6 +29,7 @@ pub enum SkillsCommand {
     Remove(SkillsRemoveArgs),
     Publish(SkillsPublishArgs),
     Verify(SkillsVerifyArgs),
+    Prune(SkillsPruneArgs),
 }
 
 #[derive(Debug, Args)]
@@ -98,11 +101,19 @@ pub struct SkillsPublishArgs {
 
 #[derive(Debug, Args)]
 pub struct SkillsVerifyArgs {
-    pub name: String,
+    pub name: Option<String>,
     #[arg(long)]
     pub version: Option<String>,
     #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsPruneArgs {
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,12 +131,12 @@ pub async fn run_skills(args: SkillsArgs) -> Result<()> {
     let root = home.join(".agentenv");
     let registry_override = registry_override_for_command(&args.command);
     let config = load_effective_config(registry_override)?;
-    let service = SkillService::new(root, config)
+    let service = SkillService::new(root.clone(), config)
         .with_credential_resolver(Arc::new(resolve_skill_credential));
-    dispatch(args.command, service).await
+    dispatch(args.command, service, root).await
 }
 
-async fn dispatch(command: SkillsCommand, service: SkillService) -> Result<()> {
+async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) -> Result<()> {
     match command {
         SkillsCommand::Search(args) => {
             let hits = service.search(&args.query).await?;
@@ -200,9 +211,17 @@ async fn dispatch(command: SkillsCommand, service: SkillService) -> Result<()> {
             }
         }
         SkillsCommand::Verify(args) => {
-            let installed = service.verify(selector(args.name, args.version))?;
-            print_installed_result(&installed, args.json)
+            if args.all {
+                run_verify_all(&root, args.json)
+            } else {
+                let name = args.name.ok_or_else(|| {
+                    anyhow::anyhow!("`agentenv skills verify` requires a skill name or `--all`")
+                })?;
+                let installed = service.verify(selector(name, args.version))?;
+                print_installed_result(&installed, args.json)
+            }
         }
+        SkillsCommand::Prune(args) => run_prune(&root, args),
     }
 }
 
@@ -215,8 +234,69 @@ fn registry_override_for_command(command: &SkillsCommand) -> Option<String> {
         | SkillsCommand::List(_)
         | SkillsCommand::Info(_)
         | SkillsCommand::Remove(_)
-        | SkillsCommand::Verify(_) => None,
+        | SkillsCommand::Verify(_)
+        | SkillsCommand::Prune(_) => None,
     }
+}
+
+fn run_verify_all(root: &std::path::Path, json: bool) -> Result<()> {
+    if json {
+        bail!("`agentenv skills verify --all --json` is not supported yet");
+    }
+
+    let layout = SkillCacheLayout::new(root);
+    let trust_keys = load_skill_trust_keys(&layout).context("failed to load skill trust keys")?;
+    let report = verify_all_installed_skills(
+        &layout,
+        SkillVerifyOptions {
+            trust_keys,
+            ..Default::default()
+        },
+    )
+    .context("failed to verify installed skills")?;
+
+    for skill in &report.skills {
+        match skill.status {
+            SkillVerifyStatus::Passed => {
+                println!("verified {} {}", skill.name, skill.version);
+            }
+            SkillVerifyStatus::Failed => {
+                eprintln!("failed {} {}", skill.name, skill.version);
+                for error in &skill.errors {
+                    eprintln!("  error: {error}");
+                }
+            }
+        }
+        for warning in &skill.warnings {
+            eprintln!("  warning: {warning}");
+        }
+    }
+
+    if !report.is_ok() {
+        bail!("skill verification failed");
+    }
+    Ok(())
+}
+
+fn run_prune(root: &std::path::Path, args: SkillsPruneArgs) -> Result<()> {
+    let layout = SkillCacheLayout::new(root);
+    let plan = plan_skill_prune(&layout).context("failed to plan skill prune")?;
+
+    if args.dry_run {
+        for path in &plan.removed_archives {
+            println!("would remove {}", path.display());
+        }
+        println!(
+            "{} archive(s) would be removed",
+            plan.removed_archives.len()
+        );
+        return Ok(());
+    }
+
+    execute_skill_prune(&plan).context("failed to prune skill cache")?;
+    rebuild_skill_index(&layout).context("failed to rebuild skill index")?;
+    println!("removed {} archive(s)", plan.removed_archives.len());
+    Ok(())
 }
 
 fn load_effective_config(registry_override: Option<String>) -> Result<SkillsConfig> {

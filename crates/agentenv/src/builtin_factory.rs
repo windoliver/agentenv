@@ -1202,6 +1202,7 @@ mod tests {
             drivers,
             artifacts: BTreeMap::new(),
             credentials: BTreeMap::new(),
+            skills: Vec::new(),
         }
     }
 

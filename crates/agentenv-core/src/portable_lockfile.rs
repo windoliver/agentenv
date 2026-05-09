@@ -115,6 +115,7 @@ pub fn build_portable_lockfile(
         composition,
         policy,
         drivers: driver_pins(&resolved, &input.driver_artifacts)?,
+        skills: Vec::new(),
         artifacts,
         credentials,
     })

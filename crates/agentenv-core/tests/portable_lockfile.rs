@@ -1,7 +1,7 @@
 use agentenv_core::{
     driver_artifact::DriverArtifact,
     driver_catalog::DriverSource,
-    lockfile::{DriverSourcePin, LockfileDocument},
+    lockfile::{DriverSourcePin, LockfileDocument, SkillPin},
     portable_lockfile::{
         build_portable_lockfile, verify_portable_lockfile_yaml, PortableLockfileError,
         PortableLockfileInput, PortableVerifyIssueKind,
@@ -221,6 +221,74 @@ fn portable_lockfile_document_round_trips_builder_output() {
 
     let parsed = LockfileDocument::from_yaml(&rendered).expect("parse rendered lockfile");
     assert!(matches!(parsed, LockfileDocument::Portable(_)));
+}
+
+#[test]
+fn portable_lockfile_serializes_skill_pins_deterministically() {
+    let mut lockfile = reference_portable_lockfile();
+    lockfile.skills = vec![
+        SkillPin {
+            name: "zeta".to_owned(),
+            version: "2.0.0".to_owned(),
+            source: "file:///skills/zeta".to_owned(),
+            digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            signatures: Vec::new(),
+        },
+        SkillPin {
+            name: "alpha".to_owned(),
+            version: "1.0.0".to_owned(),
+            source: "oci://ghcr.io/agentenv-community/alpha:1.0.0".to_owned(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            signatures: vec!["ed25519:test-key:cccc".to_owned()],
+        },
+    ];
+
+    let rendered = lockfile.to_yaml_deterministic().expect("render lockfile");
+    let alpha_index = rendered.find("name: alpha").expect("alpha skill rendered");
+    let zeta_index = rendered.find("name: zeta").expect("zeta skill rendered");
+    assert!(
+        alpha_index < zeta_index,
+        "skills should serialize sorted: {rendered}"
+    );
+    assert!(rendered.contains("skills:"));
+    assert!(rendered.contains("ed25519:test-key:cccc"));
+
+    let reparsed = LockfileDocument::from_yaml(&rendered).expect("parse rendered lockfile");
+    let LockfileDocument::Portable(reparsed) = reparsed else {
+        panic!("expected portable lockfile");
+    };
+    assert_eq!(reparsed.skills[0].name, "alpha");
+    assert_eq!(reparsed.skills[1].name, "zeta");
+}
+
+#[test]
+fn portable_lockfile_rejects_duplicate_skill_pins() {
+    let mut lockfile = reference_portable_lockfile();
+    lockfile.skills = vec![
+        SkillPin {
+            name: "code-review".to_owned(),
+            version: "1.2.0".to_owned(),
+            source: "file:///skills/code-review".to_owned(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            signatures: Vec::new(),
+        },
+        SkillPin {
+            name: "code-review".to_owned(),
+            version: "1.2.0".to_owned(),
+            source: "file:///skills/code-review".to_owned(),
+            digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            signatures: Vec::new(),
+        },
+    ];
+
+    let err = lockfile
+        .to_yaml_deterministic()
+        .expect_err("duplicate skill pin should fail validation");
+    assert!(err.to_string().contains("duplicate skill pin"));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+pub mod cache;
 mod config;
 mod digest;
 mod error;
@@ -11,6 +12,13 @@ mod service;
 mod signature;
 mod store;
 
+pub use cache::{
+    execute_skill_prune, load_skill_trust_keys, plan_skill_prune, rebuild_skill_index,
+    verify_all_installed_skills, verify_skill_pins, SkillArchive, SkillCacheError,
+    SkillCacheLayout, SkillIndex, SkillIndexEntry, SkillProvenance, SkillProvenanceSubject,
+    SkillPrunePlan, SkillSelfTest, SkillSelfTestAssertion, SkillTrustKey, SkillVerifyEntry,
+    SkillVerifyOptions, SkillVerifyReport, SkillVerifyStatus, SKILL_METADATA_SCHEMA_VERSION,
+};
 pub use config::{
     load_project_skills_config, load_user_skills_config, merge_skills_config, SkillsConfig,
     SkillsConfigOverride,

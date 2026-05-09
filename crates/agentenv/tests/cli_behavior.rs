@@ -424,13 +424,142 @@ fn skills_help_lists_lifecycle_subcommands() {
     assert!(output.status.success(), "{}", output_summary(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
     for command in [
-        "search", "add", "install", "list", "info", "remove", "publish", "verify",
+        "search", "add", "install", "list", "info", "remove", "publish", "verify", "prune",
     ] {
         assert!(
             stdout.contains(command),
             "missing {command}; stdout was: {stdout}"
         );
     }
+}
+
+#[test]
+fn skills_verify_all_succeeds_for_valid_local_cache() {
+    let temp_dir = make_temp_dir("skills-verify-valid");
+    write_cli_cache_skill(
+        &temp_dir,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verified"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_verify_all_prints_warnings_for_passed_skills() {
+    let temp_dir = make_temp_dir("skills-verify-passed-warning");
+    write_cli_cache_skill(
+        &temp_dir,
+        "missing-archive",
+        "1.0.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning:"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("extracted tree digest"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_verify_all_fails_for_broken_local_cache() {
+    let temp_dir = make_temp_dir("skills-verify-broken");
+    write_cli_cache_skill(
+        &temp_dir,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        false,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_prune_dry_run_does_not_delete_archive() {
+    let temp_dir = make_temp_dir("skills-prune-dry-run");
+    let root = temp_dir.join(".agentenv");
+    let cache_dir = root.join("cache/skills");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let archive =
+        cache_dir.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.tar.zst");
+    fs::write(&archive, b"unreferenced").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("prune")
+        .arg("--dry-run")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(archive.exists(), "dry-run should not delete archive");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("would remove"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_prune_deletes_unreferenced_archive() {
+    let temp_dir = make_temp_dir("skills-prune-delete");
+    let root = temp_dir.join(".agentenv");
+    let cache_dir = root.join("cache/skills");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let archive =
+        cache_dir.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.tar.zst");
+    fs::write(&archive, b"unreferenced").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("prune")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(
+        !archive.exists(),
+        "prune should delete unreferenced archive"
+    );
 }
 
 #[test]
@@ -3749,6 +3878,65 @@ fn make_executable(path: &Path) {
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
     }
+}
+
+fn write_cli_cache_skill(
+    home: &Path,
+    name: &str,
+    version: &str,
+    digest: &str,
+    matching_skill_md: bool,
+) {
+    let skill_dir = home
+        .join(".agentenv")
+        .join("skills")
+        .join(name)
+        .join(version);
+    fs::create_dir_all(skill_dir.join(".agentenv")).unwrap();
+    let skill_md_name = if matching_skill_md {
+        name
+    } else {
+        "different-name"
+    };
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {skill_md_name}\nversion: {version}\n---\n# {name}\n"),
+    )
+    .unwrap();
+    let hex = digest.strip_prefix("sha256:").unwrap();
+    fs::write(
+        skill_dir.join(".agentenv/manifest.json"),
+        format!(
+            r#"{{
+  "schema_version": "0.1",
+  "name": "{name}",
+  "version": "{version}",
+  "source": "file:///skills/{name}",
+  "digest": "{digest}",
+  "signatures": [],
+  "archive": {{
+    "digest": "{digest}",
+    "cache_key": "{hex}.tar.zst"
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        skill_dir.join(".agentenv/provenance.json"),
+        format!(
+            r#"{{
+  "schema_version": "0.1",
+  "subject": {{
+    "name": "{name}",
+    "version": "{version}",
+    "digest": "{digest}"
+  }},
+  "attestations": []
+}}"#
+        ),
+    )
+    .unwrap();
 }
 
 fn write_local_skill_bundle(
