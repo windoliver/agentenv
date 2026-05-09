@@ -59,6 +59,49 @@ fn freeze_persisted_env_writes_default_lockfile() {
 }
 
 #[test]
+fn bundle_help_lists_as_skill_and_out_flags() {
+    let temp_dir = make_temp_dir("bundle-help");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("--help")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--as-skill"), "stdout was: {stdout}");
+    assert!(stdout.contains("--out"), "stdout was: {stdout}");
+}
+
+#[test]
+fn bundle_as_skill_rejects_missing_env() {
+    let temp_dir = make_temp_dir("bundle-missing-env");
+    let out_dir = temp_dir.join("bundle-out");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("missing-env")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-env"), "stderr was: {stderr}");
+}
+
+#[test]
 fn fork_reports_capability_missing_for_openshell() {
     let temp_dir = make_temp_dir("fork-openshell-unsupported");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
