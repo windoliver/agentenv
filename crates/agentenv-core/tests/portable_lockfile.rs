@@ -441,6 +441,92 @@ fn portable_lockfile_parse_accepts_resolved_network_dns_policy() {
 }
 
 #[test]
+fn portable_lockfile_round_trips_declared_dns_policy() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+  dns:
+    resolvers_allowed: [8.8.8.8, 1.1.1.1, 1.1.1.1]
+    doh_upstreams_allowed: [https://dns.google/dns-query, https://dns.google/dns-query]
+    dot_upstreams_allowed: [1.1.1.1:853, 1.1.1.1:853]
+    log_all_queries: true
+    pin_resolved_ips: true
+"#;
+
+    let lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: yaml.to_owned(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("freeze blueprint with dns policy")
+    .to_yaml_deterministic()
+    .expect("render portable lockfile");
+    let parsed = agentenv_core::lockfile::LockfileDocument::from_yaml(&lockfile)
+        .expect("parse portable lockfile");
+    let agentenv_core::lockfile::LockfileDocument::Portable(lockfile) = parsed else {
+        panic!("expected portable lockfile");
+    };
+
+    assert_eq!(
+        lockfile.policy.resolved.network.dns.resolvers_allowed,
+        vec!["1.1.1.1", "8.8.8.8"]
+    );
+    assert_eq!(
+        lockfile.policy.resolved.network.dns.doh_upstreams_allowed,
+        vec!["https://dns.google/dns-query"]
+    );
+    assert_eq!(
+        lockfile.policy.resolved.network.dns.dot_upstreams_allowed,
+        vec!["1.1.1.1:853"]
+    );
+    assert!(lockfile.policy.resolved.network.dns.log_all_queries);
+    assert!(lockfile.policy.resolved.network.dns.pin_resolved_ips);
+}
+
+#[test]
+fn portable_lockfile_builder_rejects_unknown_declared_dns_policy_field() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+policy:
+  tier: restricted
+  presets: []
+  dns:
+    resolver_allowed: [8.8.8.8]
+"#;
+
+    let error = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: yaml.to_owned(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect_err("unknown dns policy fields should be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unknown field `resolver_allowed`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn portable_lockfile_verify_rejects_artifact_map_mismatch() {
     let mut lockfile = build_portable_lockfile(PortableLockfileInput {
         name: "demo".to_owned(),

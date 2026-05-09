@@ -547,7 +547,7 @@ fn resolved_policy_for_composition(
     let mut policy = compose_policy(
         parse_tier(&composition.policy.tier)?,
         &parse_presets(&composition.policy.presets)?,
-        policy_overrides(&composition.policy.overrides),
+        policy_overrides(&composition.policy),
         &PresetRegistry::load_builtin()?,
     )?;
     apply_portable_hardening_to_policy(&mut policy, composition)?;
@@ -643,27 +643,33 @@ fn parse_presets(values: &[String]) -> Result<Vec<PresetSelection>, agentenv_pol
         .collect()
 }
 
-fn policy_overrides(overrides: &[crate::blueprint::PolicyOverride]) -> Option<NetworkPolicy> {
-    if overrides.is_empty() {
+fn policy_overrides(policy: &crate::blueprint::PolicySection) -> Option<NetworkPolicy> {
+    if policy.overrides.is_empty() && policy_dns_override(policy).is_none() {
         return None;
     }
 
-    let mut policy = empty_policy_override();
-    for item in overrides {
+    let mut override_policy = empty_policy_override();
+    for item in &policy.overrides {
         if let Some(allow) = item.allow.as_ref() {
-            policy.network.allow.push(policy_override_network_rule(
-                allow,
-                PolicyOverrideTargetKind::AllowOrDeny,
-            ));
+            override_policy
+                .network
+                .allow
+                .push(policy_override_network_rule(
+                    allow,
+                    PolicyOverrideTargetKind::AllowOrDeny,
+                ));
         }
         if let Some(deny) = item.deny.as_ref() {
-            policy.network.deny.push(policy_override_network_rule(
-                deny,
-                PolicyOverrideTargetKind::AllowOrDeny,
-            ));
+            override_policy
+                .network
+                .deny
+                .push(policy_override_network_rule(
+                    deny,
+                    PolicyOverrideTargetKind::AllowOrDeny,
+                ));
         }
         if let Some(approval) = item.approval.as_ref() {
-            policy
+            override_policy
                 .network
                 .approval_required
                 .push(policy_override_network_rule(
@@ -672,8 +678,23 @@ fn policy_overrides(overrides: &[crate::blueprint::PolicyOverride]) -> Option<Ne
                 ));
         }
     }
+    if let Some(dns) = policy_dns_override(policy) {
+        override_policy.network.dns = dns;
+    }
 
-    Some(policy)
+    Some(override_policy)
+}
+
+fn policy_dns_override(
+    policy: &crate::blueprint::PolicySection,
+) -> Option<agentenv_proto::DnsPolicy> {
+    policy.dns.as_ref().map(|dns| agentenv_proto::DnsPolicy {
+        resolvers_allowed: dns.resolvers_allowed.clone(),
+        doh_upstreams_allowed: dns.doh_upstreams_allowed.clone(),
+        dot_upstreams_allowed: dns.dot_upstreams_allowed.clone(),
+        log_all_queries: dns.log_all_queries,
+        pin_resolved_ips: dns.pin_resolved_ips,
+    })
 }
 
 enum PolicyOverrideTargetKind {
