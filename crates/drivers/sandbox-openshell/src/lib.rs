@@ -46,6 +46,7 @@ use semver::Version;
 use uuid::Uuid;
 
 mod build_cache;
+pub mod dns_guard;
 
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "sandbox-openshell";

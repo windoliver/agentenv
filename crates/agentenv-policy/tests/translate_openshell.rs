@@ -283,6 +283,27 @@ fn readwrite_presets_translate_to_read_write_access() {
 }
 
 #[test]
+fn openshell_translation_keeps_dns_upstreams_out_of_agent_visible_allow_rules() {
+    let mut policy = supported_policy();
+    policy.network.dns = agentenv_proto::DnsPolicy {
+        resolvers_allowed: vec!["1.1.1.1".to_owned()],
+        doh_upstreams_allowed: vec!["https://dns.google/dns-query".to_owned()],
+        dot_upstreams_allowed: vec!["1.1.1.1:853".to_owned()],
+        log_all_queries: true,
+        pin_resolved_ips: true,
+    };
+
+    let translated = translator().translate(&policy).expect("translate policy");
+
+    assert!(!translated.policy_yaml.contains("dns.google"));
+    assert!(!translated.policy_yaml.contains("1.1.1.1"));
+    assert_eq!(
+        endpoint_access(&translated.policy_yaml, "api.github.com"),
+        Some("read-only".to_owned())
+    );
+}
+
+#[test]
 fn persisted_home_marker_translates_to_absolute_sandbox_home() {
     let mut policy = supported_policy();
     policy.filesystem.read_write.push("$HOME".to_owned());
