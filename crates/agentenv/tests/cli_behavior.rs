@@ -451,6 +451,106 @@ fn bundle_json_outputs_digest_summary() {
 }
 
 #[test]
+fn bundle_as_skill_json_output_installs_as_local_skill() {
+    let temp_dir = make_temp_dir("bundle-json-install");
+    write_minimal_env_state(&temp_dir, "demo");
+    let output_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&output_dir)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.stdout.ends_with(b"\n"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let keys = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "blueprint_digest",
+            "bundle_digest",
+            "lockfile_digest",
+            "output_dir",
+            "skill_name",
+            "version",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(json["output_dir"], output_dir.to_str().unwrap());
+    assert_eq!(json["skill_name"], "demo");
+    assert_eq!(json["version"], "1.0.0");
+    assert!(json["bundle_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(json["blueprint_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(json["lockfile_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&output_dir)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("demo")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn fork_reports_capability_missing_for_openshell() {
     let temp_dir = make_temp_dir("fork-openshell-unsupported");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");
