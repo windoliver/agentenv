@@ -9,6 +9,8 @@ use crate::security::ssrf::{
 
 #[derive(Debug, Error)]
 pub enum DnsPolicyError {
+    #[error("active DNS policy requires at least one DNS upstream")]
+    MissingUpstream,
     #[error("DNS resolver `{value}` at `{path}` failed SSRF validation: {source}")]
     ResolverBlocked {
         path: String,
@@ -39,6 +41,14 @@ pub enum DnsPolicyError {
 }
 
 pub fn validate_dns_policy(policy: &agentenv_proto::DnsPolicy) -> Result<(), DnsPolicyError> {
+    if policy.is_active()
+        && policy.resolvers_allowed.is_empty()
+        && policy.doh_upstreams_allowed.is_empty()
+        && policy.dot_upstreams_allowed.is_empty()
+    {
+        return Err(DnsPolicyError::MissingUpstream);
+    }
+
     for (index, resolver) in policy.resolvers_allowed.iter().enumerate() {
         validate_resolver(resolver, &format!("policy.dns.resolvers_allowed[{index}]"))?;
     }

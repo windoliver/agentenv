@@ -17,9 +17,29 @@ pub struct DnsGuardConfig {
     pub resolvers_allowed: Vec<String>,
     pub doh_upstreams_allowed: Vec<String>,
     pub dot_upstreams_allowed: Vec<String>,
+    #[serde(default)]
+    pub resolver_endpoints: Vec<String>,
+    #[serde(default)]
+    pub doh_upstreams: Vec<DnsGuardDohUpstream>,
+    #[serde(default)]
+    pub dot_upstreams: Vec<DnsGuardDotUpstream>,
     pub allowed_query_names: BTreeSet<String>,
     pub log_all_queries: bool,
     pub pin_resolved_ips: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsGuardDohUpstream {
+    pub url: String,
+    pub host: String,
+    pub connect_addr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsGuardDotUpstream {
+    pub host: String,
+    pub port: u16,
+    pub connect_addr: String,
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +117,9 @@ impl DnsGuardConfig {
             resolvers_allowed: dns.resolvers_allowed.clone(),
             doh_upstreams_allowed: dns.doh_upstreams_allowed.clone(),
             dot_upstreams_allowed: dns.dot_upstreams_allowed.clone(),
+            resolver_endpoints: Vec::new(),
+            doh_upstreams: Vec::new(),
+            dot_upstreams: Vec::new(),
             allowed_query_names: allowed_query_names(policy),
             log_all_queries: dns.log_all_queries,
             pin_resolved_ips: dns.pin_resolved_ips,
@@ -154,6 +177,29 @@ pub fn classify_answer(config: &DnsGuardConfig, answer: DnsAnswerSet) -> DnsQuer
         action: DnsQueryAction::Allow,
         reason_code: None,
     }
+}
+
+pub fn classify_answer_with_pins(
+    config: &DnsGuardConfig,
+    pins: &mut DnsPinStore,
+    answer: DnsAnswerSet,
+) -> DnsQueryDecision {
+    let decision = classify_answer(config, answer.clone());
+    if decision.action == DnsQueryAction::Deny {
+        return decision;
+    }
+
+    if config.pin_resolved_ips {
+        if pins.answer_rebinds(&answer) {
+            return DnsQueryDecision {
+                action: DnsQueryAction::Deny,
+                reason_code: Some("dns_rebinding_detected"),
+            };
+        }
+        pins.record_answer(&answer);
+    }
+
+    decision
 }
 
 pub async fn resolve_allowed_query(
@@ -244,6 +290,49 @@ impl DnsPinStore {
             .get(host)
             .is_some_and(|pin| pin.expires_at > Instant::now() && pin.ips.contains(&ip))
     }
+
+    pub fn record_answer(&mut self, answer: &DnsAnswerSet) {
+        if answer.ips.is_empty() || answer.ttl_seconds == 0 {
+            return;
+        }
+        self.record_key(
+            answer_pin_key(&answer.query_name, &answer.qtype),
+            answer.ips.iter().copied().collect(),
+            answer.ttl_seconds,
+        );
+    }
+
+    pub fn answer_rebinds(&self, answer: &DnsAnswerSet) -> bool {
+        let Some(pin) = self
+            .pins
+            .get(&answer_pin_key(&answer.query_name, &answer.qtype))
+        else {
+            return false;
+        };
+        if pin.expires_at <= Instant::now() || answer.ips.is_empty() {
+            return false;
+        }
+        let next_ips = answer.ips.iter().copied().collect::<BTreeSet<_>>();
+        next_ips != pin.ips
+    }
+
+    fn record_key(&mut self, key: String, ips: BTreeSet<IpAddr>, ttl_seconds: u32) {
+        self.pins.insert(
+            key,
+            DnsPin {
+                ips,
+                expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_seconds)),
+            },
+        );
+    }
+}
+
+fn answer_pin_key(query_name: &str, qtype: &str) -> String {
+    format!(
+        "{}|{}",
+        normalize_dns_name(query_name),
+        qtype.to_ascii_uppercase()
+    )
 }
 
 #[cfg(test)]
@@ -441,6 +530,22 @@ mod tests {
         assert!(!pins.connection_allowed("api.github.com", "93.184.216.35".parse().expect("ip")));
     }
 
+    #[test]
+    fn pinned_answer_blocks_rebinding_mismatch_while_fresh() {
+        let mut config = config_with_allowed_names(["api.github.com"]);
+        config.pin_resolved_ips = true;
+        let mut pins = DnsPinStore::default();
+        let original = answer_with_ip("api.github.com", "A", "93.184.216.34");
+        let rebound = answer_with_ip("api.github.com", "A", "93.184.216.35");
+
+        let first = classify_answer_with_pins(&config, &mut pins, original);
+        let second = classify_answer_with_pins(&config, &mut pins, rebound);
+
+        assert_eq!(first.action, DnsQueryAction::Allow);
+        assert_eq!(second.action, DnsQueryAction::Deny);
+        assert_eq!(second.reason_code, Some("dns_rebinding_detected"));
+    }
+
     #[tokio::test]
     async fn allowed_query_is_forwarded_to_configured_classic_resolver() {
         let config = config_with_allowed_names(["api.github.com"]);
@@ -535,6 +640,9 @@ mod tests {
             resolvers_allowed: vec!["1.1.1.1".to_owned()],
             doh_upstreams_allowed: Vec::new(),
             dot_upstreams_allowed: Vec::new(),
+            resolver_endpoints: Vec::new(),
+            doh_upstreams: Vec::new(),
+            dot_upstreams: Vec::new(),
             allowed_query_names: names.into_iter().map(str::to_owned).collect(),
             log_all_queries: false,
             pin_resolved_ips: false,

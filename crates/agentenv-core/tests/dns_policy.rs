@@ -178,6 +178,19 @@ fn valid_dot_endpoint_is_accepted() {
 }
 
 #[test]
+fn active_dns_policy_without_upstream_is_rejected() {
+    let policy = DnsPolicy {
+        log_all_queries: true,
+        pin_resolved_ips: true,
+        ..DnsPolicy::default()
+    };
+
+    let err = validate_dns_policy(&policy).expect_err("active DNS policy needs an upstream");
+
+    assert!(matches!(err, DnsPolicyError::MissingUpstream));
+}
+
+#[test]
 fn lifecycle_rejects_declared_private_dns_resolver() {
     let yaml = r#"
 version: 0.1.0

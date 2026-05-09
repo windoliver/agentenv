@@ -5,6 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     io::Write,
+    net::{IpAddr, SocketAddr},
     path::Component,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -25,6 +26,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use agentenv_core::{
     digest::parse_sha256_digest,
     driver::{DriverError, DriverResult, SandboxDriver},
+    security::ssrf::{
+        validate_outbound_with_resolver, DnsResolver, SsrfOptions, SystemDnsResolver,
+    },
 };
 use agentenv_events::{
     ActivityEvent, ActivityKind, ActivityResult, EventEmitter, NoopEventEmitter,
@@ -43,6 +47,7 @@ use agentenv_proto::{
     SCHEMA_VERSION,
 };
 use semver::Version;
+use url::Url;
 use uuid::Uuid;
 
 mod build_cache;
@@ -73,6 +78,8 @@ const TMUX_SESSION_FORMAT: &str =
     "#{session_name}\t#{session_attached}\t#{session_created}\t#{@agentenv_handle}\t#{@agentenv_session_name}\t#{@agentenv_command}";
 const DEFAULT_HARDENING_DOCKERFILE_MARKER: &str = "AGENTENV_HARDENING_PROFILE=custom";
 const DNS_GUARD_CONFIG_PATH: &str = "/etc/agentenv/dns-guard.json";
+const DNS_GUARD_SANDBOX_BIN_PATH: &str = "/etc/agentenv/agentenv-openshell-dns-guard";
+const DNS_GUARD_HOST_BIN_ENV: &str = "AGENTENV_OPEN_SHELL_DNS_GUARD_BIN";
 const DNS_GUARD_LISTENER_NAMESERVER: &str = "127.0.0.1";
 const DNS_GUARD_FALLBACK_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 const DNS_GUARD_PIDFILE: &str = "/etc/agentenv/dns-guard.pid";
@@ -1651,9 +1658,10 @@ impl OpenShellDriver {
                 message: err.to_string(),
             }
         })?;
-        let Some(config) = config else {
+        let Some(mut config) = config else {
             return Ok(None);
         };
+        materialize_dns_guard_upstreams(&mut config)?;
         let config_json =
             serde_json::to_string(&config).map_err(|err| DriverError::PolicyTranslation {
                 message: format!("failed to serialize DNS guard config: {err}"),
@@ -1676,7 +1684,6 @@ impl OpenShellDriver {
         let Some(temp_config_file) = self.write_dns_guard_temp_file(handle, policy)? else {
             return Ok(());
         };
-
         self.run_checked_command(command_request(&[
             "sandbox",
             "upload",
@@ -1684,6 +1691,17 @@ impl OpenShellDriver {
             &temp_config_file.path().to_string_lossy(),
             &dns_guard_config_path(handle),
         ]))?;
+        if self.runner.uses_host_environment() {
+            let guard_binary = dns_guard_binary_host_path()?;
+            let guard_binary_path = guard_binary.to_string_lossy().into_owned();
+            self.run_checked_command(command_request(&[
+                "sandbox",
+                "upload",
+                handle,
+                &guard_binary_path,
+                DNS_GUARD_SANDBOX_BIN_PATH,
+            ]))?;
+        }
         if rewrite_resolv_conf {
             self.run_checked_command(dns_guard_resolv_conf_command(handle))?;
         }
@@ -2647,6 +2665,185 @@ fn command_string(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+fn materialize_dns_guard_upstreams(config: &mut dns_guard::DnsGuardConfig) -> DriverResult<()> {
+    materialize_dns_guard_upstreams_with_resolver(config, &SystemDnsResolver)
+}
+
+fn materialize_dns_guard_upstreams_with_resolver(
+    config: &mut dns_guard::DnsGuardConfig,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<()> {
+    config.resolver_endpoints = config
+        .resolvers_allowed
+        .iter()
+        .map(|upstream| materialize_classic_resolver_endpoint(upstream, resolver))
+        .collect::<DriverResult<Vec<_>>>()?;
+    config.doh_upstreams = config
+        .doh_upstreams_allowed
+        .iter()
+        .map(|upstream| materialize_doh_upstream(upstream, resolver))
+        .collect::<DriverResult<Vec<_>>>()?;
+    config.dot_upstreams = config
+        .dot_upstreams_allowed
+        .iter()
+        .map(|upstream| materialize_dot_upstream(upstream, resolver))
+        .collect::<DriverResult<Vec<_>>>()?;
+
+    Ok(())
+}
+
+fn materialize_classic_resolver_endpoint(
+    upstream: &str,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<String> {
+    let host = upstream.trim_end_matches('.');
+    let validated = validate_dns_upstream_host(host, 53, resolver)?;
+    let ip = first_pinned_ip(host, &validated.pinned_ips)?;
+    Ok(SocketAddr::new(ip, 53).to_string())
+}
+
+fn materialize_doh_upstream(
+    upstream: &str,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<dns_guard::DnsGuardDohUpstream> {
+    let url = Url::parse(upstream).map_err(|err| DriverError::PolicyTranslation {
+        message: format!("invalid DNS-over-HTTPS upstream `{upstream}`: {err}"),
+    })?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| DriverError::PolicyTranslation {
+            message: format!("invalid DNS-over-HTTPS upstream `{upstream}`: missing host"),
+        })?
+        .to_owned();
+    let validated = validate_outbound_with_resolver(&url, SsrfOptions::default(), resolver)
+        .map_err(|err| DriverError::PolicyTranslation {
+            message: format!("DNS-over-HTTPS upstream `{upstream}` failed SSRF validation: {err}"),
+        })?;
+    let connect_addr = if host.parse::<IpAddr>().is_ok() {
+        None
+    } else {
+        let ip = first_pinned_ip(&host, &validated.pinned_ips)?;
+        Some(SocketAddr::new(ip, url.port_or_known_default().unwrap_or(443)).to_string())
+    };
+
+    Ok(dns_guard::DnsGuardDohUpstream {
+        url: url.to_string(),
+        host,
+        connect_addr,
+    })
+}
+
+fn materialize_dot_upstream(
+    upstream: &str,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<dns_guard::DnsGuardDotUpstream> {
+    let parsed =
+        Url::parse(&format!("dot://{upstream}")).map_err(|err| DriverError::PolicyTranslation {
+            message: format!("invalid DNS-over-TLS upstream `{upstream}`: {err}"),
+        })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| DriverError::PolicyTranslation {
+            message: format!("invalid DNS-over-TLS upstream `{upstream}`: missing host"),
+        })?
+        .to_owned();
+    let port = parsed.port().unwrap_or(853);
+    let validated = validate_dns_upstream_host(&host, port, resolver)?;
+    let ip = first_pinned_ip(&host, &validated.pinned_ips)?;
+
+    Ok(dns_guard::DnsGuardDotUpstream {
+        host,
+        port,
+        connect_addr: SocketAddr::new(ip, port).to_string(),
+    })
+}
+
+fn validate_dns_upstream_host(
+    host: &str,
+    port: u16,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<agentenv_core::security::ssrf::ValidatedUrl> {
+    let authority = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.to_owned(),
+    };
+    let url = Url::parse(&format!("http://{authority}:{port}/")).map_err(|err| {
+        DriverError::PolicyTranslation {
+            message: format!("invalid DNS upstream `{host}`: {err}"),
+        }
+    })?;
+    validate_outbound_with_resolver(&url, SsrfOptions::default(), resolver).map_err(|err| {
+        DriverError::PolicyTranslation {
+            message: format!("DNS upstream `{host}` failed SSRF validation: {err}"),
+        }
+    })
+}
+
+fn first_pinned_ip(host: &str, pinned_ips: &[IpAddr]) -> DriverResult<IpAddr> {
+    pinned_ips
+        .first()
+        .copied()
+        .ok_or_else(|| DriverError::PolicyTranslation {
+            message: format!("DNS upstream `{host}` resolved to no usable public IPs"),
+        })
+}
+
+fn dns_guard_binary_host_path() -> DriverResult<PathBuf> {
+    if let Some(path) = std::env::var_os(DNS_GUARD_HOST_BIN_ENV).map(PathBuf::from) {
+        return existing_dns_guard_binary(path);
+    }
+
+    let current_exe = std::env::current_exe().map_err(|source| DriverError::PolicyTranslation {
+        message: format!("failed to locate current executable for DNS guard upload: {source}"),
+    })?;
+    let binary_name = dns_guard_binary_name();
+    let mut candidates = Vec::new();
+    if let Some(parent) = current_exe.parent() {
+        candidates.push(parent.join(binary_name));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join(binary_name));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(DriverError::PolicyTranslation {
+        message: format!(
+            "DNS guard binary `{}` was not found next to `{}`; set {DNS_GUARD_HOST_BIN_ENV}",
+            binary_name,
+            current_exe.display()
+        ),
+    })
+}
+
+fn existing_dns_guard_binary(path: PathBuf) -> DriverResult<PathBuf> {
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(DriverError::PolicyTranslation {
+            message: format!(
+                "DNS guard binary path from {DNS_GUARD_HOST_BIN_ENV} is not a file: {}",
+                path.display()
+            ),
+        })
+    }
+}
+
+fn dns_guard_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "agentenv-openshell-dns-guard.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "agentenv-openshell-dns-guard"
+    }
+}
+
 fn dns_guard_config_path(_handle: &str) -> String {
     DNS_GUARD_CONFIG_PATH.to_owned()
 }
@@ -2685,7 +2882,8 @@ fn dns_guard_command(handle: &str) -> CommandRequest {
              esac; \
          fi; \
          rm -f \"$pidfile\"; \
-         nohup agentenv-openshell-dns-guard {config_path} >/var/log/agentenv-openshell-dns-guard.log 2>&1 & \
+         chmod 0700 {DNS_GUARD_SANDBOX_BIN_PATH}; \
+         nohup {DNS_GUARD_SANDBOX_BIN_PATH} {config_path} >/var/log/agentenv-openshell-dns-guard.log 2>&1 & \
          pid=$!; \
          printf '%s\\n' \"$pid\" > \"$pidfile\"; \
          i=0; \
@@ -3260,7 +3458,7 @@ mod driver_tests {
         time::Duration,
     };
 
-    use agentenv_core::driver::SandboxDriver;
+    use agentenv_core::{driver::SandboxDriver, security::ssrf::StaticDnsResolver};
     use agentenv_events::{ActivityEvent, ActivityKind, EventEmitter};
     use agentenv_proto::{
         AttachSessionParams, Capabilities, CopyInParams, CopyOutParams, CreateSessionParams,
@@ -3313,6 +3511,7 @@ mod driver_tests {
         expectations: Mutex<VecDeque<FlexibleCommandExpectation>>,
         calls: Mutex<Vec<CommandCall>>,
         spawn_calls: Mutex<Vec<CommandCall>>,
+        host_environment: bool,
     }
 
     #[derive(Debug)]
@@ -3606,10 +3805,18 @@ mod driver_tests {
 
     impl FlexibleCommandRunner {
         fn new(expectations: Vec<FlexibleCommandExpectation>) -> Self {
+            Self::new_with_host_environment(expectations, false)
+        }
+
+        fn new_with_host_environment(
+            expectations: Vec<FlexibleCommandExpectation>,
+            host_environment: bool,
+        ) -> Self {
             Self {
                 expectations: Mutex::new(expectations.into_iter().collect()),
                 calls: Mutex::new(Vec::new()),
                 spawn_calls: Mutex::new(Vec::new()),
+                host_environment,
             }
         }
 
@@ -3677,6 +3884,10 @@ mod driver_tests {
     }
 
     impl CommandRunner for FlexibleCommandRunner {
+        fn uses_host_environment(&self) -> bool {
+            self.host_environment
+        }
+
         fn run(
             &self,
             program: &str,
@@ -3870,7 +4081,9 @@ mod driver_tests {
             .get(7)
             .expect("dns guard shell script should be present");
 
-        assert!(script.contains("agentenv-openshell-dns-guard /etc/agentenv/dns-guard.json"));
+        assert!(script
+            .contains("/etc/agentenv/agentenv-openshell-dns-guard /etc/agentenv/dns-guard.json"));
+        assert!(script.contains("chmod 0700 /etc/agentenv/agentenv-openshell-dns-guard"));
         assert!(!script.contains("pkill -f"));
         assert!(!script.contains("/tmp/agentenv-openshell-dns-guard.pid"));
         assert!(script.contains("install -d -m 0700 /etc/agentenv"));
@@ -3896,6 +4109,23 @@ mod driver_tests {
         assert!(script.contains(":0035"));
         assert!(!script.contains("grep -q ':0035 '"));
         assert!(script.contains("exit 1"));
+    }
+
+    fn assert_dns_guard_binary_upload_command(call: &CommandCall) {
+        assert_args_prefix_suffix(
+            &call.request.args,
+            &["sandbox", "upload", "devbox"],
+            &["/etc/agentenv/agentenv-openshell-dns-guard"],
+        );
+        let host_path = call
+            .request
+            .args
+            .get(3)
+            .expect("DNS guard binary host path should be present");
+        assert!(
+            host_path.contains("agentenv-openshell-dns-guard"),
+            "unexpected DNS guard binary host path: {host_path}"
+        );
     }
 
     fn assert_dns_guard_stop_command(call: &CommandCall) {
@@ -4166,6 +4396,46 @@ mod driver_tests {
         assert!(capabilities.supports_native_inference_routing);
         assert!(capabilities.supports_remote_host);
         assert!(capabilities.supports_persistent_sessions);
+        assert!(capabilities.supports_dns_egress_control);
+    }
+
+    #[test]
+    fn materialize_dns_guard_upstreams_resolves_hosts_before_sandbox_dns_rewrite() {
+        let resolver = StaticDnsResolver::try_from_pairs([
+            ("resolver.example", ["93.184.216.34"]),
+            ("doh.example", ["93.184.216.35"]),
+            ("dot.example", ["93.184.216.36"]),
+        ])
+        .expect("static DNS records");
+        let mut config = super::dns_guard::DnsGuardConfig {
+            sandbox_handle: "devbox".to_owned(),
+            listen_addr: "127.0.0.1:53".to_owned(),
+            resolvers_allowed: vec!["resolver.example".to_owned()],
+            doh_upstreams_allowed: vec!["https://doh.example/dns-query".to_owned()],
+            dot_upstreams_allowed: vec!["dot.example:853".to_owned()],
+            resolver_endpoints: Vec::new(),
+            doh_upstreams: Vec::new(),
+            dot_upstreams: Vec::new(),
+            allowed_query_names: Default::default(),
+            log_all_queries: false,
+            pin_resolved_ips: false,
+        };
+
+        super::materialize_dns_guard_upstreams_with_resolver(&mut config, &resolver)
+            .expect("materialize upstreams");
+
+        assert_eq!(config.resolver_endpoints, vec!["93.184.216.34:53"]);
+        assert_eq!(config.doh_upstreams.len(), 1);
+        assert_eq!(config.doh_upstreams[0].url, "https://doh.example/dns-query");
+        assert_eq!(config.doh_upstreams[0].host, "doh.example");
+        assert_eq!(
+            config.doh_upstreams[0].connect_addr.as_deref(),
+            Some("93.184.216.35:443")
+        );
+        assert_eq!(config.dot_upstreams.len(), 1);
+        assert_eq!(config.dot_upstreams[0].host, "dot.example");
+        assert_eq!(config.dot_upstreams[0].port, 853);
+        assert_eq!(config.dot_upstreams[0].connect_addr, "93.184.216.36:853");
     }
 
     #[test]
@@ -4276,179 +4546,6 @@ mod driver_tests {
                         &["policy", "set", "devbox", "--policy"],
                         &["--wait"],
                     );
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["sandbox", "upload", "devbox"],
-                        &["/etc/agentenv/dns-guard.json"],
-                    );
-                    let config_path = PathBuf::from(
-                        call.request
-                            .args
-                            .get(3)
-                            .expect("guard config temp path should be present"),
-                    );
-                    let config_json =
-                        std::fs::read_to_string(config_path).expect("read guard config");
-                    assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_resolv_capture_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_readiness_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["sandbox", "upload", "devbox"],
-                        &["/etc/agentenv/dns-guard.json"],
-                    );
-                    let config_path = PathBuf::from(
-                        call.request
-                            .args
-                            .get(3)
-                            .expect("guard config temp path should be present"),
-                    );
-                    let config_json =
-                        std::fs::read_to_string(config_path).expect("read guard config");
-                    assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_resolv_capture_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_readiness_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["sandbox", "upload", "devbox"],
-                        &["/etc/agentenv/dns-guard.json"],
-                    );
-                    let config_path = PathBuf::from(
-                        call.request
-                            .args
-                            .get(3)
-                            .expect("guard config temp path should be present"),
-                    );
-                    let config_json =
-                        std::fs::read_to_string(config_path).expect("read guard config");
-                    assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_resolv_capture_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_readiness_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["sandbox", "upload", "devbox"],
-                        &["/etc/agentenv/dns-guard.json"],
-                    );
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_eq!(call.request.args[0], "sandbox");
-                    assert_eq!(call.request.args[1], "exec");
-                    assert!(command_string("openshell", &call.request.args)
-                        .contains("/etc/resolv.conf"));
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_readiness_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["sandbox", "upload", "devbox"],
-                        &["/etc/agentenv/dns-guard.json"],
-                    );
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_eq!(call.request.args[0], "sandbox");
-                    assert_eq!(call.request.args[1], "exec");
-                    assert!(command_string("openshell", &call.request.args)
-                        .contains("/etc/resolv.conf"));
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_readiness_command(call);
                 },
                 "",
                 "",
@@ -4762,68 +4859,79 @@ mod driver_tests {
         };
         let guard_config_capture = Arc::new(Mutex::new(None::<PathBuf>));
         let guard_config_for_check = guard_config_capture.clone();
-        let runner = Arc::new(FlexibleCommandRunner::new(vec![
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &[
-                            "sandbox",
-                            "create",
-                            "--name",
-                            "devbox",
-                            "--no-auto-providers",
-                            "--from",
-                            "openclaw",
-                            "--policy",
-                        ],
-                        &["--", "true"],
-                    );
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                move |call| {
-                    assert_args_prefix_suffix(
-                        &call.request.args,
-                        &["sandbox", "upload", "devbox"],
-                        &["/etc/agentenv/dns-guard.json"],
-                    );
-                    let config_path = PathBuf::from(
-                        call.request
-                            .args
-                            .get(3)
-                            .expect("guard config temp path should be present"),
-                    );
-                    let config_json =
-                        std::fs::read_to_string(&config_path).expect("read guard config");
-                    assert!(config_json.contains("\"sandbox_handle\":\"devbox\""));
-                    assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
-                    *guard_config_for_check.lock().expect("capture mutex") = Some(config_path);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_resolv_capture_command(call);
-                },
-                "",
-                "",
-            ),
-            FlexibleCommandExpectation::success(
-                "openshell",
-                |call| {
-                    assert_dns_guard_readiness_command(call);
-                },
-                "",
-                "",
-            ),
-        ]));
+        let runner = Arc::new(FlexibleCommandRunner::new_with_host_environment(
+            vec![
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_args_prefix_suffix(
+                            &call.request.args,
+                            &[
+                                "sandbox",
+                                "create",
+                                "--name",
+                                "devbox",
+                                "--no-auto-providers",
+                                "--from",
+                                "openclaw",
+                                "--policy",
+                            ],
+                            &["--", "true"],
+                        );
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    move |call| {
+                        assert_args_prefix_suffix(
+                            &call.request.args,
+                            &["sandbox", "upload", "devbox"],
+                            &["/etc/agentenv/dns-guard.json"],
+                        );
+                        let config_path = PathBuf::from(
+                            call.request
+                                .args
+                                .get(3)
+                                .expect("guard config temp path should be present"),
+                        );
+                        let config_json =
+                            std::fs::read_to_string(&config_path).expect("read guard config");
+                        assert!(config_json.contains("\"sandbox_handle\":\"devbox\""));
+                        assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
+                        *guard_config_for_check.lock().expect("capture mutex") = Some(config_path);
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_dns_guard_binary_upload_command(call);
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_dns_guard_resolv_capture_command(call);
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_dns_guard_readiness_command(call);
+                    },
+                    "",
+                    "",
+                ),
+            ],
+            true,
+        ));
         let driver = OpenShellDriver::with_command_runner(runner.clone());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4844,7 +4952,7 @@ mod driver_tests {
             .expect("create");
 
         assert_eq!(result.handle, "devbox");
-        assert_eq!(runner.calls().len(), 4);
+        assert_eq!(runner.calls().len(), 5);
         assert_eq!(driver.current_policy_for_handle("devbox"), Some(policy));
         assert!(!guard_config_capture
             .lock()

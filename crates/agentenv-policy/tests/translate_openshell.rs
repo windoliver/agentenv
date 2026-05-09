@@ -304,6 +304,45 @@ fn openshell_translation_keeps_dns_upstreams_out_of_agent_visible_allow_rules() 
 }
 
 #[test]
+fn active_dns_policy_rejects_agent_visible_doh_upstream_host() {
+    let mut policy = supported_policy();
+    policy.network.allow.push(host_rule("DNS.Google"));
+    policy.network.dns = agentenv_proto::DnsPolicy {
+        doh_upstreams_allowed: vec!["https://dns.google/dns-query".to_owned()],
+        ..agentenv_proto::DnsPolicy::default()
+    };
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("agent-visible DoH upstream should be rejected");
+
+    assert_translation_unsupported(err, "direct DoH bypass");
+}
+
+#[test]
+fn active_dns_policy_rejects_agent_visible_dns_ports() {
+    let mut policy = supported_policy();
+    policy.network.allow.push(NetworkRule {
+        target: NetworkTarget::Host {
+            host: "1.1.1.1".to_owned(),
+            port: Some(853),
+            scheme: Some("tcp".to_owned()),
+            http_access: None,
+        },
+    });
+    policy.network.dns = agentenv_proto::DnsPolicy {
+        resolvers_allowed: vec!["1.1.1.1".to_owned()],
+        ..agentenv_proto::DnsPolicy::default()
+    };
+
+    let err = translator()
+        .translate(&policy)
+        .expect_err("agent-visible DoT port should be rejected");
+
+    assert_translation_unsupported(err, "direct DNS/DoT bypass");
+}
+
+#[test]
 fn persisted_home_marker_translates_to_absolute_sandbox_home() {
     let mut policy = supported_policy();
     policy.filesystem.read_write.push("$HOME".to_owned());
