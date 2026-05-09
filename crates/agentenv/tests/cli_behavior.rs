@@ -257,6 +257,96 @@ fn bundle_as_skill_exports_existing_env_with_project_reference() {
 }
 
 #[test]
+fn bundle_metadata_detection_uses_local_git_author_and_cargo_license() {
+    let temp_dir = make_temp_dir("bundle-detected-metadata");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname = 'demo'\nversion = '0.1.0'\nlicense = 'Apache-2.0'\n",
+    )
+    .unwrap();
+    run_git(&project_dir, &["init"]);
+    run_git(&project_dir, &["config", "user.name", "Detected Author"]);
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-detected-metadata-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("author: Detected Author"),
+        "SKILL.md was: {skill}"
+    );
+    assert!(
+        skill.contains("license: Apache-2.0"),
+        "SKILL.md was: {skill}"
+    );
+}
+
+#[test]
+fn bundle_metadata_detection_ignores_global_git_author_for_non_git_project() {
+    let temp_dir = make_temp_dir("bundle-ignore-global-git-author");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join("LICENSE-MIT"), "MIT License\n").unwrap();
+    let git_config = Command::new("git")
+        .args(["config", "--global", "user.name", "Global Author"])
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        git_config.status.success(),
+        "git config --global failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&git_config.stdout),
+        String::from_utf8_lossy(&git_config.stderr)
+    );
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-license-file-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(!skill.contains("Global Author"), "SKILL.md was: {skill}");
+    assert!(skill.contains("license: MIT"), "SKILL.md was: {skill}");
+}
+
+#[test]
 fn bundle_dot_source_derives_env_from_current_directory() {
     let temp_dir = make_temp_dir("bundle-dot-source");
     write_minimal_env_state(&temp_dir, "demo");

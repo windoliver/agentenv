@@ -187,7 +187,7 @@ fn is_regular_file_without_following_symlinks(path: &Path) -> Result<bool> {
 }
 
 fn detect_git_author(project_path: &Path) -> Option<String> {
-    git_stdout(project_path, ["config", "user.name"])
+    git_stdout(project_path, ["config", "--local", "user.name"])
 }
 
 fn detect_git_commit(project_path: &Path) -> Option<String> {
@@ -231,39 +231,19 @@ fn detect_license(project_path: &Path) -> Option<String> {
 
 fn detect_cargo_license(project_path: &Path) -> Option<String> {
     let cargo_toml = fs::read_to_string(project_path.join("Cargo.toml")).ok()?;
-    license_in_cargo_section(&cargo_toml, "package")
-        .or_else(|| license_in_cargo_section(&cargo_toml, "workspace.package"))
-}
-
-fn license_in_cargo_section(contents: &str, target_section: &str) -> Option<String> {
-    let mut current_section = None;
-    for line in contents.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            current_section = Some(line.trim_matches(['[', ']']));
-            continue;
-        }
-        if current_section != Some(target_section) {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "license" {
-            continue;
-        }
-        return parse_toml_string(value.trim());
-    }
-    None
-}
-
-fn parse_toml_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        Some(value[1..value.len() - 1].to_owned())
-    } else {
-        None
-    }
+    let value: toml::Value = toml::from_str(&cargo_toml).ok()?;
+    value
+        .get("package")
+        .and_then(|package| package.get("license"))
+        .and_then(toml::Value::as_str)
+        .or_else(|| {
+            value
+                .get("workspace")
+                .and_then(|workspace| workspace.get("package"))
+                .and_then(|package| package.get("license"))
+                .and_then(toml::Value::as_str)
+        })
+        .map(str::to_owned)
 }
 
 fn detect_license_file(project_path: &Path) -> Option<String> {
