@@ -428,6 +428,7 @@ fn bundle_json_outputs_digest_summary() {
         .arg(&out_dir)
         .arg("--json")
         .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
         .current_dir(&temp_dir)
         .output()
         .unwrap();
@@ -464,6 +465,7 @@ fn bundle_as_skill_json_output_installs_as_local_skill() {
         .arg(&output_dir)
         .arg("--json")
         .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
         .current_dir(&temp_dir)
         .output()
         .unwrap();
@@ -523,6 +525,7 @@ fn bundle_as_skill_json_output_installs_as_local_skill() {
         .arg("--allow-unsigned")
         .arg("--json")
         .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
         .current_dir(&temp_dir)
         .output()
         .unwrap();
