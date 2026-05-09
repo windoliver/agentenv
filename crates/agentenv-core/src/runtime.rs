@@ -1629,6 +1629,13 @@ fn write_env_registry_file(content: &str, path: &Path) -> RuntimeResult<()> {
 
 pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResult<String> {
     let description = describe_env(options, name)?;
+    freeze_env_lockfile_from_description(options, description)
+}
+
+fn freeze_env_lockfile_from_description(
+    options: &RuntimeOptions,
+    description: EnvDescription,
+) -> RuntimeResult<String> {
     let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
     discovery_config.installed_root = options.root.join("drivers");
     let driver_artifacts =
@@ -1701,10 +1708,12 @@ pub fn freeze_env_for_bundle(
     name: &str,
 ) -> RuntimeResult<FrozenEnvBundleSource> {
     let description = describe_env(options, name)?;
-    let lockfile_yaml = freeze_env_lockfile(options, name)?;
+    let env_name = description.state.name.clone();
+    let blueprint_yaml = description.blueprint_yaml.clone();
+    let lockfile_yaml = freeze_env_lockfile_from_description(options, description)?;
     Ok(FrozenEnvBundleSource {
-        env_name: description.state.name,
-        blueprint_yaml: description.blueprint_yaml,
+        env_name,
+        blueprint_yaml,
         lockfile_yaml,
     })
 }
@@ -4908,8 +4917,28 @@ policy:
 
         assert_eq!(frozen.env_name, "demo");
         assert_eq!(frozen.blueprint_yaml, blueprint_yaml);
-        assert!(frozen.lockfile_yaml.contains("version: 0.2.0"));
-        assert!(frozen.lockfile_yaml.contains("name: demo"));
+        let crate::lockfile::LockfileDocument::Portable(lockfile) =
+            crate::lockfile::LockfileDocument::from_yaml(&frozen.lockfile_yaml).unwrap()
+        else {
+            panic!("bundle source should include a portable lockfile");
+        };
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None).unwrap();
+        let expected = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: frozen.blueprint_yaml.clone(),
+                driver_artifacts,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(lockfile.name, "demo");
+        assert_eq!(lockfile.version, crate::lockfile::PORTABLE_LOCKFILE_VERSION);
+        assert_eq!(lockfile.composition, expected.composition);
+        assert_eq!(lockfile.blueprint_hash, expected.blueprint_hash);
     }
 
     fn write_state_json(env_dir: &std::path::Path, state: crate::env::EnvStateFile) {
