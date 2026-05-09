@@ -1,7 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use agentenv_core::bundle::{
-    emit_skill_bundle, BundleSource, SkillBundleInput, SkillBundleMetadata,
+    emit_skill_bundle, BundleSource, ReferenceDocument, SkillBundleInput, SkillBundleMetadata,
 };
 use agentenv_core::skills::validate_skill_name;
 use anyhow::{bail, Context, Result};
@@ -14,7 +17,7 @@ pub(crate) struct BundleArgs {
     #[arg(long = "as-skill")]
     pub(crate) as_skill: bool,
     #[arg(long, value_name = "DIR")]
-    pub(crate) out: PathBuf,
+    pub(crate) out: Option<PathBuf>,
     #[arg(long)]
     pub(crate) env: Option<String>,
     #[arg(long)]
@@ -35,10 +38,15 @@ pub(crate) struct BundleArgs {
 
 pub(crate) fn run_bundle(args: BundleArgs) -> Result<()> {
     if !args.as_skill {
-        bail!("only `agentenv bundle <source> --as-skill --out <dir>` is supported");
+        bail!("bundle currently supports only --as-skill");
     }
+    let output_dir = args
+        .out
+        .clone()
+        .context("bundle --as-skill requires --out <dir>")?;
 
     let source = resolve_source(&args)?;
+    let reference_document = load_reference_document(source.project_path.as_deref())?;
     let options = crate::runtime_options(true)?;
     let frozen = agentenv_core::runtime::freeze_env_for_bundle(&options, &source.env_name)
         .with_context(|| format!("failed to freeze environment `{}`", source.env_name))?;
@@ -75,8 +83,8 @@ pub(crate) fn run_bundle(args: BundleArgs) -> Result<()> {
         metadata,
         blueprint_yaml: frozen.blueprint_yaml,
         lockfile_yaml: frozen.lockfile_yaml,
-        reference_document: None,
-        output_dir: args.out.clone(),
+        reference_document,
+        output_dir,
         agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
         created_at,
         driver_artifacts,
@@ -124,4 +132,25 @@ fn resolve_source(args: &BundleArgs) -> Result<BundleSource> {
         git_commit: None,
         git_dirty: None,
     })
+}
+
+fn load_reference_document(project_path: Option<&Path>) -> Result<Option<ReferenceDocument>> {
+    let Some(project_path) = project_path else {
+        return Ok(None);
+    };
+
+    for relative in ["docs/ARCHITECTURE.md", "ARCHITECTURE.md", "README.md"] {
+        let path = project_path.join(relative);
+        if path.is_file() {
+            let content = fs::read_to_string(&path).with_context(|| {
+                format!("failed to read reference document `{}`", path.display())
+            })?;
+            return Ok(Some(ReferenceDocument {
+                source_relative_path: relative.to_owned(),
+                content,
+            }));
+        }
+    }
+
+    Ok(None)
 }

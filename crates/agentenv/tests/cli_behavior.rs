@@ -78,6 +78,50 @@ fn bundle_help_lists_as_skill_and_out_flags() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--as-skill"), "stdout was: {stdout}");
     assert!(stdout.contains("--out"), "stdout was: {stdout}");
+    assert!(stdout.contains("--env"), "stdout was: {stdout}");
+}
+
+#[test]
+fn bundle_as_skill_requires_out_flag() {
+    let temp_dir = make_temp_dir("bundle-missing-out");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle --as-skill requires --out <dir>"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn bundle_rejects_missing_as_skill_flag() {
+    let temp_dir = make_temp_dir("bundle-missing-as-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--out")
+        .arg(temp_dir.join("bundle-out"))
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle currently supports only --as-skill"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[test]
@@ -99,6 +143,41 @@ fn bundle_as_skill_rejects_missing_env() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("missing-env"), "stderr was: {stderr}");
+}
+
+#[test]
+fn bundle_directory_source_loads_architecture_reference() {
+    let temp_dir = make_temp_dir("bundle-reference-doc");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    fs::write(
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+        "# Architecture\n\nReference details\n",
+    )
+    .unwrap();
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reference = fs::read_to_string(out_dir.join("references/architecture.md")).unwrap();
+    assert!(reference.contains("Source: `docs/ARCHITECTURE.md`"));
+    assert!(reference.contains("Reference details"));
 }
 
 #[test]
