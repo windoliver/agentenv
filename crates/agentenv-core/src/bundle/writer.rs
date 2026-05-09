@@ -31,8 +31,6 @@ use crate::{
 pub enum BundleError {
     #[error("output path already exists: `{path}`")]
     OutputExists { path: PathBuf },
-    #[error("output path ancestry contains symlink `{path}`")]
-    SymlinkAncestor { path: PathBuf },
     #[error("failed to read or write bundle path `{path}`: {source}")]
     Io {
         path: PathBuf,
@@ -86,7 +84,7 @@ pub fn emit_skill_bundle(input: SkillBundleInput) -> Result<SkillBundleOutput, B
             });
         }
     }
-    validate_output_ancestry(&input.output_dir)?;
+    ensure_output_parent_exists(&input.output_dir)?;
     validate_skill_name(&input.metadata.name)?;
     validate_env_name(&input.source.env_name)?;
 
@@ -577,28 +575,9 @@ fn relative_slash_path(root: &Path, path: &Path) -> Result<String, BundleError> 
     Ok(parts.join("/"))
 }
 
-fn validate_output_ancestry(output_dir: &Path) -> Result<(), BundleError> {
+fn ensure_output_parent_exists(output_dir: &Path) -> Result<(), BundleError> {
     let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
-    let mut current = PathBuf::new();
-    for component in parent.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(BundleError::SymlinkAncestor { path: current });
-            }
-            Ok(_) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                create_dir_all(&current)?;
-            }
-            Err(source) => {
-                return Err(BundleError::Io {
-                    path: current,
-                    source,
-                });
-            }
-        }
-    }
-    Ok(())
+    create_dir_all(parent)
 }
 
 fn create_unique_staging_dir(output_dir: &Path) -> Result<PathBuf, BundleError> {
