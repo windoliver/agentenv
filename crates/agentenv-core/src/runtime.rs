@@ -19,7 +19,7 @@ use agentenv_events::{
 use agentenv_policy::{compose_policy, PresetRegistry, PresetSelection, Tier};
 use agentenv_proto::{
     AgentSpec, Capabilities, ContextSpec, DriverKind, InferenceSpec, InitializeParams,
-    InitializeResult, LogLevel, PreflightParams, SCHEMA_VERSION,
+    InitializeResult, LogLevel, PreflightParams, SandboxCapabilities, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1171,6 +1171,7 @@ async fn create_env_with_input(
             policy.clone()
         };
         validate_runtime_dns_policy(&create_policy)?;
+        ensure_dns_policy_supported(&sandbox_init.capabilities, &create_policy)?;
         let restore_policy_after_install = supports_hot_reload_policy && create_policy != policy;
 
         let build_oneflight_seed = build_oneflight_seed_for_byo(
@@ -1248,6 +1249,7 @@ async fn create_env_with_input(
         install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
         if restore_policy_after_install {
             validate_runtime_dns_policy(&policy)?;
+            ensure_dns_policy_supported(&sandbox_init.capabilities, &policy)?;
             let apply_policy_start = Instant::now();
             match set
                 .sandbox
@@ -4220,6 +4222,31 @@ fn validate_runtime_dns_policy(policy: &agentenv_proto::NetworkPolicy) -> Runtim
     crate::security::dns_policy::validate_dns_policy(&policy.network.dns).map_err(Into::into)
 }
 
+fn supports_dns_egress_control(capabilities: &Capabilities) -> bool {
+    matches!(
+        capabilities,
+        Capabilities::Sandbox(SandboxCapabilities {
+            supports_dns_egress_control: true,
+            ..
+        })
+    )
+}
+
+fn ensure_dns_policy_supported(
+    capabilities: &Capabilities,
+    policy: &agentenv_proto::NetworkPolicy,
+) -> RuntimeResult<()> {
+    if policy.network.dns.is_active() && !supports_dns_egress_control(capabilities) {
+        return Err(RuntimeError::Driver(
+            crate::driver::DriverError::CapabilityMissing {
+                capability: "supports_dns_egress_control".to_owned(),
+            },
+        ));
+    }
+
+    Ok(())
+}
+
 fn policy_json_value(policy: &agentenv_proto::NetworkPolicy) -> serde_json::Value {
     serde_json::to_value(policy).unwrap_or(serde_json::Value::Null)
 }
@@ -4980,6 +5007,162 @@ policy:
                 inference: None,
             })
         }
+    }
+
+    struct DnsCapabilityFactory {
+        sandbox_capabilities: SandboxCapabilities,
+    }
+
+    impl Default for DnsCapabilityFactory {
+        fn default() -> Self {
+            Self {
+                sandbox_capabilities: SandboxCapabilities {
+                    supports_hot_reload_policy: true,
+                    supports_filesystem_lockdown: true,
+                    supports_syscall_filter: true,
+                    supports_native_inference_routing: true,
+                    supports_remote_host: false,
+                    supports_persistent_sessions: false,
+                    supports_dns_egress_control: false,
+                },
+            }
+        }
+    }
+
+    impl DriverFactory for DnsCapabilityFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(DnsCapabilitySandboxDriver {
+                    capabilities: self.sandbox_capabilities.clone(),
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
+    struct DnsCapabilitySandboxDriver {
+        capabilities: SandboxCapabilities,
+    }
+
+    #[async_trait]
+    impl SandboxDriver for DnsCapabilitySandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "openshell".to_owned(),
+                    kind: DriverKind::Sandbox,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Sandbox(self.capabilities.clone()),
+            })
+        }
+
+        async fn preflight(&self, params: PreflightParams) -> DriverResult<PreflightResult> {
+            TinySandboxDriver.preflight(params).await
+        }
+
+        async fn create(
+            &self,
+            spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            TinySandboxDriver.create(spec).await
+        }
+
+        async fn connect(
+            &self,
+            params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            TinySandboxDriver.connect(params).await
+        }
+
+        async fn exec(
+            &self,
+            params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            TinySandboxDriver.exec(params).await
+        }
+
+        async fn copy_in(&self, params: agentenv_proto::CopyInParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_in(params).await
+        }
+
+        async fn copy_out(
+            &self,
+            params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.copy_out(params).await
+        }
+
+        async fn apply_policy(
+            &self,
+            params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            TinySandboxDriver.apply_policy(params).await
+        }
+
+        async fn status(
+            &self,
+            params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            TinySandboxDriver.status(params).await
+        }
+
+        async fn logs(
+            &self,
+            params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            TinySandboxDriver.logs(params).await
+        }
+
+        async fn logs_stream(
+            &self,
+            params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.logs_stream(params).await
+        }
+
+        async fn stop(&self, params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.stop(params).await
+        }
+
+        async fn destroy(
+            &self,
+            params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.destroy(params).await
+        }
+
+        async fn shutdown(
+            &mut self,
+            params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            TinySandboxDriver.shutdown(params).await
+        }
+    }
+
+    fn dns_policy_blueprint() -> &'static str {
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+  dns:
+    resolvers_allowed: [1.1.1.1]
+    log_all_queries: true
+    pin_resolved_ips: true
+"#
     }
 
     #[derive(Clone, Default)]
@@ -7315,6 +7498,56 @@ policy:
         assert!(env_dir.join("lock.yaml").is_file());
         assert!(env_dir.join("state.json").is_file());
         assert!(env_dir.join("events.jsonl").is_file());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_dns_policy_when_sandbox_lacks_dns_egress_control() {
+        let root = unique_root("agentenv-create-dns-no-capability");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let mut factory = DnsCapabilityFactory::default();
+        factory.sandbox_capabilities.supports_dns_egress_control = false;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(
+            &options,
+            &factory,
+            &mut credentials,
+            "dns-no-capability",
+            dns_policy_blueprint(),
+        )
+        .await
+        .expect_err("dns policy should require sandbox capability");
+
+        assert!(err.to_string().contains("supports_dns_egress_control"));
+    }
+
+    #[tokio::test]
+    async fn create_accepts_dns_policy_when_sandbox_supports_dns_egress_control() {
+        let root = unique_root("agentenv-create-dns-capability");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let mut factory = DnsCapabilityFactory::default();
+        factory.sandbox_capabilities.supports_dns_egress_control = true;
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let result = super::create_env(
+            &options,
+            &factory,
+            &mut credentials,
+            "dns-capability",
+            dns_policy_blueprint(),
+        )
+        .await
+        .expect("dns policy should pass with capability");
+
+        assert_eq!(result.state.name, "dns-capability");
     }
 
     #[tokio::test]
