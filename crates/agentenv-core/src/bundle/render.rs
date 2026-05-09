@@ -92,11 +92,12 @@ pub(crate) fn render_skill_yaml(
         "SKILL.md",
         "blueprint.yaml",
         "agentenv.lock",
-        "scripts/**",
-        ".agentenv/**",
+        "scripts/bootstrap.sh",
+        ".agentenv/manifest.json",
+        ".agentenv/provenance.json",
     ];
     if has_reference {
-        files.push("references/**");
+        files.push("references/architecture.md");
     }
 
     let skill_yaml = SkillYaml {

@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use agentenv_core::{
     bundle::{
@@ -157,6 +157,69 @@ fn emit_skill_bundle_writes_reference_document_when_provided() {
     assert_eq!(
         yaml_string_sequence(&frontmatter, "tags"),
         vec!["openshell", "codex", "filesystem", "dev-env"]
+    );
+}
+
+#[test]
+fn emit_skill_bundle_declares_explicit_files_for_remote_registry_fetch() {
+    let root = temp_dir("bundle-explicit-files");
+    let out = root.join("demo-skill");
+    let blueprint_yaml = minimal_blueprint();
+    let driver_artifacts = test_driver_artifacts();
+    let lockfile_yaml = portable_lock_yaml("demo", &blueprint_yaml, &driver_artifacts);
+
+    emit_skill_bundle(SkillBundleInput {
+        source: BundleSource {
+            env_name: "demo".to_owned(),
+            project_path: Some(root.join("project")),
+            git_commit: None,
+            git_dirty: None,
+        },
+        metadata: SkillBundleMetadata {
+            name: "demo".to_owned(),
+            version: Version::parse("1.0.0").unwrap(),
+            description: "Reproducible dev env for demo".to_owned(),
+            author: None,
+            license: None,
+            tags: vec!["dev-env".to_owned()],
+        },
+        blueprint_yaml,
+        lockfile_yaml,
+        reference_document: Some(ReferenceDocument {
+            source_relative_path: "README.md".to_owned(),
+            content: "# Demo\n".to_owned(),
+        }),
+        output_dir: out.clone(),
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-09T00:00:00Z".to_owned(),
+        driver_artifacts,
+    })
+    .unwrap();
+
+    let skill_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(out.join("skill.yaml")).unwrap()).unwrap();
+    let files = yaml_string_sequence(&skill_yaml, "files")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        files,
+        [
+            ".agentenv/manifest.json",
+            ".agentenv/provenance.json",
+            "SKILL.md",
+            "agentenv.lock",
+            "blueprint.yaml",
+            "references/architecture.md",
+            "scripts/bootstrap.sh",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+    );
+    assert!(
+        files.iter().all(|path| !path.ends_with("/**")),
+        "remote registry fetch requires explicit file entries, got {files:?}"
     );
 }
 
