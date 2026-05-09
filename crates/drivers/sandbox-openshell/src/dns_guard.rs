@@ -93,7 +93,7 @@ impl DnsGuardConfig {
 
         Ok(Some(Self {
             sandbox_handle: sandbox_handle.to_owned(),
-            listen_addr: "127.0.0.1:1053".to_owned(),
+            listen_addr: "127.0.0.1:53".to_owned(),
             resolvers_allowed: dns.resolvers_allowed.clone(),
             doh_upstreams_allowed: dns.doh_upstreams_allowed.clone(),
             dot_upstreams_allowed: dns.dot_upstreams_allowed.clone(),
@@ -123,7 +123,8 @@ fn normalize_dns_name(name: &str) -> String {
 }
 
 pub fn classify_query(config: &DnsGuardConfig, query_name: &str, _qtype: &str) -> DnsQueryDecision {
-    if config.allowed_query_names.contains(query_name) {
+    let query_name = normalize_dns_name(query_name);
+    if config.allowed_query_names.contains(&query_name) {
         DnsQueryDecision {
             action: DnsQueryAction::Allow,
             reason_code: None,
@@ -290,6 +291,7 @@ mod tests {
             .expect("active dns config");
 
         assert_eq!(config.sandbox_handle, "devbox");
+        assert_eq!(config.listen_addr, "127.0.0.1:53");
         assert_eq!(config.resolvers_allowed, vec!["1.1.1.1"]);
         assert_eq!(
             config.doh_upstreams_allowed,
@@ -318,6 +320,15 @@ mod tests {
             classify_query(&config, "api.github.com", "A").action,
             DnsQueryAction::Allow
         );
+    }
+
+    #[test]
+    fn classify_query_normalizes_incoming_query_name() {
+        let config = config_with_allowed_names(["api.github.com"]);
+
+        let decision = classify_query(&config, "API.GitHub.COM.", "A");
+
+        assert_eq!(decision.action, DnsQueryAction::Allow);
     }
 
     #[test]
@@ -520,7 +531,7 @@ mod tests {
     fn config_with_allowed_names<const N: usize>(names: [&str; N]) -> DnsGuardConfig {
         DnsGuardConfig {
             sandbox_handle: "devbox".to_owned(),
-            listen_addr: "127.0.0.1:1053".to_owned(),
+            listen_addr: "127.0.0.1:53".to_owned(),
             resolvers_allowed: vec!["1.1.1.1".to_owned()],
             doh_upstreams_allowed: Vec::new(),
             dot_upstreams_allowed: Vec::new(),
