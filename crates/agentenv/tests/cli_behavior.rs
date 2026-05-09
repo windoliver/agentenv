@@ -181,6 +181,110 @@ fn bundle_directory_source_loads_architecture_reference() {
 }
 
 #[test]
+fn bundle_dot_source_derives_env_from_current_directory() {
+    let temp_dir = make_temp_dir("bundle-dot-source");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-dot-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(".")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("SKILL.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_directory_source_skips_symlinked_reference_document() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = make_temp_dir("bundle-symlink-reference");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    let outside_reference = temp_dir.join("outside-architecture.md");
+    fs::write(&outside_reference, "# Outside\n\nDo not copy\n").unwrap();
+    symlink(
+        &outside_reference,
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+    )
+    .unwrap();
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-symlink-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!out_dir.join("references/architecture.md").exists());
+}
+
+#[test]
+fn bundle_json_outputs_digest_summary() {
+    let temp_dir = make_temp_dir("bundle-json-summary");
+    write_minimal_env_state(&temp_dir, "demo");
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-json-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        summary["output_dir"].as_str(),
+        Some(out_dir.to_str().unwrap())
+    );
+    assert_eq!(summary["skill_name"].as_str(), Some("demo"));
+    assert_eq!(summary["version"].as_str(), Some("1.0.0"));
+    assert!(summary["bundle_digest"].as_str().is_some());
+    assert!(summary["blueprint_digest"].as_str().is_some());
+    assert!(summary["lockfile_digest"].as_str().is_some());
+}
+
+#[test]
 fn fork_reports_capability_missing_for_openshell() {
     let temp_dir = make_temp_dir("fork-openshell-unsupported");
     let env_dir = write_minimal_env_state(&temp_dir, "demo");

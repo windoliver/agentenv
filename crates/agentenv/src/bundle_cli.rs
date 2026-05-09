@@ -106,7 +106,9 @@ pub(crate) fn run_bundle(args: BundleArgs) -> Result<()> {
 fn resolve_source(args: &BundleArgs) -> Result<BundleSource> {
     let source_path = PathBuf::from(&args.source);
     let project_path = if source_path.is_dir() {
-        Some(source_path)
+        Some(source_path.canonicalize().with_context(|| {
+            format!("failed to resolve project path `{}`", source_path.display())
+        })?)
     } else {
         None
     };
@@ -141,7 +143,7 @@ fn load_reference_document(project_path: Option<&Path>) -> Result<Option<Referen
 
     for relative in ["docs/ARCHITECTURE.md", "ARCHITECTURE.md", "README.md"] {
         let path = project_path.join(relative);
-        if path.is_file() {
+        if is_regular_file_without_following_symlinks(&path)? {
             let content = fs::read_to_string(&path).with_context(|| {
                 format!("failed to read reference document `{}`", path.display())
             })?;
@@ -153,4 +155,13 @@ fn load_reference_document(project_path: Option<&Path>) -> Result<Option<Referen
     }
 
     Ok(None)
+}
+
+fn is_regular_file_without_following_symlinks(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(source)
+            .with_context(|| format!("failed to inspect reference document `{}`", path.display())),
+    }
 }
