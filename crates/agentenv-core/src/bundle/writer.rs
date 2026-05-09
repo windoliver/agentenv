@@ -2,10 +2,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::{
     model::{
@@ -20,6 +20,7 @@ use super::{
 };
 use crate::{
     digest::sha256_hex,
+    env::{validate_env_name, EnvError},
     portable_lockfile::{verify_portable_lockfile_yaml, PortableLockfileError},
     skills::{
         compute_bundle_digest, load_skill_manifest, validate_skill_name, SkillError, SkillManifest,
@@ -44,6 +45,14 @@ pub enum BundleError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to serialize bundle YAML at `{path}`: {source}")]
+    Yaml {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error(transparent)]
+    Env(#[from] EnvError),
     #[error(transparent)]
     Skill(#[from] SkillError),
     #[error(transparent)]
@@ -79,29 +88,13 @@ pub fn emit_skill_bundle(input: SkillBundleInput) -> Result<SkillBundleOutput, B
     }
     validate_output_ancestry(&input.output_dir)?;
     validate_skill_name(&input.metadata.name)?;
+    validate_env_name(&input.source.env_name)?;
 
-    let staging_dir = staging_dir_for(&input.output_dir)?;
-    if staging_dir.exists() {
-        remove_dir_all(&staging_dir)?;
-    }
-    create_dir_all(&staging_dir)?;
+    let staging_dir = create_unique_staging_dir(&input.output_dir)?;
 
-    let result = write_and_validate_staging(&input, &staging_dir);
+    let result = publish_validated_bundle(&input, &staging_dir);
     match result {
-        Ok(written) => {
-            rename(&staging_dir, &input.output_dir)?;
-            let manifest = load_skill_manifest(&input.output_dir)?;
-            let bundle_digest = compute_bundle_digest(&input.output_dir, &manifest)?;
-            Ok(SkillBundleOutput {
-                output_dir: input.output_dir,
-                skill_name: input.metadata.name,
-                version: input.metadata.version.to_string(),
-                bundle_digest,
-                blueprint_digest: written.blueprint_digest,
-                lockfile_digest: written.lockfile_digest,
-                warnings: written.warnings,
-            })
-        }
+        Ok(output) => Ok(output),
         Err(error) => {
             let cleanup = remove_dir_all(&staging_dir);
             if cleanup.is_err() {
@@ -110,6 +103,25 @@ pub fn emit_skill_bundle(input: SkillBundleInput) -> Result<SkillBundleOutput, B
             Err(error)
         }
     }
+}
+
+fn publish_validated_bundle(
+    input: &SkillBundleInput,
+    staging_dir: &Path,
+) -> Result<SkillBundleOutput, BundleError> {
+    let written = write_and_validate_staging(input, staging_dir)?;
+    publish_staging(staging_dir, &input.output_dir)?;
+    let manifest = load_skill_manifest(&input.output_dir)?;
+    let bundle_digest = compute_bundle_digest(&input.output_dir, &manifest)?;
+    Ok(SkillBundleOutput {
+        output_dir: input.output_dir.clone(),
+        skill_name: input.metadata.name.clone(),
+        version: input.metadata.version.to_string(),
+        bundle_digest,
+        blueprint_digest: written.blueprint_digest,
+        lockfile_digest: written.lockfile_digest,
+        warnings: written.warnings,
+    })
 }
 
 fn write_and_validate_staging(
@@ -144,12 +156,22 @@ fn write_and_validate_staging(
     write_file(
         staging_dir,
         "SKILL.md",
-        render_skill_md(&input.metadata, &input.source.env_name, has_reference).as_bytes(),
+        render_skill_md(&input.metadata, &input.source.env_name, has_reference)
+            .map_err(|source| BundleError::Yaml {
+                path: staging_dir.join("SKILL.md"),
+                source,
+            })?
+            .as_bytes(),
     )?;
     write_file(
         staging_dir,
         "skill.yaml",
-        render_skill_yaml(&input.metadata, has_reference).as_bytes(),
+        render_skill_yaml(&input.metadata, has_reference)
+            .map_err(|source| BundleError::Yaml {
+                path: staging_dir.join("skill.yaml"),
+                source,
+            })?
+            .as_bytes(),
     )?;
     write_file(staging_dir, "blueprint.yaml", blueprint_yaml.as_bytes())?;
     write_file(staging_dir, "agentenv.lock", lockfile_yaml.as_bytes())?;
@@ -279,7 +301,6 @@ fn validate_staging(
     let skill_md = read_to_string(staging_dir.join("SKILL.md"))?;
     validate_metadata_parity(&skill_manifest, &skill_md, metadata)?;
     if !skill_md.contains("agentenv-bundle: true")
-        || !skill_md.contains("agentenv-schema: \"0.1\"")
         || !skill_md.contains("agentenv verify agentenv.lock")
         || !skill_md.contains("agentenv reproduce agentenv.lock")
     {
@@ -580,22 +601,38 @@ fn validate_output_ancestry(output_dir: &Path) -> Result<(), BundleError> {
     Ok(())
 }
 
-fn staging_dir_for(output_dir: &Path) -> Result<PathBuf, BundleError> {
+fn create_unique_staging_dir(output_dir: &Path) -> Result<PathBuf, BundleError> {
+    create_unique_staging_dir_with_candidates(
+        output_dir,
+        std::iter::repeat_with(|| staging_dir_name(output_dir)),
+    )
+}
+
+fn create_unique_staging_dir_with_candidates(
+    output_dir: &Path,
+    candidates: impl IntoIterator<Item = String>,
+) -> Result<PathBuf, BundleError> {
     let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    for candidate in candidates.into_iter().take(16) {
+        let path = parent.join(candidate);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(BundleError::Io { path, source }),
+        }
+    }
+
+    Err(BundleError::Validation {
+        message: "failed to allocate unique staging directory".to_owned(),
+    })
+}
+
+fn staging_dir_name(output_dir: &Path) -> String {
     let name = output_dir
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("bundle");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|source| BundleError::Validation {
-            message: format!("system clock is before UNIX epoch: {source}"),
-        })?
-        .as_nanos();
-    Ok(parent.join(format!(
-        ".{name}.agentenv-staging-{}-{nanos}",
-        std::process::id()
-    )))
+    format!(".{name}.agentenv-staging-{}", Uuid::new_v4())
 }
 
 fn write_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), BundleError> {
@@ -627,10 +664,49 @@ fn remove_dir_all(path: &Path) -> Result<(), BundleError> {
     })
 }
 
-fn rename(from: &Path, to: &Path) -> Result<(), BundleError> {
-    fs::rename(from, to).map_err(|source| BundleError::Io {
-        path: to.to_path_buf(),
-        source,
+fn publish_staging(from: &Path, to: &Path) -> Result<(), BundleError> {
+    publish_staging_no_replace(from, to)
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn publish_staging_no_replace(from: &Path, to: &Path) -> Result<(), BundleError> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::EXIST) => Err(BundleError::OutputExists {
+            path: to.to_path_buf(),
+        }),
+        Err(source) => Err(BundleError::Io {
+            path: to.to_path_buf(),
+            source: std::io::Error::from_raw_os_error(source.raw_os_error()),
+        }),
+    }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+fn publish_staging_no_replace(from: &Path, to: &Path) -> Result<(), BundleError> {
+    fs::rename(from, to).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::AlreadyExists {
+            BundleError::OutputExists {
+                path: to.to_path_buf(),
+            }
+        } else {
+            BundleError::Io {
+                path: to.to_path_buf(),
+                source,
+            }
+        }
     })
 }
 
@@ -671,6 +747,43 @@ mod tests {
 
     use super::*;
     use crate::skills::SkillManifest;
+
+    #[test]
+    fn publish_staging_rejects_existing_output_path() {
+        let root = temp_test_dir("publish-existing");
+        let staging = root.join("staging");
+        let output = root.join("output");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&output).unwrap();
+
+        let error = publish_staging(&staging, &output).unwrap_err();
+
+        assert!(matches!(error, BundleError::OutputExists { .. }));
+        assert!(staging.is_dir());
+        assert!(output.is_dir());
+    }
+
+    #[test]
+    fn unique_staging_dir_does_not_remove_existing_collision() {
+        let root = temp_test_dir("staging-collision");
+        let output = root.join("bundle");
+        let collision = root.join(".bundle.agentenv-staging-test-collision");
+        fs::create_dir(&collision).unwrap();
+        fs::write(collision.join("sentinel"), b"keep").unwrap();
+
+        let created = create_unique_staging_dir_with_candidates(
+            &output,
+            [
+                ".bundle.agentenv-staging-test-collision".to_owned(),
+                ".bundle.agentenv-staging-test-created".to_owned(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(created, root.join(".bundle.agentenv-staging-test-created"));
+        assert!(collision.join("sentinel").is_file());
+        assert!(created.is_dir());
+    }
 
     #[test]
     fn metadata_parity_rejects_frontmatter_description_tags_and_schema_drift() {
@@ -739,5 +852,23 @@ agentenv-schema: "0.1"
             signature_public_key_ed25519: None,
             extra,
         }
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap()
+            .to_path_buf();
+        let root = workspace_root.join("target").join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }

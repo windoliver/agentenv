@@ -65,8 +65,9 @@ fn emit_skill_bundle_writes_expected_layout() {
     assert!(!out.join("references").exists());
 
     let skill = fs::read_to_string(out.join("SKILL.md")).unwrap();
-    assert!(skill.contains("agentenv-bundle: true"));
-    assert!(skill.contains("agentenv-schema: \"0.1\""));
+    let frontmatter = parse_skill_frontmatter(&skill);
+    assert_eq!(frontmatter["agentenv-bundle"].as_bool(), Some(true));
+    assert_eq!(yaml_string_field(&frontmatter, "agentenv-schema"), "0.1");
     assert!(skill.contains("agentenv reproduce agentenv.lock --name demo"));
 
     let bootstrap = fs::read_to_string(out.join("scripts/bootstrap.sh")).unwrap();
@@ -150,9 +151,13 @@ fn emit_skill_bundle_writes_reference_document_when_provided() {
         .contains(&PathBuf::from("references/architecture.md")));
 
     let skill = fs::read_to_string(out.join("SKILL.md")).unwrap();
-    assert!(skill.contains("author: Alice Example"));
-    assert!(skill.contains("license: MIT"));
-    assert!(skill.contains("tags: [openshell, codex, filesystem, dev-env]"));
+    let frontmatter = parse_skill_frontmatter(&skill);
+    assert_eq!(yaml_string_field(&frontmatter, "author"), "Alice Example");
+    assert_eq!(yaml_string_field(&frontmatter, "license"), "MIT");
+    assert_eq!(
+        yaml_string_sequence(&frontmatter, "tags"),
+        vec!["openshell", "codex", "filesystem", "dev-env"]
+    );
 }
 
 #[test]
@@ -221,6 +226,94 @@ fn emit_skill_bundle_keeps_skill_yaml_and_frontmatter_in_sync() {
         frontmatter["agentenv-bundle"].as_bool(),
         skill_yaml["agentenv_bundle"].as_bool()
     );
+}
+
+#[test]
+fn emit_skill_bundle_quotes_yaml_like_descriptions_and_special_tags() {
+    let root = temp_dir("bundle-yaml-safety");
+    let out = root.join("demo-skill");
+    let blueprint_yaml = minimal_blueprint();
+    let driver_artifacts = test_driver_artifacts();
+    let lockfile_yaml = portable_lock_yaml("demo", &blueprint_yaml, &driver_artifacts);
+    let description = "true".to_owned();
+    let tags = vec![
+        "port:5432".to_owned(),
+        "hash # tag".to_owned(),
+        "comma,tag".to_owned(),
+        "line\nbreak".to_owned(),
+    ];
+
+    emit_skill_bundle(SkillBundleInput {
+        source: BundleSource {
+            env_name: "demo".to_owned(),
+            project_path: None,
+            git_commit: None,
+            git_dirty: None,
+        },
+        metadata: SkillBundleMetadata {
+            name: "demo".to_owned(),
+            version: Version::parse("1.0.0").unwrap(),
+            description: description.clone(),
+            author: None,
+            license: None,
+            tags: tags.clone(),
+        },
+        blueprint_yaml,
+        lockfile_yaml,
+        reference_document: None,
+        output_dir: out.clone(),
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-09T00:00:00Z".to_owned(),
+        driver_artifacts,
+    })
+    .unwrap();
+
+    let skill_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(out.join("skill.yaml")).unwrap()).unwrap();
+    let skill_md = fs::read_to_string(out.join("SKILL.md")).unwrap();
+    let frontmatter = parse_skill_frontmatter(&skill_md);
+
+    assert_eq!(yaml_string_field(&frontmatter, "description"), description);
+    assert_eq!(yaml_string_field(&skill_yaml, "description"), description);
+    assert_eq!(yaml_string_sequence(&frontmatter, "tags"), tags);
+    assert_eq!(yaml_string_sequence(&skill_yaml, "tags"), tags);
+}
+
+#[test]
+fn emit_skill_bundle_rejects_invalid_env_name_before_final_output() {
+    let root = temp_dir("bundle-invalid-env");
+    let out = root.join("demo-skill");
+    let blueprint_yaml = minimal_blueprint();
+    let driver_artifacts = test_driver_artifacts();
+    let lockfile_yaml = portable_lock_yaml("demo", &blueprint_yaml, &driver_artifacts);
+
+    let error = emit_skill_bundle(SkillBundleInput {
+        source: BundleSource {
+            env_name: "demo;rm-rf".to_owned(),
+            project_path: None,
+            git_commit: None,
+            git_dirty: None,
+        },
+        metadata: SkillBundleMetadata {
+            name: "demo".to_owned(),
+            version: Version::parse("1.0.0").unwrap(),
+            description: "Reproducible dev env for demo".to_owned(),
+            author: None,
+            license: None,
+            tags: vec!["dev-env".to_owned()],
+        },
+        blueprint_yaml,
+        lockfile_yaml,
+        reference_document: None,
+        output_dir: out.clone(),
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-09T00:00:00Z".to_owned(),
+        driver_artifacts,
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("invalid env name"));
+    assert!(!out.exists());
 }
 
 #[test]

@@ -1,32 +1,54 @@
 use super::model::{ReferenceDocument, SkillBundleMetadata};
+use serde::Serialize;
 
 pub(crate) const AGENTENV_BUNDLE_SCHEMA: &str = "0.1";
+
+#[derive(Debug, Serialize)]
+struct SkillFrontmatter<'a> {
+    name: &'a str,
+    description: &'a str,
+    version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<&'a str>,
+    #[serde(rename = "agentenv-bundle")]
+    agentenv_bundle: bool,
+    #[serde(rename = "agentenv-schema")]
+    agentenv_schema: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillYaml<'a> {
+    name: &'a str,
+    version: String,
+    description: &'a str,
+    entry: &'static str,
+    files: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<&'a str>,
+    agentenv_bundle: bool,
+    agentenv_schema: &'static str,
+}
 
 pub(crate) fn render_skill_md(
     metadata: &SkillBundleMetadata,
     env_name: &str,
     has_reference: bool,
-) -> String {
-    let mut frontmatter = Vec::new();
-    frontmatter.push("---".to_owned());
-    frontmatter.push(format!("name: {}", metadata.name));
-    frontmatter.push(format!(
-        "description: {}",
-        yaml_string(&metadata.description)
-    ));
-    frontmatter.push(format!("version: {}", metadata.version));
-    if let Some(author) = metadata.author.as_deref() {
-        frontmatter.push(format!("author: {}", yaml_string(author)));
-    }
-    if let Some(license) = metadata.license.as_deref() {
-        frontmatter.push(format!("license: {}", yaml_string(license)));
-    }
-    if !metadata.tags.is_empty() {
-        frontmatter.push(format!("tags: [{}]", metadata.tags.join(", ")));
-    }
-    frontmatter.push("agentenv-bundle: true".to_owned());
-    frontmatter.push(format!("agentenv-schema: \"{}\"", AGENTENV_BUNDLE_SCHEMA));
-    frontmatter.push("---".to_owned());
+) -> Result<String, serde_yaml::Error> {
+    let frontmatter = SkillFrontmatter {
+        name: &metadata.name,
+        description: &metadata.description,
+        version: metadata.version.to_string(),
+        author: metadata.author.as_deref(),
+        license: metadata.license.as_deref(),
+        tags: metadata.tags.iter().map(String::as_str).collect(),
+        agentenv_bundle: true,
+        agentenv_schema: AGENTENV_BUNDLE_SCHEMA,
+    };
+    let frontmatter = serde_yaml::to_string(&frontmatter)?;
 
     let mut body = vec![
         format!("# {}", metadata.name),
@@ -59,37 +81,35 @@ pub(crate) fn render_skill_md(
         body.push("- `references/architecture.md` contains copied project architecture notes when available.".to_owned());
     }
 
-    format!("{}\n\n{}\n", frontmatter.join("\n"), body.join("\n"))
+    Ok(format!("---\n{}---\n\n{}\n", frontmatter, body.join("\n")))
 }
 
-pub(crate) fn render_skill_yaml(metadata: &SkillBundleMetadata, has_reference: bool) -> String {
+pub(crate) fn render_skill_yaml(
+    metadata: &SkillBundleMetadata,
+    has_reference: bool,
+) -> Result<String, serde_yaml::Error> {
     let mut files = vec![
-        "  - SKILL.md".to_owned(),
-        "  - blueprint.yaml".to_owned(),
-        "  - agentenv.lock".to_owned(),
-        "  - scripts/**".to_owned(),
-        "  - .agentenv/**".to_owned(),
+        "SKILL.md",
+        "blueprint.yaml",
+        "agentenv.lock",
+        "scripts/**",
+        ".agentenv/**",
     ];
     if has_reference {
-        files.push("  - references/**".to_owned());
+        files.push("references/**");
     }
 
-    let mut yaml = vec![
-        format!("name: {}", metadata.name),
-        format!("version: {}", metadata.version),
-        format!("description: {}", yaml_string(&metadata.description)),
-        "entry: SKILL.md".to_owned(),
-        "files:".to_owned(),
-    ];
-    yaml.extend(files);
-    if !metadata.tags.is_empty() {
-        yaml.push("tags:".to_owned());
-        yaml.extend(metadata.tags.iter().map(|tag| format!("  - {tag}")));
-    }
-    yaml.push("agentenv_bundle: true".to_owned());
-    yaml.push(format!("agentenv_schema: \"{}\"", AGENTENV_BUNDLE_SCHEMA));
-    yaml.push(String::new());
-    yaml.join("\n")
+    let skill_yaml = SkillYaml {
+        name: &metadata.name,
+        version: metadata.version.to_string(),
+        description: &metadata.description,
+        entry: "SKILL.md",
+        files,
+        tags: metadata.tags.iter().map(String::as_str).collect(),
+        agentenv_bundle: true,
+        agentenv_schema: AGENTENV_BUNDLE_SCHEMA,
+    };
+    serde_yaml::to_string(&skill_yaml)
 }
 
 pub(crate) fn render_bootstrap(env_name: &str) -> String {
@@ -122,35 +142,4 @@ pub(crate) fn ensure_trailing_newline(input: &str) -> String {
     } else {
         format!("{input}\n")
     }
-}
-
-fn yaml_string(value: &str) -> String {
-    if is_plain_yaml_scalar(value) {
-        value.to_owned()
-    } else {
-        serde_yaml::to_string(value)
-            .map(|serialized| {
-                serialized
-                    .trim()
-                    .trim_start_matches("---")
-                    .trim()
-                    .trim_end_matches("...")
-                    .trim()
-                    .to_owned()
-            })
-            .unwrap_or_else(|_| format!("{value:?}"))
-    }
-}
-
-fn is_plain_yaml_scalar(value: &str) -> bool {
-    !value.is_empty()
-        && !value.starts_with([
-            '-', '?', ':', '@', '`', '&', '*', '#', '!', '|', '>', '{', '[',
-        ])
-        && !value.contains('\n')
-        && !value.contains(": ")
-        && !matches!(
-            value,
-            "true" | "false" | "null" | "~" | "True" | "False" | "NULL"
-        )
 }
