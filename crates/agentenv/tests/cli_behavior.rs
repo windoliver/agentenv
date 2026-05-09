@@ -231,6 +231,7 @@ fn bundle_as_skill_exports_existing_env_with_project_reference() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(out_dir.join("SKILL.md").is_file());
+    assert!(out_dir.join("skill.yaml").is_file());
     let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
     assert!(
         skill.contains("author: Alice Example"),
