@@ -96,6 +96,7 @@ fn network_overrides_replace_conflicting_baseline_rules() {
             allow: Vec::new(),
             deny: vec![host_rule("api.github.com")],
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         ..empty_overrides()
     };
@@ -178,6 +179,7 @@ fn empty_overrides() -> NetworkPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: FilesystemPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,

@@ -1312,6 +1312,7 @@ impl SandboxDriver for MicroVmDriver {
                 supports_native_inference_routing: false,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_dns_egress_control: false,
             }),
         })
     }
@@ -1848,6 +1849,7 @@ mod tests {
                 allow: Vec::new(),
                 deny: Vec::new(),
                 approval_required: Vec::new(),
+                dns: agentenv_proto::DnsPolicy::default(),
             },
             filesystem: FilesystemPolicy {
                 reloadability: PolicyReloadability::LockedAtCreate,

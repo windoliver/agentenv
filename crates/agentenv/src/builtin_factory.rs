@@ -1230,6 +1230,7 @@ mod tests {
                 allow: Vec::new(),
                 deny: Vec::new(),
                 approval_required: Vec::new(),
+                dns: agentenv_proto::DnsPolicy::default(),
             },
             filesystem: FilesystemPolicy {
                 reloadability: PolicyReloadability::LockedAtCreate,

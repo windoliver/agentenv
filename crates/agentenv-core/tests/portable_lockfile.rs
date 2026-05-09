@@ -415,6 +415,32 @@ fn portable_lockfile_parse_rejects_unknown_resolved_policy_field() {
 }
 
 #[test]
+fn portable_lockfile_parse_accepts_resolved_network_dns_policy() {
+    let mut lockfile = reference_portable_lockfile();
+    lockfile.policy.resolved.network.dns = agentenv_proto::DnsPolicy {
+        resolvers_allowed: vec!["1.1.1.1".to_owned()],
+        doh_upstreams_allowed: vec!["https://dns.google/dns-query".to_owned()],
+        dot_upstreams_allowed: vec!["1.1.1.1:853".to_owned()],
+        log_all_queries: true,
+        pin_resolved_ips: true,
+    };
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render dns lockfile");
+
+    let parsed =
+        LockfileDocument::from_yaml(&rendered).expect("resolved dns policy should be accepted");
+
+    let LockfileDocument::Portable(parsed) = parsed else {
+        panic!("expected portable lockfile");
+    };
+    assert_eq!(
+        parsed.policy.resolved.network.dns.resolvers_allowed,
+        vec!["1.1.1.1"]
+    );
+}
+
+#[test]
 fn portable_lockfile_verify_rejects_artifact_map_mismatch() {
     let mut lockfile = build_portable_lockfile(PortableLockfileInput {
         name: "demo".to_owned(),

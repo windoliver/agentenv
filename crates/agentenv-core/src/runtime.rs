@@ -4375,6 +4375,7 @@ fn empty_policy_override() -> agentenv_proto::NetworkPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: agentenv_proto::FilesystemPolicy {
             reloadability: agentenv_proto::PolicyReloadability::LockedAtCreate,
@@ -5956,6 +5957,7 @@ policy:
                     supports_native_inference_routing: true,
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
+                    supports_dns_egress_control: false,
                 }),
             })
         }
@@ -6363,6 +6365,7 @@ policy:
                     supports_native_inference_routing: true,
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
+                    supports_dns_egress_control: false,
                 }),
             })
         }
@@ -6827,6 +6830,7 @@ policy:
                     supports_native_inference_routing: true,
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
+                    supports_dns_egress_control: false,
                 }),
             })
         }
@@ -10325,6 +10329,7 @@ policy:
                     supports_native_inference_routing: true,
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
+                    supports_dns_egress_control: false,
                 }),
             ),
         };

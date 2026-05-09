@@ -29,6 +29,7 @@ fn expanded_policy_round_trips_all_domains() {
                     path: "/repos/*".to_owned(),
                 },
             }],
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: FilesystemPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,
@@ -92,4 +93,96 @@ fn expanded_policy_round_trips_all_domains() {
         serde_json::from_value(serde_json::to_value(&params).expect("serialize params"))
             .expect("round-trip apply policy params");
     assert_eq!(params_round_trip, params);
+}
+
+#[test]
+fn inactive_dns_policy_is_omitted_from_network_policy_json() {
+    let policy = sample_policy();
+
+    let value = serde_json::to_value(&policy).expect("serialize policy");
+
+    assert!(value["network"].get("dns").is_none());
+}
+
+#[test]
+fn legacy_network_policy_json_defaults_missing_dns_policy() {
+    let value = serde_json::json!({
+        "network": {
+            "reloadability": "hot_reload",
+            "allow": [],
+            "deny": [],
+            "approval_required": []
+        },
+        "filesystem": {
+            "reloadability": "locked_at_create",
+            "read_only": [],
+            "read_write": []
+        },
+        "process": {
+            "reloadability": "locked_at_create",
+            "run_as_user": "sandbox",
+            "run_as_group": "sandbox",
+            "profile": "restricted",
+            "allow_syscalls": [],
+            "deny_syscalls": []
+        },
+        "inference": {
+            "reloadability": "hot_reload",
+            "routes": []
+        }
+    });
+
+    let policy: NetworkPolicy = serde_json::from_value(value).expect("deserialize legacy policy");
+
+    assert_eq!(policy.network.dns, agentenv_proto::DnsPolicy::default());
+    assert!(policy.network.dns.is_inactive());
+}
+
+#[test]
+fn dns_policy_round_trips_inside_network_policy() {
+    let mut policy = sample_policy();
+    policy.network.dns = agentenv_proto::DnsPolicy {
+        resolvers_allowed: vec!["1.1.1.1".to_owned(), "8.8.8.8".to_owned()],
+        doh_upstreams_allowed: vec!["https://dns.google/dns-query".to_owned()],
+        dot_upstreams_allowed: vec!["1.1.1.1:853".to_owned()],
+        log_all_queries: true,
+        pin_resolved_ips: true,
+    };
+
+    let value = serde_json::to_value(&policy).expect("serialize policy");
+    assert_eq!(value["network"]["dns"]["resolvers_allowed"][0], "1.1.1.1");
+    assert_eq!(value["network"]["dns"]["log_all_queries"], true);
+    assert_eq!(value["network"]["dns"]["pin_resolved_ips"], true);
+
+    let decoded: NetworkPolicy = serde_json::from_value(value).expect("deserialize policy");
+    assert_eq!(decoded, policy);
+}
+
+fn sample_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        network: NetworkAccessPolicy {
+            reloadability: PolicyReloadability::HotReload,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
+        },
+        filesystem: FilesystemPolicy {
+            reloadability: PolicyReloadability::LockedAtCreate,
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+        },
+        process: ProcessPolicy {
+            reloadability: PolicyReloadability::LockedAtCreate,
+            run_as_user: "sandbox".to_owned(),
+            run_as_group: "sandbox".to_owned(),
+            profile: "restricted".to_owned(),
+            allow_syscalls: Vec::new(),
+            deny_syscalls: Vec::new(),
+        },
+        inference: InferencePolicy {
+            reloadability: PolicyReloadability::HotReload,
+            routes: Vec::new(),
+        },
+    }
 }

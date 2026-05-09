@@ -344,6 +344,7 @@ fn supported_policy() -> NetworkPolicy {
                     path: "/repos/*".to_owned(),
                 },
             }],
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: FilesystemPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,

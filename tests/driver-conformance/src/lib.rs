@@ -1247,6 +1247,7 @@ mod tests {
                 supports_native_inference_routing: false,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_dns_egress_control: false,
             })),
             ..FakeAgentDriver::default()
         };
@@ -1371,6 +1372,7 @@ mod tests {
                         supports_native_inference_routing: true,
                         supports_remote_host: false,
                         supports_persistent_sessions: false,
+                        supports_dns_egress_control: false,
                     })
                 }),
             })
@@ -1536,6 +1538,7 @@ mod tests {
                 supports_native_inference_routing: true,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_dns_egress_control: false,
             })),
             ..FakeSandboxDriver::default()
         };

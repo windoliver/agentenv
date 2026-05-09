@@ -718,6 +718,7 @@ fn empty_policy_override() -> NetworkPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: agentenv_proto::FilesystemPolicy {
             reloadability: agentenv_proto::PolicyReloadability::LockedAtCreate,

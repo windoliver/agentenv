@@ -44,8 +44,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_1_1() {
-        assert_eq!(SCHEMA_VERSION, "1.1");
+    fn schema_version_is_1_2() {
+        assert_eq!(SCHEMA_VERSION, "1.2");
     }
 
     #[test]
@@ -101,6 +101,27 @@ mod tests {
         .expect("legacy sandbox capabilities should deserialize");
 
         assert!(!capabilities.supports_persistent_sessions);
+    }
+
+    #[test]
+    fn sandbox_capabilities_default_missing_dns_egress_control_to_false() {
+        let capabilities: SandboxCapabilities = serde_json::from_value(serde_json::json!({
+            "supports_hot_reload_policy": true,
+            "supports_filesystem_lockdown": true,
+            "supports_syscall_filter": true,
+            "supports_native_inference_routing": true,
+            "supports_remote_host": false,
+            "supports_persistent_sessions": false
+        }))
+        .expect("legacy sandbox capabilities should deserialize");
+
+        assert!(!capabilities.supports_dns_egress_control);
+    }
+
+    #[test]
+    fn dns_policy_schema_is_exported() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(manifest_dir.join("schema/dns-policy.json").exists());
     }
 
     #[test]
