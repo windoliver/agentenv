@@ -1346,6 +1346,66 @@ async fn filesystem_registry_add_uses_scanned_subdirectory_without_index() {
 }
 
 #[tokio::test]
+async fn filesystem_registry_publish_keeps_scanned_subdirectories_ephemeral() {
+    let home = temp_dir("skill-fs-scan-ephemeral-home");
+    let registry = temp_dir("skill-fs-scan-ephemeral-registry");
+    write_file(
+        &registry.join("scan-live/skill.yaml"),
+        "name: scan-live\nversion: 0.1.0\ndescription: Before publish\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("scan-live/SKILL.md"), "# Scan live\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("published-skill", "0.1.0", "Published"),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should succeed");
+
+    write_file(
+        &registry.join("scan-live/skill.yaml"),
+        "name: scan-live\nversion: 0.1.0\ndescription: After publish\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+
+    let hits = service
+        .search("After publish")
+        .await
+        .expect("search should use live scanned metadata");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "scan-live");
+    let index = fs::read_to_string(registry.join("index.yaml")).unwrap();
+    assert!(!index.contains("scan-live"));
+}
+
+#[tokio::test]
+async fn filesystem_registry_rejects_duplicate_scanned_skill_versions() {
+    let home = temp_dir("skill-fs-scan-duplicate-home");
+    let registry = temp_dir("skill-fs-scan-duplicate-registry");
+    write_file(
+        &registry.join("first/skill.yaml"),
+        "name: duplicate-scan\nversion: 0.1.0\ndescription: First duplicate\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("first/SKILL.md"), "# First duplicate\n");
+    write_file(
+        &registry.join("second/skill.yaml"),
+        "name: duplicate-scan\nversion: 0.1.0\ndescription: Second duplicate\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("second/SKILL.md"), "# Second duplicate\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .search("duplicate")
+        .await
+        .expect_err("duplicate scanned skill versions must be rejected");
+
+    assert!(matches!(error, SkillError::InvalidConfig { .. }));
+}
+
+#[tokio::test]
 async fn skill_service_add_without_version_installs_highest_semver() {
     let home = temp_dir("skill-fs-highest-home");
     let registry = temp_dir("skill-fs-highest-registry");

@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -43,12 +44,23 @@ impl FilesystemRegistryAdapter {
     }
 
     fn read_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
+        let mut index = self.read_persisted_index()?;
+        let mut scanned = self.scan_index()?;
+        scanned
+            .skills
+            .retain(|scanned| !contains_hit(&index.skills, scanned));
+        index.skills.extend(scanned.skills);
+        sort_hits(&mut index.skills);
+        Ok(index)
+    }
+
+    fn read_persisted_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
         let path = self.index_path();
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_) => return Err(SkillError::UnsafeBundlePath { path }),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return self.scan_index();
+                return Ok(FilesystemRegistryIndex::default());
             }
             Err(source) => {
                 return Err(SkillError::Io { path, source });
@@ -66,6 +78,7 @@ impl FilesystemRegistryAdapter {
 
     fn scan_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
         let mut skills = Vec::new();
+        let mut seen = HashSet::new();
         for entry in fs::read_dir(&self.root).map_err(|source| SkillError::Io {
             path: self.root.clone(),
             source,
@@ -90,6 +103,15 @@ impl FilesystemRegistryAdapter {
                 continue;
             }
             let manifest = super::load_skill_manifest(&path)?;
+            let version = manifest.version.to_string();
+            if !seen.insert((manifest.name.clone(), version.clone())) {
+                return Err(SkillError::InvalidConfig {
+                    message: format!(
+                        "filesystem registry `{}` has duplicate scanned skill `{}` version `{}`",
+                        self.name, manifest.name, version
+                    ),
+                });
+            }
             let digest = compute_bundle_digest(&path, &manifest)?;
             skills.push(self.hit_for_manifest(&manifest, digest));
         }
@@ -115,7 +137,7 @@ impl FilesystemRegistryAdapter {
     }
 
     fn upsert_hit(&self, hit: SkillSearchHit) -> Result<(), SkillError> {
-        let mut index = self.read_index()?;
+        let mut index = self.read_persisted_index()?;
         index
             .skills
             .retain(|existing| existing.name != hit.name || existing.version != hit.version);
@@ -358,6 +380,11 @@ fn verify_publish_signature(
         })?;
 
     verify_ed25519_signature(manifest, digest, signature, public_key)
+}
+
+fn contains_hit(hits: &[SkillSearchHit], needle: &SkillSearchHit) -> bool {
+    hits.iter()
+        .any(|hit| hit.name == needle.name && hit.version == needle.version)
 }
 
 fn copy_bundle_contents(
