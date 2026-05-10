@@ -1,12 +1,15 @@
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
 };
 
+use crate::security::ssrf::{validate_outbound, SsrfOptions};
 use semver::Version;
+use url::Url;
 
 use super::{
     compute_bundle_digest, manifest::validated_bundle_file, validate_skill_name, FetchedSkill,
@@ -21,7 +24,24 @@ pub(crate) trait GitCheckout: Send + Sync + std::fmt::Debug {
 }
 
 #[derive(Debug)]
-struct CommandGitCheckout;
+struct CommandGitCheckout {
+    runner: Arc<dyn GitCommandRunner>,
+}
+
+#[derive(Debug)]
+struct RealGitCommandRunner;
+
+trait GitCommandRunner: Send + Sync + std::fmt::Debug {
+    fn run(&self, args: &[String], terminal_prompt: &str) -> Result<GitCommandOutput, String>;
+}
+
+#[derive(Debug, Clone)]
+struct GitCommandOutput {
+    success: bool,
+    status: String,
+    stdout: String,
+    stderr: String,
+}
 
 #[derive(Debug, Clone)]
 struct ScannedGitSkill {
@@ -36,14 +56,54 @@ pub(crate) struct GitRegistryAdapter {
     url: String,
     cache_root: PathBuf,
     checkout: Arc<dyn GitCheckout>,
+    ssrf_options: SsrfOptions,
 }
 
 impl GitCheckout for CommandGitCheckout {
     fn checkout(&self, url: &str, cache_root: &Path) -> Result<PathBuf, SkillError> {
         ensure_directory(cache_root)?;
         let checkout = cache_root.join("checkout");
+        match fs::symlink_metadata(&checkout) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                if !checkout.join(".git").is_dir() {
+                    return Err(SkillError::GitRegistry {
+                        url: url.to_owned(),
+                        message: format!(
+                            "cache checkout path `{}` exists but is not a git repository",
+                            checkout.display()
+                        ),
+                    });
+                }
+            }
+            Ok(_) => {
+                return Err(SkillError::UnsafeBundlePath { path: checkout });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                let clone_url = clone_url(url)?;
+                run_git(
+                    self.runner.as_ref(),
+                    &[
+                        "clone".to_owned(),
+                        "--filter=blob:none".to_owned(),
+                        "--depth=1".to_owned(),
+                        clone_url,
+                        path_arg(&checkout),
+                    ],
+                    url,
+                )?;
+                return Ok(checkout);
+            }
+            Err(source) => {
+                return Err(SkillError::Io {
+                    path: checkout,
+                    source,
+                });
+            }
+        }
+
         if checkout.join(".git").is_dir() {
             run_git(
+                self.runner.as_ref(),
                 &[
                     "-C".to_owned(),
                     path_arg(&checkout),
@@ -55,6 +115,7 @@ impl GitCheckout for CommandGitCheckout {
                 url,
             )?;
             run_git(
+                self.runner.as_ref(),
                 &[
                     "-C".to_owned(),
                     path_arg(&checkout),
@@ -66,19 +127,7 @@ impl GitCheckout for CommandGitCheckout {
             )?;
             return Ok(checkout);
         }
-
-        let clone_url = clone_url(url)?;
-        run_git(
-            &[
-                "clone".to_owned(),
-                "--filter=blob:none".to_owned(),
-                "--depth=1".to_owned(),
-                clone_url,
-                path_arg(&checkout),
-            ],
-            url,
-        )?;
-        Ok(checkout)
+        unreachable!("non-git checkout paths are returned above")
     }
 }
 
@@ -87,25 +136,45 @@ impl GitRegistryAdapter {
         name: impl Into<String>,
         url: impl Into<String>,
         cache_root: impl Into<PathBuf>,
+        ssrf_options: SsrfOptions,
     ) -> Self {
-        Self::with_checkout(name, url, cache_root, Arc::new(CommandGitCheckout))
+        Self::with_checkout_and_ssrf(
+            name,
+            url,
+            cache_root,
+            Arc::new(CommandGitCheckout::new()),
+            ssrf_options,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_checkout(
         name: impl Into<String>,
         url: impl Into<String>,
         cache_root: impl Into<PathBuf>,
         checkout: Arc<dyn GitCheckout>,
     ) -> Self {
+        Self::with_checkout_and_ssrf(name, url, cache_root, checkout, SsrfOptions::default())
+    }
+
+    pub(crate) fn with_checkout_and_ssrf(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        cache_root: impl Into<PathBuf>,
+        checkout: Arc<dyn GitCheckout>,
+        ssrf_options: SsrfOptions,
+    ) -> Self {
         Self {
             name: name.into(),
             url: url.into(),
             cache_root: cache_root.into(),
             checkout,
+            ssrf_options,
         }
     }
 
     fn checkout_path(&self) -> Result<PathBuf, SkillError> {
+        validate_git_registry_url(&self.url, &self.ssrf_options)?;
         self.checkout.checkout(&self.url, &self.cache_root)
     }
 
@@ -113,6 +182,7 @@ impl GitRegistryAdapter {
         let checkout_path = self.checkout_path()?;
         let mut skills = Vec::new();
         scan_directory(&checkout_path, &mut skills)?;
+        reject_duplicate_manifests(&self.name, &skills)?;
         Ok(skills)
     }
 
@@ -184,8 +254,7 @@ impl RegistryAdapter for GitRegistryAdapter {
                 })?;
 
         let version = skill.manifest.version.to_string();
-        let staging_path = staging_fetch_path(&skill.manifest.name, &version);
-        remove_directory_if_exists(&staging_path)?;
+        let staging_path = staging_fetch_path(&self.cache_root, &skill.manifest.name, &version)?;
         copy_bundle_contents(&skill.path, &staging_path, &skill.manifest)?;
 
         Ok(FetchedSkill {
@@ -205,6 +274,36 @@ impl RegistryAdapter for GitRegistryAdapter {
         Err(SkillError::UnsupportedRegistryPublish {
             registry: self.name.clone(),
             kind: SOURCE_TYPE.to_owned(),
+        })
+    }
+}
+
+impl CommandGitCheckout {
+    fn new() -> Self {
+        Self {
+            runner: Arc::new(RealGitCommandRunner),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_runner(runner: Arc<dyn GitCommandRunner>) -> Self {
+        Self { runner }
+    }
+}
+
+impl GitCommandRunner for RealGitCommandRunner {
+    fn run(&self, args: &[String], terminal_prompt: &str) -> Result<GitCommandOutput, String> {
+        let output = Command::new("git")
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", terminal_prompt)
+            .output()
+            .map_err(|source| format!("failed to run git: {source}"))?;
+
+        Ok(GitCommandOutput {
+            success: output.status.success(),
+            status: output.status.to_string(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
 }
@@ -280,24 +379,44 @@ fn clone_url(url: &str) -> Result<String, SkillError> {
     Ok(stripped.to_owned())
 }
 
-fn run_git(args: &[String], url: &str) -> Result<(), SkillError> {
-    let output = Command::new("git")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|source| SkillError::GitRegistry {
+fn validate_git_registry_url(url: &str, options: &SsrfOptions) -> Result<(), SkillError> {
+    let clone_url = clone_url(url)?;
+    let parsed = Url::parse(&clone_url).map_err(|source| SkillError::GitRegistry {
+        url: url.to_owned(),
+        message: format!("invalid git registry URL: {source}"),
+    })?;
+    validate_outbound(&parsed, options.clone())
+        .map(|_| ())
+        .map_err(|source| SkillError::RegistryUrlBlocked {
             url: url.to_owned(),
-            message: format!("failed to run git: {source}"),
+            source: Box::new(source),
+        })
+}
+
+fn run_git(runner: &dyn GitCommandRunner, args: &[String], url: &str) -> Result<(), SkillError> {
+    let output = runner
+        .run(args, "0")
+        .map_err(|message| SkillError::GitRegistry {
+            url: url.to_owned(),
+            message,
         })?;
-    if output.status.success() {
+    if output.success {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let message = if stderr.is_empty() {
-        format!("git exited with status {}", output.status)
+    let message = if output.stderr.is_empty() {
+        let stdout = bounded_diagnostic(&output.stdout);
+        if stdout.is_empty() {
+            format!("git exited with status {}", output.status)
+        } else {
+            format!("git exited with status {}: {stdout}", output.status)
+        }
     } else {
-        format!("git exited with status {}: {stderr}", output.status)
+        format!(
+            "git exited with status {}: {}",
+            output.status,
+            bounded_diagnostic(&output.stderr)
+        )
     };
     Err(SkillError::GitRegistry {
         url: url.to_owned(),
@@ -305,55 +424,105 @@ fn run_git(args: &[String], url: &str) -> Result<(), SkillError> {
     })
 }
 
+fn bounded_diagnostic(text: &str) -> String {
+    const LIMIT: usize = 512;
+    let text = text.trim();
+    if text.len() <= LIMIT {
+        return text.to_owned();
+    }
+
+    let mut end = LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
 fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn staging_fetch_path(name: &str, version: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "agentenv-skill-git-fetch-{name}-{version}-{}-{}",
-        std::process::id(),
-        temporary_suffix()
-    ))
-}
-
-fn remove_directory_if_exists(path: &Path) -> Result<(), SkillError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => {
-            fs::remove_dir_all(path).map_err(|source| SkillError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
+fn staging_fetch_path(cache_root: &Path, name: &str, version: &str) -> Result<PathBuf, SkillError> {
+    let staging_root = cache_root.join("staging");
+    ensure_directory(&staging_root)?;
+    for _ in 0..16 {
+        let candidate = staging_root.join(format!(
+            "{name}-{version}-{}-{}",
+            std::process::id(),
+            temporary_suffix()
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(SkillError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
         }
-        Ok(_) => Err(SkillError::UnsafeBundlePath {
-            path: path.to_path_buf(),
-        }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(SkillError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
     }
+
+    Err(SkillError::GitRegistry {
+        url: SOURCE_TYPE.to_owned(),
+        message: "failed to allocate unique git skill staging directory".to_owned(),
+    })
 }
 
 fn copy_regular_file(source: &Path, destination: &Path) -> Result<(), SkillError> {
-    let metadata = fs::symlink_metadata(source).map_err(|source_error| SkillError::Io {
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
-    if !metadata.file_type().is_file() {
-        return Err(SkillError::UnsafeBundlePath {
-            path: source.to_path_buf(),
-        });
-    }
     if let Some(parent) = destination.parent() {
         ensure_directory(parent)?;
     }
-    fs::copy(source, destination).map_err(|source| SkillError::Io {
+    let mut source_file = open_regular_file(source)?;
+    let mut destination_file = fs::File::create(destination).map_err(|source| SkillError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    std::io::copy(&mut source_file, &mut destination_file).map_err(|source| SkillError::Io {
         path: destination.to_path_buf(),
         source,
     })?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_regular_file(path: &Path) -> Result<fs::File, SkillError> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    ensure_opened_regular_file(path, &file)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_regular_file(path: &Path) -> Result<fs::File, SkillError> {
+    let file = fs::File::open(path).map_err(|source| SkillError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    ensure_opened_regular_file(path, &file)?;
+    Ok(file)
+}
+
+fn ensure_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), SkillError> {
+    let metadata = file.metadata().map_err(|source| SkillError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn copy_bundle_contents(
@@ -380,6 +549,25 @@ fn sort_hits(hits: &mut [SkillSearchHit]) {
             .then_with(|| compare_versions(&left.version, &right.version))
             .then_with(|| left.registry.cmp(&right.registry))
     });
+}
+
+fn reject_duplicate_manifests(
+    registry: &str,
+    skills: &[ScannedGitSkill],
+) -> Result<(), SkillError> {
+    let mut seen = HashSet::new();
+    for skill in skills {
+        let version = skill.manifest.version.to_string();
+        if !seen.insert((skill.manifest.name.clone(), version.clone())) {
+            return Err(SkillError::InvalidConfig {
+                message: format!(
+                    "git registry `{registry}` has duplicate skill `{}` version `{version}`",
+                    skill.manifest.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn compare_versions(left: &str, right: &str) -> Ordering {
@@ -417,7 +605,15 @@ fn temporary_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, sync::Arc};
+    use crate::security::ssrf::SsrfOptions;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, Mutex,
+        },
+    };
 
     #[derive(Debug)]
     struct StaticCheckout {
@@ -427,6 +623,57 @@ mod tests {
     impl GitCheckout for StaticCheckout {
         fn checkout(&self, _url: &str, _cache_root: &Path) -> Result<PathBuf, SkillError> {
             Ok(self.path.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingCheckout {
+        calls: AtomicUsize,
+        path: PathBuf,
+    }
+
+    impl GitCheckout for CountingCheckout {
+        fn checkout(&self, _url: &str, _cache_root: &Path) -> Result<PathBuf, SkillError> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(self.path.clone())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedGitCommand {
+        args: Vec<String>,
+        terminal_prompt: String,
+    }
+
+    #[derive(Debug)]
+    struct RecordingGitCommandRunner {
+        commands: Mutex<Vec<RecordedGitCommand>>,
+    }
+
+    impl RecordingGitCommandRunner {
+        fn new() -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn commands(&self) -> Vec<RecordedGitCommand> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    impl GitCommandRunner for RecordingGitCommandRunner {
+        fn run(&self, args: &[String], terminal_prompt: &str) -> Result<GitCommandOutput, String> {
+            self.commands.lock().unwrap().push(RecordedGitCommand {
+                args: args.to_vec(),
+                terminal_prompt: terminal_prompt.to_owned(),
+            });
+            Ok(GitCommandOutput {
+                success: true,
+                status: "exit status: 0".to_owned(),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         }
     }
 
@@ -451,6 +698,14 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    fn loopback_ssrf_options() -> SsrfOptions {
+        SsrfOptions {
+            allow_loopback: true,
+            allow_private: true,
+            ..SsrfOptions::default()
+        }
+    }
+
     #[tokio::test]
     async fn git_registry_search_scans_skill_directories() {
         let checkout = temp_dir("skill-git-search");
@@ -459,11 +714,12 @@ mod tests {
             "name: review-skill\nversion: 0.2.0\ndescription: Review helper\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
         );
         write_file(&checkout.join("tools/review/SKILL.md"), "# Review\n");
-        let adapter = GitRegistryAdapter::with_checkout(
+        let adapter = GitRegistryAdapter::with_checkout_and_ssrf(
             "git-dev",
-            "git+https://github.com/acme/skills",
+            "git+https://127.0.0.1/acme/skills",
             temp_dir("skill-git-cache"),
             Arc::new(StaticCheckout { path: checkout }),
+            loopback_ssrf_options(),
         );
 
         let hits = adapter.search("review").await.unwrap();
@@ -487,11 +743,12 @@ mod tests {
             "name: versioned-git\nversion: 0.3.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
         );
         write_file(&checkout.join("new/SKILL.md"), "# New\n");
-        let adapter = GitRegistryAdapter::with_checkout(
+        let adapter = GitRegistryAdapter::with_checkout_and_ssrf(
             "git-dev",
-            "git+https://github.com/acme/skills",
+            "git+https://127.0.0.1/acme/skills",
             temp_dir("skill-git-cache"),
             Arc::new(StaticCheckout { path: checkout }),
+            loopback_ssrf_options(),
         );
 
         let fetched = adapter.fetch("versioned-git", None).await.unwrap();
@@ -499,5 +756,119 @@ mod tests {
         assert_eq!(fetched.source_type, "git");
         assert_eq!(fetched.version, "0.3.0");
         assert!(fetched.staging_path.join("SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn git_registry_blocks_ssrf_url_before_checkout() {
+        let checkout = Arc::new(CountingCheckout {
+            calls: AtomicUsize::new(0),
+            path: temp_dir("skill-git-ssrf-checkout"),
+        });
+        let adapter = GitRegistryAdapter::with_checkout(
+            "git-dev",
+            "git+https://127.0.0.1/acme/skills",
+            temp_dir("skill-git-cache"),
+            checkout.clone(),
+        );
+
+        let error = adapter
+            .search("anything")
+            .await
+            .expect_err("blocked URL should stop before checkout");
+
+        assert!(matches!(error, SkillError::RegistryUrlBlocked { .. }));
+        assert_eq!(checkout.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn git_registry_scan_rejects_duplicate_name_version_manifests() {
+        let checkout = temp_dir("skill-git-duplicates");
+        for directory in ["one", "two"] {
+            write_file(
+                &checkout.join(directory).join("skill.yaml"),
+                "name: duplicate-git\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+            );
+            write_file(&checkout.join(directory).join("SKILL.md"), "# Duplicate\n");
+        }
+        let adapter = GitRegistryAdapter::with_checkout_and_ssrf(
+            "git-dev",
+            "git+https://127.0.0.1/acme/skills",
+            temp_dir("skill-git-cache"),
+            Arc::new(StaticCheckout { path: checkout }),
+            loopback_ssrf_options(),
+        );
+
+        let error = adapter
+            .search("duplicate")
+            .await
+            .expect_err("duplicate manifests must be rejected");
+
+        assert!(matches!(error, SkillError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn command_checkout_clones_stripped_git_url_into_cache_root() {
+        let cache_root = temp_dir("skill-git-command-clone");
+        let runner = Arc::new(RecordingGitCommandRunner::new());
+        let checkout = CommandGitCheckout::with_runner(runner.clone());
+
+        let path = checkout
+            .checkout("git+https://github.com/acme/skills", &cache_root)
+            .unwrap();
+
+        assert_eq!(path, cache_root.join("checkout"));
+        assert_eq!(
+            runner.commands(),
+            vec![RecordedGitCommand {
+                args: vec![
+                    "clone".to_owned(),
+                    "--filter=blob:none".to_owned(),
+                    "--depth=1".to_owned(),
+                    "https://github.com/acme/skills".to_owned(),
+                    path_arg(&cache_root.join("checkout")),
+                ],
+                terminal_prompt: "0".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn command_checkout_fetches_and_resets_existing_checkout() {
+        let cache_root = temp_dir("skill-git-command-fetch");
+        fs::create_dir_all(cache_root.join("checkout/.git")).unwrap();
+        let runner = Arc::new(RecordingGitCommandRunner::new());
+        let checkout = CommandGitCheckout::with_runner(runner.clone());
+
+        let path = checkout
+            .checkout("git+https://github.com/acme/skills", &cache_root)
+            .unwrap();
+
+        assert_eq!(path, cache_root.join("checkout"));
+        assert_eq!(
+            runner.commands(),
+            vec![
+                RecordedGitCommand {
+                    args: vec![
+                        "-C".to_owned(),
+                        path_arg(&cache_root.join("checkout")),
+                        "fetch".to_owned(),
+                        "--all".to_owned(),
+                        "--tags".to_owned(),
+                        "--prune".to_owned(),
+                    ],
+                    terminal_prompt: "0".to_owned(),
+                },
+                RecordedGitCommand {
+                    args: vec![
+                        "-C".to_owned(),
+                        path_arg(&cache_root.join("checkout")),
+                        "reset".to_owned(),
+                        "--hard".to_owned(),
+                        "origin/HEAD".to_owned(),
+                    ],
+                    terminal_prompt: "0".to_owned(),
+                },
+            ]
+        );
     }
 }

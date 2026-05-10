@@ -230,6 +230,7 @@ impl SkillService {
                 )?))
             }
             RegistryKind::Git => {
+                validate_skill_name(&registry.name)?;
                 let url = registry
                     .url
                     .clone()
@@ -243,6 +244,7 @@ impl SkillService {
                         .join("cache")
                         .join("skill-git")
                         .join(&registry.name),
+                    self.ssrf_options.clone(),
                 )))
             }
         }

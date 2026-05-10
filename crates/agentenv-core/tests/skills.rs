@@ -2043,6 +2043,35 @@ async fn git_registry_publish_is_reported_as_unsupported() {
     ));
 }
 
+#[tokio::test]
+async fn git_registry_rejects_invalid_registry_name_before_cache_path_use() {
+    let home = temp_dir("skill-git-invalid-registry-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::git(
+                "../../outside",
+                "git+https://github.com/acme/skills",
+            )],
+            registry_order: vec!["../../outside".to_owned()],
+        },
+    );
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("git-name-reject", "0.1.0", "Git name reject"),
+            registry: Some("../../outside".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("invalid registry names must be rejected before adapter construction");
+
+    assert!(matches!(
+        error,
+        SkillError::InvalidSkillName { name } if name == "../../outside"
+    ));
+}
+
 #[cfg(windows)]
 fn self_test_file_exists_command() -> &'static str {
     "if exist SKILL.md (exit /B 0) else (exit /B 1)"
