@@ -1892,6 +1892,43 @@ async fn http_registry_add_rejects_tar_zst_symlink_entry() {
 }
 
 #[tokio::test]
+async fn http_registry_rejects_tarball_hardlink_entries() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"hardlink-skill","version":"0.1.0","description":null,"registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/hardlink-skill/0.1.0.tar.zst",
+        tar_zst_bundle_with_hardlink("hardlink-skill", "0.1.0"),
+    )
+    .await;
+    let home = temp_dir("skill-http-tar-hardlink-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "hardlink-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("hardlink tar entries must be rejected");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsafeBundlePath { .. } | SkillError::InvalidConfig { .. }
+    ));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn http_registry_uses_bearer_token_from_credential_resolver() {
     let server = TestHttpRegistry::start().await;
     server.require_authorization("secret-token").await;
@@ -2107,6 +2144,25 @@ fn tar_zst_bundle_bytes_with_symlink(
         header.set_cksum();
         builder
             .append_data(&mut header, entry_path, io::empty())
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn tar_zst_bundle_with_hardlink(name: &str, version: &str) -> Vec<u8> {
+    let bundle = skill_bundle(name, version, "Hardlink tarball skill");
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, &bundle);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_link_name("SKILL.md").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "hardlink-skill.md", io::empty())
             .unwrap();
         builder.finish().unwrap();
     }
