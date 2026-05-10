@@ -1,6 +1,4 @@
-use agentenv_core::lifecycle::{
-    create_from_blueprint_yaml, freeze_from_blueprint_yaml, LifecycleError,
-};
+use agentenv_core::lifecycle::{create_from_blueprint_yaml, freeze_from_blueprint_yaml};
 use agentenv_core::security::dns_policy::{validate_dns_policy, DnsPolicyError};
 use agentenv_proto::DnsPolicy;
 
@@ -15,16 +13,13 @@ fn public_resolver_ip_is_accepted() {
 }
 
 #[test]
-fn private_resolver_ip_is_rejected() {
+fn private_resolver_ip_is_accepted_for_explicit_resolver_allowlist() {
     let policy = DnsPolicy {
         resolvers_allowed: vec!["10.0.0.10".to_owned()],
         ..DnsPolicy::default()
     };
 
-    let err = validate_dns_policy(&policy).expect_err("private resolver should reject");
-    assert!(
-        matches!(err, DnsPolicyError::ResolverBlocked { ref path, .. } if path == "policy.dns.resolvers_allowed[0]")
-    );
+    validate_dns_policy(&policy).expect("private resolver should validate");
 }
 
 #[test]
@@ -191,7 +186,7 @@ fn active_dns_policy_without_upstream_is_rejected() {
 }
 
 #[test]
-fn lifecycle_rejects_declared_private_dns_resolver() {
+fn lifecycle_accepts_declared_private_dns_resolver() {
     let yaml = r#"
 version: 0.1.0
 min_agentenv_version: 0.0.1-alpha0
@@ -209,23 +204,6 @@ policy:
       - 10.0.0.10
 "#;
 
-    assert_private_dns_lifecycle_error(freeze_from_blueprint_yaml(yaml).unwrap_err());
-    assert_private_dns_lifecycle_error(create_from_blueprint_yaml("dns-policy", yaml).unwrap_err());
-}
-
-fn assert_private_dns_lifecycle_error(err: LifecycleError) {
-    match err {
-        LifecycleError::DnsPolicy {
-            source:
-                DnsPolicyError::ResolverBlocked {
-                    ref path,
-                    ref value,
-                    ..
-                },
-        } => {
-            assert_eq!(path, "policy.dns.resolvers_allowed[0]");
-            assert_eq!(value, "10.0.0.10");
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    freeze_from_blueprint_yaml(yaml).expect("freeze should accept private resolver");
+    create_from_blueprint_yaml("dns-policy", yaml).expect("create should accept private resolver");
 }

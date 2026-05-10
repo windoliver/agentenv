@@ -91,6 +91,13 @@ pub enum UpdateDisposition {
     HotReload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxPreCreateState {
+    Absent,
+    Present,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandRequest {
     args: Vec<String>,
@@ -706,9 +713,9 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
         let spec = _spec;
-        let name = match spec.metadata.get("name") {
-            Some(Value::String(value)) if !value.is_empty() => value.clone(),
-            Some(Value::String(_)) | None => format!("agentenv-{}", Uuid::new_v4()),
+        let (name, name_was_explicit) = match spec.metadata.get("name") {
+            Some(Value::String(value)) if !value.is_empty() => (value.clone(), true),
+            Some(Value::String(_)) | None => (format!("agentenv-{}", Uuid::new_v4()), false),
             Some(_) => {
                 return Err(DriverError::InvalidInput {
                     message: "metadata.name must be a string when set".to_owned(),
@@ -764,8 +771,11 @@ impl SandboxDriver for OpenShellDriver {
             args,
             env: spec.env,
         };
+        let rollback_ambiguous_create_failure =
+            self.should_rollback_ambiguous_create_failure(&name, name_was_explicit);
         if let Err(err) = self.run_checked_command(request) {
-            if Self::create_command_failure_may_have_created_sandbox(&err)
+            if rollback_ambiguous_create_failure
+                && Self::create_command_failure_may_have_created_sandbox(&err)
                 && self.sandbox_exists_after_ambiguous_create_failure(&name)
             {
                 return Err(self.rollback_created_sandbox(&name, err));
@@ -1648,6 +1658,35 @@ impl OpenShellDriver {
             thread::sleep(Duration::from_millis(250));
         }
         false
+    }
+
+    fn should_rollback_ambiguous_create_failure(
+        &self,
+        handle: &str,
+        name_was_explicit: bool,
+    ) -> bool {
+        if !name_was_explicit || !self.runner.uses_host_environment() {
+            return true;
+        }
+
+        matches!(
+            self.sandbox_pre_create_state(handle),
+            SandboxPreCreateState::Absent
+        )
+    }
+
+    fn sandbox_pre_create_state(&self, handle: &str) -> SandboxPreCreateState {
+        let output = match self.run_command_request(command_request(&["sandbox", "get", handle])) {
+            Ok(output) => output,
+            Err(_) => return SandboxPreCreateState::Unknown,
+        };
+        if output.status == Some(0) {
+            return SandboxPreCreateState::Present;
+        }
+        if command_output_mentions_missing_sandbox(&output) {
+            return SandboxPreCreateState::Absent;
+        }
+        SandboxPreCreateState::Unknown
     }
 
     fn rollback_created_sandbox(&self, handle: &str, primary: DriverError) -> DriverError {
@@ -2766,7 +2805,7 @@ fn materialize_classic_resolver_endpoint(
     resolver: &dyn DnsResolver,
 ) -> DriverResult<String> {
     let host = upstream.trim_end_matches('.');
-    let validated = validate_dns_upstream_host(host, 53, resolver)?;
+    let validated = validate_dns_upstream_host(host, 53, resolver, dns_resolver_ssrf_options())?;
     let ip = first_pinned_ip(host, &validated.pinned_ips)?;
     Ok(SocketAddr::new(ip, 53).to_string())
 }
@@ -2817,7 +2856,7 @@ fn materialize_dot_upstream(
         })?
         .to_owned();
     let port = parsed.port().unwrap_or(853);
-    let validated = validate_dns_upstream_host(&host, port, resolver)?;
+    let validated = validate_dns_upstream_host(&host, port, resolver, SsrfOptions::default())?;
     let ip = first_pinned_ip(&host, &validated.pinned_ips)?;
 
     Ok(dns_guard::DnsGuardDotUpstream {
@@ -2831,6 +2870,7 @@ fn validate_dns_upstream_host(
     host: &str,
     port: u16,
     resolver: &dyn DnsResolver,
+    options: SsrfOptions,
 ) -> DriverResult<agentenv_core::security::ssrf::ValidatedUrl> {
     let authority = match host.parse::<IpAddr>() {
         Ok(IpAddr::V6(_)) => format!("[{host}]"),
@@ -2841,11 +2881,18 @@ fn validate_dns_upstream_host(
             message: format!("invalid DNS upstream `{host}`: {err}"),
         }
     })?;
-    validate_outbound_with_resolver(&url, SsrfOptions::default(), resolver).map_err(|err| {
+    validate_outbound_with_resolver(&url, options, resolver).map_err(|err| {
         DriverError::PolicyTranslation {
             message: format!("DNS upstream `{host}` failed SSRF validation: {err}"),
         }
     })
+}
+
+fn dns_resolver_ssrf_options() -> SsrfOptions {
+    SsrfOptions {
+        allow_private: true,
+        ..SsrfOptions::default()
+    }
 }
 
 fn first_pinned_ip(host: &str, pinned_ips: &[IpAddr]) -> DriverResult<IpAddr> {
@@ -3374,6 +3421,14 @@ fn render_command_output(output: &CommandOutput) -> String {
     status_label(output.status)
 }
 
+fn command_output_mentions_missing_sandbox(output: &CommandOutput) -> bool {
+    let text = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    text.contains("not found")
+        || text.contains("not exist")
+        || text.contains("does not exist")
+        || text.contains("no sandbox")
+}
+
 fn extract_semver_token(text: &str) -> Option<Version> {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+')))
         .filter_map(|token| {
@@ -3633,6 +3688,11 @@ mod driver_tests {
         termination_failures_remaining: Arc<Mutex<usize>>,
     }
 
+    #[derive(Debug, Default)]
+    struct PreexistingAmbiguousCreateRunner {
+        calls: Mutex<Vec<CommandCall>>,
+    }
+
     struct TrackingSpawnedCommand {
         terminations: Arc<Mutex<usize>>,
         failures_remaining: Arc<Mutex<usize>>,
@@ -3668,6 +3728,12 @@ mod driver_tests {
 
         fn terminations(&self) -> usize {
             *self.terminations.lock().expect("terminations mutex")
+        }
+    }
+
+    impl PreexistingAmbiguousCreateRunner {
+        fn calls(&self) -> Vec<CommandCall> {
+            self.calls.lock().expect("calls mutex").clone()
         }
     }
 
@@ -3721,6 +3787,64 @@ mod driver_tests {
                 terminations: self.terminations.clone(),
                 failures_remaining: self.termination_failures_remaining.clone(),
             }))
+        }
+    }
+
+    impl CommandRunner for PreexistingAmbiguousCreateRunner {
+        fn uses_host_environment(&self) -> bool {
+            true
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            self.calls.lock().expect("calls mutex").push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+
+            if program != "openshell" {
+                return Err(io::Error::other("unexpected command"));
+            }
+
+            match request.args.as_slice() {
+                args if args.starts_with(&["sandbox".to_owned(), "create".to_owned()]) => {
+                    Ok(CommandOutput {
+                        status: Some(1),
+                        stdout: String::new(),
+                        stderr: "Sandbox.metadata: SandboxResponse.sandbox: unexpected end group tag"
+                            .to_owned(),
+                    })
+                }
+                args if args == ["sandbox", "get", "existing-sandbox"] => Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: "existing-sandbox Running\n".to_owned(),
+                    stderr: String::new(),
+                }),
+                args if args == ["sandbox", "list"] => Ok(CommandOutput {
+                    status: Some(0),
+                    stdout:
+                        "NAME              NAMESPACE  CREATED              PHASE\nexisting-sandbox  openshell  2026-05-09 18:50   Running\n"
+                            .to_owned(),
+                    stderr: String::new(),
+                }),
+                args if args == ["sandbox", "delete", "existing-sandbox"] => Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                _ => Err(io::Error::other("unexpected command")),
+            }
+        }
+
+        fn spawn(
+            &self,
+            _program: &str,
+            _request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
+            Ok(Box::new(super::NoopSpawnedCommand))
         }
     }
 
@@ -4525,6 +4649,30 @@ mod driver_tests {
     }
 
     #[test]
+    fn materialize_dns_guard_upstreams_allows_private_classic_resolver() {
+        let resolver = StaticDnsResolver::try_from_pairs([("resolver.internal", ["10.0.0.10"])])
+            .expect("static DNS records");
+        let mut config = super::dns_guard::DnsGuardConfig {
+            sandbox_handle: "devbox".to_owned(),
+            listen_addr: "127.0.0.1:53".to_owned(),
+            resolvers_allowed: vec!["resolver.internal".to_owned()],
+            doh_upstreams_allowed: Vec::new(),
+            dot_upstreams_allowed: Vec::new(),
+            resolver_endpoints: Vec::new(),
+            doh_upstreams: Vec::new(),
+            dot_upstreams: Vec::new(),
+            allowed_query_names: Default::default(),
+            log_all_queries: false,
+            pin_resolved_ips: false,
+        };
+
+        super::materialize_dns_guard_upstreams_with_resolver(&mut config, &resolver)
+            .expect("materialize upstreams");
+
+        assert_eq!(config.resolver_endpoints, vec!["10.0.0.10:53"]);
+    }
+
+    #[test]
     fn host_bootstrap_prefers_process_path_before_fallback_paths() {
         let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
         let tempdir = unique_tempdir("sandbox-openshell-host-path-precedence");
@@ -4974,6 +5122,15 @@ mod driver_tests {
         let guard_config_for_check = guard_config_capture.clone();
         let runner = Arc::new(FlexibleCommandRunner::new_with_host_environment(
             vec![
+                FlexibleCommandExpectation::output(
+                    "openshell",
+                    |call| {
+                        assert_eq!(call.request, command_request(&["sandbox", "get", "devbox"]));
+                    },
+                    Some(1),
+                    "",
+                    "not found",
+                ),
                 FlexibleCommandExpectation::success(
                     "openshell",
                     |call| {
@@ -5065,7 +5222,7 @@ mod driver_tests {
             .expect("create");
 
         assert_eq!(result.handle, "devbox");
-        assert_eq!(runner.calls().len(), 5);
+        assert_eq!(runner.calls().len(), 6);
         assert_eq!(driver.current_policy_for_handle("devbox"), Some(policy));
         assert!(!guard_config_capture
             .lock()
@@ -7677,6 +7834,41 @@ mod driver_tests {
                     request: command_request(&["sandbox", "delete", "leaked-sandbox"]),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn create_does_not_delete_preexisting_sandbox_after_ambiguous_create_failure() {
+        let runner = Arc::new(PreexistingAmbiguousCreateRunner::default());
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("existing-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("ambiguous create failure should be returned");
+
+        assert!(err.to_string().contains("unexpected end group tag"));
+        assert!(
+            !runner.calls().iter().any(|call| {
+                call.request.args
+                    == ["sandbox", "delete", "existing-sandbox"]
+                        .iter()
+                        .map(|arg| (*arg).to_owned())
+                        .collect::<Vec<_>>()
+            }),
+            "pre-existing sandbox must not be deleted"
         );
     }
 

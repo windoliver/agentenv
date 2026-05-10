@@ -83,7 +83,7 @@ fn validate_resolver(value: &str, path: &str) -> Result<(), DnsPolicyError> {
         source: Box::new(source),
     })?;
 
-    validate_outbound(&url, SsrfOptions::default()).map_err(|source| {
+    validate_outbound(&url, dns_resolver_ssrf_options()).map_err(|source| {
         DnsPolicyError::ResolverBlocked {
             path: path.to_owned(),
             value: sanitized_policy_value(value),
@@ -92,6 +92,13 @@ fn validate_resolver(value: &str, path: &str) -> Result<(), DnsPolicyError> {
     })?;
 
     Ok(())
+}
+
+fn dns_resolver_ssrf_options() -> SsrfOptions {
+    SsrfOptions {
+        allow_private: true,
+        ..SsrfOptions::default()
+    }
 }
 
 fn validate_resolver_host(value: &str) -> Result<(), SsrfBlocked> {
