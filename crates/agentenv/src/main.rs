@@ -37,7 +37,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
+mod bundle_cli;
 mod render;
+mod skills_cli;
 mod term_backend;
 
 const SELF_ENV_SENTINEL: &str = "__self__";
@@ -73,10 +75,13 @@ enum Commands {
     Approvals(ApprovalsArgs),
     Term(TermArgs),
     Snapshot(SnapshotArgs),
+    Fork(ForkArgs),
     Exec(ExecArgs),
     Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
+    Skills(skills_cli::SkillsArgs),
+    Bundle(bundle_cli::BundleArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -468,6 +473,14 @@ struct SnapshotRestoreCliArgs {
 }
 
 #[derive(Debug, Args)]
+struct ForkArgs {
+    #[arg(value_name = "SOURCE")]
+    source: String,
+    #[arg(long, value_name = "NEW_ENV")]
+    name: String,
+}
+
+#[derive(Debug, Args)]
 struct BlueprintArgs {
     #[command(subcommand)]
     command: BlueprintCommand,
@@ -571,11 +584,14 @@ async fn run() -> Result<()> {
         Some(Commands::Metrics(args)) => run_metrics(args).await,
         Some(Commands::Approvals(args)) => run_approvals(args, &cli.events_sink).await,
         Some(Commands::Snapshot(args)) => run_snapshot(args).await,
+        Some(Commands::Fork(args)) => run_fork(args).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
         Some(Commands::Term(args)) => run_term(args).await,
         Some(Commands::Blueprint(command)) => run_blueprint(command),
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
         Some(Commands::Drivers(command)) => run_drivers(command),
+        Some(Commands::Skills(args)) => skills_cli::run_skills(args).await,
+        Some(Commands::Bundle(args)) => bundle_cli::run_bundle(args),
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
         Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
@@ -2431,6 +2447,25 @@ async fn run_snapshot_restore(args: SnapshotRestoreCliArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_fork(args: ForkArgs) -> Result<()> {
+    let options = runtime_options(true)?;
+    let result = agentenv_core::runtime::fork_env(
+        &options,
+        &builtin_factory::BuiltInDriverFactory,
+        &args.source,
+        &args.name,
+    )
+    .await?;
+
+    println!(
+        "Environment `{}` forked from `{}`",
+        result.name, result.source
+    );
+    println!("snapshot: {}", result.snapshot_id);
+    println!("sandbox: {}", result.sandbox_handle);
+    Ok(())
+}
+
 fn reject_snapshot_stdout_output(output: &Path) -> Result<()> {
     if output == Path::new("-") {
         bail!("--output - is not supported for snapshots; choose a directory path");
@@ -3850,10 +3885,13 @@ mod tests {
                 "approvals".to_string(),
                 "term".to_string(),
                 "snapshot".to_string(),
+                "fork".to_string(),
                 "exec".to_string(),
                 "blueprint".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
+                "skills".to_string(),
+                "bundle".to_string(),
                 "verify-blueprint".to_string(),
                 "verify".to_string(),
                 "freeze".to_string(),

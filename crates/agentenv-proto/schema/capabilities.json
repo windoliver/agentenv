@@ -94,6 +94,10 @@
         "supports_filesystem_lockdown": {
           "type": "boolean"
         },
+        "supports_fork": {
+          "default": false,
+          "type": "boolean"
+        },
         "supports_hot_reload_policy": {
           "type": "boolean"
         },
@@ -105,6 +109,10 @@
           "type": "boolean"
         },
         "supports_remote_host": {
+          "type": "boolean"
+        },
+        "supports_snapshots": {
+          "default": false,
           "type": "boolean"
         },
         "supports_syscall_filter": {

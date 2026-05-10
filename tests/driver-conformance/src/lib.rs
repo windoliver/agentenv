@@ -1248,6 +1248,8 @@ mod tests {
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
                 supports_dns_egress_control: false,
+                supports_snapshots: false,
+                supports_fork: false,
             })),
             ..FakeAgentDriver::default()
         };
@@ -1373,6 +1375,8 @@ mod tests {
                         supports_remote_host: false,
                         supports_persistent_sessions: false,
                         supports_dns_egress_control: false,
+                        supports_snapshots: false,
+                        supports_fork: false,
                     })
                 }),
             })
@@ -1539,6 +1543,8 @@ mod tests {
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
                 supports_dns_egress_control: false,
+                supports_snapshots: false,
+                supports_fork: false,
             })),
             ..FakeSandboxDriver::default()
         };

@@ -323,6 +323,8 @@ pub enum RuntimeError {
     MissingSelectedDriver { kind: &'static str, name: String },
     #[error("env `{name}` is missing required sandbox handle")]
     MissingSandboxHandle { name: String },
+    #[error("sandbox handle `{handle}` was not found in the env registry")]
+    SandboxHandleNotFound { handle: String },
     #[error("state name `{actual}` does not match env `{expected}`")]
     StateNameMismatch { expected: String, actual: String },
     #[error("frozen lockfile {role} driver pin `{actual_name}` version `{actual_version}` does not match persisted env state `{expected_name}` version `{expected_version}`")]
@@ -341,6 +343,15 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 pub struct CreateResult {
     pub admission: crate::admission::AdmissionReport,
     pub state: crate::env::EnvStateFile,
+    pub state_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkEnvResult {
+    pub source: String,
+    pub name: String,
+    pub snapshot_id: String,
+    pub sandbox_handle: String,
     pub state_path: PathBuf,
 }
 
@@ -402,6 +413,13 @@ pub struct EnvDescription {
     pub state: crate::env::EnvStateFile,
     pub blueprint_yaml: String,
     pub lock_yaml: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenEnvBundleSource {
+    pub env_name: String,
+    pub blueprint_yaml: String,
+    pub lockfile_yaml: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1526,8 +1544,104 @@ pub fn describe_env(options: &RuntimeOptions, name: &str) -> RuntimeResult<EnvDe
     })
 }
 
+fn describe_env_for_fork_source(
+    options: &RuntimeOptions,
+    source: &str,
+) -> RuntimeResult<EnvDescription> {
+    let mut valid_env_not_found = None;
+    if crate::env::validate_env_name(source).is_ok() {
+        match describe_env(options, source) {
+            Ok(description) => return Ok(description),
+            Err(RuntimeError::Env(crate::env::EnvError::NotFound { name })) => {
+                valid_env_not_found = Some(name);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some(description) = describe_env_by_sandbox_handle(options, source)? {
+        return Ok(description);
+    }
+
+    match valid_env_not_found {
+        Some(name) => Err(crate::env::EnvError::NotFound { name }.into()),
+        None => Err(RuntimeError::SandboxHandleNotFound {
+            handle: source.to_owned(),
+        }),
+    }
+}
+
+fn describe_env_by_sandbox_handle(
+    options: &RuntimeOptions,
+    handle: &str,
+) -> RuntimeResult<Option<EnvDescription>> {
+    let envs_dir = options.root.join("envs");
+    if !envs_dir.is_dir() {
+        return Ok(None);
+    }
+
+    for entry in fs::read_dir(&envs_dir).map_err(|source| crate::env::EnvError::Io {
+        path: envs_dir.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| crate::env::EnvError::Io {
+            path: envs_dir.clone(),
+            source,
+        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| crate::env::EnvError::Io {
+                path: entry.path(),
+                source,
+            })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(env_name) = crate::env::validate_env_name(&name) else {
+            continue;
+        };
+        let paths = crate::env::EnvPaths::new(options.root.clone(), env_name);
+        let state = crate::env::read_state(&paths)?;
+        if state.name != name {
+            return Err(RuntimeError::StateNameMismatch {
+                expected: name,
+                actual: state.name,
+            });
+        }
+        if state.handles.sandbox.as_deref() == Some(handle) {
+            return describe_env(options, &name).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn write_env_registry_file(content: &str, path: &Path) -> RuntimeResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| crate::env::EnvError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(path, content).map_err(|source| crate::env::EnvError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
 pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResult<String> {
     let description = describe_env(options, name)?;
+    freeze_env_lockfile_from_description(options, description)
+}
+
+fn freeze_env_lockfile_from_description(
+    options: &RuntimeOptions,
+    description: EnvDescription,
+) -> RuntimeResult<String> {
     let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
     discovery_config.installed_root = options.root.join("drivers");
     let driver_artifacts =
@@ -1593,6 +1707,21 @@ pub fn freeze_env_lockfile(options: &RuntimeOptions, name: &str) -> RuntimeResul
     }
 
     Ok(lockfile.to_yaml_deterministic()?)
+}
+
+pub fn freeze_env_for_bundle(
+    options: &RuntimeOptions,
+    name: &str,
+) -> RuntimeResult<FrozenEnvBundleSource> {
+    let description = describe_env(options, name)?;
+    let env_name = description.state.name.clone();
+    let blueprint_yaml = description.blueprint_yaml.clone();
+    let lockfile_yaml = freeze_env_lockfile_from_description(options, description)?;
+    Ok(FrozenEnvBundleSource {
+        env_name,
+        blueprint_yaml,
+        lockfile_yaml,
+    })
 }
 
 fn portable_lockfile_matches_env_blueprint(
@@ -2102,6 +2231,7 @@ pub async fn reproduce_env(
         return Err(RuntimeError::PortableLockfileVerification { details });
     }
 
+    verify_reproduce_skill_pins(options, &lockfile)?;
     check_required_lockfile_credentials(credentials, &lockfile)?;
     let credential_bindings = credential_bindings_from_portable_lockfile(&lockfile);
     let blueprint_yaml = blueprint_yaml_from_portable_lockfile(&lockfile)?;
@@ -2134,6 +2264,56 @@ pub async fn reproduce_env(
         Arc::new(NoopEventEmitter),
     )
     .await
+}
+
+fn verify_reproduce_skill_pins(
+    options: &RuntimeOptions,
+    lockfile: &crate::lockfile::PortableLockfile,
+) -> RuntimeResult<()> {
+    if lockfile.skills.is_empty() {
+        return Ok(());
+    }
+
+    let layout = crate::skills::SkillCacheLayout::new(&options.root);
+    let trust_keys = crate::skills::load_skill_trust_keys(&layout).map_err(|error| {
+        RuntimeError::PortableLockfileVerification {
+            details: error.to_string(),
+        }
+    })?;
+    let report = crate::skills::verify_skill_pins(
+        &layout,
+        &lockfile.skills,
+        crate::skills::SkillVerifyOptions {
+            trust_keys,
+            run_self_tests: false,
+        },
+    )
+    .map_err(|error| RuntimeError::PortableLockfileVerification {
+        details: error.to_string(),
+    })?;
+
+    if report.is_ok() {
+        return Ok(());
+    }
+
+    let details = report
+        .skills
+        .iter()
+        .filter(|entry| entry.status == crate::skills::SkillVerifyStatus::Failed)
+        .map(|entry| {
+            let errors = if entry.errors.is_empty() {
+                "unknown error".to_owned()
+            } else {
+                entry.errors.join("; ")
+            };
+            format!(
+                "skill `{}` version `{}`: {errors}",
+                entry.name, entry.version
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(RuntimeError::PortableLockfileVerification { details })
 }
 
 fn registry_from_driver_artifacts(
@@ -3190,6 +3370,135 @@ pub async fn start_logs_stream_env(
     Ok(RunningLogStream { _set: set })
 }
 
+pub async fn fork_env(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    source: &str,
+    name: &str,
+) -> RuntimeResult<ForkEnvResult> {
+    let target_env_name = crate::env::validate_env_name(name)?;
+    let target_paths = crate::env::EnvPaths::new(options.root.clone(), target_env_name.clone());
+    let target_env_dir = target_paths.env_dir();
+    if target_env_dir.exists() {
+        return Err(crate::env::EnvError::AlreadyExists {
+            name: name.to_owned(),
+        }
+        .into());
+    }
+
+    let source_description = describe_env_for_fork_source(options, source)?;
+    let source_env = source_description.state.name.clone();
+    let source_state = source_description.state;
+    let source_handle = required_sandbox_handle(&source_state, &source_env)?;
+    let selection = selection_from_state(&source_state);
+    let mut set = factory.build(&selection)?;
+    let init = initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+    crate::driver::require_capability(
+        "supports_snapshots",
+        supports_snapshots(&init.capabilities),
+    )?;
+    crate::driver::require_capability("supports_fork", supports_fork(&init.capabilities))?;
+
+    let snapshot = set
+        .sandbox
+        .snapshot(agentenv_proto::SnapshotParams {
+            handle: source_handle,
+            name: Some(name.to_owned()),
+        })
+        .await?;
+    let forked = set
+        .sandbox
+        .fork_from_snapshot(agentenv_proto::ForkFromSnapshotParams {
+            snapshot: snapshot.clone(),
+            spec: agentenv_proto::ForkSpec {
+                name: name.to_owned(),
+                metadata: BTreeMap::new(),
+            },
+        })
+        .await?;
+    let forked_handle = forked.handle.clone();
+
+    let temp_workspace = create_temp_workspace(&options.root, target_env_name.as_str());
+    let temp_paths = crate::env::EnvPaths::new(temp_workspace.clone(), target_env_name);
+    let result = (|| -> RuntimeResult<ForkEnvResult> {
+        fs::create_dir_all(temp_paths.env_dir()).map_err(|source| crate::env::EnvError::Io {
+            path: temp_paths.env_dir(),
+            source,
+        })?;
+        write_env_registry_file(
+            &source_description.blueprint_yaml,
+            &temp_paths.blueprint_path(),
+        )?;
+        write_env_registry_file(&source_description.lock_yaml, &temp_paths.lock_path())?;
+
+        let now = now_utc_string();
+        let mut target_state = source_state;
+        target_state.name = name.to_owned();
+        target_state.phase = crate::env::EnvPhase::Running;
+        target_state.created_at = now.clone();
+        target_state.updated_at = now;
+        target_state.handles.sandbox = Some(forked_handle.clone());
+        target_state.handles.context = None;
+        target_state.handles.inference = None;
+        target_state.health.clear();
+        target_state.first_enter_hint_shown = false;
+        crate::env::write_state(&temp_paths, &target_state)?;
+        crate::env::append_event(
+            &temp_paths,
+            serde_json::json!({
+                "kind": "admission",
+                "status": "accepted",
+                "reason_code": crate::admission::ReasonCode::Created.as_str(),
+                "env": name,
+                "source_env": source_env.clone(),
+                "snapshot": snapshot.id.clone(),
+            }),
+        )?;
+
+        fs::create_dir_all(target_paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
+            path: target_paths.envs_dir(),
+            source,
+        })?;
+        if target_env_dir.exists() {
+            return Err(crate::env::EnvError::AlreadyExists {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+        fs::rename(temp_paths.env_dir(), &target_env_dir).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                crate::env::EnvError::AlreadyExists {
+                    name: name.to_owned(),
+                }
+            } else {
+                crate::env::EnvError::Io {
+                    path: target_env_dir.clone(),
+                    source,
+                }
+            }
+        })?;
+
+        Ok(ForkEnvResult {
+            source: source_env,
+            name: name.to_owned(),
+            snapshot_id: snapshot.id,
+            sandbox_handle: forked_handle.clone(),
+            state_path: target_paths.state_path(),
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&temp_workspace);
+    if result.is_err() {
+        let _ = set
+            .sandbox
+            .destroy(agentenv_proto::DestroyParams {
+                handle: forked_handle,
+            })
+            .await;
+    }
+    result
+}
+
 pub async fn destroy_env(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
@@ -3377,6 +3686,26 @@ fn supports_hot_reload_policy(capabilities: &Capabilities) -> bool {
         capabilities,
         Capabilities::Sandbox(agentenv_proto::SandboxCapabilities {
             supports_hot_reload_policy: true,
+            ..
+        })
+    )
+}
+
+fn supports_snapshots(capabilities: &Capabilities) -> bool {
+    matches!(
+        capabilities,
+        Capabilities::Sandbox(agentenv_proto::SandboxCapabilities {
+            supports_snapshots: true,
+            ..
+        })
+    )
+}
+
+fn supports_fork(capabilities: &Capabilities) -> bool {
+    matches!(
+        capabilities,
+        Capabilities::Sandbox(agentenv_proto::SandboxCapabilities {
+            supports_fork: true,
             ..
         })
     )
@@ -4266,7 +4595,8 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         RuntimeError::Env(EnvError::AlreadyExists { .. }) => {
             crate::admission::ReasonCode::EnvExists.as_str()
         }
-        RuntimeError::Env(EnvError::NotFound { .. }) => {
+        RuntimeError::Env(EnvError::NotFound { .. })
+        | RuntimeError::SandboxHandleNotFound { .. } => {
             crate::admission::ReasonCode::EnvNotFound.as_str()
         }
         RuntimeError::Env(EnvError::InvalidName { .. })
@@ -4606,9 +4936,9 @@ mod tests {
 
     use super::{
         approval_coordinator_for_env, component_spec, env_approval_overlay_path,
-        env_approval_proposals_path, env_events_db_path, initialize_context_driver,
-        initialize_sandbox_driver, DriverFactory, DriverSet, RuntimeError, RuntimeOptions,
-        RuntimeSecret,
+        env_approval_proposals_path, env_events_db_path, freeze_env_for_bundle,
+        initialize_context_driver, initialize_sandbox_driver, DriverFactory, DriverSet,
+        RuntimeError, RuntimeOptions, RuntimeSecret,
     };
 
     fn unique_root(prefix: &str) -> std::path::PathBuf {
@@ -4617,6 +4947,80 @@ mod tests {
             .expect("system clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn write_runtime_skill_pin(
+        root: &std::path::Path,
+        manifest_schema_version: &str,
+    ) -> crate::lockfile::SkillPin {
+        write_runtime_skill_pin_with_self_test(root, manifest_schema_version, None)
+    }
+
+    fn write_runtime_skill_pin_with_self_test(
+        root: &std::path::Path,
+        manifest_schema_version: &str,
+        self_test: Option<crate::skills::SkillSelfTest>,
+    ) -> crate::lockfile::SkillPin {
+        let skill_dir = root.join("skills").join("code-review").join("1.2.0");
+        fs::create_dir_all(skill_dir.join(".agentenv")).expect("create skill metadata dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: code-review\nversion: 1.2.0\n---\n# code-review\n",
+        )
+        .expect("write skill");
+
+        let archive_bytes = b"runtime pinned skill archive";
+        let archive_hex = crate::digest::sha256_hex(archive_bytes);
+        let digest = format!("sha256:{archive_hex}");
+        let archive_dir = root.join("cache").join("skills");
+        fs::create_dir_all(&archive_dir).expect("create skill archive dir");
+        fs::write(
+            archive_dir.join(format!("{archive_hex}.tar.zst")),
+            archive_bytes,
+        )
+        .expect("write skill archive");
+
+        let manifest = crate::skills::cache::SkillManifest {
+            schema_version: manifest_schema_version.to_owned(),
+            name: "code-review".to_owned(),
+            version: "1.2.0".to_owned(),
+            source: "file:///skills/code-review".to_owned(),
+            digest: digest.clone(),
+            signatures: Vec::new(),
+            archive: Some(crate::skills::SkillArchive {
+                digest: digest.clone(),
+                cache_key: format!("{archive_hex}.tar.zst"),
+            }),
+            self_test,
+        };
+        fs::write(
+            skill_dir.join(".agentenv/manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("render manifest"),
+        )
+        .expect("write skill manifest");
+
+        let provenance = crate::skills::SkillProvenance {
+            schema_version: crate::skills::SKILL_METADATA_SCHEMA_VERSION.to_owned(),
+            subject: crate::skills::SkillProvenanceSubject {
+                name: "code-review".to_owned(),
+                version: "1.2.0".to_owned(),
+                digest: digest.clone(),
+            },
+            attestations: Vec::new(),
+        };
+        fs::write(
+            skill_dir.join(".agentenv/provenance.json"),
+            serde_json::to_string_pretty(&provenance).expect("render provenance"),
+        )
+        .expect("write skill provenance");
+
+        crate::lockfile::SkillPin {
+            name: manifest.name,
+            version: manifest.version,
+            source: manifest.source,
+            digest: manifest.digest,
+            signatures: Vec::new(),
+        }
     }
 
     fn state_fixture(name: &str) -> crate::env::EnvStateFile {
@@ -4639,6 +5043,85 @@ mod tests {
             health: BTreeMap::new(),
             first_enter_hint_shown: false,
         }
+    }
+
+    #[test]
+    fn freeze_env_for_bundle_returns_persisted_blueprint_and_portable_lockfile() {
+        let root = unique_root("agentenv-runtime-freeze-bundle-source");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let env_dir = root.join("envs").join("demo");
+        fs::create_dir_all(&env_dir).unwrap();
+        let driver_version = env!("CARGO_PKG_VERSION");
+        fs::write(
+            env_dir.join("state.json"),
+            serde_json::json!({
+                "version": "0.1.0",
+                "name": "demo",
+                "phase": "running",
+                "created_at": "2026-05-09T00:00:00Z",
+                "updated_at": "2026-05-09T00:00:00Z",
+                "drivers": {
+                    "sandbox": {"name": "openshell", "version": driver_version},
+                    "agent": {"name": "codex", "version": driver_version},
+                    "context": {"name": "filesystem", "version": driver_version},
+                    "inference": {"name": "passthrough", "version": driver_version}
+                },
+                "handles": {},
+                "endpoints": {},
+                "first_enter_hint_shown": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let blueprint_yaml = r#"version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+inference:
+  driver: passthrough
+policy:
+  tier: balanced
+  presets: []
+"#;
+        fs::write(env_dir.join("blueprint.yaml"), blueprint_yaml).unwrap();
+        let lock_yaml = crate::lifecycle::freeze_from_blueprint_yaml(blueprint_yaml).unwrap();
+        fs::write(env_dir.join("lock.yaml"), lock_yaml).unwrap();
+
+        let frozen = freeze_env_for_bundle(&options, "demo").unwrap();
+
+        assert_eq!(frozen.env_name, "demo");
+        assert_eq!(frozen.blueprint_yaml, blueprint_yaml);
+        let crate::lockfile::LockfileDocument::Portable(lockfile) =
+            crate::lockfile::LockfileDocument::from_yaml(&frozen.lockfile_yaml).unwrap()
+        else {
+            panic!("bundle source should include a portable lockfile");
+        };
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None).unwrap();
+        let expected = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: frozen.blueprint_yaml.clone(),
+                driver_artifacts,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(lockfile.name, "demo");
+        assert_eq!(lockfile.version, crate::lockfile::PORTABLE_LOCKFILE_VERSION);
+        assert_eq!(lockfile.composition, expected.composition);
+        assert_eq!(lockfile.blueprint_hash, expected.blueprint_hash);
     }
 
     fn write_state_json(env_dir: &std::path::Path, state: crate::env::EnvStateFile) {
@@ -4692,6 +5175,94 @@ policy:
 state:
   persist_home: true
 "#
+    }
+
+    #[tokio::test]
+    async fn fork_env_persists_forked_sandbox_state() {
+        let root = unique_root("fork-env");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let source_paths =
+            crate::env::EnvPaths::new(root.clone(), crate::env::validate_env_name("demo").unwrap());
+        fs::create_dir_all(source_paths.env_dir()).unwrap();
+        fs::write(
+            source_paths.blueprint_path(),
+            "sandbox:\n  driver: microvm\n",
+        )
+        .unwrap();
+        fs::write(source_paths.lock_path(), "drivers: {}\n").unwrap();
+        fs::write(source_paths.events_path(), "").unwrap();
+
+        let mut state = state_fixture("demo")
+            .with_sandbox_handle("microvm://firecracker/demo?workdir=/tmp/demo");
+        state.drivers.sandbox = crate::env::DriverRecord::new("microvm", "0.0.1-alpha0");
+        state.handles.context = Some("ctx-source".to_owned());
+        state.endpoints.context_mcp = Some(crate::env::PersistedMcpEndpoint {
+            url: "stdio://filesystem".to_owned(),
+            transport: agentenv_proto::McpTransport::Stdio,
+        });
+        write_state_json(&source_paths.env_dir(), state);
+
+        let calls = Arc::new(Mutex::new(ForkCalls::default()));
+        let factory = ForkingFactory {
+            calls: Arc::clone(&calls),
+            supports_snapshots: true,
+            supports_fork: true,
+        };
+
+        let result = super::fork_env(&options, &factory, "demo", "experiment")
+            .await
+            .expect("fork should succeed");
+
+        assert_eq!(result.source, "demo");
+        assert_eq!(result.name, "experiment");
+        assert!(result.state_path.ends_with("envs/experiment/state.json"));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.snapshot_handle.as_deref(),
+            Some("microvm://firecracker/demo?workdir=/tmp/demo")
+        );
+        assert_eq!(calls.snapshot_name.as_deref(), Some("experiment"));
+        assert_eq!(
+            calls.fork_snapshot_id.as_deref(),
+            Some("microvm-snapshot://demo/base")
+        );
+        assert_eq!(calls.fork_name.as_deref(), Some("experiment"));
+
+        let target_paths = crate::env::EnvPaths::new(
+            root.clone(),
+            crate::env::validate_env_name("experiment").unwrap(),
+        );
+        let target = crate::env::read_state(&target_paths).unwrap();
+        assert_eq!(target.name, "experiment");
+        assert_eq!(target.phase, crate::env::EnvPhase::Running);
+        assert_eq!(
+            target.handles.sandbox.as_deref(),
+            Some("microvm://firecracker/experiment")
+        );
+        assert_eq!(target.handles.context, None);
+        assert_eq!(target.handles.inference, None);
+        assert_eq!(
+            target
+                .endpoints
+                .context_mcp
+                .as_ref()
+                .map(|endpoint| &endpoint.url),
+            Some(&"stdio://filesystem".to_owned())
+        );
+        assert_eq!(
+            fs::read_to_string(target_paths.blueprint_path()).unwrap(),
+            "sandbox:\n  driver: microvm\n"
+        );
+        assert_eq!(
+            fs::read_to_string(target_paths.lock_path()).unwrap(),
+            "drivers: {}\n"
+        );
+        assert!(target_paths.events_path().is_file());
     }
 
     fn snapshot_credential_blueprint_yaml() -> &'static str {
@@ -5024,6 +5595,8 @@ policy:
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
                     supports_dns_egress_control: false,
+                    supports_snapshots: false,
+                    supports_fork: false,
                 },
             }
         }
@@ -6152,6 +6725,41 @@ policy:
         kill_called: Arc<AtomicBool>,
     }
 
+    #[derive(Default)]
+    struct ForkCalls {
+        snapshot_handle: Option<String>,
+        snapshot_name: Option<String>,
+        fork_snapshot_id: Option<String>,
+        fork_name: Option<String>,
+    }
+
+    struct ForkingSandboxDriver {
+        calls: Arc<Mutex<ForkCalls>>,
+        supports_snapshots: bool,
+        supports_fork: bool,
+    }
+
+    struct ForkingFactory {
+        calls: Arc<Mutex<ForkCalls>>,
+        supports_snapshots: bool,
+        supports_fork: bool,
+    }
+
+    impl DriverFactory for ForkingFactory {
+        fn build(&self, _selection: &super::DriverSelection) -> super::RuntimeResult<DriverSet> {
+            Ok(DriverSet {
+                sandbox: Box::new(ForkingSandboxDriver {
+                    calls: Arc::clone(&self.calls),
+                    supports_snapshots: self.supports_snapshots,
+                    supports_fork: self.supports_fork,
+                }),
+                agent: Box::new(super::tests_support::TinyAgentDriver),
+                context: Box::new(TinyContextDriver),
+                inference: None,
+            })
+        }
+    }
+
     #[async_trait]
     impl SandboxDriver for TinySandboxDriver {
         async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
@@ -6171,6 +6779,8 @@ policy:
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
                     supports_dns_egress_control: false,
+                    supports_snapshots: false,
+                    supports_fork: false,
                 }),
             })
         }
@@ -6264,6 +6874,150 @@ policy:
         ) -> DriverResult<EmptyResult> {
             Ok(EmptyResult {})
         }
+        async fn shutdown(
+            &mut self,
+            _params: agentenv_proto::ShutdownParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+    }
+
+    #[async_trait]
+    impl SandboxDriver for ForkingSandboxDriver {
+        async fn initialize(&mut self, params: InitializeParams) -> DriverResult<InitializeResult> {
+            assert_eq!(params.schema_version, SCHEMA_VERSION);
+            Ok(InitializeResult {
+                driver: DriverInfo {
+                    name: "microvm".to_owned(),
+                    kind: DriverKind::Sandbox,
+                    version: "0.0.1-alpha0".to_owned(),
+                    protocol_version: SCHEMA_VERSION.to_owned(),
+                },
+                capabilities: Capabilities::Sandbox(SandboxCapabilities {
+                    supports_hot_reload_policy: false,
+                    supports_filesystem_lockdown: true,
+                    supports_syscall_filter: true,
+                    supports_native_inference_routing: false,
+                    supports_remote_host: false,
+                    supports_persistent_sessions: false,
+                    supports_dns_egress_control: false,
+                    supports_snapshots: self.supports_snapshots,
+                    supports_fork: self.supports_fork,
+                }),
+            })
+        }
+
+        async fn preflight(&self, _params: PreflightParams) -> DriverResult<PreflightResult> {
+            Ok(PreflightResult {
+                ok: true,
+                issues: Vec::new(),
+            })
+        }
+
+        async fn create(
+            &self,
+            _spec: agentenv_proto::SandboxSpec,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            unreachable!("fork_env should not cold-create a sandbox")
+        }
+
+        async fn snapshot(
+            &self,
+            params: agentenv_proto::SnapshotParams,
+        ) -> DriverResult<agentenv_proto::SnapshotId> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.snapshot_handle = Some(params.handle);
+            calls.snapshot_name = params.name;
+            Ok(agentenv_proto::SnapshotId {
+                id: "microvm-snapshot://demo/base".to_owned(),
+            })
+        }
+
+        async fn fork_from_snapshot(
+            &self,
+            params: agentenv_proto::ForkFromSnapshotParams,
+        ) -> DriverResult<agentenv_proto::SandboxHandle> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.fork_snapshot_id = Some(params.snapshot.id);
+            calls.fork_name = Some(params.spec.name);
+            Ok(agentenv_proto::SandboxHandle {
+                handle: "microvm://firecracker/experiment".to_owned(),
+            })
+        }
+
+        async fn connect(
+            &self,
+            _params: agentenv_proto::ConnectParams,
+        ) -> DriverResult<agentenv_proto::ShellHandle> {
+            unreachable!("fork_env should not connect")
+        }
+
+        async fn exec(
+            &self,
+            _params: agentenv_proto::ExecParams,
+        ) -> DriverResult<agentenv_proto::ExecResult> {
+            unreachable!("fork_env should not exec")
+        }
+
+        async fn copy_in(
+            &self,
+            _params: agentenv_proto::CopyInParams,
+        ) -> DriverResult<EmptyResult> {
+            unreachable!("fork_env should not copy into the sandbox")
+        }
+
+        async fn copy_out(
+            &self,
+            _params: agentenv_proto::CopyOutParams,
+        ) -> DriverResult<EmptyResult> {
+            unreachable!("fork_env should not copy out of the sandbox")
+        }
+
+        async fn apply_policy(
+            &self,
+            _params: agentenv_proto::ApplyPolicyParams,
+        ) -> DriverResult<agentenv_proto::ApplyPolicyResult> {
+            unreachable!("fork_env should not apply policy")
+        }
+
+        async fn status(
+            &self,
+            _params: agentenv_proto::SandboxStatusParams,
+        ) -> DriverResult<agentenv_proto::SandboxStatus> {
+            Ok(agentenv_proto::SandboxStatus {
+                phase: agentenv_proto::SandboxPhase::Running,
+                healthy: true,
+                last_ping: None,
+            })
+        }
+
+        async fn logs(
+            &self,
+            _params: agentenv_proto::LogsParams,
+        ) -> DriverResult<agentenv_proto::LogsResult> {
+            Ok(agentenv_proto::LogsResult {
+                entries: Vec::new(),
+            })
+        }
+
+        async fn logs_stream(
+            &self,
+            _params: agentenv_proto::LogsStreamParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn stop(&self, _params: agentenv_proto::StopParams) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
+        async fn destroy(
+            &self,
+            _params: agentenv_proto::DestroyParams,
+        ) -> DriverResult<EmptyResult> {
+            Ok(EmptyResult {})
+        }
+
         async fn shutdown(
             &mut self,
             _params: agentenv_proto::ShutdownParams,
@@ -6579,6 +7333,8 @@ policy:
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
                     supports_dns_egress_control: false,
+                    supports_snapshots: false,
+                    supports_fork: false,
                 }),
             })
         }
@@ -7044,6 +7800,8 @@ policy:
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
                     supports_dns_egress_control: false,
+                    supports_snapshots: false,
+                    supports_fork: false,
                 }),
             })
         }
@@ -9905,6 +10663,201 @@ policy:
     }
 
     #[tokio::test]
+    async fn reproduce_env_rejects_missing_skill_pin_before_driver_materialization() {
+        let root = unique_root("agentenv-reproduce-missing-skill");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile.skills.push(crate::lockfile::SkillPin {
+            name: "code-review".to_owned(),
+            version: "1.2.0".to_owned(),
+            source: "file:///skills/code-review".to_owned(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            signatures: Vec::new(),
+        });
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err =
+            super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+                .await
+                .expect_err("missing skill pin should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("missing skill pin"), "{message}");
+        assert_eq!(
+            factory.normal_builds.load(Ordering::SeqCst)
+                + factory.pinned_builds.load(Ordering::SeqCst),
+            0,
+            "skill pin verification should fail before driver materialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_rejects_unsupported_skill_manifest_schema_before_driver_materialization()
+    {
+        let root = unique_root("agentenv-reproduce-skill-schema");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        lockfile
+            .skills
+            .push(write_runtime_skill_pin(&options.root, "9.9"));
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err =
+            super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+                .await
+                .expect_err("unsupported skill manifest schema should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("unsupported skill manifest schema version"),
+            "{message}"
+        );
+        assert_eq!(
+            factory.normal_builds.load(Ordering::SeqCst)
+                + factory.pinned_builds.load(Ordering::SeqCst),
+            0,
+            "skill pin verification should fail before driver materialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn reproduce_env_skips_pinned_skill_self_test_commands() {
+        let root = unique_root("agentenv-reproduce-skill-self-test");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let mut discovery_config = crate::driver_catalog::DriverDiscoveryConfig::from_env();
+        discovery_config.installed_root = root.join("drivers");
+        let driver_artifacts =
+            crate::driver_artifact::discover_driver_artifacts(discovery_config, None)
+                .expect("discover driver artifacts");
+        let mut lockfile = crate::portable_lockfile::build_portable_lockfile(
+            crate::portable_lockfile::PortableLockfileInput {
+                name: "demo".to_owned(),
+                blueprint_yaml: yaml.to_owned(),
+                driver_artifacts,
+            },
+        )
+        .expect("build portable lockfile");
+        let self_test = crate::skills::SkillSelfTest {
+            timeout_seconds: 5,
+            assertions: vec![crate::skills::SkillSelfTestAssertion::CommandExitsZero {
+                cmd: "echo marker > host-side-marker".to_owned(),
+            }],
+        };
+        lockfile.skills.push(write_runtime_skill_pin_with_self_test(
+            &options.root,
+            crate::skills::SKILL_METADATA_SCHEMA_VERSION,
+            Some(self_test),
+        ));
+        let marker_path = options
+            .root
+            .join("skills")
+            .join("code-review")
+            .join("1.2.0")
+            .join("host-side-marker");
+        let lockfile_yaml = lockfile
+            .to_yaml_deterministic()
+            .expect("render portable lockfile");
+        let factory = PinTrackingFactory::default();
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::reproduce_env(&options, &factory, &mut credentials, "demo", &lockfile_yaml)
+            .await
+            .expect("reproduce env");
+
+        assert!(
+            !marker_path.exists(),
+            "reproduce-time skill pin verification executed a host-side self-test command"
+        );
+    }
+
+    #[tokio::test]
     async fn reproduce_env_rejects_required_credstore_credential_satisfied_only_by_env() {
         let root = unique_root("agentenv-reproduce-strict-credstore");
         let options = RuntimeOptions {
@@ -10600,6 +11553,8 @@ policy:
                     supports_remote_host: false,
                     supports_persistent_sessions: false,
                     supports_dns_egress_control: false,
+                    supports_snapshots: false,
+                    supports_fork: false,
                 }),
             ),
         };

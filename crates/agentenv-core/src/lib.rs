@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod agent_common;
 pub mod blueprint;
+pub mod bundle;
 pub mod context_common;
 pub mod digest;
 pub mod driver;
@@ -19,6 +20,7 @@ pub mod registry;
 pub mod runtime;
 pub mod security;
 pub mod sessions;
+pub mod skills;
 pub mod snapshot;
 
 /// Placeholder surface for the M1 workspace scaffold.

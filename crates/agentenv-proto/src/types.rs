@@ -154,6 +154,10 @@ pub struct SandboxCapabilities {
     pub supports_persistent_sessions: bool,
     #[serde(default)]
     pub supports_dns_egress_control: bool,
+    #[serde(default)]
+    pub supports_snapshots: bool,
+    #[serde(default)]
+    pub supports_fork: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -409,6 +413,31 @@ pub struct SandboxSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct SandboxHandle {
     pub handle: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SnapshotParams {
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct SnapshotId {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ForkSpec {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ForkFromSnapshotParams {
+    pub snapshot: SnapshotId,
+    pub spec: ForkSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

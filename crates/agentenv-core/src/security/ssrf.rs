@@ -12,6 +12,7 @@ use agentenv_events::{ActivityEvent, ActivityKind, ActivityResult};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsrfOptions {
     pub allow_private: bool,
+    pub allow_loopback: bool,
     pub allow_ssh_http: bool,
     pub extra_deny_cidrs: Vec<IpNet>,
     pub max_redirects: usize,
@@ -22,6 +23,7 @@ impl Default for SsrfOptions {
     fn default() -> Self {
         Self {
             allow_private: false,
+            allow_loopback: false,
             allow_ssh_http: false,
             extra_deny_cidrs: Vec::new(),
             max_redirects: 3,
@@ -350,7 +352,7 @@ fn check_ip(url: &Url, host: &str, ip: IpAddr, opts: &SsrfOptions) -> Result<(),
         }
     }
 
-    if let Some(category) = denied_category(ip, opts.allow_private) {
+    if let Some(category) = denied_category(ip, opts.allow_private, opts.allow_loopback) {
         return Err(block(
             url,
             Some(host.to_owned()),
@@ -371,10 +373,10 @@ fn is_cloud_metadata(ip: IpAddr) -> bool {
     }
 }
 
-fn denied_category(ip: IpAddr, allow_private: bool) -> Option<IpCategory> {
+fn denied_category(ip: IpAddr, allow_private: bool, allow_loopback: bool) -> Option<IpCategory> {
     match ip {
         IpAddr::V4(ip) => {
-            if ip.is_loopback() {
+            if ip.is_loopback() && !allow_loopback {
                 Some(IpCategory::Loopback)
             } else if ip.is_link_local() {
                 Some(IpCategory::LinkLocal)
@@ -396,7 +398,7 @@ fn denied_category(ip: IpAddr, allow_private: bool) -> Option<IpCategory> {
         }
         IpAddr::V6(ip) => {
             let wrapped = IpAddr::V6(ip);
-            if ip.is_loopback() {
+            if ip.is_loopback() && !allow_loopback {
                 Some(IpCategory::Loopback)
             } else if in_any_net(wrapped, IPV6_LINK_LOCAL_NETS) {
                 Some(IpCategory::LinkLocal)

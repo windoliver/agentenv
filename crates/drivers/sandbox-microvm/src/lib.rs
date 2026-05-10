@@ -3,10 +3,11 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use agentenv_core::driver::{
@@ -15,12 +16,12 @@ use agentenv_core::driver::{
 use agentenv_proto::{
     assert_compatible_schema_version, ApplyPolicyParams, ApplyPolicyResult, AttachSessionParams,
     Capabilities, ConnectParams, CopyInParams, CopyOutParams, CreateSessionParams, DestroyParams,
-    DriverInfo, DriverKind, EmptyResult, ExecParams, ExecResult, InitializeParams,
-    InitializeResult, IssueSeverity, KillSessionParams, ListSessionsParams, ListSessionsResult,
-    LogEntry, LogLevel, LogsParams, LogsResult, LogsStreamParams, NetworkPolicy, PreflightIssue,
-    PreflightParams, PreflightResult, SandboxCapabilities, SandboxHandle, SandboxPhase,
-    SandboxSpec, SandboxStatus, SandboxStatusParams, SessionHandle, ShellHandle, ShutdownParams,
-    StopParams, SCHEMA_VERSION,
+    DriverInfo, DriverKind, EmptyResult, ExecParams, ExecResult, ForkFromSnapshotParams,
+    InitializeParams, InitializeResult, IssueSeverity, KillSessionParams, ListSessionsParams,
+    ListSessionsResult, LogEntry, LogLevel, LogsParams, LogsResult, LogsStreamParams,
+    NetworkPolicy, PreflightIssue, PreflightParams, PreflightResult, SandboxCapabilities,
+    SandboxHandle, SandboxPhase, SandboxSpec, SandboxStatus, SandboxStatusParams, SessionHandle,
+    ShellHandle, ShutdownParams, SnapshotId, SnapshotParams, StopParams, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +63,81 @@ trait CommandRunner: Send + Sync {
     }
 
     fn spawn(&self, program: &str, request: &CommandRequest) -> io::Result<u32>;
+}
+
+trait FirecrackerApi: Send + Sync {
+    fn set_vm_state(&self, api_sock: &Path, state: &str) -> DriverResult<()>;
+
+    fn create_snapshot(
+        &self,
+        api_sock: &Path,
+        snapshot_path: &Path,
+        mem_file_path: &Path,
+    ) -> DriverResult<()>;
+
+    fn load_snapshot(
+        &self,
+        api_sock: &Path,
+        snapshot_path: &Path,
+        mem_file_path: &Path,
+        network_overrides: &BTreeMap<String, String>,
+        resume_vm: bool,
+    ) -> DriverResult<()>;
+}
+
+#[derive(Debug, Default)]
+struct UnixFirecrackerApi;
+
+impl FirecrackerApi for UnixFirecrackerApi {
+    fn set_vm_state(&self, api_sock: &Path, state: &str) -> DriverResult<()> {
+        firecracker_api_json(
+            api_sock,
+            "PATCH",
+            "/vm",
+            &serde_json::json!({ "state": state }),
+        )
+    }
+
+    fn create_snapshot(
+        &self,
+        api_sock: &Path,
+        snapshot_path: &Path,
+        mem_file_path: &Path,
+    ) -> DriverResult<()> {
+        firecracker_api_json(
+            api_sock,
+            "PUT",
+            "/snapshot/create",
+            &serde_json::json!({
+                "snapshot_type": "Full",
+                "snapshot_path": snapshot_path.display().to_string(),
+                "mem_file_path": mem_file_path.display().to_string(),
+            }),
+        )
+    }
+
+    fn load_snapshot(
+        &self,
+        api_sock: &Path,
+        snapshot_path: &Path,
+        mem_file_path: &Path,
+        network_overrides: &BTreeMap<String, String>,
+        resume_vm: bool,
+    ) -> DriverResult<()> {
+        let mut body = serde_json::json!({
+            "snapshot_path": snapshot_path.display().to_string(),
+            "mem_file_path": mem_file_path.display().to_string(),
+            "resume_vm": resume_vm,
+        });
+        if !network_overrides.is_empty() {
+            body["network_overrides"] = serde_json::to_value(network_overrides).map_err(|err| {
+                DriverError::InvalidInput {
+                    message: format!("failed to encode network overrides: {err}"),
+                }
+            })?;
+        }
+        firecracker_api_json(api_sock, "PUT", "/snapshot/load", &body)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +218,135 @@ fn command_failed(program: &str, request: &CommandRequest, output: CommandOutput
     }
 }
 
+fn firecracker_api_json(
+    api_sock: &Path,
+    method: &str,
+    path: &str,
+    body: &Value,
+) -> DriverResult<()> {
+    let body = serde_json::to_string(body).map_err(|source| DriverError::InvalidInput {
+        message: format!("failed to encode Firecracker API body: {source}"),
+    })?;
+    firecracker_api_request(api_sock, method, path, &body)
+}
+
+#[cfg(unix)]
+fn firecracker_api_request(
+    api_sock: &Path,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> DriverResult<()> {
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+
+    let mut last_error = None;
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(api_sock) {
+            Ok(value) => {
+                stream = Some(value);
+                break;
+            }
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                last_error = Some(source);
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(source) => {
+                return Err(DriverError::CommandSpawn {
+                    command: firecracker_api_command(method, path, api_sock),
+                    source,
+                });
+            }
+        }
+    }
+    let mut stream = stream.ok_or_else(|| DriverError::CommandSpawn {
+        command: firecracker_api_command(method, path, api_sock),
+        source: last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Firecracker API socket unavailable",
+            )
+        }),
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|source| DriverError::CommandSpawn {
+            command: firecracker_api_command(method, path, api_sock),
+            source,
+        })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|source| DriverError::CommandSpawn {
+            command: firecracker_api_command(method, path, api_sock),
+            source,
+        })?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|source| DriverError::CommandSpawn {
+            command: firecracker_api_command(method, path, api_sock),
+            source,
+        })?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|source| DriverError::CommandSpawn {
+            command: firecracker_api_command(method, path, api_sock),
+            source,
+        })?;
+    let status = parse_http_status(&response);
+    if matches!(status, Some(200..=299)) {
+        return Ok(());
+    }
+    Err(DriverError::CommandFailed {
+        command: firecracker_api_command(method, path, api_sock),
+        status,
+        stdout: String::new(),
+        stderr: response,
+    })
+}
+
+#[cfg(not(unix))]
+fn firecracker_api_request(
+    api_sock: &Path,
+    method: &str,
+    path: &str,
+    _body: &str,
+) -> DriverResult<()> {
+    Err(DriverError::InvalidInput {
+        message: format!(
+            "Firecracker API sockets require a Unix host: {}",
+            firecracker_api_command(method, path, api_sock)
+        ),
+    })
+}
+
+fn firecracker_api_command(method: &str, path: &str, api_sock: &Path) -> String {
+    format!(
+        "firecracker-api {method} {path} --api-sock {}",
+        api_sock.display()
+    )
+}
+
+fn parse_http_status(response: &str) -> Option<i32> {
+    response
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<i32>()
+        .ok()
+}
+
 fn preflight_issue(
     severity: IssueSeverity,
     code: &str,
@@ -168,6 +373,7 @@ pub struct MicroVmDriver {
     ssh_binary: String,
     scp_binary: String,
     runner: Arc<dyn CommandRunner>,
+    api: Arc<dyn FirecrackerApi>,
     host: HostChecks,
     workdir: Mutex<Option<PathBuf>>,
 }
@@ -180,6 +386,7 @@ impl Default for MicroVmDriver {
             ssh_binary: SSH_BINARY.to_owned(),
             scp_binary: SCP_BINARY.to_owned(),
             runner: Arc::new(ProcessCommandRunner),
+            api: Arc::new(UnixFirecrackerApi),
             host: HostChecks::detect(),
             workdir: Mutex::new(None),
         }
@@ -213,7 +420,30 @@ impl MicroVmDriver {
             ssh_binary: SSH_BINARY.to_owned(),
             scp_binary: SCP_BINARY.to_owned(),
             runner,
+            api: Arc::new(UnixFirecrackerApi),
             host,
+            workdir: Mutex::new(None),
+        }
+    }
+
+    fn for_tests_with_api<T, A>(runner: Arc<T>, api: Arc<A>, is_linux: bool, has_kvm: bool) -> Self
+    where
+        T: CommandRunner + 'static,
+        A: FirecrackerApi + 'static,
+    {
+        Self {
+            firecracker_binary: FIRECRACKER_BINARY.to_owned(),
+            apple_container_binary: APPLE_CONTAINER_BINARY.to_owned(),
+            ssh_binary: SSH_BINARY.to_owned(),
+            scp_binary: SCP_BINARY.to_owned(),
+            runner,
+            api,
+            host: HostChecks {
+                is_linux,
+                is_macos: false,
+                is_apple_silicon: false,
+                has_kvm,
+            },
             workdir: Mutex::new(None),
         }
     }
@@ -393,6 +623,38 @@ impl MicroVmDriver {
         Ok(SandboxHandle {
             handle: handle.to_handle()?,
         })
+    }
+
+    fn clone_rootfs_for_fork(&self, source_rootfs: &str, child_rootfs: &Path) -> DriverResult<()> {
+        if let Some(parent) = child_rootfs.parent() {
+            fs::create_dir_all(parent).map_err(|source| DriverError::InvalidInput {
+                message: format!("failed to create `{}`: {source}", parent.display()),
+            })?;
+        }
+        let request = CommandRequest {
+            args: vec![
+                "--reflink=auto".to_owned(),
+                "--sparse=always".to_owned(),
+                source_rootfs.to_owned(),
+                child_rootfs.to_string_lossy().into_owned(),
+            ],
+            env: BTreeMap::new(),
+            stdin: None,
+        };
+        match self.runner.run("cp", &request) {
+            Ok(output) if output.status == Some(0) => Ok(()),
+            Ok(_) | Err(_) => {
+                fs::copy(source_rootfs, child_rootfs).map_err(|source| {
+                    DriverError::InvalidInput {
+                        message: format!(
+                            "failed to copy rootfs `{source_rootfs}` to `{}`: {source}",
+                            child_rootfs.display()
+                        ),
+                    }
+                })?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -732,6 +994,8 @@ struct MicroVmHandle {
     pid_file: PathBuf,
     ssh: Option<SshTarget>,
     env_file: Option<String>,
+    rootfs: Option<String>,
+    tap: Option<String>,
 }
 
 impl MicroVmHandle {
@@ -744,6 +1008,8 @@ impl MicroVmHandle {
             workdir,
             ssh: spec.ssh.clone(),
             env_file: None,
+            rootfs: Some(spec.rootfs.clone()),
+            tap: spec.tap.clone(),
         }
     }
 
@@ -756,6 +1022,8 @@ impl MicroVmHandle {
             workdir,
             ssh: None,
             env_file: spec.guest_env_file.clone(),
+            rootfs: None,
+            tap: None,
         }
     }
 
@@ -775,6 +1043,12 @@ impl MicroVmHandle {
         }
         if let Some(env_file) = self.env_file.as_deref() {
             url.query_pairs_mut().append_pair("env_file", env_file);
+        }
+        if let Some(rootfs) = self.rootfs.as_deref() {
+            url.query_pairs_mut().append_pair("rootfs", rootfs);
+        }
+        if let Some(tap) = self.tap.as_deref() {
+            url.query_pairs_mut().append_pair("tap", tap);
         }
         Ok(url.to_string())
     }
@@ -816,6 +1090,11 @@ impl MicroVmHandle {
             validate_guest_env_file_path(env_file)
                 .map_err(|err| invalid_handle(handle, err.to_string()))?;
         }
+        let rootfs = query.get("rootfs").cloned();
+        let tap = query.get("tap").cloned();
+        if let Some(tap) = tap.as_deref() {
+            validate_tap(tap).map_err(|err| invalid_handle(handle, err.to_string()))?;
+        }
         Ok(Self {
             runtime,
             name,
@@ -824,6 +1103,8 @@ impl MicroVmHandle {
             pid_file,
             ssh,
             env_file,
+            rootfs,
+            tap,
         })
     }
 
@@ -831,6 +1112,108 @@ impl MicroVmHandle {
         self.ssh
             .as_ref()
             .ok_or_else(|| capability_missing(MICROVM_SSH_CAPABILITY))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirecrackerSnapshotId {
+    source_name: String,
+    snapshot_name: String,
+    snapshot_path: PathBuf,
+    mem_file_path: PathBuf,
+    rootfs: String,
+    tap: Option<String>,
+    ssh: Option<SshTarget>,
+}
+
+impl FirecrackerSnapshotId {
+    fn new(handle: &MicroVmHandle, snapshot_name: &str) -> DriverResult<Self> {
+        let rootfs = handle
+            .rootfs
+            .clone()
+            .ok_or_else(|| DriverError::InvalidInput {
+                message: "firecracker snapshot requires a rootfs path in the sandbox handle"
+                    .to_owned(),
+            })?;
+        let snapshot_dir = handle.workdir.join("snapshots").join(snapshot_name);
+        Ok(Self {
+            source_name: handle.name.clone(),
+            snapshot_name: snapshot_name.to_owned(),
+            snapshot_path: snapshot_dir.join("vmstate"),
+            mem_file_path: snapshot_dir.join("memory"),
+            rootfs,
+            tap: handle.tap.clone(),
+            ssh: handle.ssh.clone(),
+        })
+    }
+
+    fn to_id(&self) -> DriverResult<String> {
+        let base = format!(
+            "microvm-snapshot://firecracker/{}/{}",
+            self.source_name, self.snapshot_name
+        );
+        let mut url = Url::parse(&base).map_err(|source| DriverError::InvalidInput {
+            message: format!("failed to build microvm snapshot id: {source}"),
+        })?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("snapshot_path", &self.snapshot_path.to_string_lossy());
+            pairs.append_pair("mem_file_path", &self.mem_file_path.to_string_lossy());
+            pairs.append_pair("rootfs", &self.rootfs);
+            if let Some(tap) = self.tap.as_deref() {
+                pairs.append_pair("tap", tap);
+            }
+        }
+        if let Some(ssh) = self.ssh.as_ref() {
+            ssh.to_query(&mut url);
+        }
+        Ok(url.to_string())
+    }
+
+    fn from_id(id: &str) -> DriverResult<Self> {
+        let url = Url::parse(id).map_err(|source| DriverError::InvalidHandle {
+            handle: id.to_owned(),
+            message: source.to_string(),
+        })?;
+        if url.scheme() != "microvm-snapshot" || url.host_str() != Some("firecracker") {
+            return Err(DriverError::InvalidHandle {
+                handle: id.to_owned(),
+                message: "expected firecracker microvm snapshot id".to_owned(),
+            });
+        }
+        let mut segments = url
+            .path_segments()
+            .ok_or_else(|| DriverError::InvalidHandle {
+                handle: id.to_owned(),
+                message: "snapshot id path is invalid".to_owned(),
+            })?;
+        let source_name = segments.next().unwrap_or_default().to_owned();
+        let snapshot_name = segments.next().unwrap_or_default().to_owned();
+        validate_name(&source_name, "snapshot source name")
+            .map_err(|err| invalid_handle(id, err.to_string()))?;
+        validate_name(&snapshot_name, "snapshot name")
+            .map_err(|err| invalid_handle(id, err.to_string()))?;
+        let query = query_map(&url);
+        let snapshot_path = required_query_path(&query, id, "snapshot_path")?;
+        let mem_file_path = required_query_path(&query, id, "mem_file_path")?;
+        let rootfs = query
+            .get("rootfs")
+            .cloned()
+            .ok_or_else(|| invalid_handle(id, "missing rootfs query parameter"))?;
+        let tap = query.get("tap").cloned();
+        if let Some(tap) = tap.as_deref() {
+            validate_tap(tap).map_err(|err| invalid_handle(id, err.to_string()))?;
+        }
+        let ssh = SshTarget::from_query(&url, id)?;
+        Ok(Self {
+            source_name,
+            snapshot_name,
+            snapshot_path,
+            mem_file_path,
+            rootfs,
+            tap,
+            ssh,
+        })
     }
 }
 
@@ -1313,6 +1696,8 @@ impl SandboxDriver for MicroVmDriver {
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
                 supports_dns_egress_control: false,
+                supports_snapshots: true,
+                supports_fork: true,
             }),
         })
     }
@@ -1342,6 +1727,115 @@ impl SandboxDriver for MicroVmDriver {
                 "{UNSUPPORTED_RUNTIME_CAPABILITY}:kata"
             ))),
         }
+    }
+
+    async fn snapshot(&self, params: SnapshotParams) -> DriverResult<SnapshotId> {
+        let handle = MicroVmHandle::from_handle(&params.handle)?;
+        if handle.runtime != MicroVmRuntime::Firecracker {
+            return Err(capability_missing(&format!(
+                "supports_snapshots:{}",
+                handle.runtime.label()
+            )));
+        }
+        let snapshot_name = params
+            .name
+            .unwrap_or_else(|| format!("snapshot-{}", uuid_like_suffix()));
+        validate_name(&snapshot_name, "snapshot name")?;
+        let snapshot = FirecrackerSnapshotId::new(&handle, &snapshot_name)?;
+        if let Some(parent) = snapshot.snapshot_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| DriverError::InvalidInput {
+                message: format!(
+                    "failed to create snapshot directory `{}`: {source}",
+                    parent.display()
+                ),
+            })?;
+        }
+
+        self.api.set_vm_state(&handle.api_sock, "Paused")?;
+        let create_result = self.api.create_snapshot(
+            &handle.api_sock,
+            &snapshot.snapshot_path,
+            &snapshot.mem_file_path,
+        );
+        let resume_result = self.api.set_vm_state(&handle.api_sock, "Resumed");
+        create_result?;
+        resume_result?;
+
+        Ok(SnapshotId {
+            id: snapshot.to_id()?,
+        })
+    }
+
+    async fn fork_from_snapshot(
+        &self,
+        params: ForkFromSnapshotParams,
+    ) -> DriverResult<SandboxHandle> {
+        let snapshot = FirecrackerSnapshotId::from_id(&params.snapshot.id)?;
+        let name = params.spec.name;
+        validate_name(&name, "fork name")?;
+        let child_tap =
+            optional_metadata_string(&params.spec.metadata, "tap")?.or(snapshot.tap.clone());
+        if let Some(tap) = child_tap.as_deref() {
+            validate_tap(tap)?;
+        }
+        let child_ssh = SshTarget::from_metadata(&params.spec.metadata)?.or(snapshot.ssh.clone());
+        let parent = self.workdir_parent()?;
+        let workdir = ensure_workdir(&parent, &name)?;
+        let child_rootfs = workdir.join("rootfs.ext4");
+        self.clone_rootfs_for_fork(&snapshot.rootfs, &child_rootfs)?;
+        let handle = MicroVmHandle {
+            runtime: MicroVmRuntime::Firecracker,
+            name,
+            api_sock: workdir.join("api.sock"),
+            pid_file: workdir.join("firecracker.pid"),
+            workdir,
+            ssh: child_ssh,
+            env_file: None,
+            rootfs: Some(child_rootfs.to_string_lossy().into_owned()),
+            tap: child_tap,
+        };
+        let request = CommandRequest {
+            args: vec![
+                "--api-sock".to_owned(),
+                handle.api_sock.to_string_lossy().into_owned(),
+            ],
+            env: BTreeMap::new(),
+            stdin: None,
+        };
+        let pid = self
+            .runner
+            .spawn(&self.firecracker_binary, &request)
+            .map_err(|source| DriverError::CommandSpawn {
+                command: command_string(&self.firecracker_binary, &request.args),
+                source,
+            })?;
+        write_pid(&handle.pid_file, pid)?;
+        let mut network_overrides = BTreeMap::new();
+        if let Some(tap) = handle.tap.as_deref() {
+            network_overrides.insert("eth0".to_owned(), tap.to_owned());
+        }
+        if let Err(err) = self.api.load_snapshot(
+            &handle.api_sock,
+            &snapshot.snapshot_path,
+            &snapshot.mem_file_path,
+            &network_overrides,
+            true,
+        ) {
+            let _ = self.runner.run(
+                "kill",
+                &CommandRequest {
+                    args: vec![pid.to_string()],
+                    env: BTreeMap::new(),
+                    stdin: None,
+                },
+            );
+            let _ = fs::remove_file(&handle.pid_file);
+            return Err(err);
+        }
+
+        Ok(SandboxHandle {
+            handle: handle.to_handle()?,
+        })
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<ShellHandle> {
@@ -1763,16 +2257,90 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use agentenv_core::driver::{DriverError, SandboxDriver};
+    use agentenv_core::driver::{DriverError, DriverResult, SandboxDriver};
     use agentenv_proto::{
         Capabilities, ConnectParams, CopyInParams, CopyOutParams, DriverKind, ExecParams,
-        FilesystemPolicy, InferencePolicy, InitializeParams, LogLevel, NetworkAccessPolicy,
-        NetworkPolicy, NetworkRule, NetworkTarget, PolicyReloadability, PreflightParams,
-        ProcessPolicy, SandboxSpec, SCHEMA_VERSION,
+        FilesystemPolicy, ForkFromSnapshotParams, ForkSpec, InferencePolicy, InitializeParams,
+        LogLevel, NetworkAccessPolicy, NetworkPolicy, NetworkRule, NetworkTarget,
+        PolicyReloadability, PreflightParams, ProcessPolicy, SandboxSpec, SnapshotParams,
+        SCHEMA_VERSION,
     };
     use serde_json::json;
 
     use super::{CommandOutput, CommandRequest, FirecrackerConfig, HostChecks, MicroVmDriver};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ApiCall {
+        VmState {
+            api_sock: String,
+            state: String,
+        },
+        CreateSnapshot {
+            api_sock: String,
+            snapshot_path: String,
+            mem_file_path: String,
+        },
+        LoadSnapshot {
+            api_sock: String,
+            snapshot_path: String,
+            mem_file_path: String,
+            network_overrides: BTreeMap<String, String>,
+            resume_vm: bool,
+        },
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingFirecrackerApi {
+        calls: Mutex<Vec<ApiCall>>,
+    }
+
+    impl RecordingFirecrackerApi {
+        fn calls(&self) -> Vec<ApiCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl super::FirecrackerApi for RecordingFirecrackerApi {
+        fn set_vm_state(&self, api_sock: &Path, state: &str) -> DriverResult<()> {
+            self.calls.lock().unwrap().push(ApiCall::VmState {
+                api_sock: api_sock.display().to_string(),
+                state: state.to_owned(),
+            });
+            Ok(())
+        }
+
+        fn create_snapshot(
+            &self,
+            api_sock: &Path,
+            snapshot_path: &Path,
+            mem_file_path: &Path,
+        ) -> DriverResult<()> {
+            self.calls.lock().unwrap().push(ApiCall::CreateSnapshot {
+                api_sock: api_sock.display().to_string(),
+                snapshot_path: snapshot_path.display().to_string(),
+                mem_file_path: mem_file_path.display().to_string(),
+            });
+            Ok(())
+        }
+
+        fn load_snapshot(
+            &self,
+            api_sock: &Path,
+            snapshot_path: &Path,
+            mem_file_path: &Path,
+            network_overrides: &BTreeMap<String, String>,
+            resume_vm: bool,
+        ) -> DriverResult<()> {
+            self.calls.lock().unwrap().push(ApiCall::LoadSnapshot {
+                api_sock: api_sock.display().to_string(),
+                snapshot_path: snapshot_path.display().to_string(),
+                mem_file_path: mem_file_path.display().to_string(),
+                network_overrides: network_overrides.clone(),
+                resume_vm,
+            });
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Default)]
     struct RecordingRunner {
@@ -1889,9 +2457,141 @@ mod tests {
                 assert!(!capabilities.supports_native_inference_routing);
                 assert!(!capabilities.supports_remote_host);
                 assert!(!capabilities.supports_persistent_sessions);
+                assert!(capabilities.supports_snapshots);
+                assert!(capabilities.supports_fork);
             }
             other => panic!("expected sandbox capabilities, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn firecracker_snapshot_pauses_creates_snapshot_and_resumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let api = Arc::new(RecordingFirecrackerApi::default());
+        let mut driver =
+            MicroVmDriver::for_tests_with_api(Arc::clone(&runner), Arc::clone(&api), true, true);
+        driver.initialize(init_params(temp.path())).await.unwrap();
+        let rootfs = temp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, "rootfs").unwrap();
+        let handle = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::new(),
+                policy: None,
+                metadata: BTreeMap::from([
+                    ("name".to_owned(), json!("fc-test")),
+                    ("runtime".to_owned(), json!("firecracker")),
+                    (
+                        "kernel".to_owned(),
+                        json!("/var/lib/agentenv/kernel/vmlinux"),
+                    ),
+                    ("rootfs".to_owned(), json!(rootfs.display().to_string())),
+                    ("tap".to_owned(), json!("tap-source")),
+                ]),
+            })
+            .await
+            .unwrap();
+
+        let snapshot = driver
+            .snapshot(SnapshotParams {
+                handle: handle.handle,
+                name: Some("experiment".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        assert!(snapshot.id.starts_with("microvm-snapshot://firecracker/"));
+        let calls = api.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(matches!(
+            &calls[0],
+            ApiCall::VmState { state, .. } if state == "Paused"
+        ));
+        assert!(matches!(
+            &calls[1],
+            ApiCall::CreateSnapshot {
+                snapshot_path,
+                mem_file_path,
+                ..
+            } if snapshot_path.ends_with("/snapshots/experiment/vmstate")
+                && mem_file_path.ends_with("/snapshots/experiment/memory")
+        ));
+        assert!(matches!(
+            &calls[2],
+            ApiCall::VmState { state, .. } if state == "Resumed"
+        ));
+        assert!(snapshot.id.contains("rootfs="));
+        assert!(snapshot.id.contains("tap=tap-source"));
+    }
+
+    #[tokio::test]
+    async fn firecracker_fork_clones_rootfs_loads_snapshot_and_returns_child_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let api = Arc::new(RecordingFirecrackerApi::default());
+        let mut driver =
+            MicroVmDriver::for_tests_with_api(Arc::clone(&runner), Arc::clone(&api), true, true);
+        driver.initialize(init_params(temp.path())).await.unwrap();
+        let rootfs = temp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, "rootfs").unwrap();
+        let handle = driver
+            .create(SandboxSpec {
+                image: None,
+                env: BTreeMap::new(),
+                policy: None,
+                metadata: BTreeMap::from([
+                    ("name".to_owned(), json!("fc-test")),
+                    ("runtime".to_owned(), json!("firecracker")),
+                    (
+                        "kernel".to_owned(),
+                        json!("/var/lib/agentenv/kernel/vmlinux"),
+                    ),
+                    ("rootfs".to_owned(), json!(rootfs.display().to_string())),
+                    ("tap".to_owned(), json!("tap-source")),
+                ]),
+            })
+            .await
+            .unwrap();
+        let snapshot = driver
+            .snapshot(SnapshotParams {
+                handle: handle.handle,
+                name: Some("experiment".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        let forked = driver
+            .fork_from_snapshot(ForkFromSnapshotParams {
+                snapshot,
+                spec: ForkSpec {
+                    name: "experiment".to_owned(),
+                    metadata: BTreeMap::from([("tap".to_owned(), json!("tap-child"))]),
+                },
+            })
+            .await
+            .unwrap();
+
+        assert!(forked
+            .handle
+            .starts_with("microvm://firecracker/experiment?"));
+        assert!(forked.handle.contains("tap=tap-child"));
+        assert!(forked.handle.contains("rootfs="));
+        let spawned = runner.spawned();
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[1].args[0], "--api-sock");
+        assert!(!spawned[1].args.contains(&"--config-file".to_owned()));
+        let calls = api.calls();
+        assert!(matches!(
+            calls.last(),
+            Some(ApiCall::LoadSnapshot {
+                network_overrides,
+                resume_vm: true,
+                ..
+            }) if network_overrides.get("eth0").map(String::as_str) == Some("tap-child")
+        ));
+        assert_eq!(runner.call_programs()[1], "cp");
+        assert_eq!(runner.calls()[1].args[0], "--reflink=auto");
     }
 
     #[tokio::test]

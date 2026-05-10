@@ -675,6 +675,8 @@ impl SandboxDriver for RemoteSshDriver {
                 supports_remote_host: true,
                 supports_persistent_sessions: false,
                 supports_dns_egress_control: false,
+                supports_snapshots: false,
+                supports_fork: false,
             }),
         })
     }

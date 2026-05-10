@@ -35,18 +35,23 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 ```json
 {
   "schema_version": "1.2",
-  "name": "nexus",
-  "kind": "context",
+  "name": "microvm",
+  "kind": "sandbox",
   "version": "0.1.0",
-  "description": "Nexus context backend driver",
-  "binary": "./bin/agentenv-driver-nexus",
+  "description": "MicroVM sandbox backend driver",
+  "binary": "./bin/agentenv-driver-microvm",
   "args": [],
   "env": {},
   "capabilities_preview": {
-    "is_remote": true,
-    "is_shared": true,
-    "supports_zones": true,
-    "supports_snapshots": true
+    "supports_hot_reload_policy": false,
+    "supports_filesystem_lockdown": true,
+    "supports_syscall_filter": true,
+    "supports_native_inference_routing": false,
+    "supports_remote_host": false,
+    "supports_persistent_sessions": false,
+    "supports_dns_egress_control": false,
+    "supports_snapshots": true,
+    "supports_fork": true
   }
 }
 ```
@@ -91,7 +96,9 @@ Response:
       "supports_native_inference_routing": true,
       "supports_remote_host": true,
       "supports_persistent_sessions": true,
-      "supports_dns_egress_control": true
+      "supports_dns_egress_control": false,
+      "supports_snapshots": false,
+      "supports_fork": false
     }
   }
 }
@@ -134,6 +141,8 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `status` | `{handle}` | `SandboxStatus` |
 | `logs` | `{handle, since, follow: false}` | `[LogEntry]` |
 | `logs_stream` | `{handle, since}` | streamed via notifications |
+| `snapshot` | `SnapshotParams {handle, name?}` | `SnapshotId` |
+| `fork_from_snapshot` | `ForkFromSnapshotParams {snapshot, spec}` | `SandboxHandle` |
 | `stop` | `{handle}` | `{}` |
 | `destroy` | `{handle}` | `{}` |
 
@@ -144,8 +153,15 @@ DNS answer pinning when `pin_resolved_ips` is enabled. Drivers that cannot
 enforce these controls must return `supports_dns_egress_control = false`; core
 rejects active DNS policy before create/apply for those drivers.
 
-Image hardening profiles were introduced as create-time sandbox configuration
-in schema 1.1.
+Snapshot and fork are optional sandbox capabilities in schema 1.2. Core checks
+`supports_snapshots` before `snapshot` and `supports_fork` before
+`fork_from_snapshot`; drivers that cannot support them return
+`CapabilityMissing`. `SnapshotId.id` is an opaque driver-owned string. `ForkSpec`
+carries the target env name plus driver-specific metadata overrides such as a
+Firecracker tap or SSH target; credentials still never flow over generic driver
+RPC.
+
+Image hardening profiles are create-time sandbox configuration in schema 1.1.
 Core resolves `sandbox.hardening`, merges supported filesystem settings into
 `SandboxSpec.policy`, and sends process, runtime, and image settings through
 `SandboxSpec.metadata` keys prefixed with `hardening_`. Sandbox drivers may
@@ -346,7 +362,7 @@ Errors include `data` with machine-readable context when relevant (e.g., which c
 - Core refuses to run a driver whose `schema_version` major doesn't match its own.
 - The `1.0` schema broke the old flat `NetworkPolicy` / `NetworkRule` wire shape. Drivers must speak the four-domain policy object with `network`, `filesystem`, `process`, and `inference`, and `approval_required` replaces the old `approval` field.
 - The `1.1` schema adds rich driver activity notifications. Drivers may continue sending the legacy `event/activity` shape while adopting structured `actor`, `subject`, `result`, `trace_id`, and `extras` fields.
-- The `1.2` schema adds DNS egress policy fields and the `supports_dns_egress_control` sandbox capability.
+- The `1.2` schema adds DNS egress policy fields, the `supports_dns_egress_control` sandbox capability, and optional sandbox `snapshot` / `fork_from_snapshot` methods gated by `supports_snapshots` and `supports_fork`.
 
 ## Built-in drivers
 

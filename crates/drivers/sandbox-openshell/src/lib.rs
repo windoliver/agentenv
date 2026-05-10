@@ -576,6 +576,8 @@ impl SandboxDriver for OpenShellDriver {
                 supports_remote_host: true,
                 supports_persistent_sessions: true,
                 supports_dns_egress_control: false,
+                supports_snapshots: false,
+                supports_fork: false,
             }),
         })
     }

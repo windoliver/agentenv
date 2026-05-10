@@ -27,6 +27,10 @@ fn main() {
     write_schema::<types::McpEndpoint>(&schema_dir, "mcp-endpoint");
     write_schema::<types::SandboxSpec>(&schema_dir, "sandbox-spec");
     write_schema::<types::SandboxHandle>(&schema_dir, "sandbox-handle");
+    write_schema::<types::SnapshotParams>(&schema_dir, "snapshot-params");
+    write_schema::<types::SnapshotId>(&schema_dir, "snapshot-id");
+    write_schema::<types::ForkSpec>(&schema_dir, "fork-spec");
+    write_schema::<types::ForkFromSnapshotParams>(&schema_dir, "fork-from-snapshot-params");
     write_schema::<types::ConnectParams>(&schema_dir, "connect-params");
     write_schema::<types::ShellHandle>(&schema_dir, "shell-handle");
     write_schema::<types::CreateSessionParams>(&schema_dir, "create-session-params");

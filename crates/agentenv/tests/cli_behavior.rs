@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -55,6 +56,638 @@ fn freeze_persisted_env_writes_default_lockfile() {
     let rendered = fs::read_to_string(temp_dir.join("agentenv.lock")).unwrap();
     assert!(rendered.contains("version: 0.2.0"));
     assert!(rendered.contains("name: demo"));
+}
+
+#[test]
+fn bundle_help_lists_as_skill_and_out_flags() {
+    let temp_dir = make_temp_dir("bundle-help");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("--help")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--as-skill"), "stdout was: {stdout}");
+    assert!(stdout.contains("--out"), "stdout was: {stdout}");
+    assert!(stdout.contains("--env"), "stdout was: {stdout}");
+}
+
+#[test]
+fn bundle_as_skill_requires_out_flag() {
+    let temp_dir = make_temp_dir("bundle-missing-out");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle --as-skill requires --out <dir>"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn bundle_rejects_missing_as_skill_flag() {
+    let temp_dir = make_temp_dir("bundle-missing-as-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--out")
+        .arg(temp_dir.join("bundle-out"))
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bundle currently supports only --as-skill"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn bundle_as_skill_rejects_missing_env() {
+    let temp_dir = make_temp_dir("bundle-missing-env");
+    let out_dir = temp_dir.join("bundle-out");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("missing-env")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-env"), "stderr was: {stderr}");
+}
+
+#[test]
+fn bundle_directory_source_loads_architecture_reference() {
+    let temp_dir = make_temp_dir("bundle-reference-doc");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    fs::write(
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+        "# Architecture\n\nReference details\n",
+    )
+    .unwrap();
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reference = fs::read_to_string(out_dir.join("references/architecture.md")).unwrap();
+    assert!(reference.contains("Source: `docs/ARCHITECTURE.md`"));
+    assert!(reference.contains("Reference details"));
+}
+
+#[test]
+fn bundle_as_skill_exports_existing_env_with_project_reference() {
+    let temp_dir = make_temp_dir("bundle-project-reference");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    fs::write(
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+        "# Architecture\n\nProject reference details\n",
+    )
+    .unwrap();
+    run_git(&project_dir, &["init"]);
+    run_git(&project_dir, &["config", "user.name", "Detected Author"]);
+    run_git(
+        &project_dir,
+        &["config", "user.email", "detected@example.com"],
+    );
+    run_git(&project_dir, &["add", "docs/ARCHITECTURE.md"]);
+    run_git(
+        &project_dir,
+        &["commit", "-m", "Add architecture reference"],
+    );
+    let expected_commit = git_stdout(&project_dir, &["rev-parse", "HEAD"]);
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-project-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--author")
+        .arg("Alice Example")
+        .arg("--license")
+        .arg("MIT")
+        .arg("--tag")
+        .arg("rust")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("SKILL.md").is_file());
+    assert!(out_dir.join("skill.yaml").is_file());
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("author: Alice Example"),
+        "SKILL.md was: {skill}"
+    );
+    assert!(skill.contains("license: MIT"), "SKILL.md was: {skill}");
+    assert!(skill.contains("- rust"), "SKILL.md was: {skill}");
+    let reference = fs::read_to_string(out_dir.join("references/architecture.md")).unwrap();
+    assert!(reference.contains("Source: `docs/ARCHITECTURE.md`"));
+    assert!(reference.contains("Project reference details"));
+    let provenance: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join(".agentenv/provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        provenance["source"]["project_git_commit"].as_str(),
+        Some(expected_commit.as_str())
+    );
+    assert_eq!(
+        provenance["source"]["project_git_dirty"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn bundle_metadata_detection_uses_local_git_author_and_cargo_license() {
+    let temp_dir = make_temp_dir("bundle-detected-metadata");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname = 'demo'\nversion = '0.1.0'\nlicense = 'Apache-2.0'\n",
+    )
+    .unwrap();
+    run_git(&project_dir, &["init"]);
+    run_git(&project_dir, &["config", "user.name", "Detected Author"]);
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-detected-metadata-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("author: Detected Author"),
+        "SKILL.md was: {skill}"
+    );
+    assert!(
+        skill.contains("license: Apache-2.0"),
+        "SKILL.md was: {skill}"
+    );
+}
+
+#[test]
+fn bundle_metadata_detection_ignores_global_git_author_for_non_git_project() {
+    let temp_dir = make_temp_dir("bundle-ignore-global-git-author");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join("LICENSE-MIT"), "MIT License\n").unwrap();
+    let git_config = Command::new("git")
+        .args(["config", "--global", "user.name", "Global Author"])
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        git_config.status.success(),
+        "git config --global failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&git_config.stdout),
+        String::from_utf8_lossy(&git_config.stderr)
+    );
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-license-file-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skill = fs::read_to_string(out_dir.join("SKILL.md")).unwrap();
+    assert!(!skill.contains("Global Author"), "SKILL.md was: {skill}");
+    assert!(skill.contains("license: MIT"), "SKILL.md was: {skill}");
+}
+
+#[test]
+fn bundle_dot_source_derives_env_from_current_directory() {
+    let temp_dir = make_temp_dir("bundle-dot-source");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(&project_dir).unwrap();
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-dot-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(".")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&project_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_dir.join("SKILL.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_directory_source_skips_symlinked_reference_document() {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = make_temp_dir("bundle-symlink-reference");
+    write_minimal_env_state(&temp_dir, "demo");
+    let project_dir = temp_dir.join("demo");
+    fs::create_dir_all(project_dir.join("docs")).unwrap();
+    let outside_reference = temp_dir.join("outside-architecture.md");
+    fs::write(&outside_reference, "# Outside\n\nDo not copy\n").unwrap();
+    symlink(
+        &outside_reference,
+        project_dir.join("docs").join("ARCHITECTURE.md"),
+    )
+    .unwrap();
+    let out_dir = fs::canonicalize(&temp_dir)
+        .unwrap()
+        .join("demo-symlink-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg(&project_dir)
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!out_dir.join("references/architecture.md").exists());
+}
+
+#[test]
+fn bundle_json_outputs_digest_summary() {
+    let temp_dir = make_temp_dir("bundle-json-summary");
+    write_minimal_env_state(&temp_dir, "demo");
+    let out_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-json-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        summary["output_dir"].as_str(),
+        Some(out_dir.to_str().unwrap())
+    );
+    assert_eq!(summary["skill_name"].as_str(), Some("demo"));
+    assert_eq!(summary["version"].as_str(), Some("1.0.0"));
+    assert!(summary["bundle_digest"].as_str().is_some());
+    assert!(summary["blueprint_digest"].as_str().is_some());
+    assert!(summary["lockfile_digest"].as_str().is_some());
+}
+
+#[test]
+fn bundle_as_skill_json_output_installs_as_local_skill() {
+    let temp_dir = make_temp_dir("bundle-json-install");
+    write_minimal_env_state(&temp_dir, "demo");
+    let output_dir = fs::canonicalize(&temp_dir).unwrap().join("demo-skill");
+
+    let output = Command::new(agentenv_bin())
+        .arg("bundle")
+        .arg("demo")
+        .arg("--as-skill")
+        .arg("--out")
+        .arg(&output_dir)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.stdout.ends_with(b"\n"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let keys = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        [
+            "blueprint_digest",
+            "bundle_digest",
+            "lockfile_digest",
+            "output_dir",
+            "skill_name",
+            "version",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(json["output_dir"], output_dir.to_str().unwrap());
+    assert_eq!(json["skill_name"], "demo");
+    assert_eq!(json["version"], "1.0.0");
+    assert!(json["bundle_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(json["blueprint_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(json["lockfile_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&output_dir)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env_remove("AGENTENV_DRIVER_PATH")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("demo")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn fork_reports_capability_missing_for_openshell() {
+    let temp_dir = make_temp_dir("fork-openshell-unsupported");
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    let state_path = env_dir.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["handles"]["sandbox"] = serde_json::Value::String("openshell://demo".to_owned());
+    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("fork")
+        .arg("demo")
+        .arg("--name")
+        .arg("experiment")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("supports_snapshots"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_microvm_cli_clones_env_with_fake_firecracker_api() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = PathBuf::from(format!("/tmp/ae-fc-{}", unique_suffix()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let agentenv_root = temp_dir.join(".agentenv");
+    let source_workdir = agentenv_root.join("microvm").join("demo");
+    let child_workdir = agentenv_root.join("microvm").join("experiment");
+    fs::create_dir_all(&source_workdir).unwrap();
+    fs::create_dir_all(&child_workdir).unwrap();
+    let source_api_sock = source_workdir.join("api.sock");
+    let child_api_sock = child_workdir.join("api.sock");
+    let source_server = spawn_fake_firecracker_api(&source_api_sock, 3);
+    let child_server = spawn_fake_firecracker_api(&child_api_sock, 1);
+
+    let rootfs = temp_dir.join("rootfs.ext4");
+    fs::write(&rootfs, "rootfs").unwrap();
+    let env_dir = write_minimal_env_state(&temp_dir, "demo");
+    fs::write(
+        env_dir.join("blueprint.yaml"),
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: microvm
+  runtime: firecracker
+  kernel: /var/lib/agentenv/kernel/vmlinux
+  rootfs: /var/lib/agentenv/rootfs.ext4
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#,
+    )
+    .unwrap();
+    let state_path = env_dir.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["drivers"]["sandbox"]["name"] = serde_json::Value::String("microvm".to_owned());
+    let source_handle = format!(
+        "microvm://firecracker/demo?workdir={}&api_sock={}&pid_file={}&rootfs={}&tap=tap-source",
+        source_workdir.display(),
+        source_api_sock.display(),
+        source_workdir.join("firecracker.pid").display(),
+        rootfs.display(),
+    );
+    state["handles"]["sandbox"] = serde_json::Value::String(source_handle.clone());
+    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let fake_bin = temp_dir.join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let firecracker = fake_bin.join("firecracker");
+    fs::write(&firecracker, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = fs::metadata(&firecracker).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&firecracker, perms).unwrap();
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let test_path = format!("{}:{}", fake_bin.display(), original_path.to_string_lossy());
+
+    let output = Command::new(agentenv_bin())
+        .arg("fork")
+        .arg(&source_handle)
+        .arg("--name")
+        .arg("experiment")
+        .env("HOME", &temp_dir)
+        .env("PATH", test_path)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout was: {}\nstderr was: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Environment `experiment` forked from `demo`"));
+    assert!(stdout.contains("snapshot: microvm-snapshot://firecracker/demo/experiment"));
+
+    let target_state_path = temp_dir
+        .join(".agentenv")
+        .join("envs")
+        .join("experiment")
+        .join("state.json");
+    let target: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(target_state_path).unwrap()).unwrap();
+    assert_eq!(target["name"], "experiment");
+    let handle = target["handles"]["sandbox"].as_str().unwrap();
+    assert!(handle.starts_with("microvm://firecracker/experiment?"));
+    assert!(handle.contains("tap=tap-source"));
+    assert!(child_workdir.join("rootfs.ext4").is_file());
+
+    let source_requests = source_server.join().unwrap();
+    let child_requests = child_server.join().unwrap();
+    assert_eq!(source_requests.len(), 3);
+    assert!(source_requests[0].starts_with("PATCH /vm "));
+    assert!(source_requests[1].starts_with("PUT /snapshot/create "));
+    assert!(source_requests[2].starts_with("PATCH /vm "));
+    assert_eq!(child_requests.len(), 1);
+    assert!(child_requests[0].starts_with("PUT /snapshot/load "));
 }
 
 #[test]
@@ -194,6 +827,7 @@ policy:
         missing_stderr.contains("CUSTOM_OPENAI_KEY"),
         "stderr was: {missing_stderr}"
     );
+    write_failing_openshell_cli(&temp_dir);
 
     let present = Command::new(agentenv_bin())
         .arg("reproduce")
@@ -262,6 +896,613 @@ fn cli_includes_commands() {
     assert!(
         blueprint < credentials,
         "`blueprint` should be listed before `credentials`; stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn cli_help_includes_skills_command() {
+    let output = Command::new(agentenv_bin()).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("skills"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_help_lists_lifecycle_subcommands() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "search", "add", "install", "list", "info", "remove", "publish", "verify", "prune",
+    ] {
+        assert!(
+            stdout.contains(command),
+            "missing {command}; stdout was: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn skills_verify_all_succeeds_for_valid_local_cache() {
+    let temp_dir = make_temp_dir("skills-verify-valid");
+    write_cli_cache_skill(
+        &temp_dir,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verified"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_verify_all_prints_warnings_for_passed_skills() {
+    let temp_dir = make_temp_dir("skills-verify-passed-warning");
+    write_cli_cache_skill(
+        &temp_dir,
+        "missing-archive",
+        "1.0.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning:"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("extracted tree digest"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_verify_all_fails_for_broken_local_cache() {
+    let temp_dir = make_temp_dir("skills-verify-broken");
+    write_cli_cache_skill(
+        &temp_dir,
+        "code-review",
+        "1.2.0",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        false,
+    );
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("--all")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_prune_dry_run_does_not_delete_archive() {
+    let temp_dir = make_temp_dir("skills-prune-dry-run");
+    let root = temp_dir.join(".agentenv");
+    let cache_dir = root.join("cache/skills");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let archive =
+        cache_dir.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.tar.zst");
+    fs::write(&archive, b"unreferenced").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("prune")
+        .arg("--dry-run")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(archive.exists(), "dry-run should not delete archive");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("would remove"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_prune_deletes_unreferenced_archive() {
+    let temp_dir = make_temp_dir("skills-prune-delete");
+    let root = temp_dir.join(".agentenv");
+    let cache_dir = root.join("cache/skills");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let archive =
+        cache_dir.join("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.tar.zst");
+    fs::write(&archive, b"unreferenced").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("prune")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(
+        !archive.exists(),
+        "prune should delete unreferenced archive"
+    );
+}
+
+#[test]
+fn skills_install_list_info_verify_and_remove_local_bundle() {
+    let temp_dir = make_temp_dir("skills-cli-local");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# CLI Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+
+    let list = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", output_summary(&list));
+    let json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(json["skills"][0]["name"], "cli-skill");
+
+    let info = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("cli-skill")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", output_summary(&info));
+    let info_json: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(info_json["name"], "cli-skill");
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("cli-skill")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{}", output_summary(&verify));
+
+    let remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("cli-skill")
+        .arg("--yes")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(remove.status.success(), "{}", output_summary(&remove));
+}
+
+#[test]
+fn skills_search_add_and_publish_use_filesystem_registry_config() {
+    let temp_dir = make_temp_dir("skills-cli-registry");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Registry Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.join("agentenv.yaml"),
+        format!(
+            "version: 0.1.0\nmin_agentenv_version: 0.0.1-alpha0\nsandbox: {{ driver: openshell }}\nagent: {{ driver: codex }}\ncontext: {{ driver: filesystem, mount: . }}\npolicy: {{ tier: balanced, presets: [] }}\nskills:\n  registries:\n    - name: local-dev\n      type: filesystem\n      path: {}\n",
+            registry.display()
+        ),
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg("local-dev")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("registry")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    assert!(String::from_utf8_lossy(&search.stdout).contains("registry-skill"));
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("registry-skill@0.1.0")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+}
+
+#[test]
+fn skills_registry_cli_path_override_publishes_searches_and_adds() {
+    let temp_dir = make_temp_dir("skills-cli-registry-override");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Override Skill\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: override-skill\nversion: 0.1.0\ndescription: Override demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+    let publish_json: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(publish_json["name"], "override-skill");
+    assert_eq!(publish_json["registry"], "cli");
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("override")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(search_json["skills"][0]["name"], "override-skill");
+    assert_eq!(search_json["skills"][0]["registry"], "cli");
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("override-skill@0.1.0")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+    let add_json: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    assert_eq!(add_json["name"], "override-skill");
+    assert_eq!(add_json["source_type"], "filesystem");
+    assert_eq!(
+        add_json["source_label"],
+        "filesystem:cli:override-skill@0.1.0"
+    );
+}
+
+#[test]
+fn skills_registry_config_precedence_is_user_project_then_cli() {
+    let temp_dir = make_temp_dir("skills-cli-registry-precedence");
+    let user_registry = temp_dir.join("user-registry");
+    let project_registry = temp_dir.join("project-registry");
+    let cli_registry = temp_dir.join("cli-registry");
+    write_filesystem_registry_skill(
+        &user_registry,
+        "user-precedence-skill",
+        "0.1.0",
+        "Precedence demo",
+    );
+    write_filesystem_registry_skill(
+        &project_registry,
+        "project-precedence-skill",
+        "0.1.0",
+        "Precedence demo",
+    );
+    write_filesystem_registry_skill(
+        &cli_registry,
+        "cli-precedence-skill",
+        "0.1.0",
+        "Precedence demo",
+    );
+
+    fs::create_dir_all(temp_dir.join(".config/agentenv")).unwrap();
+    fs::write(
+        temp_dir.join(".config/agentenv/config.toml"),
+        format!(
+            "[skills]\nregistry_order = [\"shared\"]\n\n[[skills.registries]]\nname = \"shared\"\ntype = \"filesystem\"\npath = '{}'\n",
+            user_registry.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.join("agentenv.yaml"),
+        format!(
+            "skills:\n  registry_order:\n    - shared\n  registries:\n    - name: shared\n      type: filesystem\n      path: {}\n",
+            project_registry.display()
+        ),
+    )
+    .unwrap();
+    let no_project_dir = temp_dir.join("no-project");
+    fs::create_dir_all(&no_project_dir).unwrap();
+
+    let user_search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("precedence")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&no_project_dir)
+        .output()
+        .unwrap();
+    assert!(
+        user_search.status.success(),
+        "{}",
+        output_summary(&user_search)
+    );
+    assert_skill_search_names(&user_search.stdout, &["user-precedence-skill"]);
+
+    let project_search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("precedence")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        project_search.status.success(),
+        "{}",
+        output_summary(&project_search)
+    );
+    assert_skill_search_names(&project_search.stdout, &["project-precedence-skill"]);
+
+    let cli_search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("precedence")
+        .arg("--registry")
+        .arg(&cli_registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        cli_search.status.success(),
+        "{}",
+        output_summary(&cli_search)
+    );
+    assert_skill_search_names(&cli_search.stdout, &["cli-precedence-skill"]);
+}
+
+#[test]
+fn skills_cli_enforces_trust_self_tests_version_selectors_and_remove_confirmation() {
+    let temp_dir = make_temp_dir("skills-cli-lifecycle-matrix");
+    let old_bundle = temp_dir.join("matrix-0.1.0");
+    let new_bundle = temp_dir.join("matrix-0.2.0");
+    write_local_skill_bundle(
+        &old_bundle,
+        "matrix-skill",
+        "0.1.0",
+        "Old matrix skill",
+        Some("test -f SKILL.md"),
+    );
+    write_local_skill_bundle(
+        &new_bundle,
+        "matrix-skill",
+        "0.2.0",
+        "New matrix skill",
+        Some("test -f SKILL.md"),
+    );
+
+    let unsigned_default = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&old_bundle)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!unsigned_default.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsigned_default.stderr).contains("missing Ed25519 signature"),
+        "{}",
+        output_summary(&unsigned_default)
+    );
+
+    for bundle in [&old_bundle, &new_bundle] {
+        let install = Command::new(agentenv_bin())
+            .arg("skills")
+            .arg("install")
+            .arg("--from")
+            .arg(bundle)
+            .arg("--allow-unsigned")
+            .arg("--json")
+            .env("HOME", &temp_dir)
+            .current_dir(&temp_dir)
+            .output()
+            .unwrap();
+        assert!(install.status.success(), "{}", output_summary(&install));
+        let installed: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+        assert_eq!(installed["name"], "matrix-skill");
+        assert_eq!(installed["signature_status"], "unsigned");
+    }
+
+    let ambiguous_info = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("matrix-skill")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(!ambiguous_info.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous_info.stderr).contains("multiple installed versions"),
+        "{}",
+        output_summary(&ambiguous_info)
+    );
+
+    let info_old = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("info")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(info_old.status.success(), "{}", output_summary(&info_old));
+    let info_old_json: serde_json::Value = serde_json::from_slice(&info_old.stdout).unwrap();
+    assert_eq!(info_old_json["version"], "0.1.0");
+
+    let verify_new = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.2.0")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        verify_new.status.success(),
+        "{}",
+        output_summary(&verify_new)
+    );
+    let verify_new_json: serde_json::Value = serde_json::from_slice(&verify_new.stdout).unwrap();
+    assert_eq!(verify_new_json["version"], "0.2.0");
+
+    let remove_without_yes = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(!remove_without_yes.status.success());
+    assert!(
+        String::from_utf8_lossy(&remove_without_yes.stderr).contains("without --yes"),
+        "{}",
+        output_summary(&remove_without_yes)
+    );
+
+    let remove_old = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("matrix-skill")
+        .arg("--version")
+        .arg("0.1.0")
+        .arg("--yes")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        remove_old.status.success(),
+        "{}",
+        output_summary(&remove_old)
+    );
+    let remove_old_json: serde_json::Value = serde_json::from_slice(&remove_old.stdout).unwrap();
+    assert_eq!(remove_old_json["version"], "0.1.0");
+
+    let list_after_remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("list")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .output()
+        .unwrap();
+    assert!(
+        list_after_remove.status.success(),
+        "{}",
+        output_summary(&list_after_remove)
+    );
+    let list_after_remove_json: serde_json::Value =
+        serde_json::from_slice(&list_after_remove.stdout).unwrap();
+    assert_eq!(
+        list_after_remove_json["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|skill| skill["version"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["0.2.0"]
     );
 }
 
@@ -3134,6 +4375,149 @@ fn make_executable(path: &Path) {
     }
 }
 
+fn write_cli_cache_skill(
+    home: &Path,
+    name: &str,
+    version: &str,
+    digest: &str,
+    matching_skill_md: bool,
+) {
+    let skill_dir = home
+        .join(".agentenv")
+        .join("skills")
+        .join(name)
+        .join(version);
+    fs::create_dir_all(skill_dir.join(".agentenv")).unwrap();
+    let skill_md_name = if matching_skill_md {
+        name
+    } else {
+        "different-name"
+    };
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {skill_md_name}\nversion: {version}\n---\n# {name}\n"),
+    )
+    .unwrap();
+    let hex = digest.strip_prefix("sha256:").unwrap();
+    fs::write(
+        skill_dir.join(".agentenv/manifest.json"),
+        format!(
+            r#"{{
+  "schema_version": "0.1",
+  "name": "{name}",
+  "version": "{version}",
+  "source": "file:///skills/{name}",
+  "digest": "{digest}",
+  "signatures": [],
+  "archive": {{
+    "digest": "{digest}",
+    "cache_key": "{hex}.tar.zst"
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        skill_dir.join(".agentenv/provenance.json"),
+        format!(
+            r#"{{
+  "schema_version": "0.1",
+  "subject": {{
+    "name": "{name}",
+    "version": "{version}",
+    "digest": "{digest}"
+  }},
+  "attestations": []
+}}"#
+        ),
+    )
+    .unwrap();
+}
+
+fn write_local_skill_bundle(
+    bundle: &Path,
+    name: &str,
+    version: &str,
+    description: &str,
+    self_test: Option<&str>,
+) {
+    fs::create_dir_all(bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), format!("# {description}\n")).unwrap();
+    let self_test_yaml = self_test
+        .map(|command| format!("self_test:\n  command: {command}\n"))
+        .unwrap_or_default();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n{self_test_yaml}"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, description: &str) {
+    let bundle = registry.join("bundles").join(name).join(version);
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(
+        bundle.join("SKILL.md"),
+        format!("# {description}\n\n{name}\n"),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        registry.join("index.yaml"),
+        format!(
+            "skills:\n  - name: {name}\n    version: {version}\n    description: {description}\n    registry: local\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_skill_search_names(stdout: &[u8], expected: &[&str]) {
+    let json: serde_json::Value = serde_json::from_slice(stdout).unwrap();
+    let names = json["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|skill| skill["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        expected,
+        "stdout was: {}",
+        String::from_utf8_lossy(stdout)
+    );
+}
+
+fn write_failing_openshell_cli(home: &Path) {
+    let bin_dir = home.join(".local").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let openshell = bin_dir.join("openshell");
+    fs::write(
+        &openshell,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'openshell 0.0.30\n'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  printf 'gateway down\n' >&2
+  exit 1
+fi
+printf 'unexpected openshell test command: %s\n' "$*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    make_executable(&openshell);
+}
+
 fn agentenv_uninstall_temp_dirs(root: &Path) -> BTreeSet<PathBuf> {
     fs::read_dir(root)
         .unwrap()
@@ -3156,8 +4540,103 @@ fn unique_suffix() -> String {
     )
 }
 
+fn run_git(current_dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout(current_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn write_minimal_env_state(home: &Path, name: &str) -> PathBuf {
     write_minimal_env_state_with_credentials(home, name, &[])
+}
+
+#[cfg(unix)]
+fn spawn_fake_firecracker_api(
+    path: &Path,
+    expected_requests: usize,
+) -> thread::JoinHandle<Vec<String>> {
+    use std::os::unix::net::UnixListener;
+
+    if path.exists() {
+        fs::remove_file(path).unwrap();
+    }
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.len() < expected_requests && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_fake_firecracker_request(&mut stream);
+                    requests.push(request);
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("fake Firecracker API accept failed: {err}"),
+            }
+        }
+        requests
+    })
+}
+
+#[cfg(unix)]
+fn read_fake_firecracker_request(stream: &mut std::os::unix::net::UnixStream) -> String {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).unwrap();
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if fake_http_request_complete(&buffer) {
+            break;
+        }
+    }
+    String::from_utf8(buffer).unwrap()
+}
+
+#[cfg(unix)]
+fn fake_http_request_complete(buffer: &[u8]) -> bool {
+    let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    buffer.len() >= header_end + 4 + content_length
 }
 
 fn write_minimal_signed_snapshot(root: &Path, source_env: &str) -> PathBuf {
@@ -3283,7 +4762,10 @@ fn reserve_tcp_port() -> u16 {
 
 struct ApprovalsServerChild {
     child: process::Child,
+    _guard: MutexGuard<'static, ()>,
 }
+
+static APPROVALS_SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 impl Drop for ApprovalsServerChild {
     fn drop(&mut self) {
@@ -3293,12 +4775,16 @@ impl Drop for ApprovalsServerChild {
 }
 
 fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
+    let guard = APPROVALS_SERVER_TEST_LOCK.lock().unwrap();
     let child = Command::new(agentenv_bin())
         .env("HOME", home)
         .args(["approvals", "serve", "--addr", &format!("127.0.0.1:{port}")])
         .spawn()
         .unwrap();
-    ApprovalsServerChild { child }
+    ApprovalsServerChild {
+        child,
+        _guard: guard,
+    }
 }
 
 fn wait_for_http_ok(port: u16, path: &str) {

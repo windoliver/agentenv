@@ -38,7 +38,8 @@ pub fn print_error_body_json(reason_code: ReasonCode, message: impl Into<String>
 
 pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
     match error {
-        RuntimeError::Env(EnvError::NotFound { .. }) => ReasonCode::EnvNotFound,
+        RuntimeError::Env(EnvError::NotFound { .. })
+        | RuntimeError::SandboxHandleNotFound { .. } => ReasonCode::EnvNotFound,
         RuntimeError::Env(EnvError::AlreadyExists { .. }) => ReasonCode::EnvExists,
         RuntimeError::Env(EnvError::InvalidName { .. }) => ReasonCode::InvalidBlueprint,
         RuntimeError::MissingCredential { .. } => ReasonCode::MissingCredential,
