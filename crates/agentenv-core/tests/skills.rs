@@ -1690,6 +1690,37 @@ async fn http_registry_search_reads_static_index() {
 }
 
 #[tokio::test]
+async fn http_registry_search_prefers_index_json() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"json-demo","version":"0.1.0","description":"JSON demo","registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    server
+        .add_response(
+            "GET",
+            "/index.yaml",
+            "skills:\n  - name: yaml-demo\n    version: 0.1.0\n    registry: ignored\n",
+        )
+        .await;
+    let home = temp_dir("skill-http-json-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let hits = service
+        .search("demo")
+        .await
+        .expect("search should use JSON");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "json-demo");
+    assert_eq!(hits[0].registry, "http-dev");
+}
+
+#[tokio::test]
 async fn http_registry_publish_and_add_round_trip() {
     let server = TestHttpRegistry::start().await;
     server
@@ -1720,6 +1751,40 @@ async fn http_registry_publish_and_add_round_trip() {
     assert_eq!(installed.name, "http-skill");
     assert_eq!(installed.source_type, "http");
     assert_eq!(installed.source_label, "http:http-dev:http-skill@0.1.0");
+}
+
+#[tokio::test]
+async fn http_registry_add_downloads_tar_zst_skill_artifact() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("tarball-skill", "0.1.0", "Tarball skill");
+    let manifest = load_skill_manifest(&bundle).unwrap();
+    let digest = compute_bundle_digest(&bundle, &manifest).unwrap();
+    let index = format!(
+        r#"{{"skills":[{{"name":"tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":"{digest}","signature_ed25519":null,"public_key_ed25519":null}}]}}"#
+    );
+    server.add_response("GET", "/index.json", &index).await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes(&bundle),
+    )
+    .await;
+    let home = temp_dir("skill-http-tarball-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should unpack tar.zst artifact");
+
+    assert_eq!(installed.name, "tarball-skill");
+    assert_eq!(installed.source_label, "http:http-dev:tarball-skill@0.1.0");
 }
 
 #[tokio::test]
@@ -1893,6 +1958,25 @@ fn skill_bundle(name: &str, version: &str, content: &str) -> PathBuf {
     bundle
 }
 
+fn tar_zst_bundle_bytes(bundle_path: &Path) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        builder
+            .append_path_with_name(bundle_path.join("skill.yaml"), "skill.yaml")
+            .unwrap();
+        builder
+            .append_path_with_name(bundle_path.join("SKILL.md"), "SKILL.md")
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+async fn add_binary_response(server: &TestHttpRegistry, method: &str, path: &str, body: Vec<u8>) {
+    server.add_binary_response(method, path, body).await;
+}
+
 #[derive(Clone)]
 struct TestHttpRegistry {
     addr: SocketAddr,
@@ -1957,6 +2041,14 @@ impl TestHttpRegistry {
             (method.to_owned(), path.to_owned()),
             body.as_bytes().to_vec(),
         );
+    }
+
+    async fn add_binary_response(&self, method: &str, path: &str, body: Vec<u8>) {
+        self.state
+            .lock()
+            .unwrap()
+            .responses
+            .insert((method.to_owned(), path.to_owned()), body);
     }
 
     async fn require_authorization(&self, token: &str) {

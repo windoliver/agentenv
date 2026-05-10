@@ -14,14 +14,15 @@ use crate::security::ssrf::{validate_outbound, SsrfOptions};
 
 use super::{
     compute_bundle_digest,
-    manifest::{load_remote_skill_manifest, validated_bundle_file},
+    manifest::{load_remote_skill_manifest, normalize_bundle_path, validated_bundle_file},
     validate_skill_name, verify_ed25519_signature, FetchedSkill, RegistryAdapter, SkillError,
     SkillManifest, SkillSearchHit,
 };
 
 const BUNDLES_DIR: &str = "bundles";
 const CONTENT_DIR: &str = "content";
-const INDEX_FILE: &str = "index.yaml";
+const INDEX_JSON_FILE: &str = "index.json";
+const INDEX_YAML_FILE: &str = "index.yaml";
 const MANIFEST_FILE: &str = "skill.yaml";
 const SOURCE_TYPE: &str = "http";
 
@@ -69,12 +70,20 @@ impl HttpRegistryAdapter {
         })
     }
 
-    fn index_url(&self) -> Result<Url, SkillError> {
-        self.url_for(&[INDEX_FILE])
+    fn index_json_url(&self) -> Result<Url, SkillError> {
+        self.url_for(&[INDEX_JSON_FILE])
+    }
+
+    fn index_yaml_url(&self) -> Result<Url, SkillError> {
+        self.url_for(&[INDEX_YAML_FILE])
     }
 
     fn manifest_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
         self.url_for(&[BUNDLES_DIR, name, version, MANIFEST_FILE])
+    }
+
+    fn tarball_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
+        self.url_for(&["skills", name, &format!("{version}.tar.zst")])
     }
 
     fn content_url(
@@ -122,28 +131,41 @@ impl HttpRegistryAdapter {
     }
 
     async fn read_index(&self) -> Result<HttpRegistryIndex, SkillError> {
-        let url = self.index_url()?;
-        let Some(content) = self.get_optional_text(url).await? else {
+        if let Some(content) = self.get_optional_text(self.index_json_url()?).await? {
+            let mut index: HttpRegistryIndex =
+                serde_json::from_str(&content).map_err(|source| SkillError::InvalidConfig {
+                    message: format!("failed to parse HTTP registry index JSON: {source}"),
+                })?;
+            self.validate_index(&mut index)?;
+            return Ok(index);
+        }
+
+        let Some(content) = self.get_optional_text(self.index_yaml_url()?).await? else {
             return Ok(HttpRegistryIndex::default());
         };
         let mut index: HttpRegistryIndex =
             serde_yaml::from_str(&content).map_err(|source| SkillError::Yaml {
-                path: PathBuf::from(INDEX_FILE),
+                path: PathBuf::from(INDEX_YAML_FILE),
                 source,
             })?;
+        self.validate_index(&mut index)?;
+        Ok(index)
+    }
+
+    fn validate_index(&self, index: &mut HttpRegistryIndex) -> Result<(), SkillError> {
         for hit in &mut index.skills {
             self.validate_hit(hit)?;
         }
-        Ok(index)
+        Ok(())
     }
 
     async fn write_index(&self, mut index: HttpRegistryIndex) -> Result<(), SkillError> {
         sort_hits(&mut index.skills);
         let content = serde_yaml::to_string(&index).map_err(|source| SkillError::Serde {
-            path: PathBuf::from(INDEX_FILE),
+            path: PathBuf::from(INDEX_YAML_FILE),
             source,
         })?;
-        self.put_bytes(self.index_url()?, content.into_bytes())
+        self.put_bytes(self.index_yaml_url()?, content.into_bytes())
             .await
     }
 
@@ -239,6 +261,26 @@ impl HttpRegistryAdapter {
             })
     }
 
+    async fn get_optional_bytes(&self, url: Url) -> Result<Option<Vec<u8>>, SkillError> {
+        let url_text = url.to_string();
+        let response = self
+            .request(Method::GET, url.clone(), None)
+            .await
+            .map_err(|source| map_request_error(url_text.clone(), source))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        ensure_success(&url, response.status())?;
+        response
+            .bytes()
+            .await
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|source| SkillError::HttpRegistry {
+                url: url.to_string(),
+                source: Box::new(source),
+            })
+    }
+
     async fn get_bytes(&self, url: Url) -> Result<Vec<u8>, SkillError> {
         let response = self.request(Method::GET, url.clone(), None).await?;
         ensure_success(&url, response.status())?;
@@ -250,6 +292,38 @@ impl HttpRegistryAdapter {
                 url: url.to_string(),
                 source: Box::new(source),
             })
+    }
+
+    async fn fetch_expanded_bundle(
+        &self,
+        hit: &SkillSearchHit,
+        staging_path: &Path,
+    ) -> Result<(), SkillError> {
+        let manifest_url = self.manifest_url(&hit.name, &hit.version)?;
+        let manifest_content = self.get_text(manifest_url).await?;
+        let remote_manifest =
+            load_remote_skill_manifest(&manifest_content, Path::new(MANIFEST_FILE))?;
+        if remote_manifest.name != hit.name || remote_manifest.version.to_string() != hit.version {
+            return Err(SkillError::InvalidConfig {
+                message: format!(
+                    "HTTP registry index selected `{}` version `{}`, but manifest is `{}` version `{}`",
+                    hit.name, hit.version, remote_manifest.name, remote_manifest.version
+                ),
+            });
+        }
+        write_file(
+            &staging_path.join(MANIFEST_FILE),
+            manifest_content.as_bytes(),
+        )?;
+
+        for declared_file in &remote_manifest.declared_files {
+            let content = self
+                .get_bytes(self.content_url(&hit.name, &hit.version, declared_file)?)
+                .await?;
+            write_file(&staging_path.join(declared_file), &content)?;
+        }
+
+        Ok(())
     }
 
     async fn put_bytes(&self, url: Url, body: Vec<u8>) -> Result<(), SkillError> {
@@ -308,31 +382,24 @@ impl RegistryAdapter for HttpRegistryAdapter {
             source,
         })?;
 
-        let manifest_url = self.manifest_url(&hit.name, &hit.version)?;
-        let manifest_content = self.get_text(manifest_url).await?;
-        let remote_manifest =
-            load_remote_skill_manifest(&manifest_content, Path::new(MANIFEST_FILE))?;
-        if remote_manifest.name != hit.name || remote_manifest.version.to_string() != hit.version {
-            return Err(SkillError::InvalidConfig {
-                message: format!(
-                    "HTTP registry index selected `{}` version `{}`, but manifest is `{}` version `{}`",
-                    hit.name, hit.version, remote_manifest.name, remote_manifest.version
-                ),
-            });
-        }
-        write_file(
-            &staging_path.join(MANIFEST_FILE),
-            manifest_content.as_bytes(),
-        )?;
-
-        for declared_file in &remote_manifest.declared_files {
-            let content = self
-                .get_bytes(self.content_url(&hit.name, &hit.version, declared_file)?)
-                .await?;
-            write_file(&staging_path.join(declared_file), &content)?;
+        if let Some(bytes) = self
+            .get_optional_bytes(self.tarball_url(&hit.name, &hit.version)?)
+            .await?
+        {
+            unpack_tar_zst(&bytes, &staging_path)?;
+        } else {
+            self.fetch_expanded_bundle(&hit, &staging_path).await?;
         }
 
         let manifest = super::load_skill_manifest(&staging_path)?;
+        if manifest.name != hit.name || manifest.version.to_string() != hit.version {
+            return Err(SkillError::InvalidConfig {
+                message: format!(
+                    "HTTP registry index selected `{}` version `{}`, but manifest is `{}` version `{}`",
+                    hit.name, hit.version, manifest.name, manifest.version
+                ),
+            });
+        }
         let digest = compute_bundle_digest(&staging_path, &manifest)?;
         if let Some(expected) = hit.digest.as_deref() {
             if expected != digest {
@@ -401,6 +468,56 @@ impl RegistryAdapter for HttpRegistryAdapter {
         self.write_index(index).await?;
         Ok(hit)
     }
+}
+
+fn unpack_tar_zst(bytes: &[u8], destination: &Path) -> Result<(), SkillError> {
+    let decoder = zstd::stream::read::Decoder::new(bytes).map_err(|source| SkillError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|source| SkillError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|source| SkillError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        let entry_path = entry
+            .path()
+            .map_err(|source| SkillError::Io {
+                path: destination.to_path_buf(),
+                source,
+            })?
+            .into_owned();
+        let normalized = normalize_bundle_path(&entry_path)?;
+        let target = destination.join(normalized);
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target).map_err(|source| SkillError::Io {
+                path: target,
+                source,
+            })?;
+        } else if entry_type.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|source| SkillError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            entry.unpack(&target).map_err(|source| SkillError::Io {
+                path: target,
+                source,
+            })?;
+        } else {
+            return Err(SkillError::UnsafeBundlePath { path: entry_path });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_registry_url(url: &Url, options: &SsrfOptions) -> Result<(), SkillError> {
