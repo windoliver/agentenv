@@ -38,8 +38,7 @@ Set `provider: anthropic` to require `ANTHROPIC_API_KEY`:
 ```yaml
 agent:
   driver: openclaw
-  config:
-    provider: anthropic
+  provider: anthropic
 ```
 
 If `provider` is omitted, `model` prefixes are used when possible:

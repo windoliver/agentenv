@@ -12,6 +12,10 @@ Behavior:
   and that staged context is passed to `openshell sandbox create --from`.
 - Translates `agentenv` network policy into OpenShell policy documents and supports hot-reload for network and inference policy updates.
 - Passes credentials into the sandbox as environment variables only; they do not flow through argv, policy files, or image layers.
+- Does not currently advertise DNS egress control. OpenShell `exec` and
+  `upload` run as the sandbox user in current community images, so the driver
+  cannot honestly install the root-level DNS guard required to rewrite
+  `/etc/resolv.conf` and bind local DNS.
 
 BYO Dockerfiles may declare these stable build arguments:
 

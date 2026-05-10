@@ -568,7 +568,7 @@ impl SandboxDriver for OpenShellDriver {
                 supports_native_inference_routing: true,
                 supports_remote_host: true,
                 supports_persistent_sessions: true,
-                supports_dns_egress_control: true,
+                supports_dns_egress_control: false,
             }),
         })
     }
@@ -764,7 +764,14 @@ impl SandboxDriver for OpenShellDriver {
             args,
             env: spec.env,
         };
-        let _output = self.run_checked_command(request)?;
+        if let Err(err) = self.run_checked_command(request) {
+            if Self::create_command_failure_may_have_created_sandbox(&err)
+                && self.sandbox_exists_after_ambiguous_create_failure(&name)
+            {
+                return Err(self.rollback_created_sandbox(&name, err));
+            }
+            return Err(err);
+        }
 
         if let Some((policy, _temp_policy_file, inference_update)) = initial_policy {
             if let Some(inference_update) = inference_update {
@@ -1616,6 +1623,33 @@ impl OpenShellDriver {
         self.run_checked_command(command_request(&["sandbox", "delete", handle]))
     }
 
+    fn sandbox_exists_best_effort(&self, handle: &str) -> bool {
+        self.run_command_request(command_request(&["sandbox", "get", handle]))
+            .is_ok_and(|output| output.status == Some(0))
+            || self.sandbox_list_contains_best_effort(handle)
+    }
+
+    fn sandbox_list_contains_best_effort(&self, handle: &str) -> bool {
+        self.run_command_request(command_request(&["sandbox", "list"]))
+            .is_ok_and(|output| {
+                output.status == Some(0)
+                    && output
+                        .stdout
+                        .lines()
+                        .any(|line| line.split_whitespace().next() == Some(handle))
+            })
+    }
+
+    fn sandbox_exists_after_ambiguous_create_failure(&self, handle: &str) -> bool {
+        for _ in 0..120 {
+            if self.sandbox_exists_best_effort(handle) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        false
+    }
+
     fn rollback_created_sandbox(&self, handle: &str, primary: DriverError) -> DriverError {
         match self.delete_sandbox(handle) {
             Ok(_) => primary,
@@ -1625,6 +1659,28 @@ impl OpenShellDriver {
                 ),
             },
         }
+    }
+
+    fn create_command_failure_may_have_created_sandbox(err: &DriverError) -> bool {
+        let DriverError::CommandFailed { stdout, stderr, .. } = err else {
+            return false;
+        };
+        let output = format!("{stdout}\n{stderr}");
+        [
+            "failed to decode Protobuf message",
+            "Sandbox.metadata",
+            "SandboxResponse.sandbox",
+            "delimited length exceeded",
+            "invalid wire type",
+            "unexpected end group tag",
+            "h2 protocol error",
+            "error reading a body from connection",
+            "connection closed",
+            "peer closed connection",
+            "transport error",
+        ]
+        .iter()
+        .any(|needle| output.contains(needle))
     }
 
     fn write_policy_temp_file(
@@ -2591,8 +2647,8 @@ fn host_command_path(request_env: &BTreeMap<String, String>) -> String {
         .cloned()
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
-    let mut entries = host_path_entries();
-    entries.extend(std::env::split_paths(&base));
+    let mut entries: Vec<PathBuf> = std::env::split_paths(&base).collect();
+    entries.extend(host_path_entries());
     dedup_join_paths(entries).unwrap_or(base)
 }
 
@@ -2631,12 +2687,17 @@ fn resolve_executable(program: &str, extra_path_entries: &[PathBuf]) -> Option<S
         return is_executable_candidate(&candidate).then(|| program.to_owned());
     }
 
-    let mut entries = extra_path_entries.to_vec();
     if let Some(path) = std::env::var_os("PATH") {
-        entries.extend(std::env::split_paths(&path));
+        for dir in std::env::split_paths(&path) {
+            for candidate in executable_candidates(&dir, program) {
+                if is_executable_candidate(&candidate) {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
     }
-    for dir in entries {
-        for candidate in executable_candidates(&dir, program) {
+    for dir in extra_path_entries {
+        for candidate in executable_candidates(dir, program) {
             if is_executable_candidate(&candidate) {
                 return Some(candidate.to_string_lossy().into_owned());
             }
@@ -4421,7 +4482,7 @@ mod driver_tests {
         assert!(capabilities.supports_native_inference_routing);
         assert!(capabilities.supports_remote_host);
         assert!(capabilities.supports_persistent_sessions);
-        assert!(capabilities.supports_dns_egress_control);
+        assert!(!capabilities.supports_dns_egress_control);
     }
 
     #[test]
@@ -4461,6 +4522,33 @@ mod driver_tests {
         assert_eq!(config.dot_upstreams[0].host, "dot.example");
         assert_eq!(config.dot_upstreams[0].port, 853);
         assert_eq!(config.dot_upstreams[0].connect_addr, "93.184.216.36:853");
+    }
+
+    #[test]
+    fn host_bootstrap_prefers_process_path_before_fallback_paths() {
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let tempdir = unique_tempdir("sandbox-openshell-host-path-precedence");
+        write_fake_binary(&tempdir, "openshell", true);
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &tempdir);
+        let _path_guard = PathRestoreGuard {
+            original: original_path,
+        };
+        let driver = OpenShellDriver::with_host_command_runner(Arc::new(
+            FlexibleCommandRunner::new_with_host_environment(vec![], true),
+        ));
+        let expected = binary_path(&tempdir, "openshell")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(driver.effective_program("openshell"), expected);
+
+        let prepared = driver.prepare_host_request(command_request(&["--version"]));
+        let path = prepared.env.get("PATH").expect("PATH should be set");
+        let first_entry = std::env::split_paths(path)
+            .next()
+            .expect("PATH should contain caller entry");
+        assert_eq!(first_entry, tempdir);
     }
 
     #[test]
@@ -7499,6 +7587,153 @@ mod driver_tests {
                     ],
                     env
                 ),
+            }]
+        );
+    }
+
+    #[test]
+    fn create_rolls_back_when_ambiguous_create_failure_left_sandbox() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "leaked-sandbox",
+                    "--no-auto-providers",
+                    "--from",
+                    "openclaw",
+                    "--",
+                    "true",
+                ],
+                Some(1),
+                "",
+                "Sandbox.metadata: SandboxResponse.sandbox: unexpected end group tag",
+            ),
+            CommandScript::output(
+                "openshell",
+                &["sandbox", "get", "leaked-sandbox"],
+                Some(1),
+                "",
+                "not found yet",
+            ),
+            CommandScript::output(
+                "openshell",
+                &["sandbox", "list"],
+                Some(0),
+                "NAME              NAMESPACE  CREATED              PHASE\nleaked-sandbox    openshell  2026-05-09 18:50   Provisioning\n",
+                "",
+            ),
+            CommandScript::success("openshell", &["sandbox", "delete", "leaked-sandbox"], "", ""),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("leaked-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("ambiguous create failure should be returned");
+
+        assert!(err.to_string().contains("unexpected end group tag"));
+        assert_eq!(
+            runner.calls(),
+            vec![
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "create",
+                        "--name",
+                        "leaked-sandbox",
+                        "--no-auto-providers",
+                        "--from",
+                        "openclaw",
+                        "--",
+                        "true",
+                    ]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "get", "leaked-sandbox"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "list"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "delete", "leaked-sandbox"]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn create_does_not_roll_back_plain_create_rejection() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "openshell",
+            &[
+                "sandbox",
+                "create",
+                "--name",
+                "existing-sandbox",
+                "--no-auto-providers",
+                "--from",
+                "openclaw",
+                "--",
+                "true",
+            ],
+            Some(1),
+            "",
+            "sandbox already exists",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("existing-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("create rejection should be returned");
+
+        assert!(err.to_string().contains("sandbox already exists"));
+        assert_eq!(
+            runner.calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request(&[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "existing-sandbox",
+                    "--no-auto-providers",
+                    "--from",
+                    "openclaw",
+                    "--",
+                    "true",
+                ]),
             }]
         );
     }
