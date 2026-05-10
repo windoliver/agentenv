@@ -46,8 +46,12 @@ pub enum SkillError {
     CredentialReferenceUnavailable { name: String },
     #[error("unsupported registry authentication scheme `{scheme}`")]
     UnsupportedRegistryAuth { scheme: String },
+    #[error("registry `{registry}` of type `{kind}` does not support publishing")]
+    UnsupportedRegistryPublish { registry: String, kind: String },
     #[error("invalid OCI registry reference `{reference}`")]
     InvalidOciReference { reference: String },
+    #[error("git registry `{url}` failed: {message}")]
+    GitRegistry { url: String, message: String },
     #[error("invalid skills config: {message}")]
     InvalidConfig { message: String },
     #[error("invalid skill version `{version}`: {source}")]

@@ -941,6 +941,76 @@ auth = "bearer-from-credstore:CORP_SKILLS_TOKEN"
 }
 
 #[test]
+fn skills_config_loads_git_registry_from_project_yaml() {
+    let yaml = r#"
+skills:
+  registries:
+    - name: git-dev
+      type: git
+      url: git+https://github.com/acme/skills
+"#;
+
+    let config = load_project_skills_config(yaml).unwrap();
+
+    assert_eq!(config.registries[0].name, "git-dev");
+    assert_eq!(config.registries[0].kind, RegistryKind::Git);
+    assert_eq!(
+        config.registries[0].url.as_deref(),
+        Some("git+https://github.com/acme/skills")
+    );
+}
+
+#[test]
+fn skills_config_loads_git_registry_from_user_toml() {
+    let toml = r#"
+[[skills.registries]]
+name = "git-dev"
+type = "git"
+url = "git+https://github.com/acme/skills"
+"#;
+
+    let config = load_user_skills_config(toml).unwrap();
+
+    assert_eq!(config.registries[0].kind, RegistryKind::Git);
+}
+
+#[test]
+fn cli_registry_override_parses_git_source() {
+    let merged = merge_skills_config(
+        SkillsConfig::default(),
+        None,
+        SkillsConfigOverride {
+            registry: Some("git+https://github.com/acme/skills".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries[0].name, "cli");
+    assert_eq!(merged.registries[0].kind, RegistryKind::Git);
+    assert_eq!(merged.registry_order, vec!["cli"]);
+}
+
+#[test]
+fn skills_config_rejects_unsafe_git_registry_urls() {
+    for url in [
+        "https://github.com/acme/skills",
+        "git+ssh://github.com/acme/skills",
+        "git+https://user:pass@github.com/acme/skills",
+        "git+https://github.com/acme/skills?branch=main",
+        "git+https://github.com/acme/skills#main",
+    ] {
+        let yaml = format!(
+            "skills:\n  registries:\n    - name: git-dev\n      type: git\n      url: {url}\n"
+        );
+
+        let error = load_project_skills_config(&yaml)
+            .expect_err("unsafe git registry URL must be rejected");
+
+        assert!(matches!(error, SkillError::InvalidConfig { .. }));
+    }
+}
+
+#[test]
 fn cli_registry_override_wins_over_project_and_user_config() {
     let user = SkillsConfig {
         registries: vec![agentenv_core::skills::RegistryConfig::filesystem(

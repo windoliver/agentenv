@@ -49,6 +49,16 @@ impl RegistryConfig {
             auth,
         }
     }
+
+    pub fn git(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: RegistryKind::Git,
+            url: Some(url.into()),
+            path: None,
+            auth: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -57,6 +67,7 @@ pub enum RegistryKind {
     Filesystem,
     Http,
     Oci,
+    Git,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

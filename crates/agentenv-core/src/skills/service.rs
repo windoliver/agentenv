@@ -10,7 +10,7 @@ use crate::security::ssrf::SsrfOptions;
 
 use super::{
     info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
-    registry_http, registry_oci, remove_installed_skill, validate_skill_name,
+    registry_git, registry_http, registry_oci, remove_installed_skill, validate_skill_name,
     verify_installed_skill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
     RegistryConfig, RegistryKind, SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
 };
@@ -228,6 +228,18 @@ impl SkillService {
                     self.bearer_token_for(registry)?,
                     self.ssrf_options.clone(),
                 )?))
+            }
+            RegistryKind::Git => {
+                let url = registry
+                    .url
+                    .clone()
+                    .ok_or_else(|| SkillError::InvalidConfig {
+                        message: format!("git registry `{}` requires url", registry.name),
+                    })?;
+                Ok(Box::new(registry_git::GitRegistryAdapter::new(
+                    registry.name.clone(),
+                    url,
+                )))
             }
         }
     }
