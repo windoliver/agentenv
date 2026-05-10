@@ -2013,6 +2013,36 @@ async fn oci_registry_search_add_and_publish_use_distribution_api() {
     assert_eq!(installed.source_label, "oci:oci-dev:oci-skill@0.1.0");
 }
 
+#[tokio::test]
+async fn git_registry_publish_is_reported_as_unsupported() {
+    let home = temp_dir("skill-git-publish-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::git(
+                "git-dev",
+                "git+https://github.com/acme/skills",
+            )],
+            registry_order: vec!["git-dev".to_owned()],
+        },
+    );
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("git-publish", "0.1.0", "Git publish"),
+            registry: Some("git-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("git publish should be read-only");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsupportedRegistryPublish { registry, kind }
+            if registry == "git-dev" && kind == "git"
+    ));
+}
+
 #[cfg(windows)]
 fn self_test_file_exists_command() -> &'static str {
     "if exist SKILL.md (exit /B 0) else (exit /B 1)"

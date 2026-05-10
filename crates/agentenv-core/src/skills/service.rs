@@ -239,6 +239,10 @@ impl SkillService {
                 Ok(Box::new(registry_git::GitRegistryAdapter::new(
                     registry.name.clone(),
                     url,
+                    self.root
+                        .join("cache")
+                        .join("skill-git")
+                        .join(&registry.name),
                 )))
             }
         }
