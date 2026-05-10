@@ -23,6 +23,7 @@ impl OpenShellTranslator {
 impl super::PolicyTranslator for OpenShellTranslator {
     fn translate(&self, policy: &NetworkPolicy) -> crate::PolicyResult<super::TranslatedPolicy> {
         reject_unsupported_process(policy)?;
+        reject_direct_dns_bypass(policy)?;
         reject_unsupported_network_rules(policy)?;
 
         let document = OpenShellDocument {
@@ -158,6 +159,77 @@ fn reject_unsupported_network_rules(policy: &NetworkPolicy) -> crate::PolicyResu
     }
 
     Ok(())
+}
+
+fn reject_direct_dns_bypass(policy: &NetworkPolicy) -> crate::PolicyResult<()> {
+    if !policy.network.dns.is_active() {
+        return Ok(());
+    }
+
+    let doh_hosts = direct_doh_bypass_hosts(policy);
+    for rule in &policy.network.allow {
+        let NetworkTarget::Host {
+            host, port, scheme, ..
+        } = &rule.target
+        else {
+            continue;
+        };
+
+        if matches!(port, Some(53 | 853)) {
+            return Err(crate::PolicyError::TranslationUnsupported {
+                translator: "openshell",
+                message: format!(
+                    "direct DNS/DoT bypass cannot be agent-visible with active DNS policy: {:?}",
+                    rule.target
+                ),
+            });
+        }
+
+        if scheme.as_deref() == Some("https")
+            && port == &Some(443)
+            && doh_hosts
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(host))
+        {
+            return Err(crate::PolicyError::TranslationUnsupported {
+                translator: "openshell",
+                message: format!(
+                    "direct DoH bypass host cannot be agent-visible with active DNS policy: {host}"
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn direct_doh_bypass_hosts(policy: &NetworkPolicy) -> Vec<String> {
+    let mut hosts = vec![
+        "cloudflare-dns.com".to_owned(),
+        "dns.google".to_owned(),
+        "dns.quad9.net".to_owned(),
+    ];
+    for endpoint in &policy.network.dns.doh_upstreams_allowed {
+        if let Some(host) = https_url_host(endpoint) {
+            if !hosts.iter().any(|candidate| candidate == &host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
+fn https_url_host(endpoint: &str) -> Option<String> {
+    let rest = endpoint.strip_prefix("https://")?;
+    if rest.starts_with('[') {
+        let (host, _) = rest.split_once(']')?;
+        return Some(host.trim_start_matches('[').to_ascii_lowercase());
+    }
+    let host = rest
+        .split(['/', ':'])
+        .next()
+        .filter(|host| !host.is_empty())?;
+    Some(host.to_ascii_lowercase())
 }
 
 fn unsupported_rule(kind: &str, rule: &NetworkRule) -> crate::PolicyError {

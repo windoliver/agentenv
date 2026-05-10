@@ -76,8 +76,11 @@ bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 reqwest = { version = "=0.11.27", default-features = false, features = ["rustls-tls"] }
+hickory-proto = "0.26.1"
 ipnet = "2"
+tokio-rustls = "0.24"
 url = "2"
+webpki-roots = "0.25"
 opentelemetry = { version = "0.31.0", default-features = false }
 opentelemetry_sdk = { version = "0.31.0", default-features = false }
 opentelemetry-otlp = { version = "0.31.1", default-features = false }

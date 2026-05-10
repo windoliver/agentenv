@@ -49,6 +49,7 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         RuntimeError::Lifecycle(_)
         | RuntimeError::Blueprint(_)
         | RuntimeError::Hardening(_)
+        | RuntimeError::DnsPolicy(_)
         | RuntimeError::InvalidPolicyTier { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
@@ -286,7 +287,10 @@ fn truncate_table_cell(value: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agentenv_core::{admission::ExitClass, driver::DriverError, runtime::RuntimeError};
+    use agentenv_core::{
+        admission::ExitClass, driver::DriverError, runtime::RuntimeError,
+        security::dns_policy::DnsPolicyError,
+    };
 
     use super::{exit_for_error, reason_for_error};
 
@@ -298,5 +302,16 @@ mod tests {
 
         assert_eq!(reason_for_error(&error).as_str(), "preflight_failed");
         assert_eq!(exit_for_error(&error), ExitClass::PreflightFailed);
+    }
+
+    #[test]
+    fn dns_policy_error_renders_as_invalid_blueprint() {
+        let error = RuntimeError::DnsPolicy(DnsPolicyError::InvalidDohEndpoint {
+            path: "policy.dns.doh_upstreams_allowed[0]".to_owned(),
+            value: "http://dns.example/dns-query".to_owned(),
+        });
+
+        assert_eq!(reason_for_error(&error).as_str(), "invalid_blueprint");
+        assert_eq!(exit_for_error(&error), ExitClass::TerminalFailure);
     }
 }

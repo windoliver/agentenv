@@ -87,6 +87,10 @@
         "supports_syscall_filter"
       ],
       "properties": {
+        "supports_dns_egress_control": {
+          "default": false,
+          "type": "boolean"
+        },
         "supports_filesystem_lockdown": {
           "type": "boolean"
         },

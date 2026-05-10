@@ -49,6 +49,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
     "supports_native_inference_routing": false,
     "supports_remote_host": false,
     "supports_persistent_sessions": false,
+    "supports_dns_egress_control": false,
     "supports_snapshots": true,
     "supports_fork": true
   }
@@ -95,6 +96,7 @@ Response:
       "supports_native_inference_routing": true,
       "supports_remote_host": true,
       "supports_persistent_sessions": true,
+      "supports_dns_egress_control": false,
       "supports_snapshots": false,
       "supports_fork": false
     }
@@ -143,6 +145,13 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `fork_from_snapshot` | `ForkFromSnapshotParams {snapshot, spec}` | `SandboxHandle` |
 | `stop` | `{handle}` | `{}` |
 | `destroy` | `{handle}` | `{}` |
+
+Schema `1.2` adds DNS egress control to `NetworkPolicy.network.dns`.
+Sandbox drivers that advertise `supports_dns_egress_control = true` must
+enforce resolver allowlists, block direct DNS/DoT/DoH bypass paths, and honor
+DNS answer pinning when `pin_resolved_ips` is enabled. Drivers that cannot
+enforce these controls must return `supports_dns_egress_control = false`; core
+rejects active DNS policy before create/apply for those drivers.
 
 Snapshot and fork are optional sandbox capabilities in schema 1.2. Core checks
 `supports_snapshots` before `snapshot` and `supports_fork` before
@@ -353,6 +362,7 @@ Errors include `data` with machine-readable context when relevant (e.g., which c
 - Core refuses to run a driver whose `schema_version` major doesn't match its own.
 - The `1.0` schema broke the old flat `NetworkPolicy` / `NetworkRule` wire shape. Drivers must speak the four-domain policy object with `network`, `filesystem`, `process`, and `inference`, and `approval_required` replaces the old `approval` field.
 - The `1.1` schema adds rich driver activity notifications. Drivers may continue sending the legacy `event/activity` shape while adopting structured `actor`, `subject`, `result`, `trace_id`, and `extras` fields.
+- The `1.2` schema adds DNS egress policy fields, the `supports_dns_egress_control` sandbox capability, and optional sandbox `snapshot` / `fork_from_snapshot` methods gated by `supports_snapshots` and `supports_fork`.
 
 ## Built-in drivers
 

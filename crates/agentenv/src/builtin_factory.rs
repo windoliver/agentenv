@@ -1186,6 +1186,7 @@ mod tests {
                     tier: "restricted".to_owned(),
                     presets: Vec::new(),
                     overrides: Vec::new(),
+                    dns: None,
                     extra: BTreeMap::new(),
                 },
                 state: None,
@@ -1195,6 +1196,7 @@ mod tests {
                     tier: "restricted".to_owned(),
                     presets: Vec::new(),
                     overrides: Vec::new(),
+                    dns: None,
                     extra: BTreeMap::new(),
                 },
                 resolved: empty_policy(),
@@ -1231,6 +1233,7 @@ mod tests {
                 allow: Vec::new(),
                 deny: Vec::new(),
                 approval_required: Vec::new(),
+                dns: agentenv_proto::DnsPolicy::default(),
             },
             filesystem: FilesystemPolicy {
                 reloadability: PolicyReloadability::LockedAtCreate,

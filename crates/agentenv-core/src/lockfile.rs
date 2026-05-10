@@ -400,7 +400,7 @@ fn validate_resolved_policy_value(value: &Value) -> Result<(), String> {
         value,
         "network",
         "policy.resolved.network",
-        &["reloadability", "allow", "deny", "approval_required"],
+        &["reloadability", "allow", "deny", "approval_required", "dns"],
     )?;
     validate_rule_list(value, "network", "allow", "policy.resolved.network.allow")?;
     validate_rule_list(value, "network", "deny", "policy.resolved.network.deny")?;
@@ -410,6 +410,7 @@ fn validate_resolved_policy_value(value: &Value) -> Result<(), String> {
         "approval_required",
         "policy.resolved.network.approval_required",
     )?;
+    validate_network_dns_policy(value)?;
     validate_child_mapping_keys(
         value,
         "filesystem",
@@ -437,6 +438,26 @@ fn validate_resolved_policy_value(value: &Value) -> Result<(), String> {
     )?;
     validate_inference_routes(value)?;
     Ok(())
+}
+
+fn validate_network_dns_policy(policy: &Value) -> Result<(), String> {
+    let Some(value) =
+        mapping_value(policy, "network").and_then(|network| mapping_value(network, "dns"))
+    else {
+        return Ok(());
+    };
+
+    validate_mapping_keys(
+        value,
+        "policy.resolved.network.dns",
+        &[
+            "resolvers_allowed",
+            "doh_upstreams_allowed",
+            "dot_upstreams_allowed",
+            "log_all_queries",
+            "pin_resolved_ips",
+        ],
+    )
 }
 
 fn validate_mapping_keys(value: &Value, path: &str, allowed: &[&str]) -> Result<(), String> {

@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DnsPolicy",
+  "type": "object",
+  "properties": {
+    "doh_upstreams_allowed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dot_upstreams_allowed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "log_all_queries": {
+      "default": false,
+      "type": "boolean"
+    },
+    "pin_resolved_ips": {
+      "default": false,
+      "type": "boolean"
+    },
+    "resolvers_allowed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

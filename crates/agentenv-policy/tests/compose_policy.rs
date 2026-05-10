@@ -88,6 +88,56 @@ fn balanced_tier_explicit_github_readwrite_supersedes_default_github_read() {
 }
 
 #[test]
+fn restricted_policy_has_empty_dns_policy_by_default() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let policy = compose_policy(Tier::Restricted, &[], None, &registry).expect("compose");
+
+    assert!(!policy.network.dns.is_active());
+}
+
+#[test]
+fn dns_policy_overrides_merge_and_normalize() {
+    let registry = PresetRegistry::load_builtin().expect("load presets");
+    let mut overrides = empty_overrides();
+    overrides.network.dns = agentenv_proto::DnsPolicy {
+        resolvers_allowed: vec![
+            "8.8.8.8".to_owned(),
+            "1.1.1.1".to_owned(),
+            "1.1.1.1".to_owned(),
+        ],
+        doh_upstreams_allowed: vec![
+            "https://dns.google/dns-query".to_owned(),
+            "https://cloudflare-dns.com/dns-query".to_owned(),
+            "https://dns.google/dns-query".to_owned(),
+        ],
+        dot_upstreams_allowed: vec!["1.1.1.1:853".to_owned(), "1.1.1.1:853".to_owned()],
+        log_all_queries: true,
+        pin_resolved_ips: true,
+    };
+
+    let policy =
+        compose_policy(Tier::Restricted, &[], Some(overrides), &registry).expect("compose");
+
+    assert_eq!(
+        policy.network.dns.resolvers_allowed,
+        vec!["1.1.1.1", "8.8.8.8"]
+    );
+    assert_eq!(
+        policy.network.dns.doh_upstreams_allowed,
+        vec![
+            "https://cloudflare-dns.com/dns-query",
+            "https://dns.google/dns-query"
+        ]
+    );
+    assert_eq!(
+        policy.network.dns.dot_upstreams_allowed,
+        vec!["1.1.1.1:853"]
+    );
+    assert!(policy.network.dns.log_all_queries);
+    assert!(policy.network.dns.pin_resolved_ips);
+}
+
+#[test]
 fn network_overrides_replace_conflicting_baseline_rules() {
     let registry = PresetRegistry::load_builtin().expect("load presets");
     let overrides = NetworkPolicy {
@@ -96,6 +146,7 @@ fn network_overrides_replace_conflicting_baseline_rules() {
             allow: Vec::new(),
             deny: vec![host_rule("api.github.com")],
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         ..empty_overrides()
     };
@@ -178,6 +229,7 @@ fn empty_overrides() -> NetworkPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: FilesystemPolicy {
             reloadability: PolicyReloadability::LockedAtCreate,

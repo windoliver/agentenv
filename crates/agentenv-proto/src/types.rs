@@ -153,6 +153,8 @@ pub struct SandboxCapabilities {
     #[serde(default)]
     pub supports_persistent_sessions: bool,
     #[serde(default)]
+    pub supports_dns_egress_control: bool,
+    #[serde(default)]
     pub supports_snapshots: bool,
     #[serde(default)]
     pub supports_fork: bool,
@@ -279,6 +281,34 @@ pub struct NetworkRule {
     pub target: NetworkTarget,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct DnsPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolvers_allowed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doh_upstreams_allowed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dot_upstreams_allowed: Vec<String>,
+    #[serde(default)]
+    pub log_all_queries: bool,
+    #[serde(default)]
+    pub pin_resolved_ips: bool,
+}
+
+impl DnsPolicy {
+    pub fn is_active(&self) -> bool {
+        !self.is_inactive()
+    }
+
+    pub fn is_inactive(&self) -> bool {
+        self.resolvers_allowed.is_empty()
+            && self.doh_upstreams_allowed.is_empty()
+            && self.dot_upstreams_allowed.is_empty()
+            && !self.log_all_queries
+            && !self.pin_resolved_ips
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct NetworkAccessPolicy {
     pub reloadability: PolicyReloadability,
@@ -288,6 +318,8 @@ pub struct NetworkAccessPolicy {
     pub deny: Vec<NetworkRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approval_required: Vec<NetworkRule>,
+    #[serde(default, skip_serializing_if = "DnsPolicy::is_inactive")]
+    pub dns: DnsPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

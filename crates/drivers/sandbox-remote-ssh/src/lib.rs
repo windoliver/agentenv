@@ -674,6 +674,7 @@ impl SandboxDriver for RemoteSshDriver {
                 supports_native_inference_routing: false,
                 supports_remote_host: true,
                 supports_persistent_sessions: false,
+                supports_dns_egress_control: false,
                 supports_snapshots: false,
                 supports_fork: false,
             }),
@@ -1896,6 +1897,7 @@ mod tests {
                 allow: Vec::new(),
                 deny: Vec::new(),
                 approval_required: Vec::new(),
+                dns: agentenv_proto::DnsPolicy::default(),
             },
             filesystem: FilesystemPolicy {
                 reloadability: PolicyReloadability::LockedAtCreate,

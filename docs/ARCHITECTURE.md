@@ -67,7 +67,7 @@ Responsibilities:
 - Apply, update, and optionally hot-reload policy
 - Surface egress denials into the approvals queue
 
-Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`, `supports_persistent_sessions`, `supports_snapshots`, `supports_fork`.
+Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`, `supports_persistent_sessions`, `supports_dns_egress_control`, `supports_snapshots`, `supports_fork`.
 
 ### `AgentDriver` — what runs inside the sandbox?
 

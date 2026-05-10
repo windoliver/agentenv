@@ -5,6 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     io::Write,
+    net::{IpAddr, SocketAddr},
     path::Component,
     path::{Path, PathBuf},
     process::{Child, Command},
@@ -25,6 +26,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use agentenv_core::{
     digest::parse_sha256_digest,
     driver::{DriverError, DriverResult, SandboxDriver},
+    security::ssrf::{
+        validate_outbound_with_resolver, DnsResolver, SsrfOptions, SystemDnsResolver,
+    },
 };
 use agentenv_events::{
     ActivityEvent, ActivityKind, ActivityResult, EventEmitter, NoopEventEmitter,
@@ -43,9 +47,11 @@ use agentenv_proto::{
     SCHEMA_VERSION,
 };
 use semver::Version;
+use url::Url;
 use uuid::Uuid;
 
 mod build_cache;
+pub mod dns_guard;
 
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "sandbox-openshell";
@@ -71,10 +77,25 @@ const TMUX_AGENTENV_SESSION_NAME_OPTION: &str = "@agentenv_session_name";
 const TMUX_SESSION_FORMAT: &str =
     "#{session_name}\t#{session_attached}\t#{session_created}\t#{@agentenv_handle}\t#{@agentenv_session_name}\t#{@agentenv_command}";
 const DEFAULT_HARDENING_DOCKERFILE_MARKER: &str = "AGENTENV_HARDENING_PROFILE=custom";
+const DNS_GUARD_CONFIG_PATH: &str = "/etc/agentenv/dns-guard.json";
+const DNS_GUARD_SANDBOX_BIN_PATH: &str = "/etc/agentenv/agentenv-openshell-dns-guard";
+const DNS_GUARD_HOST_BIN_ENV: &str = "AGENTENV_OPEN_SHELL_DNS_GUARD_BIN";
+const DNS_GUARD_LISTENER_NAMESERVER: &str = "127.0.0.1";
+const DNS_GUARD_FALLBACK_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
+const DNS_GUARD_PIDFILE: &str = "/etc/agentenv/dns-guard.pid";
+const DNS_GUARD_LOG_PATH: &str = "/var/log/agentenv-openshell-dns-guard.log";
+const DNS_GUARD_RESOLV_BACKUP_PATH: &str = "/etc/agentenv/resolv.conf.pre-agentenv-dns-guard";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDisposition {
     HotReload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxPreCreateState {
+    Absent,
+    Present,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,6 +575,7 @@ impl SandboxDriver for OpenShellDriver {
                 supports_native_inference_routing: true,
                 supports_remote_host: true,
                 supports_persistent_sessions: true,
+                supports_dns_egress_control: false,
                 supports_snapshots: false,
                 supports_fork: false,
             }),
@@ -693,9 +715,9 @@ impl SandboxDriver for OpenShellDriver {
 
     async fn create(&self, _spec: SandboxSpec) -> DriverResult<SandboxHandle> {
         let spec = _spec;
-        let name = match spec.metadata.get("name") {
-            Some(Value::String(value)) if !value.is_empty() => value.clone(),
-            Some(Value::String(_)) | None => format!("agentenv-{}", Uuid::new_v4()),
+        let (name, name_was_explicit) = match spec.metadata.get("name") {
+            Some(Value::String(value)) if !value.is_empty() => (value.clone(), true),
+            Some(Value::String(_)) | None => (format!("agentenv-{}", Uuid::new_v4()), false),
             Some(_) => {
                 return Err(DriverError::InvalidInput {
                     message: "metadata.name must be a string when set".to_owned(),
@@ -751,13 +773,26 @@ impl SandboxDriver for OpenShellDriver {
             args,
             env: spec.env,
         };
-        let _output = self.run_checked_command(request)?;
+        let rollback_ambiguous_create_failure =
+            self.should_rollback_ambiguous_create_failure(&name, name_was_explicit);
+        if let Err(err) = self.run_checked_command(request) {
+            if rollback_ambiguous_create_failure
+                && Self::create_command_failure_may_have_created_sandbox(&err)
+                && self.sandbox_exists_after_ambiguous_create_failure(&name)
+            {
+                return Err(self.rollback_created_sandbox(&name, err));
+            }
+            return Err(err);
+        }
 
         if let Some((policy, _temp_policy_file, inference_update)) = initial_policy {
             if let Some(inference_update) = inference_update {
                 if let Err(err) = self.run_inference_update(inference_update) {
                     return Err(self.rollback_created_sandbox(&name, err));
                 }
+            }
+            if let Err(err) = self.install_dns_guard_for_policy(&name, &policy, true) {
+                return Err(self.rollback_created_sandbox(&name, err));
             }
             self.store_current_policy(name.clone(), policy);
         }
@@ -963,8 +998,9 @@ impl SandboxDriver for OpenShellDriver {
             });
         }
 
-        let mut args = vec!["logs".to_owned(), params.handle];
-        if let Some(since) = params.since {
+        let handle = params.handle;
+        let mut args = vec!["logs".to_owned(), handle.clone()];
+        if let Some(since) = params.since.clone() {
             args.push("--since".to_owned());
             args.push(since);
         }
@@ -972,9 +1008,15 @@ impl SandboxDriver for OpenShellDriver {
             args,
             env: BTreeMap::new(),
         })?;
+        let mut stdout = output.stdout;
+        if let Ok(guard_output) = self.run_command_request(dns_guard_log_command(&handle)) {
+            if guard_output.status == Some(0) {
+                append_log_stdout(&mut stdout, &guard_output.stdout);
+            }
+        }
 
         Ok(LogsResult {
-            entries: parse_log_entries(&output.stdout),
+            entries: parse_log_entries(&stdout),
         })
     }
 
@@ -1593,6 +1635,62 @@ impl OpenShellDriver {
         self.run_checked_command(command_request(&["sandbox", "delete", handle]))
     }
 
+    fn sandbox_exists_best_effort(&self, handle: &str) -> bool {
+        self.run_command_request(command_request(&["sandbox", "get", handle]))
+            .is_ok_and(|output| output.status == Some(0))
+            || self.sandbox_list_contains_best_effort(handle)
+    }
+
+    fn sandbox_list_contains_best_effort(&self, handle: &str) -> bool {
+        self.run_command_request(command_request(&["sandbox", "list"]))
+            .is_ok_and(|output| {
+                output.status == Some(0)
+                    && output
+                        .stdout
+                        .lines()
+                        .any(|line| line.split_whitespace().next() == Some(handle))
+            })
+    }
+
+    fn sandbox_exists_after_ambiguous_create_failure(&self, handle: &str) -> bool {
+        for _ in 0..120 {
+            if self.sandbox_exists_best_effort(handle) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        false
+    }
+
+    fn should_rollback_ambiguous_create_failure(
+        &self,
+        handle: &str,
+        name_was_explicit: bool,
+    ) -> bool {
+        if !name_was_explicit || !self.runner.uses_host_environment() {
+            return true;
+        }
+
+        matches!(
+            self.sandbox_pre_create_state(handle),
+            SandboxPreCreateState::Absent
+        )
+    }
+
+    fn sandbox_pre_create_state(&self, handle: &str) -> SandboxPreCreateState {
+        let output = match self.run_command_request(command_request(&["sandbox", "get", handle])) {
+            Ok(output) => output,
+            Err(_) => return SandboxPreCreateState::Unknown,
+        };
+        if output.status == Some(0) {
+            return SandboxPreCreateState::Present;
+        }
+        if command_output_mentions_missing_sandbox(&output) {
+            return SandboxPreCreateState::Absent;
+        }
+        SandboxPreCreateState::Unknown
+    }
+
     fn rollback_created_sandbox(&self, handle: &str, primary: DriverError) -> DriverError {
         match self.delete_sandbox(handle) {
             Ok(_) => primary,
@@ -1602,6 +1700,28 @@ impl OpenShellDriver {
                 ),
             },
         }
+    }
+
+    fn create_command_failure_may_have_created_sandbox(err: &DriverError) -> bool {
+        let DriverError::CommandFailed { stdout, stderr, .. } = err else {
+            return false;
+        };
+        let output = format!("{stdout}\n{stderr}");
+        [
+            "failed to decode Protobuf message",
+            "Sandbox.metadata",
+            "SandboxResponse.sandbox",
+            "delimited length exceeded",
+            "invalid wire type",
+            "unexpected end group tag",
+            "h2 protocol error",
+            "error reading a body from connection",
+            "connection closed",
+            "peer closed connection",
+            "transport error",
+        ]
+        .iter()
+        .any(|needle| output.contains(needle))
     }
 
     fn write_policy_temp_file(
@@ -1620,6 +1740,79 @@ impl OpenShellDriver {
         })?;
 
         Ok((temp_policy_file, translated.inference_update))
+    }
+
+    fn inference_update_for_policy(
+        &self,
+        policy: &NetworkPolicy,
+    ) -> DriverResult<Option<InferenceUpdate>> {
+        translate_policy_for_openshell(policy)
+            .map(|translated| translated.inference_update)
+            .map_err(|err| DriverError::PolicyTranslation {
+                message: err.to_string(),
+            })
+    }
+
+    fn write_dns_guard_temp_file(
+        &self,
+        handle: &str,
+        policy: &NetworkPolicy,
+    ) -> DriverResult<Option<TempDnsGuardConfigFile>> {
+        let config = dns_guard::DnsGuardConfig::from_policy(handle, policy).map_err(|err| {
+            DriverError::PolicyTranslation {
+                message: err.to_string(),
+            }
+        })?;
+        let Some(mut config) = config else {
+            return Ok(None);
+        };
+        materialize_dns_guard_upstreams(&mut config)?;
+        let config_json =
+            serde_json::to_string(&config).map_err(|err| DriverError::PolicyTranslation {
+                message: format!("failed to serialize DNS guard config: {err}"),
+            })?;
+        let temp_config_file = TempDnsGuardConfigFile::write(&config_json).map_err(|err| {
+            DriverError::PolicyTranslation {
+                message: format!("failed to write DNS guard config to temp file: {err}"),
+            }
+        })?;
+
+        Ok(Some(temp_config_file))
+    }
+
+    fn install_dns_guard_for_policy(
+        &self,
+        handle: &str,
+        policy: &NetworkPolicy,
+        rewrite_resolv_conf: bool,
+    ) -> DriverResult<()> {
+        let Some(temp_config_file) = self.write_dns_guard_temp_file(handle, policy)? else {
+            return Ok(());
+        };
+        self.run_checked_command(command_request(&[
+            "sandbox",
+            "upload",
+            handle,
+            &temp_config_file.path().to_string_lossy(),
+            &dns_guard_config_path(handle),
+        ]))?;
+        if self.runner.uses_host_environment() {
+            let guard_binary = dns_guard_binary_host_path()?;
+            let guard_binary_path = guard_binary.to_string_lossy().into_owned();
+            self.run_checked_command(command_request(&[
+                "sandbox",
+                "upload",
+                handle,
+                &guard_binary_path,
+                DNS_GUARD_SANDBOX_BIN_PATH,
+            ]))?;
+        }
+        if rewrite_resolv_conf {
+            self.run_checked_command(dns_guard_resolv_conf_command(handle))?;
+        }
+        self.run_checked_command(dns_guard_command(handle))?;
+
+        Ok(())
     }
 
     fn run_inference_update(&self, inference_update: InferenceUpdate) -> DriverResult<()> {
@@ -1648,11 +1841,68 @@ impl OpenShellDriver {
         handle: &str,
         policy: NetworkPolicy,
     ) -> DriverResult<ApplyPolicyResult> {
-        if let Some(current) = self.current_policy_for_handle(handle) {
-            classify_policy_update(&current, &policy).map_err(driver_error_from_policy_error)?;
+        let previous_policy = self.current_policy_for_handle(handle);
+        if let Some(current) = &previous_policy {
+            classify_policy_update(current, &policy).map_err(driver_error_from_policy_error)?;
         }
 
-        let (temp_policy_file, inference_update) = self.write_policy_temp_file(&policy)?;
+        let inference_update = self.run_openshell_policy_set(handle, &policy)?;
+
+        if let Some(inference_update) = inference_update {
+            if let Err(err) = self.run_inference_update(inference_update) {
+                return Err(self.rollback_policy_after_apply_failure(
+                    handle,
+                    previous_policy.as_ref(),
+                    "inference routing",
+                    err,
+                ));
+            }
+        }
+
+        if let Err(err) = self.apply_dns_guard_lifecycle(handle, previous_policy.as_ref(), &policy)
+        {
+            return Err(self.rollback_policy_after_apply_failure(
+                handle,
+                previous_policy.as_ref(),
+                "DNS guard lifecycle",
+                err,
+            ));
+        }
+
+        self.store_current_policy(handle.to_owned(), policy);
+
+        Ok(ApplyPolicyResult { hot_reloaded: true })
+    }
+
+    fn apply_dns_guard_lifecycle(
+        &self,
+        handle: &str,
+        previous_policy: Option<&NetworkPolicy>,
+        policy: &NetworkPolicy,
+    ) -> DriverResult<()> {
+        if policy.network.dns.is_active() {
+            return self.install_dns_guard_for_policy(handle, policy, true);
+        }
+        if previous_policy.is_some_and(|previous| previous.network.dns.is_active()) {
+            self.deactivate_dns_guard(handle)?;
+        }
+
+        Ok(())
+    }
+
+    fn deactivate_dns_guard(&self, handle: &str) -> DriverResult<()> {
+        self.run_checked_command(dns_guard_stop_command(handle))?;
+        self.run_checked_command(dns_guard_resolv_restore_command(handle))?;
+
+        Ok(())
+    }
+
+    fn run_openshell_policy_set(
+        &self,
+        handle: &str,
+        policy: &NetworkPolicy,
+    ) -> DriverResult<Option<InferenceUpdate>> {
+        let (temp_policy_file, inference_update) = self.write_policy_temp_file(policy)?;
 
         let policy_args = vec![
             "policy".to_owned(),
@@ -1667,13 +1917,91 @@ impl OpenShellDriver {
             env: BTreeMap::new(),
         })?;
 
-        if let Some(inference_update) = inference_update {
-            self.run_inference_update(inference_update)?;
+        Ok(inference_update)
+    }
+
+    fn rollback_policy_after_apply_failure(
+        &self,
+        handle: &str,
+        previous_policy: Option<&NetworkPolicy>,
+        failure_context: &str,
+        primary: DriverError,
+    ) -> DriverError {
+        let Some(previous_policy) = previous_policy else {
+            return match self.deactivate_dns_guard(handle) {
+                Ok(()) => DriverError::PolicyTranslation {
+                    message: format!(
+                        "failed to apply {failure_context}; cleaned up DNS guard state: {primary}"
+                    ),
+                },
+                Err(cleanup) => DriverError::CleanupFailed {
+                    message: format!(
+                        "failed to apply {failure_context} ({primary}); failed to clean up DNS guard state: {cleanup}"
+                    ),
+                },
+            };
+        };
+
+        let mut cleanup_failures = Vec::new();
+        let previous_inference_update = match self.inference_update_for_policy(previous_policy) {
+            Ok(inference_update) => inference_update,
+            Err(err) => {
+                cleanup_failures.push(format!(
+                    "failed to translate previous inference routing: {err}"
+                ));
+                None
+            }
+        };
+
+        match self.run_openshell_policy_set(handle, previous_policy) {
+            Ok(_) => {}
+            Err(err) => {
+                cleanup_failures.push(format!(
+                    "failed to restore previous OpenShell policy: {err}"
+                ));
+            }
         }
 
-        self.store_current_policy(handle.to_owned(), policy);
+        if let Some(inference_update) = previous_inference_update {
+            if let Err(err) = self.run_inference_update(inference_update) {
+                cleanup_failures.push(format!(
+                    "failed to restore previous inference routing: {err}"
+                ));
+            }
+        }
 
-        Ok(ApplyPolicyResult { hot_reloaded: true })
+        if let Err(err) = self.restore_previous_dns_guard(handle, previous_policy) {
+            cleanup_failures.push(format!("failed to restore previous DNS guard: {err}"));
+        }
+
+        if cleanup_failures.is_empty() {
+            DriverError::PolicyTranslation {
+                message: format!(
+                    "failed to apply {failure_context}; restored previous OpenShell policy, inference routing, and DNS guard: {primary}"
+                ),
+            }
+        } else {
+            DriverError::CleanupFailed {
+                message: format!(
+                    "failed to apply {failure_context} ({primary}); {}",
+                    cleanup_failures.join("; ")
+                ),
+            }
+        }
+    }
+
+    fn restore_previous_dns_guard(
+        &self,
+        handle: &str,
+        previous_policy: &NetworkPolicy,
+    ) -> DriverResult<()> {
+        if previous_policy.network.dns.is_active() {
+            self.install_dns_guard_for_policy(handle, previous_policy, true)?;
+        } else {
+            self.deactivate_dns_guard(handle)?;
+        }
+
+        Ok(())
     }
 
     fn run_policy_command(&self, request: CommandRequest) -> Result<CommandOutput, DriverError> {
@@ -1779,6 +2107,43 @@ impl TempPolicyFile {
 }
 
 impl Drop for TempPolicyFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct TempDnsGuardConfigFile {
+    path: PathBuf,
+}
+
+impl TempDnsGuardConfigFile {
+    fn write(config_json: &str) -> io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "sandbox-openshell-dns-guard-{}.json",
+            Uuid::new_v4()
+        ));
+        let guard = Self { path };
+
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(guard.path())?;
+        file.write_all(config_json.as_bytes())?;
+        file.flush()?;
+
+        Ok(guard)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDnsGuardConfigFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
@@ -2323,8 +2688,8 @@ fn host_command_path(request_env: &BTreeMap<String, String>) -> String {
         .cloned()
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
-    let mut entries = host_path_entries();
-    entries.extend(std::env::split_paths(&base));
+    let mut entries: Vec<PathBuf> = std::env::split_paths(&base).collect();
+    entries.extend(host_path_entries());
     dedup_join_paths(entries).unwrap_or(base)
 }
 
@@ -2363,12 +2728,17 @@ fn resolve_executable(program: &str, extra_path_entries: &[PathBuf]) -> Option<S
         return is_executable_candidate(&candidate).then(|| program.to_owned());
     }
 
-    let mut entries = extra_path_entries.to_vec();
     if let Some(path) = std::env::var_os("PATH") {
-        entries.extend(std::env::split_paths(&path));
+        for dir in std::env::split_paths(&path) {
+            for candidate in executable_candidates(&dir, program) {
+                if is_executable_candidate(&candidate) {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
     }
-    for dir in entries {
-        for candidate in executable_candidates(&dir, program) {
+    for dir in extra_path_entries {
+        for candidate in executable_candidates(dir, program) {
             if is_executable_candidate(&candidate) {
                 return Some(candidate.to_string_lossy().into_owned());
             }
@@ -2403,6 +2773,322 @@ fn command_string(program: &str, args: &[String]) -> String {
         .chain(args.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn materialize_dns_guard_upstreams(config: &mut dns_guard::DnsGuardConfig) -> DriverResult<()> {
+    materialize_dns_guard_upstreams_with_resolver(config, &SystemDnsResolver)
+}
+
+fn materialize_dns_guard_upstreams_with_resolver(
+    config: &mut dns_guard::DnsGuardConfig,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<()> {
+    config.resolver_endpoints = config
+        .resolvers_allowed
+        .iter()
+        .map(|upstream| materialize_classic_resolver_endpoint(upstream, resolver))
+        .collect::<DriverResult<Vec<_>>>()?;
+    config.doh_upstreams = config
+        .doh_upstreams_allowed
+        .iter()
+        .map(|upstream| materialize_doh_upstream(upstream, resolver))
+        .collect::<DriverResult<Vec<_>>>()?;
+    config.dot_upstreams = config
+        .dot_upstreams_allowed
+        .iter()
+        .map(|upstream| materialize_dot_upstream(upstream, resolver))
+        .collect::<DriverResult<Vec<_>>>()?;
+
+    Ok(())
+}
+
+fn materialize_classic_resolver_endpoint(
+    upstream: &str,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<String> {
+    let host = upstream.trim_end_matches('.');
+    let validated = validate_dns_upstream_host(host, 53, resolver, dns_resolver_ssrf_options())?;
+    let ip = first_pinned_ip(host, &validated.pinned_ips)?;
+    Ok(SocketAddr::new(ip, 53).to_string())
+}
+
+fn materialize_doh_upstream(
+    upstream: &str,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<dns_guard::DnsGuardDohUpstream> {
+    let url = Url::parse(upstream).map_err(|err| DriverError::PolicyTranslation {
+        message: format!("invalid DNS-over-HTTPS upstream `{upstream}`: {err}"),
+    })?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| DriverError::PolicyTranslation {
+            message: format!("invalid DNS-over-HTTPS upstream `{upstream}`: missing host"),
+        })?
+        .to_owned();
+    let validated = validate_outbound_with_resolver(&url, SsrfOptions::default(), resolver)
+        .map_err(|err| DriverError::PolicyTranslation {
+            message: format!("DNS-over-HTTPS upstream `{upstream}` failed SSRF validation: {err}"),
+        })?;
+    let connect_addr = if host.parse::<IpAddr>().is_ok() {
+        None
+    } else {
+        let ip = first_pinned_ip(&host, &validated.pinned_ips)?;
+        Some(SocketAddr::new(ip, url.port_or_known_default().unwrap_or(443)).to_string())
+    };
+
+    Ok(dns_guard::DnsGuardDohUpstream {
+        url: url.to_string(),
+        host,
+        connect_addr,
+    })
+}
+
+fn materialize_dot_upstream(
+    upstream: &str,
+    resolver: &dyn DnsResolver,
+) -> DriverResult<dns_guard::DnsGuardDotUpstream> {
+    let parsed =
+        Url::parse(&format!("dot://{upstream}")).map_err(|err| DriverError::PolicyTranslation {
+            message: format!("invalid DNS-over-TLS upstream `{upstream}`: {err}"),
+        })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| DriverError::PolicyTranslation {
+            message: format!("invalid DNS-over-TLS upstream `{upstream}`: missing host"),
+        })?
+        .to_owned();
+    let port = parsed.port().unwrap_or(853);
+    let validated = validate_dns_upstream_host(&host, port, resolver, SsrfOptions::default())?;
+    let ip = first_pinned_ip(&host, &validated.pinned_ips)?;
+
+    Ok(dns_guard::DnsGuardDotUpstream {
+        host,
+        port,
+        connect_addr: SocketAddr::new(ip, port).to_string(),
+    })
+}
+
+fn validate_dns_upstream_host(
+    host: &str,
+    port: u16,
+    resolver: &dyn DnsResolver,
+    options: SsrfOptions,
+) -> DriverResult<agentenv_core::security::ssrf::ValidatedUrl> {
+    let authority = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.to_owned(),
+    };
+    let url = Url::parse(&format!("http://{authority}:{port}/")).map_err(|err| {
+        DriverError::PolicyTranslation {
+            message: format!("invalid DNS upstream `{host}`: {err}"),
+        }
+    })?;
+    validate_outbound_with_resolver(&url, options, resolver).map_err(|err| {
+        DriverError::PolicyTranslation {
+            message: format!("DNS upstream `{host}` failed SSRF validation: {err}"),
+        }
+    })
+}
+
+fn dns_resolver_ssrf_options() -> SsrfOptions {
+    SsrfOptions {
+        allow_private: true,
+        ..SsrfOptions::default()
+    }
+}
+
+fn first_pinned_ip(host: &str, pinned_ips: &[IpAddr]) -> DriverResult<IpAddr> {
+    pinned_ips
+        .first()
+        .copied()
+        .ok_or_else(|| DriverError::PolicyTranslation {
+            message: format!("DNS upstream `{host}` resolved to no usable public IPs"),
+        })
+}
+
+fn dns_guard_binary_host_path() -> DriverResult<PathBuf> {
+    if let Some(path) = std::env::var_os(DNS_GUARD_HOST_BIN_ENV).map(PathBuf::from) {
+        return existing_dns_guard_binary(path);
+    }
+
+    let current_exe = std::env::current_exe().map_err(|source| DriverError::PolicyTranslation {
+        message: format!("failed to locate current executable for DNS guard upload: {source}"),
+    })?;
+    let binary_name = dns_guard_binary_name();
+    let mut candidates = Vec::new();
+    if let Some(parent) = current_exe.parent() {
+        candidates.push(parent.join(binary_name));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join(binary_name));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(DriverError::PolicyTranslation {
+        message: format!(
+            "DNS guard binary `{}` was not found next to `{}`; set {DNS_GUARD_HOST_BIN_ENV}",
+            binary_name,
+            current_exe.display()
+        ),
+    })
+}
+
+fn existing_dns_guard_binary(path: PathBuf) -> DriverResult<PathBuf> {
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(DriverError::PolicyTranslation {
+            message: format!(
+                "DNS guard binary path from {DNS_GUARD_HOST_BIN_ENV} is not a file: {}",
+                path.display()
+            ),
+        })
+    }
+}
+
+fn dns_guard_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "agentenv-openshell-dns-guard.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "agentenv-openshell-dns-guard"
+    }
+}
+
+fn dns_guard_config_path(_handle: &str) -> String {
+    DNS_GUARD_CONFIG_PATH.to_owned()
+}
+
+fn dns_guard_resolv_conf_command(handle: &str) -> CommandRequest {
+    let script = format!(
+        "install -d -m 0700 /etc/agentenv; \
+         if [ ! -e {DNS_GUARD_RESOLV_BACKUP_PATH} ] && [ -e /etc/resolv.conf ]; then \
+             cp /etc/resolv.conf {DNS_GUARD_RESOLV_BACKUP_PATH}; \
+         fi; \
+         printf '%s\\n' 'nameserver {DNS_GUARD_LISTENER_NAMESERVER}' > /etc/resolv.conf"
+    );
+    command_request(&[
+        "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
+    ])
+}
+
+fn dns_guard_command(handle: &str) -> CommandRequest {
+    let config_path = dns_guard_config_path(handle);
+    let script = format!(
+        "install -d -m 0700 /etc/agentenv; \
+         pidfile={DNS_GUARD_PIDFILE}; \
+         if [ -s \"$pidfile\" ]; then \
+             old_pid=$(cat \"$pidfile\"); \
+             case \"$old_pid\" in ''|*[!0-9]*) ;; *) \
+                 if [ -r /proc/$old_pid/cmdline ] && tr '\\0' ' ' < /proc/$old_pid/cmdline | grep -q 'agentenv-openshell-dns-guard'; then \
+                     kill \"$old_pid\" >/dev/null 2>&1 || true; \
+                     old_i=0; \
+                     while kill -0 \"$old_pid\" 2>/dev/null; do \
+                         if [ \"$old_i\" -ge 20 ]; then exit 1; fi; \
+                         old_i=$((old_i + 1)); \
+                         sleep 0.1; \
+                     done; \
+                 fi; \
+                 ;; \
+             esac; \
+         fi; \
+         rm -f \"$pidfile\"; \
+         chmod 0700 {DNS_GUARD_SANDBOX_BIN_PATH}; \
+         nohup {DNS_GUARD_SANDBOX_BIN_PATH} {config_path} >{DNS_GUARD_LOG_PATH} 2>&1 & \
+         pid=$!; \
+         printf '%s\\n' \"$pid\" > \"$pidfile\"; \
+         i=0; \
+         while [ \"$i\" -lt 20 ]; do \
+             if kill -0 \"$pid\" 2>/dev/null; then \
+                 udp_inodes=$(awk '$2 ~ /:0035$/ {{ print $10 }}' /proc/net/udp /proc/net/udp6 2>/dev/null); \
+                 for fd in /proc/$pid/fd/*; do \
+                     link=$(readlink \"$fd\" 2>/dev/null || true); \
+                     case \"$link\" in \
+                         socket:[*) \
+                             inode=${{link#socket:[}}; inode=${{inode%]}}; \
+                             for udp_inode in $udp_inodes; do \
+                                 if [ \"$inode\" = \"$udp_inode\" ]; then exit 0; fi; \
+                             done; \
+                             ;; \
+                     esac; \
+                 done; \
+             fi; \
+             i=$((i + 1)); \
+             sleep 0.1; \
+         done; \
+         kill \"$pid\" >/dev/null 2>&1 || true; \
+         rm -f \"$pidfile\"; \
+         exit 1"
+    );
+    command_request(&[
+        "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
+    ])
+}
+
+fn dns_guard_log_command(handle: &str) -> CommandRequest {
+    let script = format!("if [ -r {DNS_GUARD_LOG_PATH} ]; then cat {DNS_GUARD_LOG_PATH}; fi");
+    command_request(&[
+        "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
+    ])
+}
+
+fn append_log_stdout(base: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    if !base.is_empty() && !base.ends_with('\n') {
+        base.push('\n');
+    }
+    base.push_str(extra);
+}
+
+fn dns_guard_stop_command(handle: &str) -> CommandRequest {
+    let script = format!(
+        "pidfile={DNS_GUARD_PIDFILE}; \
+         if [ -s \"$pidfile\" ]; then \
+             pid=$(cat \"$pidfile\"); \
+             case \"$pid\" in ''|*[!0-9]*) rm -f \"$pidfile\"; exit 0 ;; *) \
+                 if [ -r /proc/$pid/cmdline ] && tr '\\0' ' ' < /proc/$pid/cmdline | grep -q 'agentenv-openshell-dns-guard'; then \
+                     kill \"$pid\"; \
+                     stop_i=0; \
+                     while kill -0 \"$pid\" 2>/dev/null; do \
+                         if [ \"$stop_i\" -ge 20 ]; then exit 1; fi; \
+                         stop_i=$((stop_i + 1)); \
+                         sleep 0.1; \
+                     done; \
+                 fi; \
+             esac; \
+         fi; \
+         rm -f \"$pidfile\""
+    );
+    command_request(&[
+        "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
+    ])
+}
+
+fn dns_guard_resolv_restore_command(handle: &str) -> CommandRequest {
+    let mut content = String::from("# agentenv DNS guard inactive fallback\n");
+    for nameserver in DNS_GUARD_FALLBACK_NAMESERVERS {
+        content.push_str(&format!("nameserver {nameserver}\n"));
+    }
+    let script = format!(
+        "if [ -e {DNS_GUARD_RESOLV_BACKUP_PATH} ]; then \
+             mv {DNS_GUARD_RESOLV_BACKUP_PATH} /etc/resolv.conf; \
+         else \
+             printf '%s' {} > /etc/resolv.conf; \
+         fi",
+        shell_quote(&content)
+    );
+    command_request(&[
+        "sandbox", "exec", "--name", handle, "--", "sh", "-lc", &script,
+    ])
 }
 
 fn validate_session_display_name(name: &str) -> DriverResult<()> {
@@ -2737,6 +3423,14 @@ fn render_command_output(output: &CommandOutput) -> String {
     status_label(output.status)
 }
 
+fn command_output_mentions_missing_sandbox(output: &CommandOutput) -> bool {
+    let text = format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase();
+    text.contains("not found")
+        || text.contains("not exist")
+        || text.contains("does not exist")
+        || text.contains("no sandbox")
+}
+
 fn extract_semver_token(text: &str) -> Option<Version> {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+')))
         .filter_map(|token| {
@@ -2907,13 +3601,13 @@ mod driver_tests {
         time::Duration,
     };
 
-    use agentenv_core::driver::SandboxDriver;
+    use agentenv_core::{driver::SandboxDriver, security::ssrf::StaticDnsResolver};
     use agentenv_events::{ActivityEvent, ActivityKind, EventEmitter};
     use agentenv_proto::{
         AttachSessionParams, Capabilities, CopyInParams, CopyOutParams, CreateSessionParams,
-        DestroyParams, DriverKind, ExecParams, InitializeParams, KillSessionParams,
-        ListSessionsParams, LogLevel, LogsParams, LogsStreamParams, PreflightParams, SandboxHandle,
-        SandboxSpec, SandboxStatusParams, SessionStatus, StopParams, SCHEMA_VERSION,
+        DestroyParams, DnsPolicy, DriverKind, ExecParams, InitializeParams, KillSessionParams,
+        ListSessionsParams, LogLevel, LogsParams, LogsStreamParams, NetworkPolicy, PreflightParams,
+        SandboxHandle, SandboxSpec, SandboxStatusParams, SessionStatus, StopParams, SCHEMA_VERSION,
     };
     use semver::Version;
     use serde_json::{json, Value};
@@ -2921,9 +3615,9 @@ mod driver_tests {
     use driver_conformance::assert_sandbox_driver_contract;
 
     use super::{
-        command_request, command_request_with_env, extract_semver_token, shell_quote, CommandCall,
-        CommandOutput, CommandRunner, CommandScript, CommandScriptResult, OpenShellDriver,
-        RecordingCommandRunner, OPEN_SHELL_INSTALL_URL, SANDBOX_WORKING_DIR,
+        command_request, command_request_with_env, command_string, extract_semver_token,
+        shell_quote, CommandCall, CommandOutput, CommandRunner, CommandScript, CommandScriptResult,
+        OpenShellDriver, RecordingCommandRunner, OPEN_SHELL_INSTALL_URL, SANDBOX_WORKING_DIR,
         TMUX_AGENTENV_COMMAND_OPTION, TMUX_AGENTENV_HANDLE_OPTION,
         TMUX_AGENTENV_SESSION_NAME_OPTION, TMUX_SESSION_FORMAT,
     };
@@ -2960,6 +3654,7 @@ mod driver_tests {
         expectations: Mutex<VecDeque<FlexibleCommandExpectation>>,
         calls: Mutex<Vec<CommandCall>>,
         spawn_calls: Mutex<Vec<CommandCall>>,
+        host_environment: bool,
     }
 
     #[derive(Debug)]
@@ -2993,6 +3688,11 @@ mod driver_tests {
         spawn_calls: Mutex<Vec<CommandCall>>,
         terminations: Arc<Mutex<usize>>,
         termination_failures_remaining: Arc<Mutex<usize>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PreexistingAmbiguousCreateRunner {
+        calls: Mutex<Vec<CommandCall>>,
     }
 
     struct TrackingSpawnedCommand {
@@ -3030,6 +3730,12 @@ mod driver_tests {
 
         fn terminations(&self) -> usize {
             *self.terminations.lock().expect("terminations mutex")
+        }
+    }
+
+    impl PreexistingAmbiguousCreateRunner {
+        fn calls(&self) -> Vec<CommandCall> {
+            self.calls.lock().expect("calls mutex").clone()
         }
     }
 
@@ -3083,6 +3789,64 @@ mod driver_tests {
                 terminations: self.terminations.clone(),
                 failures_remaining: self.termination_failures_remaining.clone(),
             }))
+        }
+    }
+
+    impl CommandRunner for PreexistingAmbiguousCreateRunner {
+        fn uses_host_environment(&self) -> bool {
+            true
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            request: &super::CommandRequest,
+        ) -> io::Result<super::CommandOutput> {
+            self.calls.lock().expect("calls mutex").push(CommandCall {
+                program: program.to_owned(),
+                request: request.clone(),
+            });
+
+            if program != "openshell" {
+                return Err(io::Error::other("unexpected command"));
+            }
+
+            match request.args.as_slice() {
+                args if args.starts_with(&["sandbox".to_owned(), "create".to_owned()]) => {
+                    Ok(CommandOutput {
+                        status: Some(1),
+                        stdout: String::new(),
+                        stderr: "Sandbox.metadata: SandboxResponse.sandbox: unexpected end group tag"
+                            .to_owned(),
+                    })
+                }
+                args if args == ["sandbox", "get", "existing-sandbox"] => Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: "existing-sandbox Running\n".to_owned(),
+                    stderr: String::new(),
+                }),
+                args if args == ["sandbox", "list"] => Ok(CommandOutput {
+                    status: Some(0),
+                    stdout:
+                        "NAME              NAMESPACE  CREATED              PHASE\nexisting-sandbox  openshell  2026-05-09 18:50   Running\n"
+                            .to_owned(),
+                    stderr: String::new(),
+                }),
+                args if args == ["sandbox", "delete", "existing-sandbox"] => Ok(CommandOutput {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }),
+                _ => Err(io::Error::other("unexpected command")),
+            }
+        }
+
+        fn spawn(
+            &self,
+            _program: &str,
+            _request: &super::CommandRequest,
+        ) -> io::Result<Box<dyn super::SpawnedCommand>> {
+            Ok(Box::new(super::NoopSpawnedCommand))
         }
     }
 
@@ -3253,10 +4017,18 @@ mod driver_tests {
 
     impl FlexibleCommandRunner {
         fn new(expectations: Vec<FlexibleCommandExpectation>) -> Self {
+            Self::new_with_host_environment(expectations, false)
+        }
+
+        fn new_with_host_environment(
+            expectations: Vec<FlexibleCommandExpectation>,
+            host_environment: bool,
+        ) -> Self {
             Self {
                 expectations: Mutex::new(expectations.into_iter().collect()),
                 calls: Mutex::new(Vec::new()),
                 spawn_calls: Mutex::new(Vec::new()),
+                host_environment,
             }
         }
 
@@ -3324,6 +4096,10 @@ mod driver_tests {
     }
 
     impl CommandRunner for FlexibleCommandRunner {
+        fn uses_host_environment(&self) -> bool {
+            self.host_environment
+        }
+
         fn run(
             &self,
             program: &str,
@@ -3477,6 +4253,16 @@ mod driver_tests {
         }
     }
 
+    fn activate_dns_policy(policy: &mut NetworkPolicy, resolver: &str) {
+        policy.network.dns = DnsPolicy {
+            resolvers_allowed: vec![resolver.to_owned()],
+            doh_upstreams_allowed: Vec::new(),
+            dot_upstreams_allowed: Vec::new(),
+            log_all_queries: true,
+            pin_resolved_ips: true,
+        };
+    }
+
     fn assert_args_prefix_suffix(args: &[String], prefix: &[&str], suffix: &[&str]) {
         let expected_prefix: Vec<String> = prefix.iter().map(|value| (*value).to_owned()).collect();
         let expected_suffix: Vec<String> = suffix.iter().map(|value| (*value).to_owned()).collect();
@@ -3492,6 +4278,161 @@ mod driver_tests {
             "args {:?} did not end with {:?}",
             args,
             expected_suffix
+        );
+    }
+
+    fn assert_dns_guard_readiness_command(call: &CommandCall) {
+        assert_args_prefix_suffix(
+            &call.request.args,
+            &["sandbox", "exec", "--name", "devbox", "--", "sh", "-lc"],
+            &[],
+        );
+        let script = call
+            .request
+            .args
+            .get(7)
+            .expect("dns guard shell script should be present");
+
+        assert!(script
+            .contains("/etc/agentenv/agentenv-openshell-dns-guard /etc/agentenv/dns-guard.json"));
+        assert!(script.contains("chmod 0700 /etc/agentenv/agentenv-openshell-dns-guard"));
+        assert!(!script.contains("pkill -f"));
+        assert!(!script.contains("/tmp/agentenv-openshell-dns-guard.pid"));
+        assert!(script.contains("install -d -m 0700 /etc/agentenv"));
+        assert!(script.contains("pidfile=/etc/agentenv/dns-guard.pid"));
+        assert!(script.contains("[ -s \"$pidfile\" ]"));
+        assert!(script.contains("old_pid=$(cat \"$pidfile\")"));
+        assert!(script.contains("case \"$old_pid\" in"));
+        assert!(script.contains("*[!0-9]*"));
+        assert!(script.contains("/proc/$old_pid/cmdline"));
+        assert!(script.contains("agentenv-openshell-dns-guard"));
+        assert!(script.contains("kill \"$old_pid\""));
+        assert!(script.contains("old_i=0"));
+        assert!(script.contains("kill -0 \"$old_pid\""));
+        assert!(script.contains("[ \"$old_i\" -ge 20 ]"));
+        assert!(script.contains("rm -f \"$pidfile\""));
+        assert!(script.contains("pid=$!"));
+        assert!(script.contains("printf '%s\\n' \"$pid\" > \"$pidfile\""));
+        assert!(script.contains("kill -0 \"$pid\""));
+        assert!(script.contains("/proc/net/udp"));
+        assert!(script.contains("/proc/$pid/fd"));
+        assert!(script.contains("readlink"));
+        assert!(script.contains("socket:["));
+        assert!(script.contains(":0035"));
+        assert!(!script.contains("grep -q ':0035 '"));
+        assert!(script.contains("exit 1"));
+    }
+
+    fn assert_dns_guard_binary_upload_command(call: &CommandCall) {
+        assert_args_prefix_suffix(
+            &call.request.args,
+            &["sandbox", "upload", "devbox"],
+            &["/etc/agentenv/agentenv-openshell-dns-guard"],
+        );
+        let host_path = call
+            .request
+            .args
+            .get(3)
+            .expect("DNS guard binary host path should be present");
+        assert!(
+            host_path.contains("agentenv-openshell-dns-guard"),
+            "unexpected DNS guard binary host path: {host_path}"
+        );
+    }
+
+    fn assert_dns_guard_stop_command(call: &CommandCall) {
+        assert_args_prefix_suffix(
+            &call.request.args,
+            &["sandbox", "exec", "--name", "devbox", "--", "sh", "-lc"],
+            &[],
+        );
+        let script = call
+            .request
+            .args
+            .get(7)
+            .expect("dns guard stop shell script should be present");
+
+        assert!(!script.contains("pkill -f"));
+        assert!(!script.contains("/tmp/agentenv-openshell-dns-guard.pid"));
+        assert!(script.contains("pidfile=/etc/agentenv/dns-guard.pid"));
+        assert!(script.contains("[ -s \"$pidfile\" ]"));
+        assert!(script.contains("pid=$(cat \"$pidfile\")"));
+        assert!(script.contains("case \"$pid\" in"));
+        assert!(script.contains("*[!0-9]*"));
+        assert!(script.contains("/proc/$pid/cmdline"));
+        assert!(script.contains("agentenv-openshell-dns-guard"));
+        assert!(script.contains("kill \"$pid\""));
+        assert!(script.contains("stop_i=0"));
+        assert!(script.contains("kill -0 \"$pid\""));
+        assert!(script.contains("[ \"$stop_i\" -ge 20 ]"));
+        assert!(script.contains("exit 1"));
+        assert!(script.contains("rm -f \"$pidfile\""));
+        assert!(
+            script
+                .find("[ \"$stop_i\" -ge 20 ]")
+                .expect("stop failure check")
+                < script.rfind("rm -f \"$pidfile\"").expect("pidfile removal")
+        );
+    }
+
+    fn assert_dns_guard_resolv_restore_command(call: &CommandCall) {
+        assert_args_prefix_suffix(
+            &call.request.args,
+            &["sandbox", "exec", "--name", "devbox", "--", "sh", "-lc"],
+            &[],
+        );
+        let script = call
+            .request
+            .args
+            .get(7)
+            .expect("resolv restore shell script should be present");
+
+        assert!(script.contains("/etc/resolv.conf"));
+        assert!(script.contains("/etc/agentenv/resolv.conf.pre-agentenv-dns-guard"));
+        assert!(
+            script.contains("mv /etc/agentenv/resolv.conf.pre-agentenv-dns-guard /etc/resolv.conf")
+        );
+        assert!(script.contains("nameserver 1.1.1.1"));
+        assert!(script.contains("nameserver 8.8.8.8"));
+    }
+
+    fn assert_dns_guard_resolv_capture_command(call: &CommandCall) {
+        assert_eq!(call.request.args[0], "sandbox");
+        assert_eq!(call.request.args[1], "exec");
+        let script = call
+            .request
+            .args
+            .get(7)
+            .expect("resolv capture shell script should be present");
+
+        assert!(script.contains("install -d -m 0700 /etc/agentenv"));
+        assert!(script.contains("/etc/agentenv/resolv.conf.pre-agentenv-dns-guard"));
+        assert!(script.contains("[ ! -e /etc/agentenv/resolv.conf.pre-agentenv-dns-guard ]"));
+        assert!(
+            script.contains("cp /etc/resolv.conf /etc/agentenv/resolv.conf.pre-agentenv-dns-guard")
+        );
+        assert!(script.contains("nameserver 127.0.0.1"));
+        assert!(script.contains("> /etc/resolv.conf"));
+    }
+
+    fn assert_inference_set_command(
+        call: &CommandCall,
+        provider: &str,
+        model: &str,
+        timeout_seconds: &str,
+    ) {
+        assert_eq!(
+            call.request.args,
+            vec![
+                "inference".to_owned(),
+                "set".to_owned(),
+                "--provider".to_owned(),
+                provider.to_owned(),
+                "--model".to_owned(),
+                model.to_owned(),
+                "--timeout".to_owned(),
+                timeout_seconds.to_owned(),
+            ]
         );
     }
 
@@ -3667,6 +4608,97 @@ mod driver_tests {
         assert!(capabilities.supports_native_inference_routing);
         assert!(capabilities.supports_remote_host);
         assert!(capabilities.supports_persistent_sessions);
+        assert!(!capabilities.supports_dns_egress_control);
+    }
+
+    #[test]
+    fn materialize_dns_guard_upstreams_resolves_hosts_before_sandbox_dns_rewrite() {
+        let resolver = StaticDnsResolver::try_from_pairs([
+            ("resolver.example", ["93.184.216.34"]),
+            ("doh.example", ["93.184.216.35"]),
+            ("dot.example", ["93.184.216.36"]),
+        ])
+        .expect("static DNS records");
+        let mut config = super::dns_guard::DnsGuardConfig {
+            sandbox_handle: "devbox".to_owned(),
+            listen_addr: "127.0.0.1:53".to_owned(),
+            resolvers_allowed: vec!["resolver.example".to_owned()],
+            doh_upstreams_allowed: vec!["https://doh.example/dns-query".to_owned()],
+            dot_upstreams_allowed: vec!["dot.example:853".to_owned()],
+            resolver_endpoints: Vec::new(),
+            doh_upstreams: Vec::new(),
+            dot_upstreams: Vec::new(),
+            allowed_query_names: Default::default(),
+            log_all_queries: false,
+            pin_resolved_ips: false,
+        };
+
+        super::materialize_dns_guard_upstreams_with_resolver(&mut config, &resolver)
+            .expect("materialize upstreams");
+
+        assert_eq!(config.resolver_endpoints, vec!["93.184.216.34:53"]);
+        assert_eq!(config.doh_upstreams.len(), 1);
+        assert_eq!(config.doh_upstreams[0].url, "https://doh.example/dns-query");
+        assert_eq!(config.doh_upstreams[0].host, "doh.example");
+        assert_eq!(
+            config.doh_upstreams[0].connect_addr.as_deref(),
+            Some("93.184.216.35:443")
+        );
+        assert_eq!(config.dot_upstreams.len(), 1);
+        assert_eq!(config.dot_upstreams[0].host, "dot.example");
+        assert_eq!(config.dot_upstreams[0].port, 853);
+        assert_eq!(config.dot_upstreams[0].connect_addr, "93.184.216.36:853");
+    }
+
+    #[test]
+    fn materialize_dns_guard_upstreams_allows_private_classic_resolver() {
+        let resolver = StaticDnsResolver::try_from_pairs([("resolver.internal", ["10.0.0.10"])])
+            .expect("static DNS records");
+        let mut config = super::dns_guard::DnsGuardConfig {
+            sandbox_handle: "devbox".to_owned(),
+            listen_addr: "127.0.0.1:53".to_owned(),
+            resolvers_allowed: vec!["resolver.internal".to_owned()],
+            doh_upstreams_allowed: Vec::new(),
+            dot_upstreams_allowed: Vec::new(),
+            resolver_endpoints: Vec::new(),
+            doh_upstreams: Vec::new(),
+            dot_upstreams: Vec::new(),
+            allowed_query_names: Default::default(),
+            log_all_queries: false,
+            pin_resolved_ips: false,
+        };
+
+        super::materialize_dns_guard_upstreams_with_resolver(&mut config, &resolver)
+            .expect("materialize upstreams");
+
+        assert_eq!(config.resolver_endpoints, vec!["10.0.0.10:53"]);
+    }
+
+    #[test]
+    fn host_bootstrap_prefers_process_path_before_fallback_paths() {
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let tempdir = unique_tempdir("sandbox-openshell-host-path-precedence");
+        write_fake_binary(&tempdir, "openshell", true);
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &tempdir);
+        let _path_guard = PathRestoreGuard {
+            original: original_path,
+        };
+        let driver = OpenShellDriver::with_host_command_runner(Arc::new(
+            FlexibleCommandRunner::new_with_host_environment(vec![], true),
+        ));
+        let expected = binary_path(&tempdir, "openshell")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(driver.effective_program("openshell"), expected);
+
+        let prepared = driver.prepare_host_request(command_request(&["--version"]));
+        let path = prepared.env.get("PATH").expect("PATH should be set");
+        let first_entry = std::env::split_paths(path)
+            .next()
+            .expect("PATH should contain caller entry");
+        assert_eq!(first_entry, tempdir);
     }
 
     #[test]
@@ -3940,6 +4972,1590 @@ mod driver_tests {
             .as_ref()
             .expect("policy path")
             .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_rolls_back_when_new_inference_update_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            previous
+                .inference
+                .routes
+                .push(agentenv_proto::InferenceRoute {
+                    matcher: "default".to_owned(),
+                    provider: "openai".to_owned(),
+                    model: "gpt-4.1".to_owned(),
+                    base_url: Some("https://api.openai.com/v1".to_owned()),
+                    timeout_seconds: Some(15),
+                });
+            let mut next = previous.clone();
+            next.inference.routes.clear();
+            next.inference.routes.push(agentenv_proto::InferenceRoute {
+                matcher: "default".to_owned(),
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet".to_owned(),
+                base_url: Some("https://api.anthropic.com".to_owned()),
+                timeout_seconds: Some(20),
+            });
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_inference_set_command(call, "anthropic", "claude-sonnet", "20");
+                },
+                Some(1),
+                "",
+                "new inference update failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_inference_set_command(call, "openai", "gpt-4.1", "15");
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when new inference update fails");
+
+        match err {
+            agentenv_core::driver::DriverError::PolicyTranslation { message } => {
+                assert!(message.contains("new inference update failed"));
+                assert!(message.contains("restored previous OpenShell policy"));
+            }
+            other => panic!("expected PolicyTranslation, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 7);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_with_active_dns_policy_installs_and_starts_dns_guard_before_storing_policy() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut policy, "1.1.1.1");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let guard_config_capture = Arc::new(Mutex::new(None::<PathBuf>));
+        let guard_config_for_check = guard_config_capture.clone();
+        let runner = Arc::new(FlexibleCommandRunner::new_with_host_environment(
+            vec![
+                FlexibleCommandExpectation::output(
+                    "openshell",
+                    |call| {
+                        assert_eq!(call.request, command_request(&["sandbox", "get", "devbox"]));
+                    },
+                    Some(1),
+                    "",
+                    "not found",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_args_prefix_suffix(
+                            &call.request.args,
+                            &[
+                                "sandbox",
+                                "create",
+                                "--name",
+                                "devbox",
+                                "--no-auto-providers",
+                                "--from",
+                                "openclaw",
+                                "--policy",
+                            ],
+                            &["--", "true"],
+                        );
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    move |call| {
+                        assert_args_prefix_suffix(
+                            &call.request.args,
+                            &["sandbox", "upload", "devbox"],
+                            &["/etc/agentenv/dns-guard.json"],
+                        );
+                        let config_path = PathBuf::from(
+                            call.request
+                                .args
+                                .get(3)
+                                .expect("guard config temp path should be present"),
+                        );
+                        let config_json =
+                            std::fs::read_to_string(&config_path).expect("read guard config");
+                        assert!(config_json.contains("\"sandbox_handle\":\"devbox\""));
+                        assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
+                        *guard_config_for_check.lock().expect("capture mutex") = Some(config_path);
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_dns_guard_binary_upload_command(call);
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_dns_guard_resolv_capture_command(call);
+                    },
+                    "",
+                    "",
+                ),
+                FlexibleCommandExpectation::success(
+                    "openshell",
+                    |call| {
+                        assert_dns_guard_readiness_command(call);
+                    },
+                    "",
+                    "",
+                ),
+            ],
+            true,
+        ));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: Some(policy.clone()),
+                        metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+                    })
+                    .await
+            })
+            .expect("create");
+
+        assert_eq!(result.handle, "devbox");
+        assert_eq!(runner.calls().len(), 6);
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(policy));
+        assert!(!guard_config_capture
+            .lock()
+            .expect("capture mutex")
+            .as_ref()
+            .expect("guard config path")
+            .exists());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn create_rolls_back_sandbox_when_dns_guard_setup_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut policy, "1.1.1.1");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(call.request.args[0], "sandbox");
+                    assert_eq!(call.request.args[1], "create");
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                Some(1),
+                "",
+                "upload failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(
+                        call.request,
+                        command_request(&["sandbox", "delete", "devbox"])
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: Some(policy),
+                        metadata: BTreeMap::from([("name".to_owned(), json!("devbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("create should fail when DNS guard setup fails");
+
+        match err {
+            agentenv_core::driver::DriverError::CommandFailed { command, .. } => {
+                assert!(command.contains("sandbox upload"));
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls().len(), 3);
+        assert!(driver.current_policy_for_handle("devbox").is_none());
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_rewrites_dns_guard_config_and_preserves_policy_when_reload_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            let mut next = previous.clone();
+            activate_dns_policy(&mut next, "8.8.8.8");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                    let config_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(3)
+                            .expect("guard config temp path should be present"),
+                    );
+                    let config_json =
+                        std::fs::read_to_string(config_path).expect("read guard config");
+                    assert!(config_json.contains("\"resolvers_allowed\":[\"8.8.8.8\"]"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "restart failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                    let config_path = PathBuf::from(
+                        call.request
+                            .args
+                            .get(3)
+                            .expect("guard config temp path should be present"),
+                    );
+                    let config_json =
+                        std::fs::read_to_string(config_path).expect("read guard config");
+                    assert!(config_json.contains("\"resolvers_allowed\":[\"1.1.1.1\"]"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when DNS guard reload fails");
+
+        match err {
+            agentenv_core::driver::DriverError::PolicyTranslation { message } => {
+                assert!(message.contains("DNS guard"));
+                assert!(message.contains("restart failed"));
+            }
+            other => panic!("expected PolicyTranslation, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 8);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_from_inactive_to_active_dns_rewrites_resolv_conf() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let previous = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            assert!(previous.network.dns.is_inactive());
+            let mut next = previous.clone();
+            activate_dns_policy(&mut next, "1.1.1.1");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect("apply_policy");
+
+        assert!(result.hot_reloaded);
+        assert_eq!(runner.calls().len(), 4);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_active_dns_without_previous_policy_cleans_up_when_guard_start_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut policy, "1.1.1.1");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "guard start failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_stop_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_restore_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when DNS guard start fails");
+
+        match err {
+            agentenv_core::driver::DriverError::PolicyTranslation { message } => {
+                assert!(message.contains("DNS guard"));
+                assert!(message.contains("guard start failed"));
+            }
+            other => panic!("expected PolicyTranslation, got {other:?}"),
+        }
+        assert!(driver.current_policy_for_handle("devbox").is_none());
+        assert_eq!(runner.calls().len(), 6);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_active_dns_without_previous_policy_reports_cleanup_failure() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut policy, "1.1.1.1");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "guard start failed",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_stop_command(call);
+                },
+                Some(1),
+                "",
+                "stop cleanup failed",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when DNS guard cleanup fails");
+
+        match err {
+            agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                assert!(message.contains("guard start failed"));
+                assert!(message.contains("failed to clean up DNS guard state"));
+                assert!(message.contains("stop cleanup failed"));
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+        assert!(driver.current_policy_for_handle("devbox").is_none());
+        assert_eq!(runner.calls().len(), 5);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_reports_cleanup_when_dns_guard_failure_restore_policy_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            let mut next = previous.clone();
+            activate_dns_policy(&mut next, "8.8.8.8");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(call.request.args[0], "sandbox");
+                    assert_eq!(call.request.args[1], "exec");
+                    assert!(command_string("openshell", &call.request.args)
+                        .contains("/etc/resolv.conf"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "restart failed",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                Some(1),
+                "",
+                "rollback policy set failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(call.request.args[0], "sandbox");
+                    assert_eq!(call.request.args[1], "exec");
+                    assert!(command_string("openshell", &call.request.args)
+                        .contains("/etc/resolv.conf"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when DNS guard and restore fail");
+
+        match err {
+            agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                assert!(message.contains("restart failed"));
+                assert!(message.contains("rollback policy set failed"));
+                assert!(!message.contains("failed to restore previous DNS guard"));
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 8);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_restores_previous_inference_even_when_previous_policy_set_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            previous
+                .inference
+                .routes
+                .push(agentenv_proto::InferenceRoute {
+                    matcher: "default".to_owned(),
+                    provider: "openai".to_owned(),
+                    model: "gpt-4.1".to_owned(),
+                    base_url: Some("https://api.openai.com/v1".to_owned()),
+                    timeout_seconds: Some(15),
+                });
+            let mut next = previous.clone();
+            activate_dns_policy(&mut next, "8.8.8.8");
+            next.inference.routes.clear();
+            next.inference.routes.push(agentenv_proto::InferenceRoute {
+                matcher: "default".to_owned(),
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet".to_owned(),
+                base_url: Some("https://api.anthropic.com".to_owned()),
+                timeout_seconds: Some(20),
+            });
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_inference_set_command(call, "anthropic", "claude-sonnet", "20");
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "restart failed",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                Some(1),
+                "",
+                "rollback policy set failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_inference_set_command(call, "openai", "gpt-4.1", "15");
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when previous policy set restore fails");
+
+        match err {
+            agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                assert!(message.contains("restart failed"));
+                assert!(message.contains("rollback policy set failed"));
+                assert!(!message.contains("failed to restore previous inference routing"));
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 10);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_reports_cleanup_when_previous_dns_guard_restore_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            let mut next = previous.clone();
+            activate_dns_policy(&mut next, "8.8.8.8");
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(call.request.args[0], "sandbox");
+                    assert_eq!(call.request.args[1], "exec");
+                    assert!(command_string("openshell", &call.request.args)
+                        .contains("/etc/resolv.conf"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "restart failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(call.request.args[0], "sandbox");
+                    assert_eq!(call.request.args[1], "exec");
+                    assert!(command_string("openshell", &call.request.args)
+                        .contains("/etc/resolv.conf"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "previous guard restart failed",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when previous DNS guard restore fails");
+
+        match err {
+            agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                assert!(message.contains("restart failed"));
+                assert!(message.contains("failed to restore previous DNS guard"));
+                assert!(message.contains("previous guard restart failed"));
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 8);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_reports_cleanup_when_previous_inference_restore_fails() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            previous
+                .inference
+                .routes
+                .push(agentenv_proto::InferenceRoute {
+                    matcher: "default".to_owned(),
+                    provider: "openai".to_owned(),
+                    model: "gpt-4.1".to_owned(),
+                    base_url: Some("https://api.openai.com/v1".to_owned()),
+                    timeout_seconds: Some(15),
+                });
+            let mut next = previous.clone();
+            activate_dns_policy(&mut next, "8.8.8.8");
+            next.inference.routes.clear();
+            next.inference.routes.push(agentenv_proto::InferenceRoute {
+                matcher: "default".to_owned(),
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet".to_owned(),
+                base_url: Some("https://api.anthropic.com".to_owned()),
+                timeout_seconds: Some(20),
+            });
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_inference_set_command(call, "anthropic", "claude-sonnet", "20");
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                Some(1),
+                "",
+                "restart failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_inference_set_command(call, "openai", "gpt-4.1", "15");
+                },
+                Some(1),
+                "",
+                "inference restore failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_capture_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when previous inference restore fails");
+
+        match err {
+            agentenv_core::driver::DriverError::CleanupFailed { message } => {
+                assert!(message.contains("restart failed"));
+                assert!(message.contains("failed to restore previous inference routing"));
+                assert!(message.contains("inference restore failed"));
+            }
+            other => panic!("expected CleanupFailed, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 10);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_from_active_to_inactive_dns_stops_guard_and_restores_resolv_conf() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            let mut next = previous.clone();
+            next.network.dns = DnsPolicy::default();
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_stop_command(call);
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_resolv_restore_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next.clone(),
+                    })
+                    .await
+            })
+            .expect("apply_policy");
+
+        assert!(result.hot_reloaded);
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(next));
+        assert_eq!(runner.calls().len(), 3);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_from_active_to_inactive_dns_failure_restores_previous_policy() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (previous, next, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let mut previous =
+                compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            activate_dns_policy(&mut previous, "1.1.1.1");
+            let mut next = previous.clone();
+            next.network.dns = DnsPolicy::default();
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (previous, next, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::output(
+                "openshell",
+                |call| {
+                    assert_dns_guard_stop_command(call);
+                },
+                Some(1),
+                "",
+                "stop failed",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["sandbox", "upload", "devbox"],
+                        &["/etc/agentenv/dns-guard.json"],
+                    );
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_eq!(call.request.args[0], "sandbox");
+                    assert_eq!(call.request.args[1], "exec");
+                    assert!(command_string("openshell", &call.request.args)
+                        .contains("/etc/resolv.conf"));
+                },
+                "",
+                "",
+            ),
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_dns_guard_readiness_command(call);
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+        driver.store_current_policy("devbox".to_owned(), previous.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy: next,
+                    })
+                    .await
+            })
+            .expect_err("apply_policy should fail when DNS guard deactivation fails");
+
+        match err {
+            agentenv_core::driver::DriverError::PolicyTranslation { message } => {
+                assert!(message.contains("DNS guard"));
+                assert!(message.contains("stop failed"));
+            }
+            other => panic!("expected PolicyTranslation, got {other:?}"),
+        }
+        assert_eq!(driver.current_policy_for_handle("devbox"), Some(previous));
+        assert_eq!(runner.calls().len(), 6);
+        std::fs::remove_dir_all(tempdir).expect("remove tempdir");
+    }
+
+    #[test]
+    fn apply_policy_with_inactive_dns_policy_does_not_run_dns_guard_lifecycle_commands() {
+        use agentenv_policy::{compose_policy, PresetRegistry, Tier};
+
+        let _path_lock = PATH_LOCK.lock().expect("lock PATH for test");
+        let (policy, tempdir, _path_guard) = {
+            let registry = PresetRegistry::load_builtin().expect("load presets");
+            let policy = compose_policy(Tier::Balanced, &[], None, &registry).expect("compose");
+            assert!(policy.network.dns.is_inactive());
+            let (tempdir, path_guard) = set_fake_openshell_path();
+            (policy, tempdir, path_guard)
+        };
+        let runner = Arc::new(FlexibleCommandRunner::new(vec![
+            FlexibleCommandExpectation::success(
+                "openshell",
+                |call| {
+                    assert_args_prefix_suffix(
+                        &call.request.args,
+                        &["policy", "set", "devbox", "--policy"],
+                        &["--wait"],
+                    );
+                },
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime
+            .block_on(async {
+                driver
+                    .apply_policy(agentenv_proto::ApplyPolicyParams {
+                        handle: "devbox".to_owned(),
+                        policy,
+                    })
+                    .await
+            })
+            .expect("apply_policy");
+
+        assert!(result.hot_reloaded);
+        assert_eq!(runner.calls().len(), 1);
         std::fs::remove_dir_all(tempdir).expect("remove tempdir");
     }
 
@@ -5130,6 +7746,188 @@ mod driver_tests {
                     ],
                     env
                 ),
+            }]
+        );
+    }
+
+    #[test]
+    fn create_rolls_back_when_ambiguous_create_failure_left_sandbox() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "leaked-sandbox",
+                    "--no-auto-providers",
+                    "--from",
+                    "openclaw",
+                    "--",
+                    "true",
+                ],
+                Some(1),
+                "",
+                "Sandbox.metadata: SandboxResponse.sandbox: unexpected end group tag",
+            ),
+            CommandScript::output(
+                "openshell",
+                &["sandbox", "get", "leaked-sandbox"],
+                Some(1),
+                "",
+                "not found yet",
+            ),
+            CommandScript::output(
+                "openshell",
+                &["sandbox", "list"],
+                Some(0),
+                "NAME              NAMESPACE  CREATED              PHASE\nleaked-sandbox    openshell  2026-05-09 18:50   Provisioning\n",
+                "",
+            ),
+            CommandScript::success("openshell", &["sandbox", "delete", "leaked-sandbox"], "", ""),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("leaked-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("ambiguous create failure should be returned");
+
+        assert!(err.to_string().contains("unexpected end group tag"));
+        assert_eq!(
+            runner.calls(),
+            vec![
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "create",
+                        "--name",
+                        "leaked-sandbox",
+                        "--no-auto-providers",
+                        "--from",
+                        "openclaw",
+                        "--",
+                        "true",
+                    ]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "get", "leaked-sandbox"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "list"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "delete", "leaked-sandbox"]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn create_does_not_delete_preexisting_sandbox_after_ambiguous_create_failure() {
+        let runner = Arc::new(PreexistingAmbiguousCreateRunner::default());
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("existing-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("ambiguous create failure should be returned");
+
+        assert!(err.to_string().contains("unexpected end group tag"));
+        assert!(
+            !runner.calls().iter().any(|call| {
+                call.request.args
+                    == ["sandbox", "delete", "existing-sandbox"]
+                        .iter()
+                        .map(|arg| (*arg).to_owned())
+                        .collect::<Vec<_>>()
+            }),
+            "pre-existing sandbox must not be deleted"
+        );
+    }
+
+    #[test]
+    fn create_does_not_roll_back_plain_create_rejection() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
+            "openshell",
+            &[
+                "sandbox",
+                "create",
+                "--name",
+                "existing-sandbox",
+                "--no-auto-providers",
+                "--from",
+                "openclaw",
+                "--",
+                "true",
+            ],
+            Some(1),
+            "",
+            "sandbox already exists",
+        )]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("existing-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("create rejection should be returned");
+
+        assert!(err.to_string().contains("sandbox already exists"));
+        assert_eq!(
+            runner.calls(),
+            vec![CommandCall {
+                program: "openshell".to_owned(),
+                request: command_request(&[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "existing-sandbox",
+                    "--no-auto-providers",
+                    "--from",
+                    "openclaw",
+                    "--",
+                    "true",
+                ]),
             }]
         );
     }
@@ -8006,6 +10804,22 @@ mod driver_tests {
                 "2026-04-19T00:00:00Z WARN action=deny DENIED outbound to api.example.com\nplain info line",
                 "",
             ),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-1",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
             CommandScript::success(
                 "openshell",
                 &["logs", "sb-1", "--tail", "--since", "2026-04-19T00:00:00Z"],
@@ -8113,6 +10927,19 @@ mod driver_tests {
                 CommandCall {
                     program: "openshell".to_owned(),
                     request: command_request(&["logs", "sb-1", "--since", "2026-04-19T00:00:00Z"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "exec",
+                        "--name",
+                        "sb-1",
+                        "--",
+                        "sh",
+                        "-lc",
+                        "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                    ]),
                 },
                 CommandCall {
                     program: "openshell".to_owned(),
@@ -8232,13 +11059,31 @@ mod driver_tests {
 
     #[test]
     fn logs_denied_lines_set_egress_denied_kv() {
-        let runner = Arc::new(RecordingCommandRunner::new(vec![CommandScript::output(
-            "openshell",
-            &["logs", "sb-2"],
-            Some(0),
-            "2026-04-19T00:00:00Z INFO action=deny BLOCKED outbound",
-            "",
-        )]));
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "openshell",
+                &["logs", "sb-2"],
+                Some(0),
+                "2026-04-19T00:00:00Z INFO action=deny BLOCKED outbound",
+                "",
+            ),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-2",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                ],
+                Some(0),
+                "",
+                "",
+            ),
+        ]));
         let driver = OpenShellDriver::with_command_runner(runner);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8261,6 +11106,58 @@ mod driver_tests {
         assert_eq!(logs.entries[0].level, LogLevel::Info);
         assert_eq!(
             logs.entries[0].kv.get("egress_denied"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn logs_include_dns_guard_denials_for_active_dns_policy() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::output(
+                "openshell",
+                &["logs", "sb-2"],
+                Some(0),
+                "plain info line",
+                "",
+            ),
+            CommandScript::output(
+                "openshell",
+                &[
+                    "sandbox",
+                    "exec",
+                    "--name",
+                    "sb-2",
+                    "--",
+                    "sh",
+                    "-lc",
+                    "if [ -r /var/log/agentenv-openshell-dns-guard.log ]; then cat /var/log/agentenv-openshell-dns-guard.log; fi",
+                ],
+                Some(0),
+                "dns_guard sandbox_handle=sb-2 query_name=secret.example qtype=A upstream=1.1.1.1:53 cname_chain=- answers=- ttl=- action=deny reason=dns_query_not_allowed",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let logs = runtime
+            .block_on(async {
+                driver
+                    .logs(LogsParams {
+                        handle: "sb-2".to_owned(),
+                        since: None,
+                        follow: false,
+                    })
+                    .await
+            })
+            .expect("logs");
+
+        assert_eq!(logs.entries.len(), 2);
+        assert_eq!(
+            logs.entries[1].kv.get("egress_denied"),
             Some(&Value::Bool(true))
         );
     }

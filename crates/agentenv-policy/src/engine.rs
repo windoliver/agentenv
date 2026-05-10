@@ -78,6 +78,7 @@ fn baseline_policy(tier: Tier) -> NetworkPolicy {
                 allow: Vec::new(),
                 deny: Vec::new(),
                 approval_required: Vec::new(),
+                dns: agentenv_proto::DnsPolicy::default(),
             },
             filesystem: FilesystemPolicy {
                 reloadability: PolicyReloadability::LockedAtCreate,
@@ -138,6 +139,9 @@ fn merge_policy(base: &mut NetworkPolicy, overrides: NetworkPolicy) {
         &mut base.network.approval_required,
         overrides.network.deny,
     );
+    if overrides.network.dns.is_active() {
+        base.network.dns = overrides.network.dns;
+    }
 
     merge_paths(
         &mut base.filesystem.read_write,
@@ -205,6 +209,9 @@ fn normalize(policy: &mut NetworkPolicy) {
     sort_and_dedup_rules(&mut policy.network.allow);
     sort_and_dedup_rules(&mut policy.network.deny);
     sort_and_dedup_rules(&mut policy.network.approval_required);
+    sort_and_dedup_strings(&mut policy.network.dns.resolvers_allowed);
+    sort_and_dedup_strings(&mut policy.network.dns.doh_upstreams_allowed);
+    sort_and_dedup_strings(&mut policy.network.dns.dot_upstreams_allowed);
 
     dedup_inference_routes_preserving_order(&mut policy.inference.routes);
 }

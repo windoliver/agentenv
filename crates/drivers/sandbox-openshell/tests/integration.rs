@@ -210,6 +210,7 @@ fn default_deny_policy() -> NetworkPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
             approval_required: Vec::new(),
+            dns: agentenv_proto::DnsPolicy::default(),
         },
         filesystem: live_openshell_filesystem_policy(),
         process: ProcessPolicy {

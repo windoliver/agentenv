@@ -1247,6 +1247,7 @@ mod tests {
                 supports_native_inference_routing: false,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_dns_egress_control: false,
                 supports_snapshots: false,
                 supports_fork: false,
             })),
@@ -1373,6 +1374,7 @@ mod tests {
                         supports_native_inference_routing: true,
                         supports_remote_host: false,
                         supports_persistent_sessions: false,
+                        supports_dns_egress_control: false,
                         supports_snapshots: false,
                         supports_fork: false,
                     })
@@ -1540,6 +1542,7 @@ mod tests {
                 supports_native_inference_routing: true,
                 supports_remote_host: false,
                 supports_persistent_sessions: false,
+                supports_dns_egress_control: false,
                 supports_snapshots: false,
                 supports_fork: false,
             })),

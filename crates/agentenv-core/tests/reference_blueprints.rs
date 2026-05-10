@@ -156,6 +156,21 @@ fn all_reference_blueprints_parse() {
         );
         assert_eq!(blueprint.sandbox.driver, "openshell", "{path}");
         assert_eq!(blueprint.agent.driver, expected.agent_driver, "{path}");
+        if expected.agent_driver == "openclaw" {
+            assert_eq!(
+                blueprint
+                    .agent
+                    .extra
+                    .get("provider")
+                    .and_then(|value| value.as_str()),
+                Some("openai"),
+                "{path}"
+            );
+            assert!(
+                !blueprint.agent.extra.contains_key("config"),
+                "{path}: openclaw provider must be a direct agent field"
+            );
+        }
         assert_eq!(blueprint.context.driver, expected.context_driver, "{path}");
         assert_eq!(blueprint.policy.tier, expected.tier, "{path}");
         assert_eq!(

@@ -18,13 +18,21 @@ agentenv-core = { path = "../../agentenv-core" }
 agentenv-events = { path = "../../agentenv-events" }
 agentenv-policy = { path = "../../agentenv-policy" }
 agentenv-proto = { path = "../../agentenv-proto" }
+anyhow.workspace = true
 async-trait.workspace = true
+hickory-proto.workspace = true
+ipnet.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
+tokio.workspace = true
+tokio-rustls.workspace = true
+url.workspace = true
 uuid.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 driver-conformance = { path = "../../../tests/driver-conformance" }

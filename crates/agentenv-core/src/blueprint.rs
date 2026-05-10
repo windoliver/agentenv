@@ -51,9 +51,26 @@ pub struct PolicySection {
     pub presets: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overrides: Vec<PolicyOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<PolicyDnsSection>,
     #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDnsSection {
+    #[serde(default)]
+    pub resolvers_allowed: Vec<String>,
+    #[serde(default)]
+    pub doh_upstreams_allowed: Vec<String>,
+    #[serde(default)]
+    pub dot_upstreams_allowed: Vec<String>,
+    #[serde(default)]
+    pub log_all_queries: bool,
+    #[serde(default)]
+    pub pin_resolved_ips: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
