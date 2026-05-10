@@ -45,7 +45,9 @@ config parsing, CLI overrides, provenance, documentation, and tests.
 - Do not add a fifth pluggable axis.
 - Do not add a `SkillsDriver` or any JSON-RPC driver method.
 - Do not introduce libgit2, OpenSSL, Python, Node, Docker, ORAS, or any
-  other build-time dependency to core.
+  external runtime dependency to core. Small Rust crate dependencies for
+  archive decoding are acceptable when they preserve the single-binary
+  distribution story and avoid OpenSSL.
 - Do not redesign the whole skills cache or CLI if the existing M7-2/M7-3
   implementation already satisfies the contract.
 - Do not implement in-sandbox agent discovery beyond preserving installed
