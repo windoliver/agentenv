@@ -31,6 +31,18 @@ struct FilesystemRegistryIndex {
     skills: Vec<SkillSearchHit>,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedFilesystemHit {
+    hit: SkillSearchHit,
+    source: FilesystemHitSource,
+}
+
+#[derive(Debug, Clone)]
+enum FilesystemHitSource {
+    Indexed,
+    Scanned(PathBuf),
+}
+
 impl FilesystemRegistryAdapter {
     pub(crate) fn new(name: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
@@ -180,7 +192,7 @@ impl FilesystemRegistryAdapter {
         &self,
         name: &str,
         version: Option<&str>,
-    ) -> Result<SkillSearchHit, SkillError> {
+    ) -> Result<ResolvedFilesystemHit, SkillError> {
         validate_skill_name(name)?;
         if let Some(version) = version {
             version
@@ -191,17 +203,37 @@ impl FilesystemRegistryAdapter {
                 })?;
         }
 
-        let index = self.read_index()?;
-        let matches = index
-            .skills
-            .into_iter()
+        let persisted = self.read_persisted_index()?;
+        let scanned = self.scan_index()?;
+        let persisted_hits = persisted.skills;
+        let mut matches = persisted_hits
+            .iter()
             .filter(|hit| hit.name == name)
+            .cloned()
+            .map(|hit| ResolvedFilesystemHit {
+                hit,
+                source: FilesystemHitSource::Indexed,
+            })
             .collect::<Vec<_>>();
+        for hit in scanned.skills {
+            if contains_hit(&persisted_hits, &hit) || hit.name != name {
+                continue;
+            }
+            let path = self.scanned_bundle_path_for_hit(&hit)?.ok_or_else(|| {
+                SkillError::SkillNotInstalled {
+                    name: hit.name.clone(),
+                }
+            })?;
+            matches.push(ResolvedFilesystemHit {
+                hit,
+                source: FilesystemHitSource::Scanned(path),
+            });
+        }
 
         if let Some(version) = version {
             return matches
                 .into_iter()
-                .find(|hit| hit.version == version)
+                .find(|resolved| resolved.hit.version == version)
                 .ok_or_else(|| SkillError::SkillNotInstalled {
                     name: name.to_owned(),
                 });
@@ -209,18 +241,29 @@ impl FilesystemRegistryAdapter {
 
         matches
             .into_iter()
-            .max_by(|left, right| compare_versions(&left.version, &right.version))
+            .max_by(|left, right| compare_versions(&left.hit.version, &right.hit.version))
             .ok_or_else(|| SkillError::SkillNotInstalled {
                 name: name.to_owned(),
             })
     }
 
-    fn bundle_path_for_hit(&self, hit: &SkillSearchHit) -> Result<Option<PathBuf>, SkillError> {
-        if let Some(path) =
-            existing_child_directory(&self.root, &[BUNDLES_DIR, &hit.name, &hit.version])?
-        {
-            return Ok(Some(path));
+    fn bundle_path_for_hit(&self, resolved: &ResolvedFilesystemHit) -> Result<PathBuf, SkillError> {
+        match &resolved.source {
+            FilesystemHitSource::Indexed => existing_child_directory(
+                &self.root,
+                &[BUNDLES_DIR, &resolved.hit.name, &resolved.hit.version],
+            )?
+            .ok_or_else(|| SkillError::SkillNotInstalled {
+                name: resolved.hit.name.clone(),
+            }),
+            FilesystemHitSource::Scanned(path) => Ok(path.clone()),
         }
+    }
+
+    fn scanned_bundle_path_for_hit(
+        &self,
+        hit: &SkillSearchHit,
+    ) -> Result<Option<PathBuf>, SkillError> {
         for entry in fs::read_dir(&self.root).map_err(|source| SkillError::Io {
             path: self.root.clone(),
             source,
@@ -283,12 +326,9 @@ impl RegistryAdapter for FilesystemRegistryAdapter {
 
     async fn fetch(&self, name: &str, version: Option<&str>) -> Result<FetchedSkill, SkillError> {
         ensure_directory(&self.root)?;
-        let hit = self.resolved_hit(name, version)?;
-        let bundle_path =
-            self.bundle_path_for_hit(&hit)?
-                .ok_or_else(|| SkillError::SkillNotInstalled {
-                    name: hit.name.clone(),
-                })?;
+        let resolved = self.resolved_hit(name, version)?;
+        let hit = &resolved.hit;
+        let bundle_path = self.bundle_path_for_hit(&resolved)?;
         let manifest = super::load_skill_manifest(&bundle_path)?;
         if manifest.name != hit.name || manifest.version.to_string() != hit.version {
             return Err(SkillError::UnsafeBundlePath {

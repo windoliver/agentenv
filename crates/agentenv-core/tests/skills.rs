@@ -1402,7 +1402,39 @@ async fn filesystem_registry_rejects_duplicate_scanned_skill_versions() {
         .await
         .expect_err("duplicate scanned skill versions must be rejected");
 
-    assert!(matches!(error, SkillError::InvalidConfig { .. }));
+    assert!(matches!(&error, SkillError::InvalidConfig { message }
+            if message.contains("duplicate-scan") && message.contains("0.1.0")));
+}
+
+#[tokio::test]
+async fn filesystem_registry_fetch_does_not_fallback_to_shadowed_scanned_directory() {
+    let home = temp_dir("skill-fs-shadow-home");
+    let registry = temp_dir("skill-fs-shadow-registry");
+    write_file(
+        &registry.join("index.yaml"),
+        "skills:\n  - name: shadowed-skill\n    version: 0.1.0\n    registry: local-dev\n",
+    );
+    write_file(
+        &registry.join("dev-copy/skill.yaml"),
+        "name: shadowed-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(
+        &registry.join("dev-copy/SKILL.md"),
+        "# Should not install\n",
+    );
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "shadowed-skill@0.1.0".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("indexed hit with missing bundle must not fall back to scanned directory");
+
+    assert!(matches!(error, SkillError::SkillNotInstalled { name } if name == "shadowed-skill"));
+    assert!(service.list().unwrap().is_empty());
 }
 
 #[tokio::test]
