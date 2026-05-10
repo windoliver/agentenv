@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -1754,6 +1754,37 @@ async fn http_registry_publish_and_add_round_trip() {
 }
 
 #[tokio::test]
+async fn http_registry_publish_updates_existing_index_json() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response("GET", "/index.json", r#"{"skills":[]}"#)
+        .await;
+    let home = temp_dir("skill-http-json-publish-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("json-published", "0.1.0", "JSON publish"),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should update existing JSON index");
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "json-published@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should read updated JSON index");
+
+    assert_eq!(installed.name, "json-published");
+}
+
+#[tokio::test]
 async fn http_registry_add_downloads_tar_zst_skill_artifact() {
     let server = TestHttpRegistry::start().await;
     let bundle = skill_bundle("tarball-skill", "0.1.0", "Tarball skill");
@@ -1785,6 +1816,79 @@ async fn http_registry_add_downloads_tar_zst_skill_artifact() {
 
     assert_eq!(installed.name, "tarball-skill");
     assert_eq!(installed.source_label, "http:http-dev:tarball-skill@0.1.0");
+}
+
+#[tokio::test]
+async fn http_registry_add_rejects_tar_zst_parent_traversal_entry() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("unsafe-tarball-skill", "0.1.0", "Unsafe tarball skill");
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"unsafe-tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/unsafe-tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes_with_extra_file(&bundle, "../evil", b"evil"),
+    )
+    .await;
+    let home = temp_dir("skill-http-tarball-traversal-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "unsafe-tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("add should reject unsafe tar path");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsafeBundlePath { .. } | SkillError::InvalidConfig { .. }
+    ));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_registry_add_rejects_tar_zst_symlink_entry() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("symlink-tarball-skill", "0.1.0", "Symlink tarball skill");
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"symlink-tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/symlink-tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes_with_symlink(&bundle, "linked-skill.md", "SKILL.md"),
+    )
+    .await;
+    let home = temp_dir("skill-http-tarball-symlink-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "symlink-tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("add should reject tar symlink");
+
+    assert!(matches!(error, SkillError::UnsafeBundlePath { .. }));
+    assert!(service.list().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1962,15 +2066,60 @@ fn tar_zst_bundle_bytes(bundle_path: &Path) -> Vec<u8> {
     let mut tar_bytes = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, bundle_path);
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn tar_zst_bundle_bytes_with_extra_file(
+    bundle_path: &Path,
+    entry_path: &str,
+    content: &[u8],
+) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, bundle_path);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.as_mut_bytes()[0..entry_path.len()].copy_from_slice(entry_path.as_bytes());
+        header.set_cksum();
+        builder.append(&header, io::Cursor::new(content)).unwrap();
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn tar_zst_bundle_bytes_with_symlink(
+    bundle_path: &Path,
+    entry_path: &str,
+    target_path: &str,
+) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, bundle_path);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_link_name(target_path).unwrap();
+        header.set_cksum();
         builder
-            .append_path_with_name(bundle_path.join("skill.yaml"), "skill.yaml")
-            .unwrap();
-        builder
-            .append_path_with_name(bundle_path.join("SKILL.md"), "SKILL.md")
+            .append_data(&mut header, entry_path, io::empty())
             .unwrap();
         builder.finish().unwrap();
     }
     zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn append_bundle_minimal_files<W: io::Write>(builder: &mut tar::Builder<W>, bundle_path: &Path) {
+    builder
+        .append_path_with_name(bundle_path.join("skill.yaml"), "skill.yaml")
+        .unwrap();
+    builder
+        .append_path_with_name(bundle_path.join("SKILL.md"), "SKILL.md")
+        .unwrap();
 }
 
 async fn add_binary_response(server: &TestHttpRegistry, method: &str, path: &str, body: Vec<u8>) {

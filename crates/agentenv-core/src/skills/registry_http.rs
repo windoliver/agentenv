@@ -41,6 +41,12 @@ struct HttpRegistryIndex {
     skills: Vec<SkillSearchHit>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HttpRegistryIndexFormat {
+    Json,
+    Yaml,
+}
+
 impl HttpRegistryAdapter {
     pub(crate) fn new(
         name: impl Into<String>,
@@ -131,17 +137,25 @@ impl HttpRegistryAdapter {
     }
 
     async fn read_index(&self) -> Result<HttpRegistryIndex, SkillError> {
+        self.read_index_with_format()
+            .await
+            .map(|(index, _format)| index)
+    }
+
+    async fn read_index_with_format(
+        &self,
+    ) -> Result<(HttpRegistryIndex, HttpRegistryIndexFormat), SkillError> {
         if let Some(content) = self.get_optional_text(self.index_json_url()?).await? {
             let mut index: HttpRegistryIndex =
                 serde_json::from_str(&content).map_err(|source| SkillError::InvalidConfig {
                     message: format!("failed to parse HTTP registry index JSON: {source}"),
                 })?;
             self.validate_index(&mut index)?;
-            return Ok(index);
+            return Ok((index, HttpRegistryIndexFormat::Json));
         }
 
         let Some(content) = self.get_optional_text(self.index_yaml_url()?).await? else {
-            return Ok(HttpRegistryIndex::default());
+            return Ok((HttpRegistryIndex::default(), HttpRegistryIndexFormat::Yaml));
         };
         let mut index: HttpRegistryIndex =
             serde_yaml::from_str(&content).map_err(|source| SkillError::Yaml {
@@ -149,7 +163,7 @@ impl HttpRegistryAdapter {
                 source,
             })?;
         self.validate_index(&mut index)?;
-        Ok(index)
+        Ok((index, HttpRegistryIndexFormat::Yaml))
     }
 
     fn validate_index(&self, index: &mut HttpRegistryIndex) -> Result<(), SkillError> {
@@ -159,14 +173,31 @@ impl HttpRegistryAdapter {
         Ok(())
     }
 
-    async fn write_index(&self, mut index: HttpRegistryIndex) -> Result<(), SkillError> {
+    async fn write_index(
+        &self,
+        mut index: HttpRegistryIndex,
+        format: HttpRegistryIndexFormat,
+    ) -> Result<(), SkillError> {
         sort_hits(&mut index.skills);
-        let content = serde_yaml::to_string(&index).map_err(|source| SkillError::Serde {
-            path: PathBuf::from(INDEX_YAML_FILE),
-            source,
-        })?;
-        self.put_bytes(self.index_yaml_url()?, content.into_bytes())
-            .await
+        match format {
+            HttpRegistryIndexFormat::Json => {
+                let content = serde_json::to_vec_pretty(&index).map_err(|source| {
+                    SkillError::InvalidConfig {
+                        message: format!("failed to serialize HTTP registry index JSON: {source}"),
+                    }
+                })?;
+                self.put_bytes(self.index_json_url()?, content).await
+            }
+            HttpRegistryIndexFormat::Yaml => {
+                let content =
+                    serde_yaml::to_string(&index).map_err(|source| SkillError::Serde {
+                        path: PathBuf::from(INDEX_YAML_FILE),
+                        source,
+                    })?;
+                self.put_bytes(self.index_yaml_url()?, content.into_bytes())
+                    .await
+            }
+        }
     }
 
     fn validate_hit(&self, hit: &mut SkillSearchHit) -> Result<(), SkillError> {
@@ -429,7 +460,7 @@ impl RegistryAdapter for HttpRegistryAdapter {
         verify_publish_signature(&manifest, &digest, allow_unsigned)?;
         let version = manifest.version.to_string();
         let hit = self.hit_for_manifest(&manifest, digest.clone());
-        let mut index = self.read_index().await?;
+        let (mut index, index_format) = self.read_index_with_format().await?;
 
         if let Some(existing) = index
             .skills
@@ -465,7 +496,7 @@ impl RegistryAdapter for HttpRegistryAdapter {
             .skills
             .retain(|existing| existing.name != hit.name || existing.version != hit.version);
         index.skills.push(hit.clone());
-        self.write_index(index).await?;
+        self.write_index(index, index_format).await?;
         Ok(hit)
     }
 }
