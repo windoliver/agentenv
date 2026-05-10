@@ -48,7 +48,7 @@ impl FilesystemRegistryAdapter {
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_) => return Err(SkillError::UnsafeBundlePath { path }),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(FilesystemRegistryIndex::default());
+                return self.scan_index();
             }
             Err(source) => {
                 return Err(SkillError::Io { path, source });
@@ -62,6 +62,39 @@ impl FilesystemRegistryAdapter {
             self.validate_hit(hit)?;
         }
         Ok(index)
+    }
+
+    fn scan_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
+        let mut skills = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(|source| SkillError::Io {
+            path: self.root.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| SkillError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| SkillError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !metadata.file_type().is_dir() {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(BUNDLES_DIR) {
+                continue;
+            }
+            let manifest_path = path.join(MANIFEST_FILE);
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let manifest = super::load_skill_manifest(&path)?;
+            let digest = compute_bundle_digest(&path, &manifest)?;
+            skills.push(self.hit_for_manifest(&manifest, digest));
+        }
+        sort_hits(&mut skills);
+        Ok(FilesystemRegistryIndex { skills })
     }
 
     fn validate_hit(&self, hit: &mut SkillSearchHit) -> Result<(), SkillError> {
@@ -159,6 +192,45 @@ impl FilesystemRegistryAdapter {
                 name: name.to_owned(),
             })
     }
+
+    fn bundle_path_for_hit(&self, hit: &SkillSearchHit) -> Result<Option<PathBuf>, SkillError> {
+        if let Some(path) =
+            existing_child_directory(&self.root, &[BUNDLES_DIR, &hit.name, &hit.version])?
+        {
+            return Ok(Some(path));
+        }
+        for entry in fs::read_dir(&self.root).map_err(|source| SkillError::Io {
+            path: self.root.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| SkillError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if !fs::symlink_metadata(&path)
+                .map_err(|source| SkillError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+                .file_type()
+                .is_dir()
+            {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(BUNDLES_DIR) {
+                continue;
+            }
+            if !path.join(MANIFEST_FILE).is_file() {
+                continue;
+            }
+            let manifest = super::load_skill_manifest(&path)?;
+            if manifest.name == hit.name && manifest.version.to_string() == hit.version {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -191,7 +263,7 @@ impl RegistryAdapter for FilesystemRegistryAdapter {
         ensure_directory(&self.root)?;
         let hit = self.resolved_hit(name, version)?;
         let bundle_path =
-            existing_child_directory(&self.root, &[BUNDLES_DIR, &hit.name, &hit.version])?
+            self.bundle_path_for_hit(&hit)?
                 .ok_or_else(|| SkillError::SkillNotInstalled {
                     name: hit.name.clone(),
                 })?;

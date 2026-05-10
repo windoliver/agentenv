@@ -1300,6 +1300,52 @@ async fn filesystem_registry_search_add_and_publish_work() {
 }
 
 #[tokio::test]
+async fn filesystem_registry_search_scans_skill_subdirectories_without_index() {
+    let home = temp_dir("skill-fs-scan-home");
+    let registry = temp_dir("skill-fs-scan-registry");
+    write_file(
+        &registry.join("scan-skill/skill.yaml"),
+        "name: scan-skill\nversion: 0.2.0\ndescription: Scan demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("scan-skill/SKILL.md"), "# Scan demo\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let hits = service.search("scan").await.expect("search should scan");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "scan-skill");
+    assert_eq!(hits[0].version, "0.2.0");
+    assert_eq!(hits[0].registry, "local-dev");
+}
+
+#[tokio::test]
+async fn filesystem_registry_add_uses_scanned_subdirectory_without_index() {
+    let home = temp_dir("skill-fs-scan-add-home");
+    let registry = temp_dir("skill-fs-scan-add-registry");
+    write_file(
+        &registry.join("scan-add/skill.yaml"),
+        "name: scan-add\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("scan-add/SKILL.md"), "# Scan add\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "scan-add".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should use scanned directory");
+
+    assert_eq!(installed.name, "scan-add");
+    assert_eq!(
+        installed.source_label,
+        "filesystem:local-dev:scan-add@0.1.0"
+    );
+}
+
+#[tokio::test]
 async fn skill_service_add_without_version_installs_highest_semver() {
     let home = temp_dir("skill-fs-highest-home");
     let registry = temp_dir("skill-fs-highest-registry");
