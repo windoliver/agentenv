@@ -94,7 +94,7 @@ fn require_non_empty(field: &str, value: &str) -> Result<(), SkillError> {
 
 fn reject_secret_text(value: &str) -> Result<(), SkillError> {
     let lowered = value.to_ascii_lowercase();
-    if lowered.contains("sk-")
+    if contains_suspicious_sk_token(&lowered)
         || lowered.contains("bearer ")
         || lowered.contains("token ")
         || lowered.contains("token:")
@@ -108,10 +108,23 @@ fn reject_secret_text(value: &str) -> Result<(), SkillError> {
     Ok(())
 }
 
+fn contains_suspicious_sk_token(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+        })
+        .any(|token| {
+            token
+                .strip_prefix("sk-")
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+}
+
 fn template_variables_in(field: &str, value: &str) -> Result<BTreeSet<String>, SkillError> {
     let mut variables = BTreeSet::new();
     let mut remainder = value;
     while let Some(start) = remainder.find("{{") {
+        reject_stray_closing_marker(field, &remainder[..start])?;
         let after_start = &remainder[start + 2..];
         let Some(end) = after_start.find("}}") else {
             return Err(SkillError::InvalidConfig {
@@ -125,5 +138,15 @@ fn template_variables_in(field: &str, value: &str) -> Result<BTreeSet<String>, S
         variables.insert(variable.to_owned());
         remainder = &after_start[end + 2..];
     }
+    reject_stray_closing_marker(field, remainder)?;
     Ok(variables)
+}
+
+fn reject_stray_closing_marker(field: &str, value: &str) -> Result<(), SkillError> {
+    if value.contains("}}") {
+        return Err(SkillError::InvalidConfig {
+            message: format!("{field} contains a stray closing template marker"),
+        });
+    }
+    Ok(())
 }

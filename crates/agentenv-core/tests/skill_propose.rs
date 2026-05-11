@@ -133,10 +133,37 @@ fn generalization_validation_rejects_secrets_in_llm_text_fields() {
 }
 
 #[test]
+fn generalization_validation_allows_non_secret_sk_words() {
+    let mut generalization = clean_generalization();
+    generalization.description =
+        "Use task-specific steps for disk-backed filesystem edits.".to_owned();
+    generalization.skill_md_body =
+        "Use task-specific steps for disk-backed edits to {{target_path}}.".to_owned();
+
+    validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap();
+}
+
+#[test]
+fn generalization_validation_rejects_actual_sk_secret_tokens() {
+    let mut generalization = clean_generalization();
+    generalization.description = "Use sk-secret from the trace".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
 fn generalization_validation_rejects_undeclared_placeholders() {
     let mut generalization = clean_generalization();
     generalization.template_variables = Vec::new();
     generalization.skill_md_body = "Read {{target_path}} before editing.".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_stray_closing_placeholder_markers() {
+    let mut generalization = clean_generalization();
+    generalization.skill_md_body = "Read {{target_path}} before editing }}.".to_owned();
 
     assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
 }
