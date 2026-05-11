@@ -1251,6 +1251,33 @@ fn skills_registry_cli_path_override_publishes_searches_and_adds() {
 }
 
 #[test]
+fn skills_search_accepts_git_registry_override_syntax() {
+    let temp_dir = make_temp_dir("skills-cli-git-registry-override");
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("registry")
+        .arg("--registry")
+        .arg("git+https://127.0.0.1/acme/skills")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!search.status.success());
+    let stderr = String::from_utf8_lossy(&search.stderr);
+    assert!(
+        !stderr.contains("unsupported registry URL scheme"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("blocked by SSRF policy") || stderr.contains("git registry"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn skills_registry_config_precedence_is_user_project_then_cli() {
     let temp_dir = make_temp_dir("skills-cli-registry-precedence");
     let user_registry = temp_dir.join("user-registry");
