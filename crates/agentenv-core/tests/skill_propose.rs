@@ -75,23 +75,7 @@ fn argument_shape_redacts_secret_like_values() {
 
 #[test]
 fn generalization_validation_accepts_schema_clean_output() {
-    let generalization = SkillGeneralization {
-        name: "fs-edit-skill".to_owned(),
-        description: "Edit a repeated filesystem target.".to_owned(),
-        template_variables: vec![TemplateVariable {
-            name: "target_path".to_owned(),
-            description: "Path to the file being edited.".to_owned(),
-            example: "src/lib.rs".to_owned(),
-        }],
-        procedure_steps: vec![ProcedureStep {
-            tool: Some("fs_read".to_owned()),
-            instruction: "Read {{target_path}} before editing.".to_owned(),
-        }],
-        self_test: ProposedSelfTest {
-            command: "test -f SKILL.md".to_owned(),
-        },
-        skill_md_body: "Read {{target_path}} before editing.".to_owned(),
-    };
+    let generalization = clean_generalization();
 
     validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap();
 }
@@ -124,6 +108,77 @@ fn generalization_validation_rejects_invalid_names_and_secret_leaks() {
         skill_md_body: "token sk-secret".to_owned(),
     };
     assert!(validate_generalization(&secret_body, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_secrets_in_llm_text_fields() {
+    let mut secret_description = clean_generalization();
+    secret_description.description = "Use api_key from the trace".to_owned();
+    assert!(validate_generalization(&secret_description, &["fs_read".to_owned()]).is_err());
+
+    let mut secret_variable_description = clean_generalization();
+    secret_variable_description.template_variables[0].description =
+        "Password captured from args".to_owned();
+    assert!(
+        validate_generalization(&secret_variable_description, &["fs_read".to_owned()]).is_err()
+    );
+
+    let mut secret_variable_example = clean_generalization();
+    secret_variable_example.template_variables[0].example = "token: copied".to_owned();
+    assert!(validate_generalization(&secret_variable_example, &["fs_read".to_owned()]).is_err());
+
+    let mut secret_self_test = clean_generalization();
+    secret_self_test.self_test.command = "echo Bearer copied".to_owned();
+    assert!(validate_generalization(&secret_self_test, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_undeclared_placeholders() {
+    let mut generalization = clean_generalization();
+    generalization.template_variables = Vec::new();
+    generalization.skill_md_body = "Read {{target_path}} before editing.".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_duplicate_template_variables() {
+    let mut generalization = clean_generalization();
+    generalization.template_variables.push(TemplateVariable {
+        name: "target_path".to_owned(),
+        description: "Duplicate path variable.".to_owned(),
+        example: "src/main.rs".to_owned(),
+    });
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_unknown_procedure_step_tools() {
+    let mut generalization = clean_generalization();
+    generalization.procedure_steps[0].tool = Some("unknown_tool".to_owned());
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+fn clean_generalization() -> SkillGeneralization {
+    SkillGeneralization {
+        name: "fs-edit-skill".to_owned(),
+        description: "Edit a repeated filesystem target.".to_owned(),
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Path to the file being edited.".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        procedure_steps: vec![ProcedureStep {
+            tool: Some("fs_read".to_owned()),
+            instruction: "Read {{target_path}} before editing.".to_owned(),
+        }],
+        self_test: ProposedSelfTest {
+            command: "test -f SKILL.md".to_owned(),
+        },
+        skill_md_body: "Read {{target_path}} before editing.".to_owned(),
+    }
 }
 
 fn trace(trace_id: &str, calls: Vec<TraceToolCall>) -> TraceRun {
