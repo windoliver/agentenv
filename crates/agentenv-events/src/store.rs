@@ -258,6 +258,7 @@ impl SqliteEventStore {
 
     pub fn query_trace_runs(&self, query: TraceQuery) -> StoreResult<Vec<TraceRun>> {
         let conn = self.connection()?;
+        let limit = query.limit.clamp(1, 10_000);
         let trace_ids = candidate_trace_ids(&conn, &query)?;
         let rows = trace_rows(&conn, &trace_ids, query.env.as_deref())?;
 
@@ -309,15 +310,20 @@ impl SqliteEventStore {
             }
         }
 
-        let mut runs: Vec<_> = traces
-            .into_values()
-            .filter_map(|accumulator| {
-                (accumulator.matches_blueprint
+        let mut runs = Vec::new();
+        for trace_id in trace_ids {
+            if let Some(accumulator) = traces.remove(&trace_id) {
+                if accumulator.matches_blueprint
                     && !accumulator.is_excluded()
-                    && !accumulator.trace.calls.is_empty())
-                .then_some(accumulator.trace)
-            })
-            .collect();
+                    && !accumulator.trace.calls.is_empty()
+                {
+                    runs.push(accumulator.trace);
+                    if runs.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
         runs.sort_by(|left, right| left.trace_id.cmp(&right.trace_id));
         Ok(runs)
     }
@@ -604,7 +610,6 @@ impl SqliteEventStore {
 }
 
 fn candidate_trace_ids(conn: &Connection, query: &TraceQuery) -> StoreResult<Vec<String>> {
-    let limit = query.limit.clamp(1, 10_000);
     let mut sql = String::from(
         r#"
         SELECT trace_id, MAX(id) AS latest_event_id
@@ -627,7 +632,7 @@ fn candidate_trace_ids(conn: &Connection, query: &TraceQuery) -> StoreResult<Vec
         LIMIT ?
         "#,
     );
-    query_params.push(SqlValue::Integer(limit as i64));
+    query_params.push(SqlValue::Integer(10_000));
 
     let mut stmt = conn.prepare(&sql)?;
     let raw_rows = stmt.query_map(params_from_iter(query_params), |row| {

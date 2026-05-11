@@ -97,6 +97,14 @@ fn trace_query_excludes_denied_pending_and_error_traces() {
                 "fs_read",
                 ActivityResult::Error,
             ),
+            event(
+                "pending-trace",
+                1,
+                "demo",
+                "sha256:blueprint-a",
+                "fs_read",
+                ActivityResult::Ok,
+            ),
             ActivityEvent::new(
                 "2026-05-11T00:00:03Z",
                 ActivityKind::ApprovalRequested,
@@ -220,6 +228,55 @@ fn trace_query_limit_selects_complete_trace_runs_not_raw_events() {
     assert_eq!(traces[0].calls.len(), 2);
     assert_eq!(traces[0].calls[0].tool, "fs_read");
     assert_eq!(traces[0].calls[1].tool, "fs_write");
+}
+
+#[test]
+fn trace_query_limit_skips_excluded_candidates_to_return_successful_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+    store
+        .append_many(&[
+            event(
+                "older-valid-trace",
+                1,
+                "demo",
+                "sha256:blueprint-a",
+                "fs_read",
+                ActivityResult::Ok,
+            ),
+            event(
+                "newer-blocked-trace",
+                2,
+                "demo",
+                "sha256:blueprint-a",
+                "fs_read",
+                ActivityResult::Ok,
+            ),
+            ActivityEvent::new(
+                "2026-05-11T00:00:03Z",
+                ActivityKind::EgressDenied,
+                ActivityResult::Denied,
+                "newer-blocked-trace",
+            )
+            .with_env("demo"),
+        ])
+        .unwrap();
+
+    let traces = store
+        .query_trace_runs(TraceQuery {
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            env: Some("demo".to_owned()),
+            limit: 1,
+        })
+        .unwrap();
+
+    assert_eq!(
+        traces
+            .iter()
+            .map(|trace| trace.trace_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["older-valid-trace"]
+    );
 }
 
 #[test]
