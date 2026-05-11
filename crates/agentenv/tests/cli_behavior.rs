@@ -1272,7 +1272,7 @@ fn skills_search_accepts_git_registry_override_syntax() {
         "stderr was: {stderr}"
     );
     assert!(
-        stderr.contains("blocked by SSRF policy") || stderr.contains("git registry"),
+        stderr.contains("blocked by SSRF policy"),
         "stderr was: {stderr}"
     );
 }
