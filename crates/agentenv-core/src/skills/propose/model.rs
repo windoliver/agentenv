@@ -114,3 +114,22 @@ pub struct ProposalSelfTestReport {
     pub total_variables: u32,
     pub failures: Vec<String>,
 }
+
+#[derive(Debug, Clone)]
+pub struct ProposalEmitInput {
+    pub output_root: std::path::PathBuf,
+    pub candidate: ProposalCandidate,
+    pub generalization: SkillGeneralization,
+    pub score: ProposalScore,
+    pub self_test: ProposalSelfTestReport,
+    pub agentenv_version: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalEmitOutput {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub novelty: f32,
+    pub self_test_score: f32,
+}

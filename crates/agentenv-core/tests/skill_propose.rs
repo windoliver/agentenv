@@ -1,4 +1,8 @@
-use agentenv_core::skills::propose::{evaluate_self_test, ProposalSelfTestInput};
+use agentenv_core::skills::load_skill_manifest;
+use agentenv_core::skills::propose::{
+    emit_proposal, evaluate_self_test, CandidateToolCall, ProposalEmitInput, ProposalScore,
+    ProposalSelfTestInput,
+};
 use agentenv_core::skills::propose::{
     extract_candidates, normalize_args_shape, CandidateExtractionOptions, ProposalCandidate,
 };
@@ -491,6 +495,62 @@ fn self_test_no_variables_scores_variable_coverage_complete() {
     assert_eq!(report.score, 1.0);
 }
 
+#[test]
+fn proposal_writer_emits_skill_manifest_and_reports() {
+    let temp = temp_dir("proposal-writer");
+    let output_root = temp.join("proposed");
+    let generalization = valid_generalization();
+    let report = evaluate_self_test(ProposalSelfTestInput {
+        source_tools: vec!["fs_read".to_owned()],
+        procedure_steps: generalization.procedure_steps.clone(),
+        template_variables: generalization.template_variables.clone(),
+        min_score: 0.8,
+    })
+    .unwrap();
+
+    let output = emit_proposal(ProposalEmitInput {
+        output_root: output_root.clone(),
+        candidate: ProposalCandidate {
+            name_seed: "fs-read".to_owned(),
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            fingerprint: "fingerprint-a".to_owned(),
+            occurrences: 3,
+            sequence: vec![CandidateToolCall {
+                tool: "fs_read".to_owned(),
+                args_shape: serde_json::json!({"path": "string:path"}),
+            }],
+            source_trace_ids: vec![
+                "trace-1".to_owned(),
+                "trace-2".to_owned(),
+                "trace-3".to_owned(),
+            ],
+            redaction_count: 0,
+        },
+        generalization,
+        score: ProposalScore {
+            novelty: 0.9,
+            utility: 0.6,
+            final_score: 0.81,
+            nearest_matches: Vec::new(),
+            reasons: vec!["no existing skill matches".to_owned()],
+        },
+        self_test: report,
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-11T00:00:00Z".to_owned(),
+    })
+    .unwrap();
+
+    assert_eq!(output.name, "fs-edit-skill");
+    assert!(output.path.join("SKILL.md").is_file());
+    assert!(output.path.join("skill.yaml").is_file());
+    assert!(output.path.join("proposal.yaml").is_file());
+    assert!(output.path.join("self-test.json").is_file());
+    assert!(output.path.join("traces/provenance.json").is_file());
+    let manifest = load_skill_manifest(&output.path).unwrap();
+    assert_eq!(manifest.name, "fs-edit-skill");
+    assert_eq!(manifest.entry, std::path::PathBuf::from("SKILL.md"));
+}
+
 fn clean_generalization() -> SkillGeneralization {
     SkillGeneralization {
         name: "fs-edit-skill".to_owned(),
@@ -509,6 +569,39 @@ fn clean_generalization() -> SkillGeneralization {
         },
         skill_md_body: "Read {{target_path}} before editing.".to_owned(),
     }
+}
+
+fn valid_generalization() -> SkillGeneralization {
+    SkillGeneralization {
+        name: "fs-edit-skill".to_owned(),
+        description: "Edit a repeated filesystem target.".to_owned(),
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Target path".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        procedure_steps: vec![ProcedureStep {
+            tool: Some("fs_read".to_owned()),
+            instruction: "Read {{target_path}}.".to_owned(),
+        }],
+        self_test: ProposedSelfTest {
+            command: "test -f SKILL.md".to_owned(),
+        },
+        skill_md_body: "Read {{target_path}}.".to_owned(),
+    }
+}
+
+fn temp_dir(prefix: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    path
 }
 
 fn trace(trace_id: &str, calls: Vec<TraceToolCall>) -> TraceRun {
