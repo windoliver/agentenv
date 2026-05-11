@@ -21,6 +21,41 @@ pub struct SkillsConfig {
     pub registries: Vec<RegistryConfig>,
     #[serde(default)]
     pub registry_order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ProposalConfig>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProposalConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<ProposalLlmConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<ProposalSemanticConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<ProposalPrConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProposalLlmConfig {
+    pub provider: String,
+    pub endpoint: String,
+    pub model: String,
+    pub credential: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProposalSemanticConfig {
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProposalPrConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,6 +131,7 @@ fn apply_registry_override(
         return normalize_config(SkillsConfig {
             registries: vec![registry],
             registry_order: vec![CLI_REGISTRY_NAME.to_owned()],
+            proposal: config.proposal,
         });
     }
 
@@ -103,6 +139,7 @@ fn apply_registry_override(
         return normalize_config(SkillsConfig {
             registries: vec![RegistryConfig::oci(CLI_REGISTRY_NAME, registry, None)],
             registry_order: vec![CLI_REGISTRY_NAME.to_owned()],
+            proposal: config.proposal,
         });
     }
     if registry.contains('/') {
@@ -113,8 +150,12 @@ fn apply_registry_override(
 
     validate_skill_name(registry)?;
     let config = normalize_config(config)?;
-    let selected = config
-        .registries
+    let SkillsConfig {
+        registries,
+        proposal,
+        ..
+    } = config;
+    let selected = registries
         .into_iter()
         .find(|candidate| candidate.name == registry)
         .ok_or_else(|| SkillError::RegistryNotFound {
@@ -124,6 +165,7 @@ fn apply_registry_override(
     Ok(SkillsConfig {
         registries: vec![selected],
         registry_order: vec![registry.to_owned()],
+        proposal,
     })
 }
 
@@ -239,6 +281,7 @@ fn merge_project_over_user(
 ) -> Result<SkillsConfig, SkillError> {
     let user = normalize_config(user)?;
     let project = normalize_config(project)?;
+    let proposal = project.proposal.or(user.proposal);
     let mut by_name = BTreeMap::new();
     let mut order = Vec::new();
 
@@ -265,6 +308,7 @@ fn merge_project_over_user(
     normalize_config(SkillsConfig {
         registries: by_name.into_values().collect(),
         registry_order: order,
+        proposal,
     })
 }
 
@@ -482,7 +526,7 @@ fn validate_registry_order(config: &SkillsConfig) -> Result<(), SkillError> {
 }
 
 fn has_skills_config(config: &SkillsConfig) -> bool {
-    !config.registries.is_empty() || !config.registry_order.is_empty()
+    !config.registries.is_empty() || !config.registry_order.is_empty() || config.proposal.is_some()
 }
 
 fn invalid_config(message: impl Into<String>) -> SkillError {

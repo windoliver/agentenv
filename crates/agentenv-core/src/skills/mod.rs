@@ -21,7 +21,8 @@ pub use cache::{
     SkillVerifyOptions, SkillVerifyReport, SkillVerifyStatus, SKILL_METADATA_SCHEMA_VERSION,
 };
 pub use config::{
-    load_project_skills_config, load_user_skills_config, merge_skills_config, SkillsConfig,
+    load_project_skills_config, load_user_skills_config, merge_skills_config, ProposalConfig,
+    ProposalLlmConfig, ProposalPrConfig, ProposalSemanticConfig, SkillsConfig,
     SkillsConfigOverride,
 };
 pub use digest::compute_bundle_digest;
