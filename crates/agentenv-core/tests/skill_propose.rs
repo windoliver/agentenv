@@ -2,6 +2,9 @@ use agentenv_core::skills::propose::{
     extract_candidates, normalize_args_shape, CandidateExtractionOptions, ProposalCandidate,
 };
 use agentenv_core::skills::propose::{
+    score_proposal, ExistingSkillSummary, NoveltyBackend, ProposalScoreInput,
+};
+use agentenv_core::skills::propose::{
     validate_generalization, ProcedureStep, ProposedSelfTest, SkillGeneralization, TemplateVariable,
 };
 use agentenv_events::{ActivityResult, TraceRun, TraceToolCall};
@@ -252,6 +255,76 @@ fn generalization_validation_rejects_unknown_procedure_step_tools() {
     generalization.procedure_steps[0].tool = Some("unknown_tool".to_owned());
 
     assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn scoring_maps_duplicate_minor_variant_and_new_capability_to_ladder() {
+    let duplicate = score_proposal(ProposalScoreInput {
+        name: "review-skill".to_owned(),
+        description: "Review code changes".to_owned(),
+        procedure_text: "read diff write review".to_owned(),
+        fingerprint: "same".to_owned(),
+        occurrences: 3,
+        existing_skills: vec![ExistingSkillSummary {
+            name: "review-skill".to_owned(),
+            description: "Review code changes".to_owned(),
+            procedure_text: "read diff write review".to_owned(),
+            fingerprint: Some("same".to_owned()),
+        }],
+        backend: NoveltyBackend::Local,
+    })
+    .unwrap();
+    assert_eq!(duplicate.novelty, 0.0);
+
+    let new_capability = score_proposal(ProposalScoreInput {
+        name: "snapshot-skill".to_owned(),
+        description: "Create and verify snapshots".to_owned(),
+        procedure_text: "snapshot verify restore".to_owned(),
+        fingerprint: "new".to_owned(),
+        occurrences: 5,
+        existing_skills: Vec::new(),
+        backend: NoveltyBackend::Local,
+    })
+    .unwrap();
+    assert_eq!(new_capability.novelty, 0.9);
+    assert!(new_capability.utility > 0.5);
+}
+
+#[test]
+fn scoring_maps_local_similarity_to_minor_and_distinct_variants() {
+    let minor_variation = score_proposal(ProposalScoreInput {
+        name: "review-skill-v2".to_owned(),
+        description: "Review code changes carefully".to_owned(),
+        procedure_text: "read diff write review".to_owned(),
+        fingerprint: "minor".to_owned(),
+        occurrences: 2,
+        existing_skills: vec![ExistingSkillSummary {
+            name: "review-skill".to_owned(),
+            description: "Review code changes".to_owned(),
+            procedure_text: "read diff write review".to_owned(),
+            fingerprint: Some("existing".to_owned()),
+        }],
+        backend: NoveltyBackend::Local,
+    })
+    .unwrap();
+    assert_eq!(minor_variation.novelty, 0.3);
+
+    let distinct_variant = score_proposal(ProposalScoreInput {
+        name: "review-tests-skill".to_owned(),
+        description: "Review test changes".to_owned(),
+        procedure_text: "read tests write review".to_owned(),
+        fingerprint: "distinct".to_owned(),
+        occurrences: 2,
+        existing_skills: vec![ExistingSkillSummary {
+            name: "review-skill".to_owned(),
+            description: "Review code changes".to_owned(),
+            procedure_text: "read diff write review".to_owned(),
+            fingerprint: Some("existing".to_owned()),
+        }],
+        backend: NoveltyBackend::Local,
+    })
+    .unwrap();
+    assert_eq!(distinct_variant.novelty, 0.6);
 }
 
 fn clean_generalization() -> SkillGeneralization {

@@ -55,3 +55,43 @@ pub struct ProcedureStep {
 pub struct ProposedSelfTest {
     pub command: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalScore {
+    pub novelty: f32,
+    pub utility: f32,
+    pub final_score: f32,
+    pub nearest_matches: Vec<SkillMatch>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillMatch {
+    pub name: String,
+    pub similarity: f32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingSkillSummary {
+    pub name: String,
+    pub description: String,
+    pub procedure_text: String,
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoveltyBackend {
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposalScoreInput {
+    pub name: String,
+    pub description: String,
+    pub procedure_text: String,
+    pub fingerprint: String,
+    pub occurrences: usize,
+    pub existing_skills: Vec<ExistingSkillSummary>,
+    pub backend: NoveltyBackend,
+}
