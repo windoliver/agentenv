@@ -4,6 +4,7 @@ mod digest;
 mod error;
 mod index;
 mod manifest;
+pub mod propose;
 mod registry;
 mod registry_filesystem;
 mod registry_http;
