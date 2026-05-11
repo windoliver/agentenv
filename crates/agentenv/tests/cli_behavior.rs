@@ -1081,6 +1081,90 @@ fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
 }
 
 #[test]
+fn skills_propose_missing_explicit_events_db_fails_clearly() {
+    let temp_dir = make_temp_dir("skills-propose-missing-events-db");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/missing-events.db");
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.trim().is_empty(), "stdout was: {stdout}");
+    assert!(stderr.contains("events DB"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains(&db_path.display().to_string()),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_empty_events_db_json_warns_without_stderr_warning() {
+    let temp_dir = make_temp_dir("skills-propose-empty-events-db");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    SqliteEventStore::open(&db_path).unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"].as_array().unwrap().len(), 0);
+    assert!(!json["warnings"].as_array().unwrap().is_empty());
+    let warning = json["warnings"][0].as_str().unwrap();
+    assert!(warning.contains("No traces"), "warning was: {warning}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(warning), "stderr was: {stderr}");
+}
+
+#[test]
 fn skills_verify_all_succeeds_for_valid_local_cache() {
     let temp_dir = make_temp_dir("skills-verify-valid");
     write_cli_cache_skill(

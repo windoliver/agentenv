@@ -4,8 +4,8 @@ use std::{
 };
 
 use agentenv_core::skills::propose::{
-    ProposalEmitOutput, ProposeRunInput, ProposedSkillService, SkillGeneralization,
-    SkillGeneralizationRequest, SkillGeneralizer,
+    ProposalEmitOutput, ProposeRunInput, ProposeRunOutput, ProposedSkillService,
+    SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
 };
 use agentenv_events::{SqliteEventStore, TraceQuery};
 use anyhow::{bail, Context, Result};
@@ -76,6 +76,9 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .events_db
         .clone()
         .unwrap_or_else(default_events_db_path);
+    if args.events_db.is_some() && !events_db.is_file() {
+        bail!("events DB `{}` does not exist", events_db.display());
+    }
     let store = SqliteEventStore::open(&events_db)
         .with_context(|| format!("open events database `{}`", events_db.display()))?;
     let traces = store
@@ -85,6 +88,18 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
             limit: 10_000,
         })
         .with_context(|| format!("query traces from `{}`", events_db.display()))?;
+    if traces.is_empty() {
+        return print_skills_propose_output(
+            args.json,
+            ProposeRunOutput {
+                proposals: Vec::new(),
+                warnings: vec![no_matching_traces_warning(
+                    &blueprint_id,
+                    args.env.as_deref(),
+                )],
+            },
+        );
+    }
     let output_root = args.out.clone().unwrap_or_else(default_proposed_dir);
     let generalizer = generalizer_for_args(&args)?;
     let created_at = now_event_ts();
@@ -103,7 +118,11 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .await
         .context("run skill proposal service")?;
 
-    if args.json {
+    print_skills_propose_output(args.json, output)
+}
+
+fn print_skills_propose_output(json: bool, output: ProposeRunOutput) -> Result<()> {
+    if json {
         let rendered = serde_json::to_string_pretty(&SkillsProposeJson {
             proposals: output.proposals,
             warnings: output.warnings,
@@ -166,6 +185,15 @@ fn validate_repo(repo: &str) -> Result<()> {
 
 fn is_repo_component_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+fn no_matching_traces_warning(blueprint_id: &str, env: Option<&str>) -> String {
+    match env {
+        Some(env) => {
+            format!("No traces matched blueprint `{blueprint_id}` and env `{env}` in the events DB")
+        }
+        None => format!("No traces matched blueprint `{blueprint_id}` in the events DB"),
+    }
 }
 
 fn generalizer_for_args(args: &SkillsProposeArgs) -> Result<Box<dyn SkillGeneralizer>> {
