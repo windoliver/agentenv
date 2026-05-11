@@ -500,47 +500,12 @@ fn proposal_writer_emits_skill_manifest_and_reports() {
     let temp = temp_dir("proposal-writer");
     let output_root = temp.join("proposed");
     let generalization = valid_generalization();
-    let report = evaluate_self_test(ProposalSelfTestInput {
-        source_tools: vec!["fs_read".to_owned()],
-        procedure_steps: generalization.procedure_steps.clone(),
-        template_variables: generalization.template_variables.clone(),
-        min_score: 0.8,
-    })
-    .unwrap();
-
-    let output = emit_proposal(ProposalEmitInput {
-        output_root: output_root.clone(),
-        candidate: ProposalCandidate {
-            name_seed: "fs-read".to_owned(),
-            blueprint_id: "sha256:blueprint-a".to_owned(),
-            fingerprint: "fingerprint-a".to_owned(),
-            occurrences: 3,
-            sequence: vec![CandidateToolCall {
-                tool: "fs_read".to_owned(),
-                args_shape: serde_json::json!({"path": "string:path"}),
-            }],
-            source_trace_ids: vec![
-                "trace-1".to_owned(),
-                "trace-2".to_owned(),
-                "trace-3".to_owned(),
-            ],
-            redaction_count: 0,
-        },
-        generalization,
-        score: ProposalScore {
-            novelty: 0.9,
-            utility: 0.6,
-            final_score: 0.81,
-            nearest_matches: Vec::new(),
-            reasons: vec!["no existing skill matches".to_owned()],
-        },
-        self_test: report,
-        agentenv_version: "0.0.1-alpha0".to_owned(),
-        created_at: "2026-05-11T00:00:00Z".to_owned(),
-    })
-    .unwrap();
+    let output = emit_proposal(proposal_writer_input(output_root.clone(), generalization)).unwrap();
 
     assert_eq!(output.name, "fs-edit-skill");
+    assert_eq!(output.novelty, 0.9);
+    assert_eq!(output.utility, 0.6);
+    assert_eq!(output.final_score, 0.81);
     assert!(output.path.join("SKILL.md").is_file());
     assert!(output.path.join("skill.yaml").is_file());
     assert!(output.path.join("proposal.yaml").is_file());
@@ -549,6 +514,58 @@ fn proposal_writer_emits_skill_manifest_and_reports() {
     let manifest = load_skill_manifest(&output.path).unwrap();
     assert_eq!(manifest.name, "fs-edit-skill");
     assert_eq!(manifest.entry, std::path::PathBuf::from("SKILL.md"));
+
+    let proposal = read_yaml(&output.path.join("proposal.yaml"));
+    assert_eq!(
+        yaml_str(&proposal, "created_at"),
+        Some("2026-05-11T00:00:00Z")
+    );
+}
+
+#[test]
+fn proposal_writer_refuses_existing_output_and_preserves_contents() {
+    let temp = temp_dir("proposal-writer-existing");
+    let output_root = temp.join("proposed");
+    let existing = output_root.join("fs-edit-skill");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("sentinel.txt"), "keep").unwrap();
+
+    let error = emit_proposal(proposal_writer_input(
+        output_root.clone(),
+        valid_generalization(),
+    ))
+    .unwrap_err();
+
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(
+        std::fs::read_to_string(existing.join("sentinel.txt")).unwrap(),
+        "keep"
+    );
+    assert!(!existing.join("SKILL.md").exists());
+    assert_no_staging_dirs(&output_root);
+}
+
+#[test]
+fn proposal_writer_serializes_skill_md_frontmatter_safely() {
+    let temp = temp_dir("proposal-writer-frontmatter");
+    let output_root = temp.join("proposed");
+    let mut generalization = valid_generalization();
+    generalization.description =
+        "Edit: a repeated filesystem target\nwith --- marker text".to_owned();
+
+    let output = emit_proposal(proposal_writer_input(output_root, generalization)).unwrap();
+    let skill_md = std::fs::read_to_string(output.path.join("SKILL.md")).unwrap();
+    let frontmatter = skill_md
+        .strip_prefix("---\n")
+        .and_then(|body| body.split_once("\n---\n"))
+        .map(|(frontmatter, _body)| frontmatter)
+        .expect("SKILL.md should contain YAML frontmatter");
+    let metadata: serde_yaml::Value = serde_yaml::from_str(frontmatter).unwrap();
+
+    assert_eq!(
+        yaml_str(&metadata, "description"),
+        Some("Edit: a repeated filesystem target\nwith --- marker text")
+    );
 }
 
 fn clean_generalization() -> SkillGeneralization {
@@ -591,6 +608,50 @@ fn valid_generalization() -> SkillGeneralization {
     }
 }
 
+fn proposal_writer_input(
+    output_root: std::path::PathBuf,
+    generalization: SkillGeneralization,
+) -> ProposalEmitInput {
+    let report = evaluate_self_test(ProposalSelfTestInput {
+        source_tools: vec!["fs_read".to_owned()],
+        procedure_steps: generalization.procedure_steps.clone(),
+        template_variables: generalization.template_variables.clone(),
+        min_score: 0.8,
+    })
+    .unwrap();
+
+    ProposalEmitInput {
+        output_root,
+        candidate: ProposalCandidate {
+            name_seed: "fs-read".to_owned(),
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            fingerprint: "fingerprint-a".to_owned(),
+            occurrences: 3,
+            sequence: vec![CandidateToolCall {
+                tool: "fs_read".to_owned(),
+                args_shape: serde_json::json!({"path": "string:path"}),
+            }],
+            source_trace_ids: vec![
+                "trace-1".to_owned(),
+                "trace-2".to_owned(),
+                "trace-3".to_owned(),
+            ],
+            redaction_count: 0,
+        },
+        generalization,
+        score: ProposalScore {
+            novelty: 0.9,
+            utility: 0.6,
+            final_score: 0.81,
+            nearest_matches: Vec::new(),
+            reasons: vec!["no existing skill matches".to_owned()],
+        },
+        self_test: report,
+        agentenv_version: "0.0.1-alpha0".to_owned(),
+        created_at: "2026-05-11T00:00:00Z".to_owned(),
+    }
+}
+
 fn temp_dir(prefix: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "{prefix}-{}-{}",
@@ -602,6 +663,32 @@ fn temp_dir(prefix: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn read_yaml(path: &std::path::Path) -> serde_yaml::Value {
+    let yaml = std::fs::read_to_string(path).unwrap();
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+fn yaml_str<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a str> {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => mapping
+            .get(serde_yaml::Value::String(key.to_owned()))
+            .and_then(serde_yaml::Value::as_str),
+        _ => None,
+    }
+}
+
+fn assert_no_staging_dirs(root: &std::path::Path) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let entry = entry.unwrap();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        assert!(
+            !file_name.contains(".staging"),
+            "unexpected staging directory left behind: {file_name}"
+        );
+    }
 }
 
 fn trace(trace_id: &str, calls: Vec<TraceToolCall>) -> TraceRun {

@@ -131,5 +131,7 @@ pub struct ProposalEmitOutput {
     pub name: String,
     pub path: std::path::PathBuf,
     pub novelty: f32,
+    pub utility: f32,
+    pub final_score: f32,
     pub self_test_score: f32,
 }
