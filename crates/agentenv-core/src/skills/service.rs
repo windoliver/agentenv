@@ -5,13 +5,14 @@ use std::{
 };
 
 use semver::Version;
+use sha2::{Digest, Sha256};
 
 use crate::security::ssrf::SsrfOptions;
 
 use super::{
     info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
-    registry_http, registry_oci, remove_installed_skill, validate_skill_name,
-    verify_installed_skill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
+    registry_git, registry_http, registry_oci, remove_installed_skill, validate_skill_name,
+    verify_installed_skill, FetchedSkill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
     RegistryConfig, RegistryKind, SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
 };
 
@@ -81,21 +82,7 @@ impl SkillService {
             let adapter = self.adapter_for(registry)?;
             match adapter.fetch(&parsed.name, parsed.version.as_deref()).await {
                 Ok(fetched) => {
-                    let source_label = format!(
-                        "{}:{}:{}@{}",
-                        fetched.source_type, fetched.registry, fetched.name, fetched.version
-                    );
-                    let installed = install_local_skill(
-                        &self.root,
-                        &fetched.staging_path,
-                        SkillInstallOptions {
-                            allow_unsigned: request.allow_unsigned,
-                            source_type: fetched.source_type.clone(),
-                            source_label,
-                        },
-                    );
-                    cleanup_staging_path(&fetched.staging_path);
-                    return installed;
+                    return self.install_fetched_skill(fetched, request.allow_unsigned);
                 }
                 Err(SkillError::SkillNotInstalled { .. }) => {
                     continue;
@@ -229,6 +216,21 @@ impl SkillService {
                     self.ssrf_options.clone(),
                 )?))
             }
+            RegistryKind::Git => {
+                validate_skill_name(&registry.name)?;
+                let url = registry
+                    .url
+                    .clone()
+                    .ok_or_else(|| SkillError::InvalidConfig {
+                        message: format!("git registry `{}` requires url", registry.name),
+                    })?;
+                Ok(Box::new(registry_git::GitRegistryAdapter::new(
+                    registry.name.clone(),
+                    url.clone(),
+                    git_cache_root(&self.root, &registry.name, &url)?,
+                    self.ssrf_options.clone(),
+                )))
+            }
         }
     }
 
@@ -264,6 +266,25 @@ impl SkillService {
                 name: credential_name,
             })
             .map(Some)
+    }
+
+    fn install_fetched_skill(
+        &self,
+        fetched: FetchedSkill,
+        allow_unsigned: bool,
+    ) -> Result<InstalledSkill, SkillError> {
+        let source_label = source_label_for_fetched(&fetched);
+        let installed = install_local_skill(
+            &self.root,
+            &fetched.staging_path,
+            SkillInstallOptions {
+                allow_unsigned,
+                source_type: fetched.source_type.clone(),
+                source_label,
+            },
+        );
+        cleanup_staging_path(&fetched.staging_path);
+        installed
     }
 }
 
@@ -314,6 +335,63 @@ fn cleanup_staging_path(path: &Path) {
     }
 }
 
+fn source_label_for_fetched(fetched: &FetchedSkill) -> String {
+    format!(
+        "{}:{}:{}@{}",
+        fetched.source_type, fetched.registry, fetched.name, fetched.version
+    )
+}
+
+fn git_cache_root(root: &Path, registry_name: &str, url: &str) -> Result<PathBuf, SkillError> {
+    let url_digest = git_cache_url_digest(url);
+    ensure_owned_directory_path(root, &["cache", "skill-git", registry_name, &url_digest])
+}
+
+fn git_cache_url_digest(url: &str) -> String {
+    let digest = Sha256::digest(url.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+fn ensure_owned_directory_path(root: &Path, components: &[&str]) -> Result<PathBuf, SkillError> {
+    ensure_owned_directory(root)?;
+    let mut path = root.to_path_buf();
+    for component in components {
+        path.push(component);
+        ensure_owned_directory(&path)?;
+    }
+    Ok(path)
+}
+
+fn ensure_owned_directory(path: &Path) -> Result<(), SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|source| SkillError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let metadata = fs::symlink_metadata(path).map_err(|source| SkillError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if metadata.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(SkillError::UnsafeBundlePath {
+                    path: path.to_path_buf(),
+                })
+            }
+        }
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn sort_hits(hits: &mut [SkillSearchHit]) {
     hits.sort_by(|left, right| {
         left.name
@@ -342,4 +420,110 @@ fn default_bearer_credential_name(registry_name: &str) -> String {
         })
         .collect::<String>();
     format!("AGENTENV_SKILLS_{normalized}_TOKEN")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_fetched_skill_source_label_records_registry_name_and_version() {
+        let fetched = FetchedSkill {
+            staging_path: PathBuf::from("/tmp/staged-git-skill"),
+            registry: "git-dev".to_owned(),
+            source_type: "git".to_owned(),
+            name: "provenance-git".to_owned(),
+            version: "0.4.0".to_owned(),
+        };
+
+        assert_eq!(
+            source_label_for_fetched(&fetched),
+            "git:git-dev:provenance-git@0.4.0"
+        );
+    }
+
+    #[test]
+    fn service_installs_git_fetched_skill_with_provenance_label() {
+        let root = temp_dir("skill-service-git-provenance-home").join(".agentenv");
+        let bundle = temp_dir("skill-service-git-provenance-bundle");
+        write_file(&bundle.join("SKILL.md"), "# Git provenance\n");
+        write_file(
+            &bundle.join("skill.yaml"),
+            "name: provenance-git\nversion: 0.4.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        );
+        let service = SkillService::new(&root, SkillsConfig::default());
+        let fetched = FetchedSkill {
+            staging_path: bundle.clone(),
+            registry: "git-dev".to_owned(),
+            source_type: "git".to_owned(),
+            name: "provenance-git".to_owned(),
+            version: "0.4.0".to_owned(),
+        };
+
+        let installed = service
+            .install_fetched_skill(fetched, true)
+            .expect("fetched git skill should install");
+
+        assert_eq!(installed.name, "provenance-git");
+        assert_eq!(installed.source_type, "git");
+        assert_eq!(installed.source_label, "git:git-dev:provenance-git@0.4.0");
+        assert!(!bundle.exists());
+    }
+
+    #[test]
+    fn git_cache_root_changes_when_registry_url_changes() {
+        let root = temp_dir("skill-service-git-cache-url").join(".agentenv");
+
+        let first =
+            git_cache_root(&root, "git-dev", "git+https://github.com/acme/skills-one").unwrap();
+        let second =
+            git_cache_root(&root, "git-dev", "git+https://github.com/acme/skills-two").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("git-dev"))
+        );
+        assert_eq!(
+            second.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("git-dev"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_cache_root_rejects_symlinked_cache_parent() {
+        let home = temp_dir("skill-service-git-cache-symlink-home");
+        let root = home.join(".agentenv");
+        let outside = temp_dir("skill-service-git-cache-symlink-outside");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("cache")).unwrap();
+
+        let error = git_cache_root(&root, "git-dev", "git+https://github.com/acme/skills")
+            .expect_err("git cache parent symlink must be rejected");
+
+        assert!(matches!(error, SkillError::UnsafeBundlePath { .. }));
+        assert!(!outside.join("skill-git").exists());
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
 }

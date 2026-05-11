@@ -1251,6 +1251,172 @@ fn skills_registry_cli_path_override_publishes_searches_and_adds() {
 }
 
 #[test]
+fn skills_cli_filesystem_registry_scans_indexless_subdirectories_e2e() {
+    let temp_dir = make_temp_dir("skills-cli-indexless-filesystem-registry");
+    let registry = temp_dir.join("registry");
+    write_indexless_filesystem_registry_skill(
+        &registry,
+        "indexless-cli-skill",
+        "0.2.0",
+        "Indexless CLI demo",
+    );
+    fs::write(
+        temp_dir.join("agentenv.yaml"),
+        format!(
+            "skills:\n  registries:\n    - name: local-dev\n      type: filesystem\n      path: {}\n",
+            registry.display()
+        ),
+    )
+    .unwrap();
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("indexless")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    assert_skill_search_names(&search.stdout, &["indexless-cli-skill"]);
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("indexless-cli-skill")
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+    let add_json: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    assert_eq!(add_json["name"], "indexless-cli-skill");
+    assert_eq!(add_json["version"], "0.2.0");
+    assert_eq!(add_json["source_type"], "filesystem");
+    assert_eq!(
+        add_json["source_label"],
+        "filesystem:local-dev:indexless-cli-skill@0.2.0"
+    );
+}
+
+#[test]
+fn skills_search_reports_http_registry_override_ssrf_block() {
+    let temp_dir = make_temp_dir("skills-cli-http-registry-override-ssrf");
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("registry")
+        .arg("--registry")
+        .arg("http://127.0.0.1:9/skills")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!search.status.success());
+    let stderr = String::from_utf8_lossy(&search.stderr);
+    assert!(
+        !stderr.contains("unsupported registry URL scheme"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("blocked by SSRF policy"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_search_accepts_git_registry_override_syntax() {
+    let temp_dir = make_temp_dir("skills-cli-git-registry-override");
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("registry")
+        .arg("--registry")
+        .arg("git+https://127.0.0.1/acme/skills")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!search.status.success());
+    let stderr = String::from_utf8_lossy(&search.stderr);
+    assert!(
+        !stderr.contains("unsupported registry URL scheme"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("blocked by SSRF policy"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_add_accepts_git_registry_override_syntax_until_ssrf_block() {
+    let temp_dir = make_temp_dir("skills-cli-git-add-registry-override");
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("registry-skill@0.1.0")
+        .arg("--registry")
+        .arg("git+https://127.0.0.1/acme/skills")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!add.status.success());
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    assert!(
+        !stderr.contains("unsupported registry URL scheme"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("blocked by SSRF policy"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_publish_reports_git_registry_override_as_read_only() {
+    let temp_dir = make_temp_dir("skills-cli-git-publish-registry-override");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Git Publish\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: git-publish-cli\nversion: 0.1.0\ndescription: Git publish CLI\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg("git+https://127.0.0.1/acme/skills")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!publish.status.success());
+    let stderr = String::from_utf8_lossy(&publish.stderr);
+    assert!(
+        stderr.contains("registry `cli` of type `git` does not support publishing"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn skills_registry_config_precedence_is_user_project_then_cli() {
     let temp_dir = make_temp_dir("skills-cli-registry-precedence");
     let user_registry = temp_dir.join("user-registry");
@@ -4474,6 +4640,28 @@ fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, d
         registry.join("index.yaml"),
         format!(
             "skills:\n  - name: {name}\n    version: {version}\n    description: {description}\n    registry: local\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_indexless_filesystem_registry_skill(
+    registry: &Path,
+    name: &str,
+    version: &str,
+    description: &str,
+) {
+    let bundle = registry.join(name);
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(
+        bundle.join("SKILL.md"),
+        format!("# {description}\n\n{name}\n"),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
         ),
     )
     .unwrap();

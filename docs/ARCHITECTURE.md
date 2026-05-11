@@ -126,6 +126,10 @@ Core owns the skill lifecycle:
 - Expose only the selected skill bundle to the sandbox; credential values do
   not flow through skill fetching or generic driver RPC.
 
+Supported registry adapters are filesystem registries, HTTP static indexes
+(`index.yaml` or `index.json` plus `.tar.zst` bundle artifacts), OCI artifacts,
+and git repositories, all resolved by core before sandbox creation.
+
 Registry adapters are not JSON-RPC drivers. They are core-managed fetch and
 verify backends, analogous to package registries in Cargo, npm, and pip. If a
 registry adapter needs network access, its URLs pass through the SSRF validator

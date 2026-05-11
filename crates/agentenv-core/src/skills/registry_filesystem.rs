@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -30,6 +31,18 @@ struct FilesystemRegistryIndex {
     skills: Vec<SkillSearchHit>,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedFilesystemHit {
+    hit: SkillSearchHit,
+    source: FilesystemHitSource,
+}
+
+#[derive(Debug, Clone)]
+enum FilesystemHitSource {
+    Indexed,
+    Scanned(PathBuf),
+}
+
 impl FilesystemRegistryAdapter {
     pub(crate) fn new(name: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
@@ -43,6 +56,17 @@ impl FilesystemRegistryAdapter {
     }
 
     fn read_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
+        let mut index = self.read_persisted_index()?;
+        let mut scanned = self.scan_index()?;
+        scanned
+            .skills
+            .retain(|scanned| !contains_hit(&index.skills, scanned));
+        index.skills.extend(scanned.skills);
+        sort_hits(&mut index.skills);
+        Ok(index)
+    }
+
+    fn read_persisted_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
         let path = self.index_path();
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => {}
@@ -64,6 +88,49 @@ impl FilesystemRegistryAdapter {
         Ok(index)
     }
 
+    fn scan_index(&self) -> Result<FilesystemRegistryIndex, SkillError> {
+        let mut skills = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in fs::read_dir(&self.root).map_err(|source| SkillError::Io {
+            path: self.root.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| SkillError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| SkillError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !metadata.file_type().is_dir() {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(BUNDLES_DIR) {
+                continue;
+            }
+            let manifest_path = path.join(MANIFEST_FILE);
+            if !manifest_path_is_regular_file(&manifest_path)? {
+                continue;
+            }
+            let manifest = super::load_skill_manifest(&path)?;
+            let version = manifest.version.to_string();
+            if !seen.insert((manifest.name.clone(), version.clone())) {
+                return Err(SkillError::InvalidConfig {
+                    message: format!(
+                        "filesystem registry `{}` has duplicate scanned skill `{}` version `{}`",
+                        self.name, manifest.name, version
+                    ),
+                });
+            }
+            let digest = compute_bundle_digest(&path, &manifest)?;
+            skills.push(self.hit_for_manifest(&manifest, digest));
+        }
+        sort_hits(&mut skills);
+        Ok(FilesystemRegistryIndex { skills })
+    }
+
     fn validate_hit(&self, hit: &mut SkillSearchHit) -> Result<(), SkillError> {
         validate_skill_name(&hit.name)?;
         hit.version
@@ -82,7 +149,7 @@ impl FilesystemRegistryAdapter {
     }
 
     fn upsert_hit(&self, hit: SkillSearchHit) -> Result<(), SkillError> {
-        let mut index = self.read_index()?;
+        let mut index = self.read_persisted_index()?;
         index
             .skills
             .retain(|existing| existing.name != hit.name || existing.version != hit.version);
@@ -125,7 +192,7 @@ impl FilesystemRegistryAdapter {
         &self,
         name: &str,
         version: Option<&str>,
-    ) -> Result<SkillSearchHit, SkillError> {
+    ) -> Result<ResolvedFilesystemHit, SkillError> {
         validate_skill_name(name)?;
         if let Some(version) = version {
             version
@@ -136,17 +203,37 @@ impl FilesystemRegistryAdapter {
                 })?;
         }
 
-        let index = self.read_index()?;
-        let matches = index
-            .skills
-            .into_iter()
+        let persisted = self.read_persisted_index()?;
+        let scanned = self.scan_index()?;
+        let persisted_hits = persisted.skills;
+        let mut matches = persisted_hits
+            .iter()
             .filter(|hit| hit.name == name)
+            .cloned()
+            .map(|hit| ResolvedFilesystemHit {
+                hit,
+                source: FilesystemHitSource::Indexed,
+            })
             .collect::<Vec<_>>();
+        for hit in scanned.skills {
+            if contains_hit(&persisted_hits, &hit) || hit.name != name {
+                continue;
+            }
+            let path = self.scanned_bundle_path_for_hit(&hit)?.ok_or_else(|| {
+                SkillError::SkillNotInstalled {
+                    name: hit.name.clone(),
+                }
+            })?;
+            matches.push(ResolvedFilesystemHit {
+                hit,
+                source: FilesystemHitSource::Scanned(path),
+            });
+        }
 
         if let Some(version) = version {
             return matches
                 .into_iter()
-                .find(|hit| hit.version == version)
+                .find(|resolved| resolved.hit.version == version)
                 .ok_or_else(|| SkillError::SkillNotInstalled {
                     name: name.to_owned(),
                 });
@@ -154,10 +241,71 @@ impl FilesystemRegistryAdapter {
 
         matches
             .into_iter()
-            .max_by(|left, right| compare_versions(&left.version, &right.version))
+            .max_by(|left, right| compare_versions(&left.hit.version, &right.hit.version))
             .ok_or_else(|| SkillError::SkillNotInstalled {
                 name: name.to_owned(),
             })
+    }
+
+    fn bundle_path_for_hit(&self, resolved: &ResolvedFilesystemHit) -> Result<PathBuf, SkillError> {
+        match &resolved.source {
+            FilesystemHitSource::Indexed => existing_child_directory(
+                &self.root,
+                &[BUNDLES_DIR, &resolved.hit.name, &resolved.hit.version],
+            )?
+            .ok_or_else(|| SkillError::SkillNotInstalled {
+                name: resolved.hit.name.clone(),
+            }),
+            FilesystemHitSource::Scanned(path) => Ok(path.clone()),
+        }
+    }
+
+    fn scanned_bundle_path_for_hit(
+        &self,
+        hit: &SkillSearchHit,
+    ) -> Result<Option<PathBuf>, SkillError> {
+        for entry in fs::read_dir(&self.root).map_err(|source| SkillError::Io {
+            path: self.root.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| SkillError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if !fs::symlink_metadata(&path)
+                .map_err(|source| SkillError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+                .file_type()
+                .is_dir()
+            {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(BUNDLES_DIR) {
+                continue;
+            }
+            if !path.join(MANIFEST_FILE).is_file() {
+                continue;
+            }
+            let manifest = super::load_skill_manifest(&path)?;
+            if manifest.name == hit.name && manifest.version.to_string() == hit.version {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn manifest_path_is_regular_file(path: &Path) -> Result<bool, SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -189,12 +337,9 @@ impl RegistryAdapter for FilesystemRegistryAdapter {
 
     async fn fetch(&self, name: &str, version: Option<&str>) -> Result<FetchedSkill, SkillError> {
         ensure_directory(&self.root)?;
-        let hit = self.resolved_hit(name, version)?;
-        let bundle_path =
-            existing_child_directory(&self.root, &[BUNDLES_DIR, &hit.name, &hit.version])?
-                .ok_or_else(|| SkillError::SkillNotInstalled {
-                    name: hit.name.clone(),
-                })?;
+        let resolved = self.resolved_hit(name, version)?;
+        let hit = &resolved.hit;
+        let bundle_path = self.bundle_path_for_hit(&resolved)?;
         let manifest = super::load_skill_manifest(&bundle_path)?;
         if manifest.name != hit.name || manifest.version.to_string() != hit.version {
             return Err(SkillError::UnsafeBundlePath {
@@ -286,6 +431,11 @@ fn verify_publish_signature(
         })?;
 
     verify_ed25519_signature(manifest, digest, signature, public_key)
+}
+
+fn contains_hit(hits: &[SkillSearchHit], needle: &SkillSearchHit) -> bool {
+    hits.iter()
+        .any(|hit| hit.name == needle.name && hit.version == needle.version)
 }
 
 fn copy_bundle_contents(
