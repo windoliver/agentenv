@@ -32,7 +32,17 @@ struct CommandGitCheckout {
 struct RealGitCommandRunner;
 
 trait GitCommandRunner: Send + Sync + std::fmt::Debug {
-    fn run(&self, args: &[String], terminal_prompt: &str) -> Result<GitCommandOutput, String>;
+    fn run(
+        &self,
+        args: &[String],
+        environment: &GitCommandEnvironment,
+    ) -> Result<GitCommandOutput, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCommandEnvironment {
+    set: Vec<(String, String)>,
+    remove: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,10 +302,20 @@ impl CommandGitCheckout {
 }
 
 impl GitCommandRunner for RealGitCommandRunner {
-    fn run(&self, args: &[String], terminal_prompt: &str) -> Result<GitCommandOutput, String> {
-        let output = Command::new("git")
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", terminal_prompt)
+    fn run(
+        &self,
+        args: &[String],
+        environment: &GitCommandEnvironment,
+    ) -> Result<GitCommandOutput, String> {
+        let mut command = Command::new("git");
+        command.args(args);
+        for name in &environment.remove {
+            command.env_remove(name);
+        }
+        for (name, value) in &environment.set {
+            command.env(name, value);
+        }
+        let output = command
             .output()
             .map_err(|source| format!("failed to run git: {source}"))?;
 
@@ -394,8 +414,10 @@ fn validate_git_registry_url(url: &str, options: &SsrfOptions) -> Result<(), Ski
 }
 
 fn run_git(runner: &dyn GitCommandRunner, args: &[String], url: &str) -> Result<(), SkillError> {
+    let args = isolated_git_args(args);
+    let environment = isolated_git_environment();
     let output = runner
-        .run(args, "0")
+        .run(&args, &environment)
         .map_err(|message| SkillError::GitRegistry {
             url: url.to_owned(),
             message,
@@ -422,6 +444,72 @@ fn run_git(runner: &dyn GitCommandRunner, args: &[String], url: &str) -> Result<
         url: url.to_owned(),
         message,
     })
+}
+
+fn isolated_git_args(args: &[String]) -> Vec<String> {
+    let mut isolated = [
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    isolated.extend(args.iter().cloned());
+    isolated
+}
+
+fn isolated_git_environment() -> GitCommandEnvironment {
+    GitCommandEnvironment {
+        set: vec![
+            ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+            ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+            (
+                "GIT_CONFIG_SYSTEM".to_owned(),
+                git_null_config_path().to_owned(),
+            ),
+            (
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                git_null_config_path().to_owned(),
+            ),
+            ("GIT_CONFIG_COUNT".to_owned(), "0".to_owned()),
+        ],
+        remove: [
+            "GIT_CONFIG",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    }
+}
+
+fn git_null_config_path() -> &'static str {
+    if cfg!(windows) {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
 }
 
 fn bounded_diagnostic(text: &str) -> String {
@@ -708,7 +796,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct RecordedGitCommand {
         args: Vec<String>,
-        terminal_prompt: String,
+        environment: GitCommandEnvironment,
     }
 
     #[derive(Debug)]
@@ -729,10 +817,14 @@ mod tests {
     }
 
     impl GitCommandRunner for RecordingGitCommandRunner {
-        fn run(&self, args: &[String], terminal_prompt: &str) -> Result<GitCommandOutput, String> {
+        fn run(
+            &self,
+            args: &[String],
+            environment: &GitCommandEnvironment,
+        ) -> Result<GitCommandOutput, String> {
             self.commands.lock().unwrap().push(RecordedGitCommand {
                 args: args.to_vec(),
-                terminal_prompt: terminal_prompt.to_owned(),
+                environment: environment.clone(),
             });
             Ok(GitCommandOutput {
                 success: true,
@@ -741,6 +833,14 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    fn expected_isolated_args(args: Vec<String>) -> Vec<String> {
+        isolated_git_args(&args)
+    }
+
+    fn expected_git_environment() -> GitCommandEnvironment {
+        isolated_git_environment()
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -980,16 +1080,40 @@ mod tests {
         assert_eq!(
             runner.commands(),
             vec![RecordedGitCommand {
-                args: vec![
+                args: expected_isolated_args(vec![
                     "clone".to_owned(),
                     "--filter=blob:none".to_owned(),
                     "--depth=1".to_owned(),
                     "https://github.com/acme/skills".to_owned(),
                     path_arg(&cache_root.join("checkout")),
-                ],
-                terminal_prompt: "0".to_owned(),
+                ]),
+                environment: expected_git_environment(),
             }]
         );
+        let command = &runner.commands()[0];
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-c".to_owned(), "http.followRedirects=false".to_owned()]));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-c".to_owned(), "protocol.allow=never".to_owned()]));
+        assert!(command
+            .environment
+            .set
+            .iter()
+            .any(|(name, value)| { name == "GIT_TERMINAL_PROMPT" && value == "0" }));
+        assert!(command
+            .environment
+            .set
+            .iter()
+            .any(|(name, value)| { name == "GIT_CONFIG_NOSYSTEM" && value == "1" }));
+        assert!(command
+            .environment
+            .remove
+            .iter()
+            .any(|name| name == "HTTPS_PROXY"));
     }
 
     #[test]
@@ -1008,25 +1132,25 @@ mod tests {
             runner.commands(),
             vec![
                 RecordedGitCommand {
-                    args: vec![
+                    args: expected_isolated_args(vec![
                         "-C".to_owned(),
                         path_arg(&cache_root.join("checkout")),
                         "fetch".to_owned(),
                         "--all".to_owned(),
                         "--tags".to_owned(),
                         "--prune".to_owned(),
-                    ],
-                    terminal_prompt: "0".to_owned(),
+                    ]),
+                    environment: expected_git_environment(),
                 },
                 RecordedGitCommand {
-                    args: vec![
+                    args: expected_isolated_args(vec![
                         "-C".to_owned(),
                         path_arg(&cache_root.join("checkout")),
                         "reset".to_owned(),
                         "--hard".to_owned(),
                         "origin/HEAD".to_owned(),
-                    ],
-                    terminal_prompt: "0".to_owned(),
+                    ]),
+                    environment: expected_git_environment(),
                 },
             ]
         );

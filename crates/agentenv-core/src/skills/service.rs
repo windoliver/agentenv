@@ -5,6 +5,7 @@ use std::{
 };
 
 use semver::Version;
+use sha2::{Digest, Sha256};
 
 use crate::security::ssrf::SsrfOptions;
 
@@ -225,11 +226,8 @@ impl SkillService {
                     })?;
                 Ok(Box::new(registry_git::GitRegistryAdapter::new(
                     registry.name.clone(),
-                    url,
-                    self.root
-                        .join("cache")
-                        .join("skill-git")
-                        .join(&registry.name),
+                    url.clone(),
+                    git_cache_root(&self.root, &registry.name, &url)?,
                     self.ssrf_options.clone(),
                 )))
             }
@@ -344,6 +342,56 @@ fn source_label_for_fetched(fetched: &FetchedSkill) -> String {
     )
 }
 
+fn git_cache_root(root: &Path, registry_name: &str, url: &str) -> Result<PathBuf, SkillError> {
+    let url_digest = git_cache_url_digest(url);
+    ensure_owned_directory_path(root, &["cache", "skill-git", registry_name, &url_digest])
+}
+
+fn git_cache_url_digest(url: &str) -> String {
+    let digest = Sha256::digest(url.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+fn ensure_owned_directory_path(root: &Path, components: &[&str]) -> Result<PathBuf, SkillError> {
+    ensure_owned_directory(root)?;
+    let mut path = root.to_path_buf();
+    for component in components {
+        path.push(component);
+        ensure_owned_directory(&path)?;
+    }
+    Ok(path)
+}
+
+fn ensure_owned_directory(path: &Path) -> Result<(), SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|source| SkillError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let metadata = fs::symlink_metadata(path).map_err(|source| SkillError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if metadata.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(SkillError::UnsafeBundlePath {
+                    path: path.to_path_buf(),
+                })
+            }
+        }
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn sort_hits(hits: &mut [SkillSearchHit]) {
     hits.sort_by(|left, right| {
         left.name
@@ -420,6 +468,42 @@ mod tests {
         assert_eq!(installed.source_type, "git");
         assert_eq!(installed.source_label, "git:git-dev:provenance-git@0.4.0");
         assert!(!bundle.exists());
+    }
+
+    #[test]
+    fn git_cache_root_changes_when_registry_url_changes() {
+        let root = temp_dir("skill-service-git-cache-url").join(".agentenv");
+
+        let first =
+            git_cache_root(&root, "git-dev", "git+https://github.com/acme/skills-one").unwrap();
+        let second =
+            git_cache_root(&root, "git-dev", "git+https://github.com/acme/skills-two").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("git-dev"))
+        );
+        assert_eq!(
+            second.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("git-dev"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_cache_root_rejects_symlinked_cache_parent() {
+        let home = temp_dir("skill-service-git-cache-symlink-home");
+        let root = home.join(".agentenv");
+        let outside = temp_dir("skill-service-git-cache-symlink-outside");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("cache")).unwrap();
+
+        let error = git_cache_root(&root, "git-dev", "git+https://github.com/acme/skills")
+            .expect_err("git cache parent symlink must be rejected");
+
+        assert!(matches!(error, SkillError::UnsafeBundlePath { .. }));
+        assert!(!outside.join("skill-git").exists());
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
