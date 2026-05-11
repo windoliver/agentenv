@@ -1,6 +1,9 @@
 use agentenv_core::skills::propose::{
     extract_candidates, normalize_args_shape, CandidateExtractionOptions, ProposalCandidate,
 };
+use agentenv_core::skills::propose::{
+    validate_generalization, ProcedureStep, ProposedSelfTest, SkillGeneralization, TemplateVariable,
+};
 use agentenv_events::{ActivityResult, TraceRun, TraceToolCall};
 
 #[test]
@@ -68,6 +71,59 @@ fn argument_shape_redacts_secret_like_values() {
     assert!(!rendered.contains("Bearer secret"));
     assert!(rendered.contains("[redacted]"));
     assert!(rendered.contains("string:path"));
+}
+
+#[test]
+fn generalization_validation_accepts_schema_clean_output() {
+    let generalization = SkillGeneralization {
+        name: "fs-edit-skill".to_owned(),
+        description: "Edit a repeated filesystem target.".to_owned(),
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Path to the file being edited.".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        procedure_steps: vec![ProcedureStep {
+            tool: Some("fs_read".to_owned()),
+            instruction: "Read {{target_path}} before editing.".to_owned(),
+        }],
+        self_test: ProposedSelfTest {
+            command: "test -f SKILL.md".to_owned(),
+        },
+        skill_md_body: "Read {{target_path}} before editing.".to_owned(),
+    };
+
+    validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap();
+}
+
+#[test]
+fn generalization_validation_rejects_invalid_names_and_secret_leaks() {
+    let invalid_name = SkillGeneralization {
+        name: "../bad".to_owned(),
+        description: "Bad".to_owned(),
+        template_variables: Vec::new(),
+        procedure_steps: Vec::new(),
+        self_test: ProposedSelfTest {
+            command: "test -f SKILL.md".to_owned(),
+        },
+        skill_md_body: "Body".to_owned(),
+    };
+    assert!(validate_generalization(&invalid_name, &[]).is_err());
+
+    let secret_body = SkillGeneralization {
+        name: "secret-skill".to_owned(),
+        description: "Bad".to_owned(),
+        template_variables: Vec::new(),
+        procedure_steps: vec![ProcedureStep {
+            tool: Some("fs_read".to_owned()),
+            instruction: "Use token sk-secret".to_owned(),
+        }],
+        self_test: ProposedSelfTest {
+            command: "test -f SKILL.md".to_owned(),
+        },
+        skill_md_body: "token sk-secret".to_owned(),
+    };
+    assert!(validate_generalization(&secret_body, &["fs_read".to_owned()]).is_err());
 }
 
 fn trace(trace_id: &str, calls: Vec<TraceToolCall>) -> TraceRun {
