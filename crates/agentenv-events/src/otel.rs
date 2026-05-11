@@ -153,6 +153,9 @@ fn activity_kind_name(kind: ActivityKind) -> &'static str {
         ActivityKind::SpawnRejected => "spawn_rejected",
         ActivityKind::SpawnStarted => "spawn_started",
         ActivityKind::SpawnReady => "spawn_ready",
+        ActivityKind::BuildOneflightHit => "build_oneflight_hit",
+        ActivityKind::BuildOneflightMiss => "build_oneflight_miss",
+        ActivityKind::BuildQueueDepth => "build_queue_depth",
         ActivityKind::Log => "log",
     }
 }
@@ -182,5 +185,21 @@ mod tests {
         assert_eq!(mapped["agentenv.reason_code"], "created");
         assert_eq!(mapped["agentenv.trace_id"], "trace-otel");
         assert_eq!(mapped["agentenv.latency_ms"], "42");
+    }
+
+    #[test]
+    fn maps_build_activity_kinds_to_otel_names() {
+        assert_eq!(
+            activity_kind_name(ActivityKind::BuildOneflightHit),
+            "build_oneflight_hit"
+        );
+        assert_eq!(
+            activity_kind_name(ActivityKind::BuildOneflightMiss),
+            "build_oneflight_miss"
+        );
+        assert_eq!(
+            activity_kind_name(ActivityKind::BuildQueueDepth),
+            "build_queue_depth"
+        );
     }
 }
