@@ -49,13 +49,19 @@ pub fn validate_generalization(
         require_non_empty("template variable example", &variable.example)?;
         reject_secret_text(&variable.example)?;
     }
+    if generalization.procedure_steps.is_empty() {
+        return Err(SkillError::InvalidConfig {
+            message: "procedure_steps must not be empty".to_owned(),
+        });
+    }
 
-    let mut referenced_variables =
+    let body_referenced_variables =
         template_variables_in("skill_md_body", &generalization.skill_md_body)?;
+    let mut step_referenced_variables = BTreeSet::new();
     for step in &generalization.procedure_steps {
         require_non_empty("procedure step instruction", &step.instruction)?;
         reject_secret_text(&step.instruction)?;
-        referenced_variables.extend(template_variables_in(
+        step_referenced_variables.extend(template_variables_in(
             "procedure step instruction",
             &step.instruction,
         )?);
@@ -67,6 +73,8 @@ pub fn validate_generalization(
             }
         }
     }
+    let mut referenced_variables = body_referenced_variables;
+    referenced_variables.extend(step_referenced_variables.iter().cloned());
     for variable in &referenced_variables {
         if !variables.contains(variable) {
             return Err(SkillError::InvalidConfig {
@@ -75,9 +83,11 @@ pub fn validate_generalization(
         }
     }
     for variable in &variables {
-        if !referenced_variables.contains(variable) {
+        if !step_referenced_variables.contains(variable) {
             return Err(SkillError::InvalidConfig {
-                message: format!("template variable `{variable}` is not referenced"),
+                message: format!(
+                    "template variable `{variable}` is not referenced by a procedure step"
+                ),
             });
         }
     }

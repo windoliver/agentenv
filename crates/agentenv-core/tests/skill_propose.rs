@@ -218,6 +218,23 @@ fn generalization_validation_rejects_unreferenced_declared_variables() {
 }
 
 #[test]
+fn generalization_validation_rejects_empty_procedure_steps() {
+    let mut generalization = clean_generalization();
+    generalization.procedure_steps = Vec::new();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_body_only_template_variable_references() {
+    let mut generalization = clean_generalization();
+    generalization.procedure_steps[0].instruction = "Read the target before editing.".to_owned();
+    generalization.skill_md_body = "Read {{target_path}} before editing.".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
 fn generalization_validation_rejects_duplicate_template_variables() {
     let mut generalization = clean_generalization();
     generalization.template_variables.push(TemplateVariable {
