@@ -39,6 +39,10 @@ pub(crate) fn event_tool_name(event: &crate::ActivityEvent) -> Option<&str> {
     event.subject.get("tool").and_then(Value::as_str)
 }
 
+pub(crate) fn event_request_id(event: &crate::ActivityEvent) -> Option<&str> {
+    event.subject.get("request_id").and_then(Value::as_str)
+}
+
 pub(crate) fn event_arguments(event: &crate::ActivityEvent) -> Value {
     event
         .subject
