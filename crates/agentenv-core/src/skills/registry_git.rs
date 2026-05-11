@@ -155,6 +155,16 @@ impl GitCheckout for CommandGitCheckout {
                 ],
                 url,
             )?;
+            run_git(
+                self.runner.as_ref(),
+                &[
+                    "-C".to_owned(),
+                    path_arg(&checkout),
+                    "clean".to_owned(),
+                    "-fdx".to_owned(),
+                ],
+                url,
+            )?;
             return Ok(checkout);
         }
         unreachable!("non-git checkout paths are returned above")
@@ -1273,6 +1283,15 @@ mod tests {
                         "reset".to_owned(),
                         "--hard".to_owned(),
                         "origin/HEAD".to_owned(),
+                    ]),
+                    environment: expected_git_environment(),
+                },
+                RecordedGitCommand {
+                    args: expected_isolated_args(vec![
+                        "-C".to_owned(),
+                        path_arg(&cache_root.join("checkout")),
+                        "clean".to_owned(),
+                        "-fdx".to_owned(),
                     ]),
                     environment: expected_git_environment(),
                 },
