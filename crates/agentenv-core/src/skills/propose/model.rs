@@ -95,3 +95,22 @@ pub struct ProposalScoreInput {
     pub existing_skills: Vec<ExistingSkillSummary>,
     pub backend: NoveltyBackend,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposalSelfTestInput {
+    pub source_tools: Vec<String>,
+    pub procedure_steps: Vec<ProcedureStep>,
+    pub template_variables: Vec<TemplateVariable>,
+    pub min_score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalSelfTestReport {
+    pub score: f32,
+    pub passed: bool,
+    pub matched_steps: u32,
+    pub total_steps: u32,
+    pub matched_variables: u32,
+    pub total_variables: u32,
+    pub failures: Vec<String>,
+}

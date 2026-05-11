@@ -1,3 +1,4 @@
+use agentenv_core::skills::propose::{evaluate_self_test, ProposalSelfTestInput};
 use agentenv_core::skills::propose::{
     extract_candidates, normalize_args_shape, CandidateExtractionOptions, ProposalCandidate,
 };
@@ -325,6 +326,35 @@ fn scoring_maps_local_similarity_to_minor_and_distinct_variants() {
     })
     .unwrap();
     assert_eq!(distinct_variant.novelty, 0.6);
+}
+
+#[test]
+fn self_test_scores_step_and_variable_coverage() {
+    let report = evaluate_self_test(ProposalSelfTestInput {
+        source_tools: vec!["fs_read".to_owned(), "fs_write".to_owned()],
+        procedure_steps: vec![
+            ProcedureStep {
+                tool: Some("fs_read".to_owned()),
+                instruction: "Read {{target_path}}".to_owned(),
+            },
+            ProcedureStep {
+                tool: Some("fs_write".to_owned()),
+                instruction: "Write {{target_path}}".to_owned(),
+            },
+        ],
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Target path".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        min_score: 0.8,
+    })
+    .unwrap();
+
+    assert!(report.passed);
+    assert!(report.score >= 0.8);
+    assert_eq!(report.matched_steps, 2);
+    assert_eq!(report.matched_variables, 1);
 }
 
 fn clean_generalization() -> SkillGeneralization {
