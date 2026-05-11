@@ -389,6 +389,70 @@ fn self_test_missing_source_tool_coverage_fails() {
     assert!(!report.passed);
     assert!(report.matched_steps < report.total_steps);
     assert_eq!(report.matched_steps, 1);
+    assert_eq!(report.total_steps, 3);
+}
+
+#[test]
+fn self_test_missing_repeated_source_tool_fails() {
+    let report = evaluate_self_test(ProposalSelfTestInput {
+        source_tools: vec![
+            "fs_read".to_owned(),
+            "fs_write".to_owned(),
+            "fs_read".to_owned(),
+        ],
+        procedure_steps: vec![
+            ProcedureStep {
+                tool: Some("fs_read".to_owned()),
+                instruction: "Read {{target_path}} before editing.".to_owned(),
+            },
+            ProcedureStep {
+                tool: Some("fs_write".to_owned()),
+                instruction: "Write {{target_path}}.".to_owned(),
+            },
+        ],
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Target path".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        min_score: 0.8,
+    })
+    .unwrap();
+
+    assert!(!report.passed);
+    assert_eq!(report.matched_steps, 2);
+    assert_eq!(report.total_steps, 3);
+    assert!(report
+        .failures
+        .iter()
+        .any(|failure| failure.contains("source tool sequence")));
+}
+
+#[test]
+fn self_test_order_sensitive_source_tool_coverage_fails() {
+    let report = evaluate_self_test(ProposalSelfTestInput {
+        source_tools: vec!["fs_read".to_owned(), "fs_write".to_owned()],
+        procedure_steps: vec![
+            ProcedureStep {
+                tool: Some("fs_write".to_owned()),
+                instruction: "Write {{target_path}}.".to_owned(),
+            },
+            ProcedureStep {
+                tool: Some("fs_read".to_owned()),
+                instruction: "Read {{target_path}} after writing.".to_owned(),
+            },
+        ],
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Target path".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        min_score: 0.8,
+    })
+    .unwrap();
+
+    assert!(!report.passed);
+    assert_eq!(report.matched_steps, 1);
     assert_eq!(report.total_steps, 2);
 }
 
@@ -602,6 +666,128 @@ async fn proposal_service_runs_full_pipeline_with_fake_generalizer() {
     assert!(output.proposals[0].path.join("SKILL.md").is_file());
 }
 
+#[tokio::test]
+async fn proposal_service_skips_duplicate_generated_names_with_warning() {
+    let temp = temp_dir("proposal-service-duplicate");
+    let traces = vec![
+        trace("trace-1", vec![call("fs_read", "/repo/a.rs")]),
+        trace("trace-2", vec![call("fs_read", "/repo/b.rs")]),
+        trace("trace-3", vec![call("fs_read", "/repo/c.rs")]),
+        trace(
+            "trace-4",
+            vec![call("fs_read", "/repo/d.rs"), call("fs_read", "/repo/d.rs")],
+        ),
+        trace(
+            "trace-5",
+            vec![call("fs_read", "/repo/e.rs"), call("fs_read", "/repo/e.rs")],
+        ),
+        trace(
+            "trace-6",
+            vec![call("fs_read", "/repo/f.rs"), call("fs_read", "/repo/f.rs")],
+        ),
+    ];
+    let service = ProposedSkillService::new(Box::new(DuplicateNameGeneralizer));
+
+    let output = service
+        .run(ProposeRunInput {
+            traces,
+            output_root: temp.join("proposed"),
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            min_occurrences: 3,
+            min_novelty: 0.6,
+            min_self_test_score: 0.8,
+            existing_skills: Vec::new(),
+            agentenv_version: "0.0.1-alpha0".to_owned(),
+            created_at: "2026-05-11T00:00:00Z".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(output.proposals.len(), 1);
+    assert_eq!(output.proposals[0].name, "fs-edit-skill");
+    assert!(output
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("duplicate generated name")));
+}
+
+#[tokio::test]
+async fn proposal_service_rejects_invalid_min_novelty_before_generalization() {
+    for min_novelty in [f32::NAN, -0.1, 1.1] {
+        let service = ProposedSkillService::new(Box::new(PanicGeneralizer));
+
+        let error = service
+            .run(ProposeRunInput {
+                traces: Vec::new(),
+                output_root: temp_dir("proposal-service-invalid-novelty").join("proposed"),
+                blueprint_id: "sha256:blueprint-a".to_owned(),
+                min_occurrences: 3,
+                min_novelty,
+                min_self_test_score: 0.8,
+                existing_skills: Vec::new(),
+                agentenv_version: "0.0.1-alpha0".to_owned(),
+                created_at: "2026-05-11T00:00:00Z".to_owned(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("min novelty"));
+    }
+}
+
+#[tokio::test]
+async fn proposal_service_self_test_warning_includes_failures() {
+    let temp = temp_dir("proposal-service-self-test-warning");
+    let traces = vec![
+        trace(
+            "trace-1",
+            vec![
+                call("fs_read", "/repo/a.rs"),
+                call("fs_write", "/repo/a.rs"),
+                call("fs_read", "/repo/a.rs"),
+            ],
+        ),
+        trace(
+            "trace-2",
+            vec![
+                call("fs_read", "/repo/b.rs"),
+                call("fs_write", "/repo/b.rs"),
+                call("fs_read", "/repo/b.rs"),
+            ],
+        ),
+        trace(
+            "trace-3",
+            vec![
+                call("fs_read", "/repo/c.rs"),
+                call("fs_write", "/repo/c.rs"),
+                call("fs_read", "/repo/c.rs"),
+            ],
+        ),
+    ];
+    let service = ProposedSkillService::new(Box::new(IncompleteGeneralizer));
+
+    let output = service
+        .run(ProposeRunInput {
+            traces,
+            output_root: temp.join("proposed"),
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            min_occurrences: 3,
+            min_novelty: 0.6,
+            min_self_test_score: 0.8,
+            existing_skills: Vec::new(),
+            agentenv_version: "0.0.1-alpha0".to_owned(),
+            created_at: "2026-05-11T00:00:00Z".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(output.proposals.is_empty());
+    assert!(output
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("source tool sequence")));
+}
+
 struct FakeGeneralizer;
 
 #[async_trait]
@@ -611,6 +797,54 @@ impl SkillGeneralizer for FakeGeneralizer {
         _request: SkillGeneralizationRequest,
     ) -> Result<SkillGeneralization, agentenv_core::skills::SkillError> {
         Ok(valid_generalization())
+    }
+}
+
+struct DuplicateNameGeneralizer;
+
+#[async_trait]
+impl SkillGeneralizer for DuplicateNameGeneralizer {
+    async fn generalize(
+        &self,
+        request: SkillGeneralizationRequest,
+    ) -> Result<SkillGeneralization, agentenv_core::skills::SkillError> {
+        let count = request
+            .candidate_json
+            .get("sequence")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(1);
+        Ok(generalization_with_tools(
+            "fs-edit-skill",
+            vec!["fs_read"; count],
+        ))
+    }
+}
+
+struct PanicGeneralizer;
+
+#[async_trait]
+impl SkillGeneralizer for PanicGeneralizer {
+    async fn generalize(
+        &self,
+        _request: SkillGeneralizationRequest,
+    ) -> Result<SkillGeneralization, agentenv_core::skills::SkillError> {
+        panic!("generalizer should not run for invalid service input")
+    }
+}
+
+struct IncompleteGeneralizer;
+
+#[async_trait]
+impl SkillGeneralizer for IncompleteGeneralizer {
+    async fn generalize(
+        &self,
+        _request: SkillGeneralizationRequest,
+    ) -> Result<SkillGeneralization, agentenv_core::skills::SkillError> {
+        Ok(generalization_with_tools(
+            "incomplete-fs-edit-skill",
+            vec!["fs_read", "fs_write"],
+        ))
     }
 }
 
@@ -651,6 +885,37 @@ fn valid_generalization() -> SkillGeneralization {
             command: "test -f SKILL.md".to_owned(),
         },
         skill_md_body: "Read {{target_path}}.".to_owned(),
+    }
+}
+
+fn generalization_with_tools(name: &str, tools: Vec<&str>) -> SkillGeneralization {
+    let procedure_steps = tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| ProcedureStep {
+            tool: Some((*tool).to_owned()),
+            instruction: format!("Run {tool} for {{{{target_path}}}} at step {index}."),
+        })
+        .collect::<Vec<_>>();
+    let skill_md_body = procedure_steps
+        .iter()
+        .map(|step| step.instruction.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    SkillGeneralization {
+        name: name.to_owned(),
+        description: "Edit a repeated filesystem target.".to_owned(),
+        template_variables: vec![TemplateVariable {
+            name: "target_path".to_owned(),
+            description: "Target path".to_owned(),
+            example: "src/lib.rs".to_owned(),
+        }],
+        procedure_steps,
+        self_test: ProposedSelfTest {
+            command: "test -f SKILL.md".to_owned(),
+        },
+        skill_md_body,
     }
 }
 

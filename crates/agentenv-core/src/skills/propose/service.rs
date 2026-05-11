@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::{
     emit_proposal, evaluate_self_test, extract_candidates, score_proposal, validate_generalization,
     CandidateExtractionOptions, ProposalEmitInput, ProposalScoreInput, ProposalSelfTestInput,
@@ -15,6 +17,7 @@ impl ProposedSkillService {
     }
 
     pub async fn run(&self, input: ProposeRunInput) -> Result<ProposeRunOutput, SkillError> {
+        validate_min_novelty(input.min_novelty)?;
         let candidates = extract_candidates(
             &input.traces,
             CandidateExtractionOptions {
@@ -24,6 +27,7 @@ impl ProposedSkillService {
         )?;
         let mut proposals = Vec::new();
         let mut warnings = Vec::new();
+        let mut emitted_names = BTreeSet::new();
         for candidate in candidates {
             let request = SkillGeneralizationRequest {
                 schema_version: "0.1".to_owned(),
@@ -68,9 +72,18 @@ impl ProposedSkillService {
                 min_score: input.min_self_test_score,
             })?;
             if !self_test.passed {
+                warnings.push(self_test_warning(
+                    &generalization.name,
+                    self_test.score,
+                    input.min_self_test_score,
+                    &self_test.failures,
+                ));
+                continue;
+            }
+            if !emitted_names.insert(generalization.name.clone()) {
                 warnings.push(format!(
-                    "skipped `{}` because self-test score {} is below {}",
-                    generalization.name, self_test.score, input.min_self_test_score
+                    "skipped `{}` because duplicate generated name was already proposed",
+                    generalization.name
                 ));
                 continue;
             }
@@ -88,5 +101,37 @@ impl ProposedSkillService {
             proposals,
             warnings,
         })
+    }
+}
+
+fn validate_min_novelty(min_novelty: f32) -> Result<(), SkillError> {
+    if !min_novelty.is_finite() || !(0.0..=1.0).contains(&min_novelty) {
+        return Err(SkillError::InvalidConfig {
+            message: "min novelty must be a finite value between 0.0 and 1.0".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn self_test_warning(
+    name: &str,
+    score: f32,
+    min_self_test_score: f32,
+    failures: &[String],
+) -> String {
+    let score_below_threshold = score < min_self_test_score;
+    match (failures.is_empty(), score_below_threshold) {
+        (true, true) => format!(
+            "skipped `{name}` because self-test score {score} is below {min_self_test_score}"
+        ),
+        (true, false) => format!("skipped `{name}` because self-test did not pass"),
+        (false, true) => format!(
+            "skipped `{name}` because self-test failed: {}; score {score} is below {min_self_test_score}",
+            failures.join("; ")
+        ),
+        (false, false) => format!(
+            "skipped `{name}` because self-test failed: {}",
+            failures.join("; ")
+        ),
     }
 }

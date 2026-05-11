@@ -17,23 +17,22 @@ pub fn evaluate_self_test(
         });
     }
 
-    let source_tools = input.source_tools.iter().cloned().collect::<BTreeSet<_>>();
-    let covered_source_tools = input
+    let source_tool_names = input.source_tools.iter().cloned().collect::<BTreeSet<_>>();
+    let generated_tools = input
         .procedure_steps
         .iter()
         .filter_map(|step| step.tool.as_ref())
-        .filter(|tool| source_tools.contains(*tool))
         .cloned()
-        .collect::<BTreeSet<_>>();
+        .collect::<Vec<_>>();
     let unknown_step_tools = input
         .procedure_steps
         .iter()
         .filter_map(|step| step.tool.as_ref())
-        .filter(|tool| !source_tools.contains(*tool))
+        .filter(|tool| !source_tool_names.contains(*tool))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let total_steps = source_tools.len() as u32;
-    let matched_steps = covered_source_tools.len() as u32;
+    let matched_steps = ordered_match_count(&input.source_tools, &generated_tools) as u32;
+    let total_steps = input.source_tools.len() as u32;
 
     let all_text = input
         .procedure_steps
@@ -53,7 +52,9 @@ pub fn evaluate_self_test(
     let score = ((step_score * 0.7) + (variable_score * 0.3)).clamp(0.0, 1.0);
     let mut failures = Vec::new();
     if matched_steps != total_steps {
-        failures.push("not every source tool is covered by a procedure step".to_owned());
+        failures.push(
+            "not every source tool sequence occurrence is covered by a procedure step".to_owned(),
+        );
     }
     if !unknown_step_tools.is_empty() {
         failures.push(format!(
@@ -78,6 +79,21 @@ pub fn evaluate_self_test(
         total_variables,
         failures,
     })
+}
+
+fn ordered_match_count(source_tools: &[String], generated_tools: &[String]) -> usize {
+    let mut lengths = vec![vec![0usize; generated_tools.len() + 1]; source_tools.len() + 1];
+    for (source_index, source_tool) in source_tools.iter().enumerate() {
+        for (generated_index, generated_tool) in generated_tools.iter().enumerate() {
+            lengths[source_index + 1][generated_index + 1] = if source_tool == generated_tool {
+                lengths[source_index][generated_index] + 1
+            } else {
+                lengths[source_index][generated_index + 1]
+                    .max(lengths[source_index + 1][generated_index])
+            };
+        }
+    }
+    lengths[source_tools.len()][generated_tools.len()]
 }
 
 fn ratio(matched: u32, total: u32) -> f32 {
