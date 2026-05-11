@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+
 use agentenv_core::skills::load_skill_manifest;
 use agentenv_core::skills::propose::{
     emit_proposal, evaluate_self_test, CandidateToolCall, ProposalEmitInput, ProposalScore,
@@ -10,7 +12,9 @@ use agentenv_core::skills::propose::{
     score_proposal, ExistingSkillSummary, NoveltyBackend, ProposalScoreInput,
 };
 use agentenv_core::skills::propose::{
-    validate_generalization, ProcedureStep, ProposedSelfTest, SkillGeneralization, TemplateVariable,
+    validate_generalization, ProcedureStep, ProposeRunInput, ProposedSelfTest,
+    ProposedSkillService, SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
+    TemplateVariable,
 };
 use agentenv_events::{ActivityResult, TraceRun, TraceToolCall};
 
@@ -566,6 +570,48 @@ fn proposal_writer_serializes_skill_md_frontmatter_safely() {
         yaml_str(&metadata, "description"),
         Some("Edit: a repeated filesystem target\nwith --- marker text")
     );
+}
+
+#[tokio::test]
+async fn proposal_service_runs_full_pipeline_with_fake_generalizer() {
+    let temp = temp_dir("proposal-service");
+    let traces = vec![
+        trace("trace-1", vec![call("fs_read", "/repo/a.rs")]),
+        trace("trace-2", vec![call("fs_read", "/repo/b.rs")]),
+        trace("trace-3", vec![call("fs_read", "/repo/c.rs")]),
+    ];
+    let service = ProposedSkillService::new(Box::new(FakeGeneralizer));
+
+    let output = service
+        .run(ProposeRunInput {
+            traces,
+            output_root: temp.join("proposed"),
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            min_occurrences: 3,
+            min_novelty: 0.6,
+            min_self_test_score: 0.8,
+            existing_skills: Vec::new(),
+            agentenv_version: "0.0.1-alpha0".to_owned(),
+            created_at: "2026-05-11T00:00:00Z".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(output.proposals.len(), 1);
+    assert_eq!(output.proposals[0].name, "fs-edit-skill");
+    assert!(output.proposals[0].path.join("SKILL.md").is_file());
+}
+
+struct FakeGeneralizer;
+
+#[async_trait]
+impl SkillGeneralizer for FakeGeneralizer {
+    async fn generalize(
+        &self,
+        _request: SkillGeneralizationRequest,
+    ) -> Result<SkillGeneralization, agentenv_core::skills::SkillError> {
+        Ok(valid_generalization())
+    }
 }
 
 fn clean_generalization() -> SkillGeneralization {

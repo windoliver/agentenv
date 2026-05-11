@@ -80,6 +80,25 @@ pub struct ExistingSkillSummary {
     pub fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProposeRunInput {
+    pub traces: Vec<agentenv_events::TraceRun>,
+    pub output_root: std::path::PathBuf,
+    pub blueprint_id: String,
+    pub min_occurrences: usize,
+    pub min_novelty: f32,
+    pub min_self_test_score: f32,
+    pub existing_skills: Vec<ExistingSkillSummary>,
+    pub agentenv_version: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposeRunOutput {
+    pub proposals: Vec<ProposalEmitOutput>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoveltyBackend {
     Local,
