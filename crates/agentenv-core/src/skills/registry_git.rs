@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::Arc,
 };
@@ -12,7 +12,7 @@ use semver::Version;
 use url::Url;
 
 use super::{
-    compute_bundle_digest, manifest::validated_bundle_file, validate_skill_name, FetchedSkill,
+    compute_bundle_digest, manifest::normalize_bundle_path, validate_skill_name, FetchedSkill,
     RegistryAdapter, SkillError, SkillManifest, SkillSearchHit,
 };
 
@@ -469,11 +469,15 @@ fn staging_fetch_path(cache_root: &Path, name: &str, version: &str) -> Result<Pa
     })
 }
 
-fn copy_regular_file(source: &Path, destination: &Path) -> Result<(), SkillError> {
+fn copy_regular_file(
+    source_root: &Path,
+    relative_source: &Path,
+    destination: &Path,
+) -> Result<(), SkillError> {
     if let Some(parent) = destination.parent() {
         ensure_directory(parent)?;
     }
-    let mut source_file = open_regular_file(source)?;
+    let mut source_file = open_regular_file_under_root(source_root, relative_source)?;
     let mut destination_file = fs::File::create(destination).map_err(|source| SkillError::Io {
         path: destination.to_path_buf(),
         source,
@@ -486,29 +490,87 @@ fn copy_regular_file(source: &Path, destination: &Path) -> Result<(), SkillError
 }
 
 #[cfg(unix)]
-fn open_regular_file(path: &Path) -> Result<fs::File, SkillError> {
-    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+fn open_regular_file_under_root(root: &Path, relative_path: &Path) -> Result<fs::File, SkillError> {
+    use rustix::fs::{Mode, OFlags};
 
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|source| SkillError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    ensure_opened_regular_file(path, &file)?;
+    let relative_path = normalize_bundle_path(relative_path)?;
+    let mut components = relative_path.components().peekable();
+    let mut directory = open_directory_no_follow(root)?;
+
+    while let Some(component) = components.next() {
+        let Component::Normal(part) = component else {
+            return Err(SkillError::UnsafeBundlePath {
+                path: relative_path.clone(),
+            });
+        };
+        let is_final = components.peek().is_none();
+        let flags = if is_final {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        } else {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW
+        };
+        let opened = rustix::fs::openat(&directory, part, flags, Mode::empty())
+            .map(fs::File::from)
+            .map_err(|source| SkillError::Io {
+                path: root.join(&relative_path),
+                source: std::io::Error::from(source),
+            })?;
+        if is_final {
+            ensure_opened_regular_file(&root.join(&relative_path), &opened)?;
+            return Ok(opened);
+        }
+        ensure_opened_directory(&root.join(&relative_path), &opened)?;
+        directory = opened;
+    }
+
+    Err(SkillError::UnsafeBundlePath {
+        path: relative_path,
+    })
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> Result<fs::File, SkillError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let file = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(|source| SkillError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::from(source),
+    })?;
+    ensure_opened_directory(path, &file)?;
     Ok(file)
 }
 
 #[cfg(not(unix))]
-fn open_regular_file(path: &Path) -> Result<fs::File, SkillError> {
-    let file = fs::File::open(path).map_err(|source| SkillError::Io {
+fn open_regular_file_under_root(root: &Path, relative_path: &Path) -> Result<fs::File, SkillError> {
+    let relative_path = normalize_bundle_path(relative_path)?;
+    let path = root.join(&relative_path);
+    let file = fs::File::open(&path).map_err(|source| SkillError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    ensure_opened_regular_file(&path, &file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn ensure_opened_directory(path: &Path, file: &fs::File) -> Result<(), SkillError> {
+    let metadata = file.metadata().map_err(|source| SkillError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    ensure_opened_regular_file(path, &file)?;
-    Ok(file)
+    if metadata.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn ensure_opened_regular_file(path: &Path, file: &fs::File) -> Result<(), SkillError> {
@@ -532,12 +594,16 @@ fn copy_bundle_contents(
 ) -> Result<(), SkillError> {
     ensure_directory(destination_root)?;
     copy_regular_file(
-        &source_root.join(MANIFEST_FILE),
+        source_root,
+        Path::new(MANIFEST_FILE),
         &destination_root.join(MANIFEST_FILE),
     )?;
     for declared_file in &manifest.declared_files {
-        let source = validated_bundle_file(source_root, declared_file)?;
-        copy_regular_file(&source, &destination_root.join(declared_file))?;
+        copy_regular_file(
+            source_root,
+            declared_file,
+            &destination_root.join(declared_file),
+        )?;
     }
     Ok(())
 }
@@ -756,6 +822,71 @@ mod tests {
         assert_eq!(fetched.source_type, "git");
         assert_eq!(fetched.version, "0.3.0");
         assert!(fetched.staging_path.join("SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn git_registry_fetch_exact_version_copies_selected_bundle() {
+        let checkout = temp_dir("skill-git-fetch-exact");
+        write_file(
+            &checkout.join("old/skill.yaml"),
+            "name: exact-git\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        );
+        write_file(&checkout.join("old/SKILL.md"), "# Old\n");
+        write_file(
+            &checkout.join("new/skill.yaml"),
+            "name: exact-git\nversion: 0.3.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        );
+        write_file(&checkout.join("new/SKILL.md"), "# New\n");
+        let adapter = GitRegistryAdapter::with_checkout_and_ssrf(
+            "git-dev",
+            "git+https://127.0.0.1/acme/skills",
+            temp_dir("skill-git-cache"),
+            Arc::new(StaticCheckout { path: checkout }),
+            loopback_ssrf_options(),
+        );
+
+        let fetched = adapter.fetch("exact-git", Some("0.1.0")).await.unwrap();
+
+        assert_eq!(fetched.source_type, "git");
+        assert_eq!(fetched.version, "0.1.0");
+        assert_eq!(
+            fs::read_to_string(fetched.staging_path.join("SKILL.md")).unwrap(),
+            "# Old\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_bundle_copy_rejects_symlinked_declared_file_parent() {
+        let source = temp_dir("skill-git-copy-symlink-parent-source");
+        let destination = temp_dir("skill-git-copy-symlink-parent-destination");
+        let outside = temp_dir("skill-git-copy-symlink-parent-outside");
+        write_file(
+            &source.join("skill.yaml"),
+            "name: symlink-parent-git\nversion: 0.1.0\nentry: docs/SKILL.md\nfiles:\n  - docs/SKILL.md\n",
+        );
+        write_file(&outside.join("SKILL.md"), "# Outside\n");
+        std::os::unix::fs::symlink(&outside, source.join("docs")).unwrap();
+        let manifest = SkillManifest {
+            name: "symlink-parent-git".to_owned(),
+            version: Version::parse("0.1.0").unwrap(),
+            description: None,
+            entry: PathBuf::from("docs/SKILL.md"),
+            declared_files: vec![PathBuf::from("docs/SKILL.md")],
+            self_test_command: None,
+            signature_ed25519: None,
+            signature_public_key_ed25519: None,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        let error = copy_bundle_contents(&source, &destination, &manifest)
+            .expect_err("copy must not follow symlinked parents");
+
+        assert!(matches!(
+            error,
+            SkillError::Io { .. } | SkillError::UnsafeBundlePath { .. }
+        ));
+        assert!(!destination.join("docs/SKILL.md").exists());
     }
 
     #[tokio::test]

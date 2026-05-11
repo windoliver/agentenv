@@ -11,7 +11,7 @@ use crate::security::ssrf::SsrfOptions;
 use super::{
     info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
     registry_git, registry_http, registry_oci, remove_installed_skill, validate_skill_name,
-    verify_installed_skill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
+    verify_installed_skill, FetchedSkill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
     RegistryConfig, RegistryKind, SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
 };
 
@@ -81,21 +81,7 @@ impl SkillService {
             let adapter = self.adapter_for(registry)?;
             match adapter.fetch(&parsed.name, parsed.version.as_deref()).await {
                 Ok(fetched) => {
-                    let source_label = format!(
-                        "{}:{}:{}@{}",
-                        fetched.source_type, fetched.registry, fetched.name, fetched.version
-                    );
-                    let installed = install_local_skill(
-                        &self.root,
-                        &fetched.staging_path,
-                        SkillInstallOptions {
-                            allow_unsigned: request.allow_unsigned,
-                            source_type: fetched.source_type.clone(),
-                            source_label,
-                        },
-                    );
-                    cleanup_staging_path(&fetched.staging_path);
-                    return installed;
+                    return self.install_fetched_skill(fetched, request.allow_unsigned);
                 }
                 Err(SkillError::SkillNotInstalled { .. }) => {
                     continue;
@@ -283,6 +269,25 @@ impl SkillService {
             })
             .map(Some)
     }
+
+    fn install_fetched_skill(
+        &self,
+        fetched: FetchedSkill,
+        allow_unsigned: bool,
+    ) -> Result<InstalledSkill, SkillError> {
+        let source_label = source_label_for_fetched(&fetched);
+        let installed = install_local_skill(
+            &self.root,
+            &fetched.staging_path,
+            SkillInstallOptions {
+                allow_unsigned,
+                source_type: fetched.source_type.clone(),
+                source_label,
+            },
+        );
+        cleanup_staging_path(&fetched.staging_path);
+        installed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +337,13 @@ fn cleanup_staging_path(path: &Path) {
     }
 }
 
+fn source_label_for_fetched(fetched: &FetchedSkill) -> String {
+    format!(
+        "{}:{}:{}@{}",
+        fetched.source_type, fetched.registry, fetched.name, fetched.version
+    )
+}
+
 fn sort_hits(hits: &mut [SkillSearchHit]) {
     hits.sort_by(|left, right| {
         left.name
@@ -360,4 +372,74 @@ fn default_bearer_credential_name(registry_name: &str) -> String {
         })
         .collect::<String>();
     format!("AGENTENV_SKILLS_{normalized}_TOKEN")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_fetched_skill_source_label_records_registry_name_and_version() {
+        let fetched = FetchedSkill {
+            staging_path: PathBuf::from("/tmp/staged-git-skill"),
+            registry: "git-dev".to_owned(),
+            source_type: "git".to_owned(),
+            name: "provenance-git".to_owned(),
+            version: "0.4.0".to_owned(),
+        };
+
+        assert_eq!(
+            source_label_for_fetched(&fetched),
+            "git:git-dev:provenance-git@0.4.0"
+        );
+    }
+
+    #[test]
+    fn service_installs_git_fetched_skill_with_provenance_label() {
+        let root = temp_dir("skill-service-git-provenance-home").join(".agentenv");
+        let bundle = temp_dir("skill-service-git-provenance-bundle");
+        write_file(&bundle.join("SKILL.md"), "# Git provenance\n");
+        write_file(
+            &bundle.join("skill.yaml"),
+            "name: provenance-git\nversion: 0.4.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        );
+        let service = SkillService::new(&root, SkillsConfig::default());
+        let fetched = FetchedSkill {
+            staging_path: bundle.clone(),
+            registry: "git-dev".to_owned(),
+            source_type: "git".to_owned(),
+            name: "provenance-git".to_owned(),
+            version: "0.4.0".to_owned(),
+        };
+
+        let installed = service
+            .install_fetched_skill(fetched, true)
+            .expect("fetched git skill should install");
+
+        assert_eq!(installed.name, "provenance-git");
+        assert_eq!(installed.source_type, "git");
+        assert_eq!(installed.source_label, "git:git-dev:provenance-git@0.4.0");
+        assert!(!bundle.exists());
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
 }
