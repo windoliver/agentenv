@@ -10,6 +10,7 @@ pub mod otel;
 pub mod redaction;
 pub mod sink;
 pub mod store;
+pub mod trace;
 pub mod webhook;
 
 pub use activity::{ActivityEvent, ActivityKind, ActivityResult, ActorKind};
@@ -21,4 +22,6 @@ pub use local_ops::{
 #[cfg(feature = "otel")]
 pub use otel::OtelSink;
 pub use sink::{EventSink, SinkConfig, SinkError};
+pub use store::SqliteEventStore;
+pub use trace::{TraceQuery, TraceRun, TraceToolCall};
 pub use webhook::{WebhookConfig, WebhookSink};
