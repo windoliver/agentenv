@@ -152,6 +152,35 @@ fn generalization_validation_rejects_actual_sk_secret_tokens() {
 }
 
 #[test]
+fn generalization_validation_rejects_secret_shaped_skill_names() {
+    let mut generalization = clean_generalization();
+    generalization.name = "sk-secret".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_secret_shaped_template_variable_names() {
+    let mut generalization = clean_generalization();
+    generalization.template_variables.push(TemplateVariable {
+        name: "sk-secret".to_owned(),
+        description: "Secret-shaped variable name.".to_owned(),
+        example: "src/main.rs".to_owned(),
+    });
+
+    let error = validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap_err();
+    assert!(error.to_string().contains("secret-like"));
+}
+
+#[test]
+fn generalization_validation_rejects_empty_template_variable_examples() {
+    let mut generalization = clean_generalization();
+    generalization.template_variables[0].example = "  ".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
 fn generalization_validation_rejects_undeclared_placeholders() {
     let mut generalization = clean_generalization();
     generalization.template_variables = Vec::new();
@@ -161,9 +190,29 @@ fn generalization_validation_rejects_undeclared_placeholders() {
 }
 
 #[test]
+fn generalization_validation_rejects_unclosed_placeholder_markers() {
+    let mut generalization = clean_generalization();
+    generalization.skill_md_body = "Read {{target_path before editing.".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
 fn generalization_validation_rejects_stray_closing_placeholder_markers() {
     let mut generalization = clean_generalization();
     generalization.skill_md_body = "Read {{target_path}} before editing }}.".to_owned();
+
+    assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_unreferenced_declared_variables() {
+    let mut generalization = clean_generalization();
+    generalization.template_variables.push(TemplateVariable {
+        name: "unused_path".to_owned(),
+        description: "Unused path variable.".to_owned(),
+        example: "src/main.rs".to_owned(),
+    });
 
     assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
 }

@@ -25,6 +25,7 @@ pub fn validate_generalization(
     allowed_tools: &[String],
 ) -> Result<(), SkillError> {
     validate_skill_name(&generalization.name)?;
+    reject_secret_text(&generalization.name)?;
     require_non_empty("description", &generalization.description)?;
     reject_secret_text(&generalization.description)?;
     require_non_empty("skill_md_body", &generalization.skill_md_body)?;
@@ -34,6 +35,7 @@ pub fn validate_generalization(
     let mut variables = BTreeSet::new();
     for variable in &generalization.template_variables {
         validate_skill_name(&variable.name)?;
+        reject_secret_text(&variable.name)?;
         if !variables.insert(variable.name.clone()) {
             return Err(SkillError::InvalidConfig {
                 message: format!(
@@ -44,6 +46,7 @@ pub fn validate_generalization(
         }
         require_non_empty("template variable description", &variable.description)?;
         reject_secret_text(&variable.description)?;
+        require_non_empty("template variable example", &variable.example)?;
         reject_secret_text(&variable.example)?;
     }
 
