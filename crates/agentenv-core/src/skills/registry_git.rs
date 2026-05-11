@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashSet,
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
     sync::Arc,
 };
@@ -498,7 +498,7 @@ fn open_regular_file_under_root(root: &Path, relative_path: &Path) -> Result<fs:
     let mut directory = open_directory_no_follow(root)?;
 
     while let Some(component) = components.next() {
-        let Component::Normal(part) = component else {
+        let std::path::Component::Normal(part) = component else {
             return Err(SkillError::UnsafeBundlePath {
                 path: relative_path.clone(),
             });
@@ -547,15 +547,15 @@ fn open_directory_no_follow(path: &Path) -> Result<fs::File, SkillError> {
 }
 
 #[cfg(not(unix))]
-fn open_regular_file_under_root(root: &Path, relative_path: &Path) -> Result<fs::File, SkillError> {
-    let relative_path = normalize_bundle_path(relative_path)?;
-    let path = root.join(&relative_path);
-    let file = fs::File::open(&path).map_err(|source| SkillError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    ensure_opened_regular_file(&path, &file)?;
-    Ok(file)
+fn open_regular_file_under_root(
+    _root: &Path,
+    _relative_path: &Path,
+) -> Result<fs::File, SkillError> {
+    Err(SkillError::GitRegistry {
+        url: SOURCE_TYPE.to_owned(),
+        message: "git registry fetch is unsupported on this platform because safe no-follow staging is unavailable"
+            .to_owned(),
+    })
 }
 
 #[cfg(unix)]
@@ -887,6 +887,35 @@ mod tests {
             SkillError::Io { .. } | SkillError::UnsafeBundlePath { .. }
         ));
         assert!(!destination.join("docs/SKILL.md").exists());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn git_bundle_copy_fails_closed_without_safe_nofollow_staging() {
+        let source = temp_dir("skill-git-copy-non-unix-source");
+        let destination = temp_dir("skill-git-copy-non-unix-destination");
+        write_file(
+            &source.join("skill.yaml"),
+            "name: non-unix-git\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        );
+        write_file(&source.join("SKILL.md"), "# Non-Unix\n");
+        let manifest = SkillManifest {
+            name: "non-unix-git".to_owned(),
+            version: Version::parse("0.1.0").unwrap(),
+            description: None,
+            entry: PathBuf::from("SKILL.md"),
+            declared_files: vec![PathBuf::from("SKILL.md")],
+            self_test_command: None,
+            signature_ed25519: None,
+            signature_public_key_ed25519: None,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        let error = copy_bundle_contents(&source, &destination, &manifest)
+            .expect_err("non-Unix staging must fail closed without no-follow support");
+
+        assert!(matches!(error, SkillError::GitRegistry { .. }));
+        assert!(!destination.join("SKILL.md").exists());
     }
 
     #[tokio::test]
