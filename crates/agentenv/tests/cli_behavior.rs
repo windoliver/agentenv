@@ -929,6 +929,35 @@ fn skills_help_lists_lifecycle_subcommands() {
 }
 
 #[test]
+fn skills_help_lists_propose_subcommand() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("propose"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_propose_requires_from_traces_and_blueprint() {
+    let temp_dir = make_temp_dir("skills-propose-required");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--from-traces"), "stderr was: {stderr}");
+}
+
+#[test]
 fn skills_verify_all_succeeds_for_valid_local_cache() {
     let temp_dir = make_temp_dir("skills-verify-valid");
     write_cli_cache_skill(
