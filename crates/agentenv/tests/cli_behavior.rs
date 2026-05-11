@@ -938,7 +938,31 @@ fn skills_help_lists_propose_subcommand() {
 
     assert!(output.status.success(), "{}", output_summary(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("propose"), "stdout was: {stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("propose")),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn skills_propose_help_lists_expected_flags() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--from-traces", "--blueprint", "--min-self-test-score"] {
+        assert!(
+            stdout.contains(flag),
+            "missing {flag}; stdout was: {stdout}"
+        );
+    }
 }
 
 #[test]
@@ -955,6 +979,56 @@ fn skills_propose_requires_from_traces_and_blueprint() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--from-traces"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_validation_runs_before_loading_skills_config() {
+    let temp_dir = make_temp_dir("skills-propose-invalid-config");
+    let config_dir = temp_dir.join(".config").join("agentenv");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("config.toml"), "skills = [").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--from-traces"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_open_pr_rejects_invalid_repo() {
+    let temp_dir = make_temp_dir("skills-propose-invalid-repo");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("bad repo")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("no proposals emitted"),
+        "stdout was: {stdout}"
+    );
+    assert!(stderr.contains("owner/repo"), "stderr was: {stderr}");
 }
 
 #[test]

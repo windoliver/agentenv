@@ -130,6 +130,10 @@ struct SkillsSearchJson {
 }
 
 pub async fn run_skills(args: SkillsArgs) -> Result<()> {
+    if let SkillsCommand::Propose(args) = args.command {
+        return run_skills_propose(args).await;
+    }
+
     let home = dirs::home_dir().context("home directory is unavailable")?;
     let root = home.join(".agentenv");
     let registry_override = registry_override_for_command(&args.command);

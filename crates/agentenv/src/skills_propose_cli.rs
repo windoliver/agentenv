@@ -58,5 +58,25 @@ pub fn validate_args(args: &SkillsProposeArgs) -> Result<()> {
     if args.open_pr && args.repo.is_none() {
         bail!("--open-pr requires --repo owner/repo");
     }
+    if let Some(repo) = &args.repo {
+        validate_repo(repo)?;
+    }
     Ok(())
+}
+
+fn validate_repo(repo: &str) -> Result<()> {
+    let Some((owner, name)) = repo.split_once('/') else {
+        bail!("--repo must be in owner/repo format");
+    };
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        bail!("--repo must be in owner/repo format");
+    }
+    if !owner.chars().all(is_repo_component_char) || !name.chars().all(is_repo_component_char) {
+        bail!("--repo must be in owner/repo format");
+    }
+    Ok(())
+}
+
+fn is_repo_component_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
