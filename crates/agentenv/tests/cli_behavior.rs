@@ -1278,6 +1278,38 @@ fn skills_search_accepts_git_registry_override_syntax() {
 }
 
 #[test]
+fn skills_publish_reports_git_registry_override_as_read_only() {
+    let temp_dir = make_temp_dir("skills-cli-git-publish-registry-override");
+    let bundle = temp_dir.join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), "# Git Publish\n").unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: git-publish-cli\nversion: 0.1.0\ndescription: Git publish CLI\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg("git+https://127.0.0.1/acme/skills")
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!publish.status.success());
+    let stderr = String::from_utf8_lossy(&publish.stderr);
+    assert!(
+        stderr.contains("registry `cli` of type `git` does not support publishing"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn skills_registry_config_precedence_is_user_project_then_cli() {
     let temp_dir = make_temp_dir("skills-cli-registry-precedence");
     let user_registry = temp_dir.join("user-registry");

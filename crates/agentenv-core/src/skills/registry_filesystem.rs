@@ -111,7 +111,7 @@ impl FilesystemRegistryAdapter {
                 continue;
             }
             let manifest_path = path.join(MANIFEST_FILE);
-            if !manifest_path.is_file() {
+            if !manifest_path_is_regular_file(&manifest_path)? {
                 continue;
             }
             let manifest = super::load_skill_manifest(&path)?;
@@ -295,6 +295,17 @@ impl FilesystemRegistryAdapter {
             }
         }
         Ok(None)
+    }
+}
+
+fn manifest_path_is_regular_file(path: &Path) -> Result<bool, SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 

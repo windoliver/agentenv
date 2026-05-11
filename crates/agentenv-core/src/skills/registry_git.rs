@@ -2,9 +2,12 @@ use std::{
     cmp::Ordering,
     collections::HashSet,
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::security::ssrf::{validate_outbound, SsrfOptions};
@@ -18,6 +21,7 @@ use super::{
 
 const MANIFEST_FILE: &str = "skill.yaml";
 const SOURCE_TYPE: &str = "git";
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) trait GitCheckout: Send + Sync + std::fmt::Debug {
     fn checkout(&self, url: &str, cache_root: &Path) -> Result<PathBuf, SkillError>;
@@ -29,7 +33,10 @@ struct CommandGitCheckout {
 }
 
 #[derive(Debug)]
-struct RealGitCommandRunner;
+struct RealGitCommandRunner {
+    program: PathBuf,
+    timeout: Duration,
+}
 
 trait GitCommandRunner: Send + Sync + std::fmt::Debug {
     fn run(
@@ -75,7 +82,7 @@ impl GitCheckout for CommandGitCheckout {
         let checkout = cache_root.join("checkout");
         match fs::symlink_metadata(&checkout) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                if !checkout.join(".git").is_dir() {
+                if !checkout_git_dir_exists(&checkout)? {
                     return Err(SkillError::GitRegistry {
                         url: url.to_owned(),
                         message: format!(
@@ -111,14 +118,27 @@ impl GitCheckout for CommandGitCheckout {
             }
         }
 
-        if checkout.join(".git").is_dir() {
+        if checkout_git_dir_exists(&checkout)? {
+            let clone_url = clone_url(url)?;
+            run_git(
+                self.runner.as_ref(),
+                &[
+                    "-C".to_owned(),
+                    path_arg(&checkout),
+                    "remote".to_owned(),
+                    "set-url".to_owned(),
+                    "origin".to_owned(),
+                    clone_url,
+                ],
+                url,
+            )?;
             run_git(
                 self.runner.as_ref(),
                 &[
                     "-C".to_owned(),
                     path_arg(&checkout),
                     "fetch".to_owned(),
-                    "--all".to_owned(),
+                    "origin".to_owned(),
                     "--tags".to_owned(),
                     "--prune".to_owned(),
                 ],
@@ -291,7 +311,7 @@ impl RegistryAdapter for GitRegistryAdapter {
 impl CommandGitCheckout {
     fn new() -> Self {
         Self {
-            runner: Arc::new(RealGitCommandRunner),
+            runner: Arc::new(RealGitCommandRunner::new()),
         }
     }
 
@@ -301,13 +321,30 @@ impl CommandGitCheckout {
     }
 }
 
+impl RealGitCommandRunner {
+    fn new() -> Self {
+        Self {
+            program: PathBuf::from("git"),
+            timeout: GIT_COMMAND_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_program_and_timeout(program: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self {
+            program: program.into(),
+            timeout,
+        }
+    }
+}
+
 impl GitCommandRunner for RealGitCommandRunner {
     fn run(
         &self,
         args: &[String],
         environment: &GitCommandEnvironment,
     ) -> Result<GitCommandOutput, String> {
-        let mut command = Command::new("git");
+        let mut command = Command::new(&self.program);
         command.args(args);
         for name in &environment.remove {
             command.env_remove(name);
@@ -315,16 +352,79 @@ impl GitCommandRunner for RealGitCommandRunner {
         for (name, value) in &environment.set {
             command.env(name, value);
         }
-        let output = command
-            .output()
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
             .map_err(|source| format!("failed to run git: {source}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture git stdout".to_owned())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture git stderr".to_owned())?;
+        let stdout_reader = read_child_pipe(stdout);
+        let stderr_reader = read_child_pipe(stderr);
+        let deadline = Instant::now() + self.timeout;
+
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|source| format!("failed to wait for git: {source}"))?
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_child_pipe(stdout_reader, "stdout");
+                let _ = join_child_pipe(stderr_reader, "stderr");
+                return Err(format!(
+                    "git command timed out after {}",
+                    timeout_diagnostic(self.timeout)
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let stdout = join_child_pipe(stdout_reader, "stdout")?;
+        let stderr = join_child_pipe(stderr_reader, "stderr")?;
 
         Ok(GitCommandOutput {
-            success: output.status.success(),
-            status: output.status.to_string(),
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            success: status.success(),
+            status: status.to_string(),
+            stdout: String::from_utf8_lossy(&stdout).trim().to_owned(),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
         })
+    }
+}
+
+fn read_child_pipe(
+    mut pipe: impl Read + Send + 'static,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        pipe.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn join_child_pipe(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, String> {
+    handle
+        .join()
+        .map_err(|_| format!("failed to read git {stream_name}: reader thread panicked"))?
+        .map_err(|source| format!("failed to read git {stream_name}: {source}"))
+}
+
+fn timeout_diagnostic(timeout: Duration) -> String {
+    if timeout.as_secs() > 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{}ms", timeout.as_millis())
     }
 }
 
@@ -397,6 +497,19 @@ fn clone_url(url: &str) -> Result<String, SkillError> {
         });
     }
     Ok(stripped.to_owned())
+}
+
+fn checkout_git_dir_exists(checkout: &Path) -> Result<bool, SkillError> {
+    let git_dir = checkout.join(".git");
+    match fs::symlink_metadata(&git_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(SkillError::UnsafeBundlePath { path: git_dir }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SkillError::Io {
+            path: git_dir,
+            source,
+        }),
+    }
 }
 
 fn validate_git_registry_url(url: &str, options: &SsrfOptions) -> Result<(), SkillError> {
@@ -1135,8 +1248,19 @@ mod tests {
                     args: expected_isolated_args(vec![
                         "-C".to_owned(),
                         path_arg(&cache_root.join("checkout")),
+                        "remote".to_owned(),
+                        "set-url".to_owned(),
+                        "origin".to_owned(),
+                        "https://github.com/acme/skills".to_owned(),
+                    ]),
+                    environment: expected_git_environment(),
+                },
+                RecordedGitCommand {
+                    args: expected_isolated_args(vec![
+                        "-C".to_owned(),
+                        path_arg(&cache_root.join("checkout")),
                         "fetch".to_owned(),
-                        "--all".to_owned(),
+                        "origin".to_owned(),
                         "--tags".to_owned(),
                         "--prune".to_owned(),
                     ]),
@@ -1154,5 +1278,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_git_runner_times_out_stalled_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("skill-git-command-timeout");
+        let fake_git = root.join("git");
+        fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut permissions = fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_git, permissions).unwrap();
+        let runner =
+            RealGitCommandRunner::with_program_and_timeout(fake_git, Duration::from_millis(25));
+
+        let error = runner
+            .run(&["status".to_owned()], &isolated_git_environment())
+            .expect_err("stalled git commands must time out");
+
+        assert!(error.contains("timed out"), "error was: {error}");
     }
 }

@@ -92,6 +92,10 @@ impl HttpRegistryAdapter {
         self.url_for(&["skills", name, &format!("{version}.tar.zst")])
     }
 
+    fn tarball_signature_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
+        self.url_for(&["skills", name, &format!("{version}.tar.zst.sig")])
+    }
+
     fn content_url(
         &self,
         name: &str,
@@ -155,7 +159,7 @@ impl HttpRegistryAdapter {
         }
 
         let Some(content) = self.get_optional_text(self.index_yaml_url()?).await? else {
-            return Ok((HttpRegistryIndex::default(), HttpRegistryIndexFormat::Yaml));
+            return Ok((HttpRegistryIndex::default(), HttpRegistryIndexFormat::Json));
         };
         let mut index: HttpRegistryIndex =
             serde_yaml::from_str(&content).map_err(|source| SkillError::Yaml {
@@ -357,6 +361,53 @@ impl HttpRegistryAdapter {
         Ok(())
     }
 
+    async fn verify_tarball_signature_sidecar(
+        &self,
+        hit: &SkillSearchHit,
+        manifest: &SkillManifest,
+        digest: &str,
+    ) -> Result<(), SkillError> {
+        if hit.signature_ed25519.is_none() && hit.public_key_ed25519.is_none() {
+            return Ok(());
+        }
+
+        let public_key =
+            hit.public_key_ed25519
+                .as_deref()
+                .ok_or_else(|| SkillError::MissingSignature {
+                    name: hit.name.clone(),
+                    version: hit.version.clone(),
+                })?;
+        let signature_bytes = self
+            .get_bytes(self.tarball_signature_url(&hit.name, &hit.version)?)
+            .await?;
+        let signature = std::str::from_utf8(&signature_bytes)
+            .map_err(|source| SkillError::InvalidSignature {
+                name: hit.name.clone(),
+                version: hit.version.clone(),
+                message: format!("signature sidecar is not valid UTF-8: {source}"),
+            })?
+            .trim();
+        if signature.is_empty() {
+            return Err(SkillError::InvalidSignature {
+                name: hit.name.clone(),
+                version: hit.version.clone(),
+                message: "signature sidecar is empty".to_owned(),
+            });
+        }
+        if let Some(index_signature) = hit.signature_ed25519.as_deref() {
+            if index_signature != signature {
+                return Err(SkillError::InvalidSignature {
+                    name: hit.name.clone(),
+                    version: hit.version.clone(),
+                    message: "signature sidecar does not match index signature".to_owned(),
+                });
+            }
+        }
+
+        verify_ed25519_signature(manifest, digest, signature, public_key)
+    }
+
     async fn put_bytes(&self, url: Url, body: Vec<u8>) -> Result<(), SkillError> {
         let response = self.request(Method::PUT, url.clone(), Some(body)).await?;
         ensure_success(&url, response.status())
@@ -413,14 +464,16 @@ impl RegistryAdapter for HttpRegistryAdapter {
             source,
         })?;
 
-        if let Some(bytes) = self
+        let used_tarball = if let Some(bytes) = self
             .get_optional_bytes(self.tarball_url(&hit.name, &hit.version)?)
             .await?
         {
             unpack_tar_zst(&bytes, &staging_path)?;
+            true
         } else {
             self.fetch_expanded_bundle(&hit, &staging_path).await?;
-        }
+            false
+        };
 
         let manifest = super::load_skill_manifest(&staging_path)?;
         if manifest.name != hit.name || manifest.version.to_string() != hit.version {
@@ -439,6 +492,10 @@ impl RegistryAdapter for HttpRegistryAdapter {
                     actual: digest,
                 });
             }
+        }
+        if used_tarball {
+            self.verify_tarball_signature_sidecar(&hit, &manifest, &digest)
+                .await?;
         }
 
         Ok(FetchedSkill {
