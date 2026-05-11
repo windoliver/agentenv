@@ -1032,6 +1032,55 @@ fn skills_propose_open_pr_rejects_invalid_repo() {
 }
 
 #[test]
+fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
+    let temp_dir = make_temp_dir("skills-propose-e2e");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let out = temp_dir.join("proposed");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(out.join("fs-edit-skill/SKILL.md").is_file());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+}
+
+#[test]
 fn skills_verify_all_succeeds_for_valid_local_cache() {
     let temp_dir = make_temp_dir("skills-verify-valid");
     write_cli_cache_skill(
@@ -4827,6 +4876,36 @@ fn activity_event(
     trace_id: &str,
 ) -> ActivityEvent {
     ActivityEvent::new(ts, kind, result, trace_id).with_env("demo")
+}
+
+fn propose_event(trace_id: &str, blueprint_id: &str, tool: &str, path: &str) -> ActivityEvent {
+    ActivityEvent::new(
+        "2026-05-11T00:00:00Z",
+        ActivityKind::McpToolCall,
+        ActivityResult::Ok,
+        trace_id,
+    )
+    .with_env("demo")
+    .with_subject_value("tool", serde_json::json!(tool))
+    .with_subject_value("arguments", serde_json::json!({"path": path}))
+    .with_extra("blueprint_id", serde_json::json!(blueprint_id))
+}
+
+fn blueprint_digest(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap();
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn fixture_generalization_json() -> String {
+    serde_json::json!({
+        "name": "fs-edit-skill",
+        "description": "Edit a repeated filesystem target.",
+        "template_variables": [{"name": "target_path", "description": "Target path", "example": "src/lib.rs"}],
+        "procedure_steps": [{"tool": "fs_read", "instruction": "Read {{target_path}}."}],
+        "self_test": {"command": "test -f SKILL.md"},
+        "skill_md_body": "Read {{target_path}}."
+    })
+    .to_string()
 }
 
 fn seed_activity_db(home: &Path, env: &str, events: &[ActivityEvent]) {
