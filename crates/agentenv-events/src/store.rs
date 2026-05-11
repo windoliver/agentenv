@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -282,7 +282,7 @@ impl SqliteEventStore {
                     matches_blueprint: false,
                     excluded: false,
                     unresolved_pending_approval: false,
-                    pending_approval_request_ids: BTreeSet::new(),
+                    pending_approval_request_ids: BTreeMap::new(),
                 });
 
             if event_blueprint_id(&event) == Some(query.blueprint_id.as_str()) {
@@ -291,12 +291,12 @@ impl SqliteEventStore {
             if immediately_excludes_trace(&event) {
                 accumulator.excluded = true;
             }
-            accumulator.record_approval_state(&event);
+            accumulator.record_approval_state(row.id, &event);
 
             accumulator.trace.terminal_result = event.result;
             accumulator.trace.event_ids.push(row.id);
 
-            if event.kind == ActivityKind::McpToolCall {
+            if event.kind == ActivityKind::McpToolCall && event.result == ActivityResult::Ok {
                 if let Some(tool) = event_tool_name(&event) {
                     accumulator.trace.calls.push(TraceToolCall {
                         event_id: row.id,
@@ -309,6 +309,8 @@ impl SqliteEventStore {
                 }
             }
         }
+
+        resolve_pending_approvals(&conn, &mut traces, query.env.as_deref())?;
 
         let mut runs = Vec::new();
         for trace_id in trace_ids {
@@ -702,15 +704,15 @@ struct TraceAccumulator {
     matches_blueprint: bool,
     excluded: bool,
     unresolved_pending_approval: bool,
-    pending_approval_request_ids: BTreeSet<String>,
+    pending_approval_request_ids: BTreeMap<String, i64>,
 }
 
 impl TraceAccumulator {
-    fn record_approval_state(&mut self, event: &ActivityEvent) {
+    fn record_approval_state(&mut self, event_id: i64, event: &ActivityEvent) {
         if event.result == ActivityResult::PendingApproval {
             if let Some(request_id) = event_request_id(event) {
                 self.pending_approval_request_ids
-                    .insert(request_id.to_owned());
+                    .insert(request_id.to_owned(), event_id);
             } else {
                 self.unresolved_pending_approval = true;
             }
@@ -728,6 +730,73 @@ impl TraceAccumulator {
             || self.unresolved_pending_approval
             || !self.pending_approval_request_ids.is_empty()
     }
+}
+
+fn resolve_pending_approvals(
+    conn: &Connection,
+    traces: &mut BTreeMap<String, TraceAccumulator>,
+    env: Option<&str>,
+) -> StoreResult<()> {
+    for accumulator in traces.values_mut() {
+        let pending = accumulator
+            .pending_approval_request_ids
+            .iter()
+            .map(|(request_id, event_id)| (request_id.clone(), *event_id))
+            .collect::<Vec<_>>();
+
+        for (request_id, request_event_id) in pending {
+            if approval_request_has_later_ok_decision(conn, &request_id, request_event_id, env)? {
+                accumulator.pending_approval_request_ids.remove(&request_id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn approval_request_has_later_ok_decision(
+    conn: &Connection,
+    request_id: &str,
+    request_event_id: i64,
+    env: Option<&str>,
+) -> StoreResult<bool> {
+    let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
+    let ok = enum_to_db_string(ActivityResult::Ok, "result")?;
+    let mut sql = String::from(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM activity_events
+            WHERE id > ?
+              AND kind = ?
+              AND result = ?
+              AND json_type(subject_json, '$.request_id') = 'text'
+              AND json_extract(subject_json, '$.request_id') = ?
+        "#,
+    );
+    let mut query_params = vec![
+        SqlValue::Integer(request_event_id),
+        SqlValue::Text(approval_decided),
+        SqlValue::Text(ok),
+        SqlValue::Text(request_id.to_owned()),
+    ];
+
+    if let Some(env) = env {
+        sql.push_str(" AND env = ?");
+        query_params.push(SqlValue::Text(env.to_owned()));
+    }
+
+    sql.push_str(
+        r#"
+            LIMIT 1
+        )
+        "#,
+    );
+
+    let found = conn.query_row(&sql, params_from_iter(query_params), |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(found != 0)
 }
 
 fn immediately_excludes_trace(event: &ActivityEvent) -> bool {

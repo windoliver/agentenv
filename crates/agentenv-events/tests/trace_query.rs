@@ -331,6 +331,181 @@ fn trace_query_keeps_trace_with_resolved_approval_request() {
     );
 }
 
+#[test]
+fn trace_query_keeps_trace_with_cross_trace_approval_decision() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+    store
+        .append_many(&[
+            event(
+                "approved-trace",
+                1,
+                "demo",
+                "sha256:blueprint-a",
+                "fs_read",
+                ActivityResult::Ok,
+            ),
+            ActivityEvent::new(
+                "2026-05-11T00:00:02Z",
+                ActivityKind::ApprovalRequested,
+                ActivityResult::PendingApproval,
+                "approved-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("request_id", serde_json::json!("approval-1"))
+            .with_extra("blueprint_id", serde_json::json!("sha256:blueprint-a")),
+            ActivityEvent::new(
+                "2026-05-11T00:00:03Z",
+                ActivityKind::ApprovalDecided,
+                ActivityResult::Ok,
+                "approval-decision-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("request_id", serde_json::json!("approval-1")),
+        ])
+        .unwrap();
+
+    let traces = store
+        .query_trace_runs(TraceQuery {
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            env: Some("demo".to_owned()),
+            limit: 100,
+        })
+        .unwrap();
+
+    assert_eq!(
+        traces
+            .iter()
+            .map(|trace| trace.trace_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["approved-trace"]
+    );
+}
+
+#[test]
+fn trace_query_excludes_unresolved_pending_approval_with_request_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+    store
+        .append_many(&[
+            event(
+                "pending-trace",
+                1,
+                "demo",
+                "sha256:blueprint-a",
+                "fs_read",
+                ActivityResult::Ok,
+            ),
+            ActivityEvent::new(
+                "2026-05-11T00:00:02Z",
+                ActivityKind::ApprovalRequested,
+                ActivityResult::PendingApproval,
+                "pending-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("request_id", serde_json::json!("approval-1"))
+            .with_extra("blueprint_id", serde_json::json!("sha256:blueprint-a")),
+        ])
+        .unwrap();
+
+    let traces = store
+        .query_trace_runs(TraceQuery {
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            env: Some("demo".to_owned()),
+            limit: 100,
+        })
+        .unwrap();
+
+    assert!(traces.is_empty());
+}
+
+#[test]
+fn trace_query_does_not_resolve_request_with_earlier_approval_decision() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+    store
+        .append_many(&[
+            ActivityEvent::new(
+                "2026-05-11T00:00:01Z",
+                ActivityKind::ApprovalDecided,
+                ActivityResult::Ok,
+                "approval-decision-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("request_id", serde_json::json!("approval-1")),
+            event(
+                "pending-trace",
+                2,
+                "demo",
+                "sha256:blueprint-a",
+                "fs_read",
+                ActivityResult::Ok,
+            ),
+            ActivityEvent::new(
+                "2026-05-11T00:00:03Z",
+                ActivityKind::ApprovalRequested,
+                ActivityResult::PendingApproval,
+                "pending-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("request_id", serde_json::json!("approval-1"))
+            .with_extra("blueprint_id", serde_json::json!("sha256:blueprint-a")),
+        ])
+        .unwrap();
+
+    let traces = store
+        .query_trace_runs(TraceQuery {
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            env: Some("demo".to_owned()),
+            limit: 100,
+        })
+        .unwrap();
+
+    assert!(traces.is_empty());
+}
+
+#[test]
+fn trace_query_requires_successful_mcp_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+    store
+        .append_many(&[
+            ActivityEvent::new(
+                "2026-05-11T00:00:01Z",
+                ActivityKind::McpToolCall,
+                ActivityResult::PendingApproval,
+                "pending-call-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("tool", serde_json::json!("fs_read"))
+            .with_subject_value(
+                "arguments",
+                serde_json::json!({"path": "needs-approval.rs"}),
+            )
+            .with_subject_value("request_id", serde_json::json!("approval-1"))
+            .with_extra("blueprint_id", serde_json::json!("sha256:blueprint-a")),
+            ActivityEvent::new(
+                "2026-05-11T00:00:02Z",
+                ActivityKind::ApprovalDecided,
+                ActivityResult::Ok,
+                "pending-call-trace",
+            )
+            .with_env("demo")
+            .with_subject_value("request_id", serde_json::json!("approval-1")),
+        ])
+        .unwrap();
+
+    let traces = store
+        .query_trace_runs(TraceQuery {
+            blueprint_id: "sha256:blueprint-a".to_owned(),
+            env: Some("demo".to_owned()),
+            limit: 100,
+        })
+        .unwrap();
+
+    assert!(traces.is_empty());
+}
+
 fn event(
     trace_id: &str,
     ordinal: u32,
