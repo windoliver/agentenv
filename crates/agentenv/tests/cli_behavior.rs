@@ -1044,15 +1044,7 @@ fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
     )
     .unwrap();
     let db_path = temp_dir.join(".agentenv/events.db");
-    let store = SqliteEventStore::open(&db_path).unwrap();
-    let blueprint_id = blueprint_digest(&blueprint);
-    store
-        .append_many(&[
-            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
-            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
-            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
-        ])
-        .unwrap();
+    seed_propose_events(&db_path, &blueprint);
 
     let out = temp_dir.join("proposed");
     let output = Command::new(agentenv_bin())
@@ -1078,9 +1070,83 @@ fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
         .unwrap();
 
     assert!(output.status.success(), "{}", output_summary(&output));
-    assert!(out.join("fs-edit-skill/SKILL.md").is_file());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["warnings"].as_array().unwrap().len(), 0);
     assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+    let expected_proposal_path = out.join("fs-edit-skill").to_string_lossy().into_owned();
+    assert_eq!(
+        json["proposals"][0]["path"].as_str(),
+        Some(expected_proposal_path.as_str())
+    );
+    assert_eq!(json["proposals"][0]["novelty"].as_f64(), Some(0.9));
+    assert_eq!(json["proposals"][0]["utility"].as_f64(), Some(0.6));
+    assert_eq!(json["proposals"][0]["self_test_score"].as_f64(), Some(1.0));
+
+    let proposal_dir = out.join("fs-edit-skill");
+    for relative in [
+        "SKILL.md",
+        "skill.yaml",
+        "proposal.yaml",
+        "self-test.json",
+        "traces/provenance.json",
+    ] {
+        assert!(
+            proposal_dir.join(relative).is_file(),
+            "proposal should emit {relative}"
+        );
+    }
+
+    let skill_md = fs::read_to_string(proposal_dir.join("SKILL.md")).unwrap();
+    assert!(skill_md.contains("agentenv-proposal: true"));
+    assert!(skill_md.contains("Read {{target_path}}."));
+
+    let skill_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(proposal_dir.join("skill.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(skill_yaml["name"].as_str(), Some("fs-edit-skill"));
+    assert_eq!(skill_yaml["entry"].as_str(), Some("SKILL.md"));
+    assert_eq!(skill_yaml["agentenv_proposal"].as_bool(), Some(true));
+    let files = skill_yaml["files"].as_sequence().unwrap();
+    for expected in [
+        "SKILL.md",
+        "proposal.yaml",
+        "self-test.json",
+        "traces/provenance.json",
+    ] {
+        assert!(
+            files.iter().any(|file| file.as_str() == Some(expected)),
+            "skill.yaml should declare {expected}: {skill_yaml:?}"
+        );
+    }
+
+    let proposal_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(proposal_dir.join("proposal.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(proposal_yaml["status"].as_str(), Some("proposed"));
+    let expected_blueprint_id = blueprint_digest(&blueprint);
+    assert_eq!(
+        proposal_yaml["blueprint_id"].as_str(),
+        Some(expected_blueprint_id.as_str())
+    );
+    assert_eq!(proposal_yaml["occurrences"].as_u64(), Some(3));
+
+    let self_test: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(proposal_dir.join("self-test.json")).unwrap())
+            .unwrap();
+    assert_eq!(self_test["passed"].as_bool(), Some(true));
+    assert_eq!(self_test["matched_steps"].as_u64(), Some(1));
+    assert_eq!(self_test["total_steps"].as_u64(), Some(1));
+
+    let provenance: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(proposal_dir.join("traces/provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        provenance["fingerprint"].as_str(),
+        Some(fs_read_candidate_fingerprint())
+    );
+    assert_eq!(provenance["source_trace_ids"].as_array().unwrap().len(), 3);
+    assert_eq!(provenance["sequence"][0]["tool"].as_str(), Some("fs_read"));
 }
 
 #[test]
@@ -1163,20 +1229,20 @@ fn skills_propose_filters_duplicate_installed_skill_by_provenance_fingerprint() 
     let db_path = temp_dir.join(".agentenv/events.db");
     seed_propose_events(&db_path, &blueprint);
 
-    let installed = temp_dir.join(".agentenv/skills/existing-installed-skill/0.1.0");
-    fs::create_dir_all(installed.join("content/traces")).unwrap();
+    let bundle = temp_dir.join("installed-skill-bundle");
+    fs::create_dir_all(bundle.join("traces")).unwrap();
     fs::write(
-        installed.join("skill.yaml"),
+        bundle.join("skill.yaml"),
         "name: existing-installed-skill\nversion: 0.1.0\ndescription: unrelated installed skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\n",
     )
     .unwrap();
     fs::write(
-        installed.join("content/SKILL.md"),
+        bundle.join("SKILL.md"),
         "This text intentionally does not overlap the generated procedure.\n",
     )
     .unwrap();
     fs::write(
-        installed.join("content/traces/provenance.json"),
+        bundle.join("traces/provenance.json"),
         serde_json::json!({
             "name_seed": "fs-read",
             "blueprint_id": blueprint_digest(&blueprint),
@@ -1189,6 +1255,30 @@ fn skills_propose_filters_duplicate_installed_skill_by_provenance_fingerprint() 
         .to_string(),
     )
     .unwrap();
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+    let install_json: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+    assert_eq!(
+        install_json["name"].as_str(),
+        Some("existing-installed-skill")
+    );
+    assert!(
+        temp_dir
+            .join(".agentenv/skills/existing-installed-skill/0.1.0/content/traces/provenance.json")
+            .is_file(),
+        "install command should copy proposal provenance into installed content"
+    );
 
     let out = temp_dir.join("proposed");
     let output = Command::new(agentenv_bin())
