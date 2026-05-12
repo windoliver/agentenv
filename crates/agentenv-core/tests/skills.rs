@@ -2196,6 +2196,7 @@ async fn git_registry_publish_is_reported_as_unsupported() {
                 "git+https://github.com/acme/skills",
             )],
             registry_order: vec!["git-dev".to_owned()],
+            proposal: None,
         },
     );
 
@@ -2226,6 +2227,7 @@ async fn git_registry_rejects_invalid_registry_name_before_cache_path_use() {
                 "git+https://github.com/acme/skills",
             )],
             registry_order: vec!["../../outside".to_owned()],
+            proposal: None,
         },
     );
 
