@@ -4,7 +4,10 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -926,6 +929,1453 @@ fn skills_help_lists_lifecycle_subcommands() {
             "missing {command}; stdout was: {stdout}"
         );
     }
+}
+
+#[test]
+fn skills_help_lists_propose_subcommand() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("propose")),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn skills_propose_help_lists_expected_flags() {
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--from-traces", "--blueprint", "--min-self-test-score"] {
+        assert!(
+            stdout.contains(flag),
+            "missing {flag}; stdout was: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn skills_propose_requires_from_traces_and_blueprint() {
+    let temp_dir = make_temp_dir("skills-propose-required");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--from-traces"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_validation_runs_before_loading_skills_config() {
+    let temp_dir = make_temp_dir("skills-propose-invalid-config");
+    let config_dir = temp_dir.join(".config").join("agentenv");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("config.toml"), "skills = [").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--from-traces"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_open_pr_rejects_invalid_repo() {
+    let temp_dir = make_temp_dir("skills-propose-invalid-repo");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("bad repo")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("no proposals emitted"),
+        "stdout was: {stdout}"
+    );
+    assert!(stderr.contains("owner/repo"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
+    let temp_dir = make_temp_dir("skills-propose-e2e");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let out = temp_dir.join("proposed");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["warnings"].as_array().unwrap().len(), 0);
+    assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+    let expected_proposal_path = out.join("fs-edit-skill").to_string_lossy().into_owned();
+    assert_eq!(
+        json["proposals"][0]["path"].as_str(),
+        Some(expected_proposal_path.as_str())
+    );
+    assert_eq!(json["proposals"][0]["novelty"].as_f64(), Some(0.9));
+    assert_eq!(json["proposals"][0]["utility"].as_f64(), Some(0.6));
+    assert_eq!(json["proposals"][0]["self_test_score"].as_f64(), Some(1.0));
+
+    let proposal_dir = out.join("fs-edit-skill");
+    for relative in [
+        "SKILL.md",
+        "skill.yaml",
+        "proposal.yaml",
+        "self-test.json",
+        "traces/provenance.json",
+    ] {
+        assert!(
+            proposal_dir.join(relative).is_file(),
+            "proposal should emit {relative}"
+        );
+    }
+
+    let skill_md = fs::read_to_string(proposal_dir.join("SKILL.md")).unwrap();
+    assert!(skill_md.contains("agentenv-proposal: true"));
+    assert!(skill_md.contains("Read {{target_path}}."));
+
+    let skill_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(proposal_dir.join("skill.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(skill_yaml["name"].as_str(), Some("fs-edit-skill"));
+    assert_eq!(skill_yaml["entry"].as_str(), Some("SKILL.md"));
+    assert_eq!(skill_yaml["agentenv_proposal"].as_bool(), Some(true));
+    let files = skill_yaml["files"].as_sequence().unwrap();
+    for expected in [
+        "SKILL.md",
+        "proposal.yaml",
+        "self-test.json",
+        "traces/provenance.json",
+    ] {
+        assert!(
+            files.iter().any(|file| file.as_str() == Some(expected)),
+            "skill.yaml should declare {expected}: {skill_yaml:?}"
+        );
+    }
+
+    let proposal_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(proposal_dir.join("proposal.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(proposal_yaml["status"].as_str(), Some("proposed"));
+    let expected_blueprint_id = blueprint_digest(&blueprint);
+    assert_eq!(
+        proposal_yaml["blueprint_id"].as_str(),
+        Some(expected_blueprint_id.as_str())
+    );
+    assert_eq!(proposal_yaml["occurrences"].as_u64(), Some(3));
+
+    let self_test: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(proposal_dir.join("self-test.json")).unwrap())
+            .unwrap();
+    assert_eq!(self_test["passed"].as_bool(), Some(true));
+    assert_eq!(self_test["matched_steps"].as_u64(), Some(1));
+    assert_eq!(self_test["total_steps"].as_u64(), Some(1));
+
+    let provenance: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(proposal_dir.join("traces/provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        provenance["fingerprint"].as_str(),
+        Some(fs_read_candidate_fingerprint())
+    );
+    assert_eq!(provenance["source_trace_ids"].as_array().unwrap().len(), 3);
+    assert_eq!(provenance["sequence"][0]["tool"].as_str(), Some("fs_read"));
+}
+
+#[test]
+fn skills_propose_filters_duplicate_existing_proposal_by_min_novelty() {
+    let temp_dir = make_temp_dir("skills-propose-existing-proposal");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let out = temp_dir.join("proposed");
+    let existing = out.join("existing-fs-edit-skill");
+    fs::create_dir_all(&existing).unwrap();
+    fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: existing-fs-edit-skill\ndescription: Edit a repeated filesystem target.\n---\n\nRead {{target_path}}.\n",
+    )
+    .unwrap();
+    fs::write(
+        existing.join("skill.yaml"),
+        "name: existing-fs-edit-skill\nversion: 0.1.0\ndescription: Edit a repeated filesystem target.\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--min-novelty")
+        .arg("0.85")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json_named("fs-edit-skill-v2"),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"].as_array().unwrap().len(), 0);
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .unwrap()
+            .contains("novelty 0.3 is below 0.85")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !out.join("fs-edit-skill-v2/SKILL.md").exists(),
+        "duplicate-ish proposal should be skipped before emission"
+    );
+}
+
+#[test]
+fn skills_propose_filters_duplicate_installed_skill_by_provenance_fingerprint() {
+    let temp_dir = make_temp_dir("skills-propose-existing-installed");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let bundle = temp_dir.join("installed-skill-bundle");
+    fs::create_dir_all(bundle.join("traces")).unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        "name: existing-installed-skill\nversion: 0.1.0\ndescription: unrelated installed skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\n",
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("SKILL.md"),
+        "This text intentionally does not overlap the generated procedure.\n",
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("traces/provenance.json"),
+        serde_json::json!({
+            "name_seed": "fs-read",
+            "blueprint_id": blueprint_digest(&blueprint),
+            "fingerprint": fs_read_candidate_fingerprint(),
+            "occurrences": 3,
+            "sequence": [{"tool": "fs_read", "args_shape": {"path": "string:path"}}],
+            "source_trace_ids": ["trace-1", "trace-2", "trace-3"],
+            "redaction_count": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+    let install_json: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+    assert_eq!(
+        install_json["name"].as_str(),
+        Some("existing-installed-skill")
+    );
+    assert!(
+        temp_dir
+            .join(".agentenv/skills/existing-installed-skill/0.1.0/content/traces/provenance.json")
+            .is_file(),
+        "install command should copy proposal provenance into installed content"
+    );
+
+    let out = temp_dir.join("proposed");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--min-novelty")
+        .arg("0.1")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json_named("fs-edit-skill-v3"),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"].as_array().unwrap().len(), 0);
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("novelty 0 is below 0.1")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !out.join("fs-edit-skill-v3/SKILL.md").exists(),
+        "exact installed duplicate should be skipped before emission"
+    );
+}
+
+#[test]
+fn skills_propose_warns_and_continues_past_malformed_existing_proposal_provenance() {
+    let temp_dir = make_temp_dir("skills-propose-malformed-proposed-provenance");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let out = temp_dir.join("proposed");
+    let existing = out.join("broken-cache");
+    fs::create_dir_all(existing.join("traces")).unwrap();
+    fs::write(
+        existing.join("skill.yaml"),
+        "name: broken-cache\nversion: 0.1.0\ndescription: unrelated cached proposal\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\n",
+    )
+    .unwrap();
+    fs::write(
+        existing.join("SKILL.md"),
+        "This cached proposal is unrelated to filesystem reads.\n",
+    )
+    .unwrap();
+    fs::write(existing.join("traces/provenance.json"), "{not json").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| {
+            let warning = warning.as_str().unwrap();
+            warning.contains("broken-cache") && warning.contains("provenance")
+        }),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn skills_propose_rejects_unsupported_semantic_backend() {
+    let temp_dir = make_temp_dir("skills-propose-semantic-backend");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--semantic-backend")
+        .arg("remote")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--semantic-backend") && stderr.contains("local"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_publishes_first_proposal_with_fake_git_and_gh() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr");
+    let repo_root = temp_dir.join("repo");
+    let home = temp_dir.join("home");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let log_path = temp_dir.join("commands.log");
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    for program in ["git", "gh"] {
+        let script = fake_bin.join(program);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> '{}'\nif [ \"$(basename \"$0\")\" = git ] && [ \"$1\" = rev-parse ]; then\n  printf '%s\\n' '{}'\nfi\nif [ \"$(basename \"$0\")\" = gh ]; then\n  printf '%s\\n' 'https://github.com/owner/repo/pull/123'\nfi\n",
+                log_path.display(),
+                repo_root.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", &home)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let out = repo_root.join(".agentenv/skills/proposed");
+    assert!(out.join("fs-edit-skill/SKILL.md").is_file());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("https://github.com/owner/repo/pull/123"),
+        "stdout was: {stdout}"
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let canonical_repo_root = fs::canonicalize(&repo_root).unwrap();
+    let expected_commands = [
+        "git rev-parse --show-toplevel".to_owned(),
+        format!(
+            "git -C {} diff --cached --quiet --exit-code",
+            canonical_repo_root.display()
+        ),
+        format!(
+            "git -C {} checkout -B agentenv/proposed-skill/fs-edit-skill",
+            canonical_repo_root.display()
+        ),
+        format!(
+            "git -C {} add -- .agentenv/skills/proposed/fs-edit-skill",
+            canonical_repo_root.display()
+        ),
+        format!(
+            "git -C {} commit -m feat: propose trace-derived skill fs-edit-skill",
+            canonical_repo_root.display()
+        ),
+        format!(
+            "git -C {} push -u origin agentenv/proposed-skill/fs-edit-skill",
+            canonical_repo_root.display()
+        ),
+        "gh pr create --repo owner/repo --draft --title feat: propose trace-derived skill fs-edit-skill --body Trace-derived skill proposal.".to_owned(),
+    ];
+    let mut cursor = 0;
+    for expected in expected_commands {
+        let relative = log[cursor..]
+            .find(&expected)
+            .unwrap_or_else(|| panic!("missing ordered command `{expected}`; log was: {log}"));
+        cursor += relative + expected.len();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_rejects_staged_changes_before_emitting() {
+    let temp_dir = make_temp_dir("skills-propose-open-pr-staged");
+    let repo_root = temp_dir.join("repo");
+    let home = temp_dir.join("home");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    run_git(&repo_root, &["init"]);
+
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    fs::write(repo_root.join("unrelated.txt"), "user staged change\n").unwrap();
+    run_git(&repo_root, &["add", "unrelated.txt"]);
+
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", &home)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("commit or unstage") && stderr.contains("staged"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !repo_root
+            .join(".agentenv/skills/proposed/fs-edit-skill/SKILL.md")
+            .exists(),
+        "proposal should not be emitted when the index has unrelated staged changes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_rejects_explicit_outside_repo_before_emitting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr-outside");
+    let repo_root = temp_dir.join("repo");
+    let outside = temp_dir.join("outside");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let log_path = temp_dir.join("commands.log");
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let git = fake_bin.join("git");
+    fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nprintf 'git %s\\n' \"$*\" >> '{}'\nif [ \"$1\" = rev-parse ]; then\n  printf '%s\\n' '{}'\nfi\n",
+            log_path.display(),
+            repo_root.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&git).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).unwrap();
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&outside)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", temp_dir.join("home"))
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--out must be inside the git worktree when --open-pr is set"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !outside.join("fs-edit-skill/SKILL.md").exists(),
+        "proposal should not be emitted outside the repo"
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert_eq!(log.trim(), "git rev-parse --show-toplevel");
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_rejects_default_output_through_symlinked_agentenv() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr-symlink-default");
+    let repo_root = temp_dir.join("repo");
+    let outside = temp_dir.join("outside-agentenv");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    run_git(&repo_root, &["init"]);
+    symlink(&outside, repo_root.join(".agentenv")).unwrap();
+
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join("events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let gh_log = temp_dir.join("gh.log");
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let gh = fake_bin.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> '{}'\nprintf '%s\\n' 'https://github.com/owner/repo/pull/789'\n",
+            gh_log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&gh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh, permissions).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", temp_dir.join("home"))
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inside the git worktree"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !outside
+            .join("skills/proposed/fs-edit-skill/SKILL.md")
+            .exists(),
+        "proposal should not be emitted through the .agentenv symlink"
+    );
+    assert!(
+        !gh_log.exists(),
+        "gh should not be reached when output preflight fails"
+    );
+    let head = git_stdout(&repo_root, &["symbolic-ref", "--short", "HEAD"]);
+    assert_ne!(head, "agentenv/proposed-skill/fs-edit-skill");
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_sanitizes_git_branch_slug_for_lock_like_names() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr-slug");
+    let repo_root = temp_dir.join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let log_path = temp_dir.join("commands.log");
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    for program in ["git", "gh"] {
+        let script = fake_bin.join(program);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> '{}'\nif [ \"$(basename \"$0\")\" = git ] && [ \"$1\" = rev-parse ]; then\n  printf '%s\\n' '{}'\nfi\nif [ \"$(basename \"$0\")\" = gh ]; then\n  printf '%s\\n' 'https://github.com/owner/repo/pull/456'\nfi\n",
+                log_path.display(),
+                repo_root.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", temp_dir.join("home"))
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json_named("bad..name.lock"),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let log = fs::read_to_string(&log_path).unwrap();
+    let checkout_line = log
+        .lines()
+        .find(|line| line.contains(" checkout -B "))
+        .unwrap();
+    assert!(
+        checkout_line.contains("agentenv/proposed-skill/bad-name-lock-"),
+        "log was: {log}"
+    );
+    assert!(!checkout_line.contains(".."), "log was: {log}");
+    assert!(!checkout_line.contains(".lock"), "log was: {log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_fails_when_no_proposals_are_emitted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr-empty");
+    let repo_root = temp_dir.join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    SqliteEventStore::open(&db_path).unwrap();
+
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let git = fake_bin.join("git");
+    fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then\n  printf '%s\\n' '{}'\nfi\n",
+            repo_root.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&git).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", &temp_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open-pr requested but no proposals were emitted"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_without_configured_llm_fails_clearly() {
+    let temp_dir = make_temp_dir("skills-propose-missing-llm");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skill proposal LLM provider is not configured"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_uses_configured_openai_compatible_provider_and_env_credential() {
+    let temp_dir = make_temp_dir("skills-propose-http-provider");
+    let project_dir = temp_dir.join("project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let (endpoint, captured_request, server) =
+        spawn_openai_compatible_skill_proposer(fixture_generalization_json());
+    let blueprint = project_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        format!(
+            r#"
+version: 0.1.0
+sandbox: {{ driver: openshell }}
+agent: {{ driver: codex }}
+context: {{ driver: filesystem, mount: . }}
+skills:
+  proposal:
+    llm:
+      provider: openai-compatible
+      endpoint: {endpoint}
+      model: test-model
+      credential: AGENTENV_TEST_SKILL_PROPOSER_TOKEN
+"#
+        ),
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let out = temp_dir.join("proposed");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_TEST_SKILL_PROPOSER_TOKEN", "test-token")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(out.join("fs-edit-skill/SKILL.md").is_file());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+    let request = captured_request.lock().unwrap().clone().unwrap();
+    assert!(
+        request.contains("authorization: Bearer test-token")
+            || request.contains("Authorization: Bearer test-token"),
+        "request was: {request}"
+    );
+    assert!(
+        request.contains(r#""model":"test-model""#),
+        "request was: {request}"
+    );
+}
+
+#[test]
+fn skills_propose_http_provider_times_out_when_server_never_responds() {
+    let temp_dir = make_temp_dir("skills-propose-http-timeout");
+    let (endpoint, server) = spawn_never_responding_skill_proposer();
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        &endpoint,
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_TIMEOUT_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let started_at = Instant::now();
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_TIMEOUT_TOKEN",
+            "timeout-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    let elapsed = started_at.elapsed();
+    server.join().unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out"),
+        "stderr was: {stderr}; elapsed: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "request should not wait for the production default timeout, elapsed: {elapsed:?}"
+    );
+    assert!(
+        stderr.contains("skill proposal LLM request failed"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_blocks_metadata_endpoint_before_http_request() {
+    let temp_dir = make_temp_dir("skills-propose-metadata-endpoint");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        "http://169.254.169.254/latest/meta-data",
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_METADATA_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_METADATA_TOKEN",
+            "metadata-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skill proposal LLM endpoint was blocked"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("169.254.169.254"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_does_not_follow_provider_redirect_to_metadata_endpoint() {
+    let temp_dir = make_temp_dir("skills-propose-redirect-ssrf");
+    let (endpoint, request_count, server) =
+        spawn_redirecting_skill_proposer("http://169.254.169.254/latest/meta-data");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        &endpoint,
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_REDIRECT_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_REDIRECT_TOKEN",
+            "redirect-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("307 Temporary Redirect"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("redirecting to metadata"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_blocks_private_endpoint_with_only_local_opt_in() {
+    let temp_dir = make_temp_dir("skills-propose-private-local-only");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        "http://10.0.0.1/v1/chat/completions",
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_LOCAL_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_LOCAL_TOKEN",
+            "private-local-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skill proposal LLM endpoint was blocked"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("10.0.0.1"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_private_endpoint_opt_in_reaches_request_layer() {
+    let temp_dir = make_temp_dir("skills-propose-private-opt-in");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        "http://10.0.0.1/v1/chat/completions",
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_PRIVATE_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_TOKEN",
+            "private-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("skill proposal LLM endpoint was blocked"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("skill proposal LLM request failed"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_redacts_and_bounds_non_success_provider_body() {
+    let temp_dir = make_temp_dir("skills-propose-http-error-redaction");
+    let (endpoint, server) = spawn_erroring_skill_proposer("test-token", "x".repeat(10_000));
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        &endpoint,
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_ERROR_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_TEST_SKILL_PROPOSER_ERROR_TOKEN", "test-token")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("test-token"), "stderr was: {stderr}");
+    assert!(stderr.contains("[REDACTED]"), "stderr was: {stderr}");
+    assert!(
+        stderr.len() < 6_000,
+        "stderr should include a bounded provider body, got {} bytes",
+        stderr.len()
+    );
+}
+
+#[test]
+fn skills_propose_missing_explicit_events_db_fails_clearly() {
+    let temp_dir = make_temp_dir("skills-propose-missing-events-db");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/missing-events.db");
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.trim().is_empty(), "stdout was: {stdout}");
+    assert!(stderr.contains("events DB"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains(&db_path.display().to_string()),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_empty_events_db_json_warns_without_stderr_warning() {
+    let temp_dir = make_temp_dir("skills-propose-empty-events-db");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    SqliteEventStore::open(&db_path).unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"].as_array().unwrap().len(), 0);
+    assert!(!json["warnings"].as_array().unwrap().is_empty());
+    let warning = json["warnings"][0].as_str().unwrap();
+    assert!(warning.contains("No traces"), "warning was: {warning}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(warning), "stderr was: {stderr}");
 }
 
 #[test]
@@ -4914,6 +6364,44 @@ fn activity_event(
     ActivityEvent::new(ts, kind, result, trace_id).with_env("demo")
 }
 
+fn propose_event(trace_id: &str, blueprint_id: &str, tool: &str, path: &str) -> ActivityEvent {
+    ActivityEvent::new(
+        "2026-05-11T00:00:00Z",
+        ActivityKind::McpToolCall,
+        ActivityResult::Ok,
+        trace_id,
+    )
+    .with_env("demo")
+    .with_subject_value("tool", serde_json::json!(tool))
+    .with_subject_value("arguments", serde_json::json!({"path": path}))
+    .with_extra("blueprint_id", serde_json::json!(blueprint_id))
+}
+
+fn blueprint_digest(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap();
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn fixture_generalization_json() -> String {
+    fixture_generalization_json_named("fs-edit-skill")
+}
+
+fn fixture_generalization_json_named(name: &str) -> String {
+    serde_json::json!({
+        "name": name,
+        "description": "Edit a repeated filesystem target.",
+        "template_variables": [{"name": "target_path", "description": "Target path", "example": "src/lib.rs"}],
+        "procedure_steps": [{"tool": "fs_read", "instruction": "Read {{target_path}}."}],
+        "self_test": {"command": "test -f SKILL.md"},
+        "skill_md_body": "Read {{target_path}}."
+    })
+    .to_string()
+}
+
+fn fs_read_candidate_fingerprint() -> &'static str {
+    r#"[{"tool":"fs_read","args_shape":{"path":"string:path"}}]"#
+}
+
 fn seed_activity_db(home: &Path, env: &str, events: &[ActivityEvent]) {
     let db_path = env_activity_db_path(home, env);
     let store = SqliteEventStore::open(db_path).unwrap();
@@ -4946,6 +6434,242 @@ fn reserve_tcp_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn spawn_openai_compatible_skill_proposer(
+    content: String,
+) -> (String, Arc<Mutex<Option<String>>>, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let captured_request = Arc::new(Mutex::new(None));
+    let captured_for_thread = Arc::clone(&captured_request);
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for OpenAI-compatible test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept OpenAI-compatible test request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let request = read_http_request(&mut stream);
+        *captured_for_thread.lock().unwrap() = Some(request);
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}],
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    (endpoint, captured_request, handle)
+}
+
+fn spawn_never_responding_skill_proposer() -> (String, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for never-responding test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept never-responding test request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let _request = read_http_request(&mut stream);
+        thread::sleep(Duration::from_secs(2));
+    });
+
+    (endpoint, handle)
+}
+
+fn spawn_erroring_skill_proposer(secret: &str, suffix: String) -> (String, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let body = format!("provider failed with token {secret}: {suffix}");
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for erroring test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept erroring test request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let _request = read_http_request(&mut stream);
+        write!(
+            stream,
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    (endpoint, handle)
+}
+
+fn spawn_redirecting_skill_proposer(
+    location: &str,
+) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_thread = Arc::clone(&request_count);
+    let location = location.to_owned();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for redirecting test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept redirecting test request: {error}"),
+            }
+        };
+        request_count_for_thread.fetch_add(1, Ordering::SeqCst);
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let _request = read_http_request(&mut stream);
+        let body = format!("redirecting to metadata: {location}");
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    (endpoint, request_count, handle)
+}
+
+fn write_skill_proposer_blueprint(blueprint: &Path, endpoint: &str, model: &str, credential: &str) {
+    fs::write(
+        blueprint,
+        format!(
+            r#"
+version: 0.1.0
+sandbox: {{ driver: openshell }}
+agent: {{ driver: codex }}
+context: {{ driver: filesystem, mount: . }}
+skills:
+  proposal:
+    llm:
+      provider: openai-compatible
+      endpoint: {endpoint}
+      model: {model}
+      credential: {credential}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn seed_propose_events(db_path: &Path, blueprint: &Path) {
+    let store = SqliteEventStore::open(db_path).unwrap();
+    let blueprint_id = blueprint_digest(blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count != 0, "connection closed before request headers");
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(header_end) = find_header_end(&bytes) {
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let target_len = header_end + 4 + content_length;
+            while bytes.len() < target_len {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count != 0, "connection closed before request body");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            return String::from_utf8_lossy(&bytes).to_string();
+        }
+    }
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 struct ApprovalsServerChild {

@@ -40,6 +40,7 @@ mod builtin_factory;
 mod bundle_cli;
 mod render;
 mod skills_cli;
+mod skills_propose_cli;
 mod term_backend;
 
 const SELF_ENV_SENTINEL: &str = "__self__";

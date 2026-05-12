@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
+use crate::trace::{
+    event_arguments, event_blueprint_id, event_request_id, event_tool_name, TraceQuery, TraceRun,
+    TraceToolCall,
+};
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
@@ -249,6 +254,80 @@ impl SqliteEventStore {
             rows.push(raw?.try_into_stored_event()?);
         }
         Ok(rows)
+    }
+
+    pub fn query_trace_runs(&self, query: TraceQuery) -> StoreResult<Vec<TraceRun>> {
+        let conn = self.connection()?;
+        let limit = query.limit.clamp(1, 10_000);
+        let trace_ids = candidate_trace_ids(&conn, &query)?;
+        let rows = trace_rows(&conn, &trace_ids, query.env.as_deref())?;
+
+        let mut traces = BTreeMap::new();
+        for row in rows {
+            let event = row.event;
+
+            let trace_id = event.trace_id.clone();
+            let accumulator = traces
+                .entry(trace_id.clone())
+                .or_insert_with(|| TraceAccumulator {
+                    trace: TraceRun {
+                        trace_id,
+                        env: event.env.clone(),
+                        blueprint_id: query.blueprint_id.clone(),
+                        started_at: event.ts.clone(),
+                        calls: Vec::new(),
+                        terminal_result: event.result,
+                        event_ids: Vec::new(),
+                    },
+                    matches_blueprint: false,
+                    excluded: false,
+                    unresolved_pending_approval: false,
+                    pending_approval_request_ids: BTreeMap::new(),
+                });
+
+            if event_blueprint_id(&event) == Some(query.blueprint_id.as_str()) {
+                accumulator.matches_blueprint = true;
+            }
+            if immediately_excludes_trace(&event) {
+                accumulator.excluded = true;
+            }
+            accumulator.record_approval_state(row.id, &event);
+
+            accumulator.trace.terminal_result = event.result;
+            accumulator.trace.event_ids.push(row.id);
+
+            if event.kind == ActivityKind::McpToolCall && event.result == ActivityResult::Ok {
+                if let Some(tool) = event_tool_name(&event) {
+                    accumulator.trace.calls.push(TraceToolCall {
+                        event_id: row.id,
+                        ordinal: accumulator.trace.calls.len() as u32,
+                        tool: tool.to_owned(),
+                        args: event_arguments(&event),
+                        result: event.result,
+                        subject: Value::Object(event.subject.clone().into_iter().collect()),
+                    });
+                }
+            }
+        }
+
+        resolve_pending_approvals(&conn, &mut traces, query.env.as_deref())?;
+
+        let mut runs = Vec::new();
+        for trace_id in trace_ids {
+            if let Some(accumulator) = traces.remove(&trace_id) {
+                if accumulator.matches_blueprint
+                    && !accumulator.is_excluded()
+                    && !accumulator.trace.calls.is_empty()
+                {
+                    runs.push(accumulator.trace);
+                    if runs.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        runs.sort_by(|left, right| left.trace_id.cmp(&right.trace_id));
+        Ok(runs)
     }
 
     pub fn has_entries_for_env(&self, env: &str) -> StoreResult<bool> {
@@ -530,6 +609,201 @@ impl SqliteEventStore {
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
     }
+}
+
+fn candidate_trace_ids(conn: &Connection, query: &TraceQuery) -> StoreResult<Vec<String>> {
+    let mut sql = String::from(
+        r#"
+        SELECT trace_id, MAX(id) AS latest_event_id
+        FROM activity_events
+        WHERE json_type(extras_json, '$.blueprint_id') = 'text'
+          AND json_extract(extras_json, '$.blueprint_id') = ?
+        "#,
+    );
+    let mut query_params = vec![SqlValue::Text(query.blueprint_id.clone())];
+
+    if let Some(env) = &query.env {
+        sql.push_str(" AND env = ?");
+        query_params.push(SqlValue::Text(env.clone()));
+    }
+
+    sql.push_str(
+        r#"
+        GROUP BY trace_id
+        ORDER BY latest_event_id DESC
+        LIMIT ?
+        "#,
+    );
+    query_params.push(SqlValue::Integer(10_000));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let raw_rows = stmt.query_map(params_from_iter(query_params), |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    let mut trace_ids = Vec::new();
+    for raw in raw_rows {
+        trace_ids.push(raw?);
+    }
+    Ok(trace_ids)
+}
+
+fn trace_rows(
+    conn: &Connection,
+    trace_ids: &[String],
+    env: Option<&str>,
+) -> StoreResult<Vec<StoredEvent>> {
+    if trace_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", trace_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!(
+        r#"
+        SELECT
+            id,
+            ts,
+            kind,
+            env,
+            actor_json,
+            subject_json,
+            result,
+            latency_ms,
+            trace_id,
+            reason_code,
+            extras_json
+        FROM activity_events
+        WHERE trace_id IN ({placeholders})
+        "#
+    );
+    let mut query_params = trace_ids
+        .iter()
+        .map(|trace_id| SqlValue::Text(trace_id.clone()))
+        .collect::<Vec<_>>();
+
+    if let Some(env) = env {
+        sql.push_str(" AND env = ?");
+        query_params.push(SqlValue::Text(env.to_owned()));
+    }
+
+    sql.push_str(" ORDER BY id ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let raw_rows = stmt.query_map(params_from_iter(query_params), raw_event_from_row)?;
+    let mut rows = Vec::new();
+    for raw in raw_rows {
+        rows.push(raw?.try_into_stored_event()?);
+    }
+    Ok(rows)
+}
+
+struct TraceAccumulator {
+    trace: TraceRun,
+    matches_blueprint: bool,
+    excluded: bool,
+    unresolved_pending_approval: bool,
+    pending_approval_request_ids: BTreeMap<String, i64>,
+}
+
+impl TraceAccumulator {
+    fn record_approval_state(&mut self, event_id: i64, event: &ActivityEvent) {
+        if event.result == ActivityResult::PendingApproval {
+            if let Some(request_id) = event_request_id(event) {
+                self.pending_approval_request_ids
+                    .insert(request_id.to_owned(), event_id);
+            } else {
+                self.unresolved_pending_approval = true;
+            }
+        }
+
+        if event.kind == ActivityKind::ApprovalDecided && event.result == ActivityResult::Ok {
+            if let Some(request_id) = event_request_id(event) {
+                self.pending_approval_request_ids.remove(request_id);
+            }
+        }
+    }
+
+    fn is_excluded(&self) -> bool {
+        self.excluded
+            || self.unresolved_pending_approval
+            || !self.pending_approval_request_ids.is_empty()
+    }
+}
+
+fn resolve_pending_approvals(
+    conn: &Connection,
+    traces: &mut BTreeMap<String, TraceAccumulator>,
+    env: Option<&str>,
+) -> StoreResult<()> {
+    for accumulator in traces.values_mut() {
+        let pending = accumulator
+            .pending_approval_request_ids
+            .iter()
+            .map(|(request_id, event_id)| (request_id.clone(), *event_id))
+            .collect::<Vec<_>>();
+
+        for (request_id, request_event_id) in pending {
+            if approval_request_has_later_ok_decision(conn, &request_id, request_event_id, env)? {
+                accumulator.pending_approval_request_ids.remove(&request_id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn approval_request_has_later_ok_decision(
+    conn: &Connection,
+    request_id: &str,
+    request_event_id: i64,
+    env: Option<&str>,
+) -> StoreResult<bool> {
+    let approval_decided = enum_to_db_string(ActivityKind::ApprovalDecided, "kind")?;
+    let ok = enum_to_db_string(ActivityResult::Ok, "result")?;
+    let mut sql = String::from(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM activity_events
+            WHERE id > ?
+              AND kind = ?
+              AND result = ?
+              AND json_type(subject_json, '$.request_id') = 'text'
+              AND json_extract(subject_json, '$.request_id') = ?
+        "#,
+    );
+    let mut query_params = vec![
+        SqlValue::Integer(request_event_id),
+        SqlValue::Text(approval_decided),
+        SqlValue::Text(ok),
+        SqlValue::Text(request_id.to_owned()),
+    ];
+
+    if let Some(env) = env {
+        sql.push_str(" AND env = ?");
+        query_params.push(SqlValue::Text(env.to_owned()));
+    }
+
+    sql.push_str(
+        r#"
+            LIMIT 1
+        )
+        "#,
+    );
+
+    let found = conn.query_row(&sql, params_from_iter(query_params), |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(found != 0)
+}
+
+fn immediately_excludes_trace(event: &ActivityEvent) -> bool {
+    matches!(
+        event.kind,
+        ActivityKind::EgressDenied | ActivityKind::SpawnRejected
+    ) || matches!(event.result, ActivityResult::Denied | ActivityResult::Error)
 }
 
 fn approval_requests_table_exists(conn: &Connection) -> StoreResult<bool> {

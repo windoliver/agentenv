@@ -13,6 +13,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
+use crate::skills_propose_cli::{run_skills_propose, SkillsProposeArgs};
+
 #[derive(Debug, Args)]
 pub struct SkillsArgs {
     #[command(subcommand)]
@@ -21,6 +23,7 @@ pub struct SkillsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SkillsCommand {
+    Propose(SkillsProposeArgs),
     Search(SkillsSearchArgs),
     Add(SkillsAddArgs),
     Install(SkillsInstallArgs),
@@ -127,6 +130,10 @@ struct SkillsSearchJson {
 }
 
 pub async fn run_skills(args: SkillsArgs) -> Result<()> {
+    if let SkillsCommand::Propose(args) = args.command {
+        return run_skills_propose(args).await;
+    }
+
     let home = dirs::home_dir().context("home directory is unavailable")?;
     let root = home.join(".agentenv");
     let registry_override = registry_override_for_command(&args.command);
@@ -138,6 +145,7 @@ pub async fn run_skills(args: SkillsArgs) -> Result<()> {
 
 async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) -> Result<()> {
     match command {
+        SkillsCommand::Propose(args) => run_skills_propose(args).await,
         SkillsCommand::Search(args) => {
             let hits = service.search(&args.query).await?;
             if args.json {
@@ -227,6 +235,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
 
 fn registry_override_for_command(command: &SkillsCommand) -> Option<String> {
     match command {
+        SkillsCommand::Propose(_) => None,
         SkillsCommand::Search(args) => args.registry.clone(),
         SkillsCommand::Add(args) => args.registry.clone(),
         SkillsCommand::Publish(args) => args.registry.clone(),
