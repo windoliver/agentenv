@@ -30,8 +30,10 @@ pub use error::SkillError;
 pub use manifest::{load_skill_manifest, validate_skill_name, SkillManifest};
 pub use registry::{FetchedSkill, RegistryAdapter, RegistryConfig, RegistryKind, SkillSearchHit};
 pub use self_test::{
-    load_skill_self_test_spec, normalized_self_test_digest, SkillSelfTestAssertion,
-    SkillSelfTestRunner, SkillSelfTestSpec,
+    load_skill_self_test_spec, normalized_self_test_digest, run_skill_self_test,
+    AgentProduceRequest, AgentProduceRunner, SkillAssertionResult, SkillAssertionStatus,
+    SkillSelfTestAssertion, SkillSelfTestOptions, SkillSelfTestReport, SkillSelfTestRunner,
+    SkillSelfTestSpec, UnsupportedAgentProduceRunner, SELF_TEST_PUBLISH_THRESHOLD,
 };
 pub use service::{SkillAddRequest, SkillCredentialResolver, SkillPublishRequest, SkillService};
 pub use signature::{signature_payload, verify_ed25519_signature};

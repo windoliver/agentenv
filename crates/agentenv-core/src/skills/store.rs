@@ -462,7 +462,10 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::MissingManifestField { .. }
         | SkillError::MissingSelfTest
         | SkillError::InvalidSelfTest { .. }
-        | SkillError::ConflictingSelfTestDeclarations { .. } => true,
+        | SkillError::ConflictingSelfTestDeclarations { .. }
+        | SkillError::SelfTestTimeout { .. }
+        | SkillError::SelfTestScoreBelowThreshold { .. }
+        | SkillError::UnsupportedAgentProduces => true,
         SkillError::UnsafeBundlePath { .. }
         | SkillError::DigestMismatch { .. }
         | SkillError::MissingSignature { .. }

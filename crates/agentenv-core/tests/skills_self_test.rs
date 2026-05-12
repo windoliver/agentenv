@@ -1,7 +1,16 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use agentenv_core::skills::{
-    load_skill_self_test_spec, SkillError, SkillSelfTestAssertion, SkillSelfTestRunner,
+    load_skill_self_test_spec, run_skill_self_test, AgentProduceRequest, AgentProduceRunner,
+    SkillAssertionStatus, SkillError, SkillSelfTestAssertion, SkillSelfTestOptions,
+    SkillSelfTestRunner, SkillSelfTestSpec,
 };
 
 #[test]
@@ -555,6 +564,395 @@ fn self_test_spec_rejects_missing_self_test() {
     let error = load_skill_self_test_spec(&root).expect_err("missing self-test must fail");
 
     assert!(matches!(error, SkillError::MissingSelfTest));
+}
+
+#[test]
+fn self_test_runner_scores_file_and_command_assertions() {
+    let root = temp_dir("self-test-runner-score-file-command");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: None,
+        assertions: vec![
+            SkillSelfTestAssertion::FileExists {
+                path: "missing.txt".into(),
+            },
+            SkillSelfTestAssertion::CommandExitsZero {
+                cmd: "exit 0".to_owned(),
+            },
+        ],
+        timeout_seconds: 5,
+    };
+
+    let report = run_skill_self_test(
+        &root,
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedTestAgentRunner),
+    )
+    .expect("runner should produce report");
+
+    assert_eq!(report.name, "demo");
+    assert_eq!(report.version, "0.1.0");
+    assert_eq!(report.digest, "sha256:bundle");
+    assert_eq!(report.passed, 1);
+    assert_eq!(report.total, 2);
+    assert_eq!(report.score, 0.5);
+    assert!(!report.publishable);
+    assert_eq!(report.assertions.len(), 2);
+    assert_eq!(report.assertions[0].assertion_type, "file_exists");
+    assert_eq!(report.assertions[0].status, SkillAssertionStatus::Failed);
+    assert_eq!(report.assertions[1].status, SkillAssertionStatus::Passed);
+    assert!(report.started_at <= report.completed_at);
+}
+
+#[test]
+fn self_test_runner_marks_publishable_at_default_threshold() {
+    let root = temp_dir("self-test-runner-threshold");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    write_file(&root.join("README.md"), "# Readme\n");
+    write_file(&root.join("examples/demo.txt"), "demo\n");
+    write_file(&root.join("fixtures/input.txt"), "input\n");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: None,
+        assertions: vec![
+            SkillSelfTestAssertion::FileExists {
+                path: "SKILL.md".into(),
+            },
+            SkillSelfTestAssertion::FileExists {
+                path: "README.md".into(),
+            },
+            SkillSelfTestAssertion::FileExists {
+                path: "examples/demo.txt".into(),
+            },
+            SkillSelfTestAssertion::FileExists {
+                path: "fixtures/input.txt".into(),
+            },
+            SkillSelfTestAssertion::FileExists {
+                path: "missing.txt".into(),
+            },
+        ],
+        timeout_seconds: 5,
+    };
+
+    let report = run_skill_self_test(
+        &root,
+        "demo-threshold",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedTestAgentRunner),
+    )
+    .expect("runner should produce report");
+
+    assert_eq!(report.passed, 4);
+    assert_eq!(report.total, 5);
+    assert_eq!(report.score, 0.8);
+    assert!(report.publishable);
+}
+
+#[test]
+fn self_test_runner_scores_agent_produces_token_matches() {
+    let root = temp_dir("self-test-runner-agent-produces");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    write_file(&root.join("agentenv.yaml"), "version: 1\n");
+    let runner = Arc::new(FakeAgentRunner::new(
+        "The answer mentions Cargo.toml and SKILL.md.",
+    ));
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: Some(PathBuf::from("agentenv.yaml")),
+        assertions: vec![SkillSelfTestAssertion::AgentProduces {
+            prompt: "summarize".to_owned(),
+            expect_tokens_matching: vec![
+                "Cargo.toml".to_owned(),
+                "SKILL.md".to_owned(),
+                "missing-token".to_owned(),
+            ],
+            min_match_ratio: 0.66,
+        }],
+        timeout_seconds: 5,
+    };
+
+    let report = run_skill_self_test(
+        &root,
+        "demo-agent",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        runner.clone(),
+    )
+    .expect("runner should produce report");
+
+    assert_eq!(report.passed, 1);
+    assert_eq!(report.total, 1);
+    assert_eq!(report.score, 1.0);
+    assert!(report.publishable);
+    assert_eq!(report.assertions[0].assertion_type, "agent_produces");
+    assert_eq!(report.assertions[0].status, SkillAssertionStatus::Passed);
+
+    let request = runner.take_request().expect("request should be captured");
+    assert_eq!(request.skill_root, root);
+    assert_eq!(request.blueprint, root.join("agentenv.yaml"));
+    assert_eq!(request.prompt, "summarize");
+    assert!(request.timeout > Duration::ZERO);
+    assert!(request.timeout <= Duration::from_secs(5));
+}
+
+#[test]
+fn self_test_runner_passes_remaining_timeout_to_agent_produces() {
+    let root = temp_dir("self-test-runner-agent-produces-timeout");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    write_file(&root.join("agentenv.yaml"), "version: 1\n");
+    let runner = Arc::new(FakeAgentRunner::new("ready"));
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: Some(PathBuf::from("agentenv.yaml")),
+        assertions: vec![
+            SkillSelfTestAssertion::CommandExitsZero {
+                cmd: "exit 0".to_owned(),
+            },
+            SkillSelfTestAssertion::AgentProduces {
+                prompt: "summarize".to_owned(),
+                expect_tokens_matching: vec!["ready".to_owned()],
+                min_match_ratio: 1.0,
+            },
+        ],
+        timeout_seconds: 5,
+    };
+
+    let report = run_skill_self_test(
+        &root,
+        "demo-agent-timeout",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        runner.clone(),
+    )
+    .expect("runner should produce report");
+
+    assert!(report.publishable);
+
+    let request = runner.take_request().expect("request should be captured");
+    assert!(request.timeout > Duration::ZERO);
+    assert!(
+        request.timeout < Duration::from_secs(5),
+        "agent_produces should receive remaining budget, got {:?}",
+        request.timeout
+    );
+}
+
+#[test]
+fn self_test_runner_bounds_slow_agent_produces_runner() {
+    let root = temp_dir("self-test-runner-slow-agent-produces");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    write_file(&root.join("agentenv.yaml"), "version: 1\n");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: Some(PathBuf::from("agentenv.yaml")),
+        assertions: vec![SkillSelfTestAssertion::AgentProduces {
+            prompt: "summarize".to_owned(),
+            expect_tokens_matching: vec!["ready".to_owned()],
+            min_match_ratio: 1.0,
+        }],
+        timeout_seconds: 1,
+    };
+
+    let started = Instant::now();
+    let report = run_skill_self_test(
+        &root,
+        "demo-slow-agent",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(SlowAgentRunner),
+    )
+    .expect("runner should produce report");
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(report.passed, 0);
+    assert_eq!(report.assertions[0].status, SkillAssertionStatus::Failed);
+    assert!(report.assertions[0].message.contains("timed out"));
+}
+
+#[test]
+fn self_test_runner_rejects_invalid_threshold_option() {
+    let root = temp_dir("self-test-runner-invalid-threshold");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: None,
+        assertions: vec![SkillSelfTestAssertion::FileExists {
+            path: "SKILL.md".into(),
+        }],
+        timeout_seconds: 5,
+    };
+
+    let error = run_skill_self_test(
+        &root,
+        "demo-invalid-threshold",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions {
+            threshold: f64::NAN,
+        },
+        Arc::new(UnsupportedTestAgentRunner),
+    )
+    .expect_err("invalid threshold must fail");
+
+    assert!(matches!(error, SkillError::InvalidSelfTest { .. }));
+}
+
+#[test]
+fn self_test_runner_rejects_unrepresentable_deadline() {
+    let root = temp_dir("self-test-runner-unrepresentable-deadline");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: None,
+        assertions: vec![SkillSelfTestAssertion::FileExists {
+            path: "SKILL.md".into(),
+        }],
+        timeout_seconds: u64::MAX,
+    };
+
+    let error = run_skill_self_test(
+        &root,
+        "demo-huge-timeout",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedTestAgentRunner),
+    )
+    .expect_err("huge timeout must fail");
+
+    assert!(matches!(error, SkillError::InvalidSelfTest { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn self_test_runner_clears_command_environment() {
+    let root = temp_dir("self-test-runner-command-env-clear");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: None,
+        assertions: vec![SkillSelfTestAssertion::CommandExitsZero {
+            cmd: r#"test -z "$HOME""#.to_owned(),
+        }],
+        timeout_seconds: 5,
+    };
+
+    let report = run_skill_self_test(
+        &root,
+        "demo-env-clear",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedTestAgentRunner),
+    )
+    .expect("runner should produce report");
+
+    assert_eq!(report.assertions[0].status, SkillAssertionStatus::Passed);
+}
+
+#[cfg(unix)]
+#[test]
+fn self_test_runner_kills_command_descendants_on_timeout() {
+    let root = temp_dir("self-test-runner-command-descendants");
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    let late_file = root.join("late.txt");
+    let spec = SkillSelfTestSpec {
+        runner: SkillSelfTestRunner::Agentenv,
+        blueprint: None,
+        assertions: vec![SkillSelfTestAssertion::CommandExitsZero {
+            cmd: "(/bin/sleep 2; /usr/bin/touch late.txt) & /bin/sleep 5".to_owned(),
+        }],
+        timeout_seconds: 1,
+    };
+
+    let report = run_skill_self_test(
+        &root,
+        "demo-descendants",
+        "0.1.0",
+        "sha256:bundle",
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedTestAgentRunner),
+    )
+    .expect("runner should produce report");
+
+    assert_eq!(report.assertions[0].status, SkillAssertionStatus::Failed);
+    thread::sleep(Duration::from_secs(3));
+    assert!(!late_file.exists());
+}
+
+struct UnsupportedTestAgentRunner;
+
+impl AgentProduceRunner for UnsupportedTestAgentRunner {
+    fn run_agent_prompt(&self, _request: AgentProduceRequest<'_>) -> Result<String, SkillError> {
+        Err(SkillError::UnsupportedAgentProduces)
+    }
+}
+
+struct SlowAgentRunner;
+
+impl AgentProduceRunner for SlowAgentRunner {
+    fn run_agent_prompt(&self, request: AgentProduceRequest<'_>) -> Result<String, SkillError> {
+        while !request.cancelled.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok("ready".to_owned())
+    }
+}
+
+#[derive(Debug)]
+struct CapturedAgentRequest {
+    skill_root: PathBuf,
+    blueprint: PathBuf,
+    prompt: String,
+    timeout: Duration,
+}
+
+struct FakeAgentRunner {
+    output: String,
+    request: Mutex<Option<CapturedAgentRequest>>,
+}
+
+impl FakeAgentRunner {
+    fn new(output: &str) -> Self {
+        Self {
+            output: output.to_owned(),
+            request: Mutex::new(None),
+        }
+    }
+
+    fn take_request(&self) -> Option<CapturedAgentRequest> {
+        self.request.lock().unwrap().take()
+    }
+}
+
+impl AgentProduceRunner for FakeAgentRunner {
+    fn run_agent_prompt(&self, request: AgentProduceRequest<'_>) -> Result<String, SkillError> {
+        *self.request.lock().unwrap() = Some(CapturedAgentRequest {
+            skill_root: request.skill_root.to_path_buf(),
+            blueprint: request.blueprint.to_path_buf(),
+            prompt: request.prompt.to_owned(),
+            timeout: request.timeout,
+        });
+        Ok(self.output.clone())
+    }
 }
 
 fn temp_dir(prefix: &str) -> std::path::PathBuf {

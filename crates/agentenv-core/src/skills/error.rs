@@ -76,6 +76,12 @@ pub enum SkillError {
     InvalidSelfTest { message: String },
     #[error("conflicting skill self-test declaration in `{declaration_source}`")]
     ConflictingSelfTestDeclarations { declaration_source: String },
+    #[error("skill self-test timed out after {timeout_seconds}s")]
+    SelfTestTimeout { timeout_seconds: u64 },
+    #[error("skill self-test score {score:.3} is below required threshold {threshold:.3}")]
+    SelfTestScoreBelowThreshold { score: f64, threshold: f64 },
+    #[error("agent_produces self-test assertions are unavailable in this execution context")]
+    UnsupportedAgentProduces,
     #[error("missing Ed25519 signature for skill `{name}` version `{version}`")]
     MissingSignature { name: String, version: String },
     #[error("invalid Ed25519 signature for skill `{name}` version `{version}`: {message}")]
