@@ -1,7 +1,8 @@
 use std::{
+    ffi::OsStr,
     fs,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -75,9 +76,16 @@ struct SkillsProposeJson {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PullRequestPlan {
     repo: String,
+    repo_root: PathBuf,
     branch: String,
     title: String,
     body: String,
+}
+
+#[derive(Debug, Clone)]
+struct OpenPrContext {
+    repo_root: PathBuf,
+    output_root: PathBuf,
 }
 
 struct FixtureGeneralizer {
@@ -162,6 +170,11 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .as_deref()
         .context("`agentenv skills propose` requires --blueprint <path>")?;
     let blueprint_id = blueprint_id_for_path(blueprint)?;
+    let open_pr_context = if args.open_pr {
+        Some(resolve_open_pr_context(args.out.as_deref())?)
+    } else {
+        None
+    };
     let events_db = args
         .events_db
         .clone()
@@ -186,9 +199,13 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
                 args.env.as_deref(),
             )],
         };
-        return finish_skills_propose(args.json, args.open_pr, args.repo.clone(), output);
+        return finish_skills_propose(args.json, open_pr_context, args.repo.clone(), output);
     }
-    let output_root = args.out.clone().unwrap_or_else(default_proposed_dir);
+    let output_root = open_pr_context
+        .as_ref()
+        .map(|context| context.output_root.clone())
+        .or_else(|| args.out.clone())
+        .unwrap_or_else(default_proposed_dir);
     let generalizer = generalizer_for_args(&args, blueprint)?;
     let created_at = now_event_ts();
     let output = ProposedSkillService::new(generalizer)
@@ -206,23 +223,23 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .await
         .context("run skill proposal service")?;
 
-    finish_skills_propose(args.json, args.open_pr, args.repo.clone(), output)
+    finish_skills_propose(args.json, open_pr_context, args.repo.clone(), output)
 }
 
 fn finish_skills_propose(
     json: bool,
-    open_pr: bool,
+    open_pr_context: Option<OpenPrContext>,
     repo: Option<String>,
     output: ProposeRunOutput,
 ) -> Result<()> {
     let mut pull_requests = Vec::new();
-    if open_pr {
+    if let Some(context) = open_pr_context {
         let proposal = output
             .proposals
             .first()
             .context("--open-pr requested but no proposals were emitted")?;
         let repo = repo.context("--open-pr requires --repo owner/repo")?;
-        let plan = pr_plan_for(repo, proposal);
+        let plan = pr_plan_for(repo, context.repo_root, proposal);
         pull_requests.push(publish_pr(&plan, &proposal.path)?);
     }
 
@@ -261,10 +278,11 @@ fn print_skills_propose_output(
     Ok(())
 }
 
-fn pr_plan_for(repo: String, proposal: &ProposalEmitOutput) -> PullRequestPlan {
-    let short_name = proposal.name.replace('_', "-");
+fn pr_plan_for(repo: String, repo_root: PathBuf, proposal: &ProposalEmitOutput) -> PullRequestPlan {
+    let short_name = git_ref_safe_slug(&proposal.name);
     PullRequestPlan {
         repo,
+        repo_root,
         branch: format!("agentenv/proposed-skill/{short_name}"),
         title: format!("feat: propose trace-derived skill {}", proposal.name),
         body: format!(
@@ -277,18 +295,49 @@ fn pr_plan_for(repo: String, proposal: &ProposalEmitOutput) -> PullRequestPlan {
 }
 
 fn publish_pr(plan: &PullRequestPlan, proposal_path: &Path) -> Result<String> {
-    run_command("git", &["checkout", "-B", &plan.branch])?;
-    run_command(
-        "git",
+    let relative_proposal_path =
+        proposal_path
+            .strip_prefix(&plan.repo_root)
+            .with_context(|| {
+                format!(
+                    "proposal path `{}` is not inside git worktree `{}`",
+                    proposal_path.display(),
+                    plan.repo_root.display()
+                )
+            })?;
+    run_git_command(
+        &plan.repo_root,
         &[
-            "add",
-            proposal_path
-                .to_str()
-                .context("proposal path is not UTF-8")?,
+            OsStr::new("checkout"),
+            OsStr::new("-B"),
+            OsStr::new(&plan.branch),
         ],
     )?;
-    run_command("git", &["commit", "-m", &plan.title])?;
-    run_command("git", &["push", "-u", "origin", &plan.branch])?;
+    run_git_command(
+        &plan.repo_root,
+        &[
+            OsStr::new("add"),
+            OsStr::new("--"),
+            relative_proposal_path.as_os_str(),
+        ],
+    )?;
+    run_git_command(
+        &plan.repo_root,
+        &[
+            OsStr::new("commit"),
+            OsStr::new("-m"),
+            OsStr::new(&plan.title),
+        ],
+    )?;
+    run_git_command(
+        &plan.repo_root,
+        &[
+            OsStr::new("push"),
+            OsStr::new("-u"),
+            OsStr::new("origin"),
+            OsStr::new(&plan.branch),
+        ],
+    )?;
     let output = std::process::Command::new("gh")
         .args([
             "pr",
@@ -312,18 +361,143 @@ fn publish_pr(plan: &PullRequestPlan, proposal_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn run_command(program: &str, args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new(program)
-        .args(args)
+fn resolve_open_pr_context(out: Option<&Path>) -> Result<OpenPrContext> {
+    let repo_root = git_worktree_root()?;
+    let output_root = match out {
+        Some(path) => {
+            let absolute = absolute_path(path)?;
+            if !absolute.starts_with(&repo_root) {
+                bail!(
+                    "--out must be inside the git worktree when --open-pr is set: `{}` is outside `{}`",
+                    absolute.display(),
+                    repo_root.display()
+                );
+            }
+            absolute
+        }
+        None => repo_root.join(".agentenv/skills/proposed"),
+    };
+    Ok(OpenPrContext {
+        repo_root,
+        output_root,
+    })
+}
+
+fn git_worktree_root() -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
         .output()
-        .with_context(|| format!("run {program}"))?;
+        .context("run git rev-parse --show-toplevel")?;
     if !output.status.success() {
         bail!(
-            "{program} failed: {}",
+            "git rev-parse --show-toplevel failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let rendered = String::from_utf8(output.stdout)
+        .context("git rev-parse --show-toplevel output was not UTF-8")?;
+    let root = rendered.trim();
+    if root.is_empty() {
+        bail!("git rev-parse --show-toplevel returned an empty path");
+    }
+    absolute_path(Path::new(root))
+}
+
+fn run_git_command(repo_root: &Path, args: &[&OsStr]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git -C {}", repo_root.display()))?;
+    if !output.status.success() {
+        bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
     Ok(())
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("read current directory")?
+            .join(path)
+    };
+    normalize_absolute_path(&absolute)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path `{}` escapes its root", path.display());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if !normalized.is_absolute() {
+        bail!("path `{}` is not absolute", path.display());
+    }
+    Ok(normalized)
+}
+
+fn git_ref_safe_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for byte in name.bytes() {
+        let lowered = byte.to_ascii_lowercase();
+        if lowered.is_ascii_alphanumeric() {
+            slug.push(lowered as char);
+            previous_dash = false;
+        } else if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-').to_owned();
+    let mut slug = if trimmed.is_empty() {
+        "skill".to_owned()
+    } else {
+        trimmed
+    };
+    if slug != name {
+        let digest = Sha256::digest(name.as_bytes());
+        let hex = hex::encode(digest);
+        slug.push('-');
+        slug.push_str(&hex[..8]);
+    }
+    while slug.ends_with('.') || slug.ends_with(".lock") || slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        let digest = Sha256::digest(name.as_bytes());
+        let hex = hex::encode(digest);
+        slug = format!("skill-{}", &hex[..8]);
+    }
+    while slug.contains("..") {
+        slug = slug.replace("..", "-");
+    }
+    if slug.ends_with(".lock") {
+        let digest = Sha256::digest(name.as_bytes());
+        let hex = hex::encode(digest);
+        slug.push('-');
+        slug.push_str(&hex[..8]);
+    }
+    if slug.ends_with('.') {
+        slug.push_str("-ref");
+    }
+    if slug.is_empty() {
+        "skill".to_owned()
+    } else {
+        slug
+    }
 }
 
 pub fn validate_args(args: &SkillsProposeArgs) -> Result<()> {
