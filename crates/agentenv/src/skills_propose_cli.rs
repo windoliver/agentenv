@@ -68,6 +68,16 @@ pub struct SkillsProposeArgs {
 struct SkillsProposeJson {
     proposals: Vec<ProposalEmitOutput>,
     warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pull_requests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRequestPlan {
+    repo: String,
+    branch: String,
+    title: String,
+    body: String,
 }
 
 struct FixtureGeneralizer {
@@ -169,16 +179,14 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         })
         .with_context(|| format!("query traces from `{}`", events_db.display()))?;
     if traces.is_empty() {
-        return print_skills_propose_output(
-            args.json,
-            ProposeRunOutput {
-                proposals: Vec::new(),
-                warnings: vec![no_matching_traces_warning(
-                    &blueprint_id,
-                    args.env.as_deref(),
-                )],
-            },
-        );
+        let output = ProposeRunOutput {
+            proposals: Vec::new(),
+            warnings: vec![no_matching_traces_warning(
+                &blueprint_id,
+                args.env.as_deref(),
+            )],
+        };
+        return finish_skills_propose(args.json, args.open_pr, args.repo.clone(), output);
     }
     let output_root = args.out.clone().unwrap_or_else(default_proposed_dir);
     let generalizer = generalizer_for_args(&args, blueprint)?;
@@ -198,14 +206,39 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .await
         .context("run skill proposal service")?;
 
-    print_skills_propose_output(args.json, output)
+    finish_skills_propose(args.json, args.open_pr, args.repo.clone(), output)
 }
 
-fn print_skills_propose_output(json: bool, output: ProposeRunOutput) -> Result<()> {
+fn finish_skills_propose(
+    json: bool,
+    open_pr: bool,
+    repo: Option<String>,
+    output: ProposeRunOutput,
+) -> Result<()> {
+    let mut pull_requests = Vec::new();
+    if open_pr {
+        let proposal = output
+            .proposals
+            .first()
+            .context("--open-pr requested but no proposals were emitted")?;
+        let repo = repo.context("--open-pr requires --repo owner/repo")?;
+        let plan = pr_plan_for(repo, proposal);
+        pull_requests.push(publish_pr(&plan, &proposal.path)?);
+    }
+
+    print_skills_propose_output(json, output, pull_requests)
+}
+
+fn print_skills_propose_output(
+    json: bool,
+    output: ProposeRunOutput,
+    pull_requests: Vec<String>,
+) -> Result<()> {
     if json {
         let rendered = serde_json::to_string_pretty(&SkillsProposeJson {
             proposals: output.proposals,
             warnings: output.warnings,
+            pull_requests,
         })
         .context("serialize skill proposal JSON")?;
         println!("{rendered}");
@@ -221,6 +254,74 @@ fn print_skills_propose_output(json: bool, output: ProposeRunOutput) -> Result<(
         for warning in &output.warnings {
             eprintln!("warning: {warning}");
         }
+        for pull_request in &pull_requests {
+            println!("{pull_request}");
+        }
+    }
+    Ok(())
+}
+
+fn pr_plan_for(repo: String, proposal: &ProposalEmitOutput) -> PullRequestPlan {
+    let short_name = proposal.name.replace('_', "-");
+    PullRequestPlan {
+        repo,
+        branch: format!("agentenv/proposed-skill/{short_name}"),
+        title: format!("feat: propose trace-derived skill {}", proposal.name),
+        body: format!(
+            "Trace-derived skill proposal.\n\nNovelty: {}\nSelf-test score: {}\nPath: `{}`\n",
+            proposal.novelty,
+            proposal.self_test_score,
+            proposal.path.display()
+        ),
+    }
+}
+
+fn publish_pr(plan: &PullRequestPlan, proposal_path: &Path) -> Result<String> {
+    run_command("git", &["checkout", "-B", &plan.branch])?;
+    run_command(
+        "git",
+        &[
+            "add",
+            proposal_path
+                .to_str()
+                .context("proposal path is not UTF-8")?,
+        ],
+    )?;
+    run_command("git", &["commit", "-m", &plan.title])?;
+    run_command("git", &["push", "-u", "origin", &plan.branch])?;
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--repo",
+            &plan.repo,
+            "--draft",
+            "--title",
+            &plan.title,
+            "--body",
+            &plan.body,
+        ])
+        .output()
+        .context("run gh pr create")?;
+    if !output.status.success() {
+        bail!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {program}"))?;
+    if !output.status.success() {
+        bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     Ok(())
 }

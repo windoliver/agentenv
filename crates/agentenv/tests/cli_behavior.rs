@@ -1083,6 +1083,134 @@ fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
     assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
 }
 
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_publishes_first_proposal_with_fake_git_and_gh() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let log_path = temp_dir.join("commands.log");
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    for program in ["git", "gh"] {
+        let script = fake_bin.join(program);
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> '{}'\nif [ \"$(basename \"$0\")\" = gh ]; then\n  printf '%s\\n' 'https://github.com/owner/repo/pull/123'\nfi\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+
+    let out = temp_dir.join("proposed");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", &temp_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(out.join("fs-edit-skill/SKILL.md").is_file());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("https://github.com/owner/repo/pull/123"),
+        "stdout was: {stdout}"
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let proposal_path = out.join("fs-edit-skill");
+    let expected_commands = [
+        "git checkout -B agentenv/proposed-skill/fs-edit-skill".to_owned(),
+        format!("git add {}", proposal_path.display()),
+        "git commit -m feat: propose trace-derived skill fs-edit-skill".to_owned(),
+        "git push -u origin agentenv/proposed-skill/fs-edit-skill".to_owned(),
+        "gh pr create --repo owner/repo --draft --title feat: propose trace-derived skill fs-edit-skill --body Trace-derived skill proposal.".to_owned(),
+    ];
+    let mut cursor = 0;
+    for expected in expected_commands {
+        let relative = log[cursor..]
+            .find(&expected)
+            .unwrap_or_else(|| panic!("missing ordered command `{expected}`; log was: {log}"));
+        cursor += relative + expected.len();
+    }
+}
+
+#[test]
+fn skills_propose_open_pr_fails_when_no_proposals_are_emitted() {
+    let temp_dir = make_temp_dir("skills-propose-open-pr-empty");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    SqliteEventStore::open(&db_path).unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--open-pr requested but no proposals were emitted"),
+        "stderr was: {stderr}"
+    );
+}
+
 #[test]
 fn skills_propose_without_configured_llm_fails_clearly() {
     let temp_dir = make_temp_dir("skills-propose-missing-llm");
