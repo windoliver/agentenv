@@ -11,8 +11,9 @@ use agentenv_core::{
     skills::{
         load_project_skills_config, load_user_skills_config, merge_skills_config,
         propose::{
-            ProposalEmitOutput, ProposeRunInput, ProposeRunOutput, ProposedSkillService,
-            SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
+            ExistingSkillSummary, ProposalCandidate, ProposalEmitOutput, ProposeRunInput,
+            ProposeRunOutput, ProposedSkillService, SkillGeneralization,
+            SkillGeneralizationRequest, SkillGeneralizer,
         },
         SkillError, SkillsConfig, SkillsConfigOverride,
     },
@@ -24,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use clap::Args;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use url::Url;
@@ -34,6 +35,9 @@ const HTTP_ERROR_BODY_LIMIT: usize = 4096;
 const LOCAL_ENDPOINTS_ENV: &str = "AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS";
 const PRIVATE_ENDPOINTS_ENV: &str = "AGENTENV_SKILL_PROPOSER_ALLOW_PRIVATE_ENDPOINTS";
 const HTTP_TIMEOUT_ENV: &str = "AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS";
+const SKILL_MANIFEST_FILE: &str = "skill.yaml";
+const INSTALLED_CONTENT_DIR: &str = "content";
+const PROPOSED_SKILLS_DIR_NAME: &str = "proposed";
 
 #[derive(Debug, Args, Clone)]
 pub struct SkillsProposeArgs {
@@ -97,6 +101,14 @@ struct HttpGeneralizer {
     model: String,
     bearer: String,
     client: Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillSummaryManifest {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    entry: PathBuf,
 }
 
 #[async_trait]
@@ -206,6 +218,7 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .map(|context| context.output_root.clone())
         .or_else(|| args.out.clone())
         .unwrap_or_else(default_proposed_dir);
+    let existing_skills = load_existing_skill_summaries(&output_root)?;
     let generalizer = generalizer_for_args(&args, blueprint)?;
     let created_at = now_event_ts();
     let output = ProposedSkillService::new(generalizer)
@@ -216,7 +229,7 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
             min_occurrences: args.min_occurrences,
             min_novelty: args.min_novelty,
             min_self_test_score: args.min_self_test_score,
-            existing_skills: Vec::new(),
+            existing_skills,
             agentenv_version: env!("CARGO_PKG_VERSION").to_owned(),
             created_at,
         })
@@ -375,6 +388,7 @@ fn resolve_open_pr_context(out: Option<&Path>) -> Result<OpenPrContext> {
             output_root
         }
     };
+    ensure_clean_git_index(&repo_root)?;
     Ok(OpenPrContext {
         repo_root,
         output_root,
@@ -414,6 +428,200 @@ fn run_git_command(repo_root: &Path, args: &[&OsStr]) -> Result<()> {
         bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
+}
+
+fn ensure_clean_git_index(repo_root: &Path) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--cached", "--quiet", "--exit-code"])
+        .output()
+        .with_context(|| format!("run git -C {} diff --cached", repo_root.display()))?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => bail!(
+            "--open-pr requires a clean git index; commit or unstage staged changes before publishing a proposed skill"
+        ),
+        _ => bail!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+fn load_existing_skill_summaries(output_root: &Path) -> Result<Vec<ExistingSkillSummary>> {
+    let mut summaries = load_installed_skill_summaries()?;
+    summaries.extend(load_proposed_skill_summaries(output_root)?);
+    Ok(summaries)
+}
+
+fn load_installed_skill_summaries() -> Result<Vec<ExistingSkillSummary>> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(Vec::new());
+    };
+    let skills_root = home.join(".agentenv").join("skills");
+    let Some(entries) = read_directory_if_exists(&skills_root)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut summaries = Vec::new();
+    for name_entry in entries {
+        let name_entry = name_entry.with_context(|| format!("read `{}`", skills_root.display()))?;
+        let name_path = name_entry.path();
+        let Some(name) = name_path.file_name().and_then(OsStr::to_str) else {
+            bail!("skill path `{}` is not valid UTF-8", name_path.display());
+        };
+        if name.starts_with('.') || name == PROPOSED_SKILLS_DIR_NAME {
+            continue;
+        }
+        if !entry_file_type(&name_entry)?.is_dir() {
+            continue;
+        }
+        let Some(version_entries) = read_directory_if_exists(&name_path)? else {
+            continue;
+        };
+        for version_entry in version_entries {
+            let version_entry =
+                version_entry.with_context(|| format!("read `{}`", name_path.display()))?;
+            if !entry_file_type(&version_entry)?.is_dir() {
+                continue;
+            }
+            let install_dir = version_entry.path();
+            let content_root = install_dir.join(INSTALLED_CONTENT_DIR);
+            let fingerprint = skill_provenance_fingerprint(&content_root)?;
+            if let Some(summary) =
+                load_skill_summary_from_dir(&install_dir, &content_root, fingerprint)?
+            {
+                summaries.push(summary);
+            }
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn load_proposed_skill_summaries(output_root: &Path) -> Result<Vec<ExistingSkillSummary>> {
+    let Some(entries) = read_directory_if_exists(output_root)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut summaries = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read `{}`", output_root.display()))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            bail!(
+                "proposed skill path `{}` is not valid UTF-8",
+                path.display()
+            );
+        };
+        if name.starts_with('.') || !entry_file_type(&entry)?.is_dir() {
+            continue;
+        }
+        let fingerprint = skill_provenance_fingerprint(&path)?;
+        if let Some(summary) = load_skill_summary_from_dir(&path, &path, fingerprint)? {
+            summaries.push(summary);
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn load_skill_summary_from_dir(
+    manifest_root: &Path,
+    content_root: &Path,
+    fingerprint: Option<String>,
+) -> Result<Option<ExistingSkillSummary>> {
+    let manifest_path = manifest_root.join(SKILL_MANIFEST_FILE);
+    if !regular_file_exists(&manifest_path)? {
+        return Ok(None);
+    }
+    let manifest_text = read_regular_text_file(&manifest_path)?;
+    let manifest: SkillSummaryManifest = serde_yaml::from_str(&manifest_text)
+        .with_context(|| format!("parse skill manifest `{}`", manifest_path.display()))?;
+    let entry_path = safe_child_path(content_root, &manifest.entry)?;
+    let procedure_text = read_regular_text_file(&entry_path)?;
+
+    Ok(Some(ExistingSkillSummary {
+        name: manifest.name,
+        description: manifest.description.unwrap_or_default(),
+        procedure_text,
+        fingerprint,
+    }))
+}
+
+fn skill_provenance_fingerprint(skill_content_root: &Path) -> Result<Option<String>> {
+    let provenance_path = skill_content_root.join("traces").join("provenance.json");
+    if !regular_file_exists(&provenance_path)? {
+        return Ok(None);
+    }
+    let provenance = read_regular_text_file(&provenance_path)?;
+    let candidate: ProposalCandidate = serde_json::from_str(&provenance)
+        .with_context(|| format!("parse proposal provenance `{}`", provenance_path.display()))?;
+    Ok(Some(candidate.fingerprint))
+}
+
+fn read_directory_if_exists(path: &Path) -> Result<Option<fs::ReadDir>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                bail!("skill summary path `{}` is not a directory", path.display());
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(source).with_context(|| format!("read metadata `{}`", path.display()));
+        }
+    }
+    fs::read_dir(path)
+        .map(Some)
+        .with_context(|| format!("read directory `{}`", path.display()))
+}
+
+fn entry_file_type(entry: &fs::DirEntry) -> Result<fs::FileType> {
+    entry
+        .file_type()
+        .with_context(|| format!("read file type `{}`", entry.path().display()))
+}
+
+fn regular_file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "skill summary file `{}` is not a regular file",
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(source).with_context(|| format!("read metadata `{}`", path.display())),
+    }
+}
+
+fn read_regular_text_file(path: &Path) -> Result<String> {
+    if !regular_file_exists(path)? {
+        bail!("skill summary file `{}` does not exist", path.display());
+    }
+    fs::read_to_string(path).with_context(|| format!("read `{}`", path.display()))
+}
+
+fn safe_child_path(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("skill entry path `{}` is not relative", relative.display());
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("skill entry path `{}` is empty", relative.display());
+    }
+    Ok(root.join(normalized))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -546,6 +754,9 @@ pub fn validate_args(args: &SkillsProposeArgs) -> Result<()> {
     }
     if !(0.0..=1.0).contains(&args.min_self_test_score) {
         bail!("--min-self-test-score must be between 0.0 and 1.0");
+    }
+    if args.semantic_backend != "local" {
+        bail!("--semantic-backend currently supports only `local`");
     }
     if args.open_pr && args.repo.is_none() {
         bail!("--open-pr requires --repo owner/repo");

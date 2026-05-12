@@ -1083,6 +1083,182 @@ fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
     assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
 }
 
+#[test]
+fn skills_propose_filters_duplicate_existing_proposal_by_min_novelty() {
+    let temp_dir = make_temp_dir("skills-propose-existing-proposal");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let out = temp_dir.join("proposed");
+    let existing = out.join("existing-fs-edit-skill");
+    fs::create_dir_all(&existing).unwrap();
+    fs::write(
+        existing.join("SKILL.md"),
+        "---\nname: existing-fs-edit-skill\ndescription: Edit a repeated filesystem target.\n---\n\nRead {{target_path}}.\n",
+    )
+    .unwrap();
+    fs::write(
+        existing.join("skill.yaml"),
+        "name: existing-fs-edit-skill\nversion: 0.1.0\ndescription: Edit a repeated filesystem target.\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--min-novelty")
+        .arg("0.85")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json_named("fs-edit-skill-v2"),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"].as_array().unwrap().len(), 0);
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .unwrap()
+            .contains("novelty 0.3 is below 0.85")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !out.join("fs-edit-skill-v2/SKILL.md").exists(),
+        "duplicate-ish proposal should be skipped before emission"
+    );
+}
+
+#[test]
+fn skills_propose_filters_duplicate_installed_skill_by_provenance_fingerprint() {
+    let temp_dir = make_temp_dir("skills-propose-existing-installed");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let installed = temp_dir.join(".agentenv/skills/existing-installed-skill/0.1.0");
+    fs::create_dir_all(installed.join("content/traces")).unwrap();
+    fs::write(
+        installed.join("skill.yaml"),
+        "name: existing-installed-skill\nversion: 0.1.0\ndescription: unrelated installed skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\n",
+    )
+    .unwrap();
+    fs::write(
+        installed.join("content/SKILL.md"),
+        "This text intentionally does not overlap the generated procedure.\n",
+    )
+    .unwrap();
+    fs::write(
+        installed.join("content/traces/provenance.json"),
+        serde_json::json!({
+            "name_seed": "fs-read",
+            "blueprint_id": blueprint_digest(&blueprint),
+            "fingerprint": fs_read_candidate_fingerprint(),
+            "occurrences": 3,
+            "sequence": [{"tool": "fs_read", "args_shape": {"path": "string:path"}}],
+            "source_trace_ids": ["trace-1", "trace-2", "trace-3"],
+            "redaction_count": 0
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = temp_dir.join("proposed");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--min-novelty")
+        .arg("0.1")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json_named("fs-edit-skill-v3"),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"].as_array().unwrap().len(), 0);
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("novelty 0 is below 0.1")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !out.join("fs-edit-skill-v3/SKILL.md").exists(),
+        "exact installed duplicate should be skipped before emission"
+    );
+}
+
+#[test]
+fn skills_propose_rejects_unsupported_semantic_backend() {
+    let temp_dir = make_temp_dir("skills-propose-semantic-backend");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--semantic-backend")
+        .arg("remote")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--semantic-backend") && stderr.contains("local"),
+        "stderr was: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn skills_propose_open_pr_publishes_first_proposal_with_fake_git_and_gh() {
@@ -1169,6 +1345,10 @@ fn skills_propose_open_pr_publishes_first_proposal_with_fake_git_and_gh() {
     let expected_commands = [
         "git rev-parse --show-toplevel".to_owned(),
         format!(
+            "git -C {} diff --cached --quiet --exit-code",
+            canonical_repo_root.display()
+        ),
+        format!(
             "git -C {} checkout -B agentenv/proposed-skill/fs-edit-skill",
             canonical_repo_root.display()
         ),
@@ -1193,6 +1373,64 @@ fn skills_propose_open_pr_publishes_first_proposal_with_fake_git_and_gh() {
             .unwrap_or_else(|| panic!("missing ordered command `{expected}`; log was: {log}"));
         cursor += relative + expected.len();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_rejects_staged_changes_before_emitting() {
+    let temp_dir = make_temp_dir("skills-propose-open-pr-staged");
+    let repo_root = temp_dir.join("repo");
+    let home = temp_dir.join("home");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    run_git(&repo_root, &["init"]);
+
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    fs::write(repo_root.join("unrelated.txt"), "user staged change\n").unwrap();
+    run_git(&repo_root, &["add", "unrelated.txt"]);
+
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", &home)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("commit or unstage") && stderr.contains("staged"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !repo_root
+            .join(".agentenv/skills/proposed/fs-edit-skill/SKILL.md")
+            .exists(),
+        "proposal should not be emitted when the index has unrelated staged changes"
+    );
 }
 
 #[cfg(unix)]
@@ -5817,6 +6055,10 @@ fn fixture_generalization_json_named(name: &str) -> String {
         "skill_md_body": "Read {{target_path}}."
     })
     .to_string()
+}
+
+fn fs_read_candidate_fingerprint() -> &'static str {
+    r#"[{"tool":"fs_read","args_shape":{"path":"string:path"}}]"#
 }
 
 fn seed_activity_db(home: &Path, env: &str, events: &[ActivityEvent]) {
