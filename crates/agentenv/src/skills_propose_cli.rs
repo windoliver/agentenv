@@ -1,15 +1,20 @@
 use std::{
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use agentenv_core::skills::{
-    load_project_skills_config, load_user_skills_config, merge_skills_config,
-    propose::{
-        ProposalEmitOutput, ProposeRunInput, ProposeRunOutput, ProposedSkillService,
-        SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
+use agentenv_core::{
+    security::ssrf::{validate_outbound, SsrfOptions, ValidatedUrl},
+    skills::{
+        load_project_skills_config, load_user_skills_config, merge_skills_config,
+        propose::{
+            ProposalEmitOutput, ProposeRunInput, ProposeRunOutput, ProposedSkillService,
+            SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
+        },
+        SkillError, SkillsConfig, SkillsConfigOverride,
     },
-    SkillError, SkillsConfig, SkillsConfigOverride,
 };
 use agentenv_credstore::{CredentialStore, CredentialStoreError};
 use agentenv_events::{SqliteEventStore, TraceQuery};
@@ -21,6 +26,12 @@ use reqwest::Client;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use url::Url;
+
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_ERROR_BODY_LIMIT: usize = 4096;
+const LOCAL_ENDPOINTS_ENV: &str = "AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS";
+const HTTP_TIMEOUT_ENV: &str = "AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS";
 
 #[derive(Debug, Args, Clone)]
 pub struct SkillsProposeArgs {
@@ -108,7 +119,7 @@ impl SkillGeneralizer for HttpGeneralizer {
             })?;
         let status = response.status();
         if !status.is_success() {
-            let body = http_error_body(response).await;
+            let body = http_error_body(response, &self.bearer).await;
             return Err(SkillError::InvalidConfig {
                 message: format!("skill proposal LLM request failed with status {status}: {body}"),
             });
@@ -169,7 +180,7 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         );
     }
     let output_root = args.out.clone().unwrap_or_else(default_proposed_dir);
-    let generalizer = generalizer_for_args(&args)?;
+    let generalizer = generalizer_for_args(&args, blueprint)?;
     let created_at = now_event_ts();
     let output = ProposedSkillService::new(generalizer)
         .run(ProposeRunInput {
@@ -264,7 +275,10 @@ fn no_matching_traces_warning(blueprint_id: &str, env: Option<&str>) -> String {
     }
 }
 
-fn generalizer_for_args(args: &SkillsProposeArgs) -> Result<Box<dyn SkillGeneralizer>> {
+fn generalizer_for_args(
+    args: &SkillsProposeArgs,
+    blueprint: &Path,
+) -> Result<Box<dyn SkillGeneralizer>> {
     if args.llm_provider.as_deref() == Some("fixture") {
         let raw = std::env::var("AGENTENV_SKILL_PROPOSER_FIXTURE_JSON")
             .context("AGENTENV_SKILL_PROPOSER_FIXTURE_JSON is required for fixture provider")?;
@@ -272,7 +286,7 @@ fn generalizer_for_args(args: &SkillsProposeArgs) -> Result<Box<dyn SkillGeneral
         return Ok(Box::new(FixtureGeneralizer { value }));
     }
 
-    let config = load_effective_skills_config()?;
+    let config = load_effective_skills_config(blueprint)?;
     let llm = config
         .proposal
         .and_then(|proposal| proposal.llm)
@@ -292,23 +306,51 @@ fn generalizer_for_args(args: &SkillsProposeArgs) -> Result<Box<dyn SkillGeneral
         );
     }
     let bearer = resolve_llm_bearer(&llm.credential)?;
+    let endpoint = validate_llm_endpoint(&llm.endpoint)?;
+    let client = build_http_client(&endpoint)?;
 
     Ok(Box::new(HttpGeneralizer {
-        endpoint: llm.endpoint,
+        endpoint: endpoint.url.to_string(),
         model: llm.model,
         bearer,
-        client: Client::new(),
+        client,
     }))
 }
 
-async fn http_error_body(response: reqwest::Response) -> String {
-    match response.text().await {
-        Ok(body) => body,
-        Err(error) => format!("<failed to read response body: {error}>"),
+async fn http_error_body(mut response: reqwest::Response, bearer: &str) -> String {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = HTTP_ERROR_BODY_LIMIT.saturating_sub(body.len());
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+                if body.len() == HTTP_ERROR_BODY_LIMIT {
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return format!("<failed to read response body: {error}>"),
+        }
     }
+
+    let mut rendered = String::from_utf8_lossy(&body).into_owned();
+    if !bearer.is_empty() {
+        rendered = rendered.replace(bearer, "[REDACTED]");
+    }
+    if truncated {
+        rendered.push_str("<truncated>");
+    }
+    rendered
 }
 
-fn load_effective_skills_config() -> Result<SkillsConfig> {
+fn load_effective_skills_config(blueprint: &Path) -> Result<SkillsConfig> {
     let user = match dirs::home_dir() {
         Some(home) => {
             let path = home.join(".config/agentenv/config.toml");
@@ -325,20 +367,13 @@ fn load_effective_skills_config() -> Result<SkillsConfig> {
         None => SkillsConfig::default(),
     };
 
-    let project_path = std::env::current_dir()
-        .context("read current directory")?
-        .join("agentenv.yaml");
-    let project = if project_path.is_file() {
-        Some(
-            load_project_skills_config(
-                &fs::read_to_string(&project_path)
-                    .with_context(|| format!("read `{}`", project_path.display()))?,
-            )
-            .with_context(|| format!("load project skills config `{}`", project_path.display()))?,
+    let project = Some(
+        load_project_skills_config(
+            &fs::read_to_string(blueprint)
+                .with_context(|| format!("read `{}`", blueprint.display()))?,
         )
-    } else {
-        None
-    };
+        .with_context(|| format!("load project skills config `{}`", blueprint.display()))?,
+    );
 
     merge_skills_config(user, project, SkillsConfigOverride { registry: None })
         .context("merge skills config")
@@ -362,6 +397,70 @@ fn resolve_llm_bearer(name: &str) -> Result<String> {
             }
             error => anyhow::anyhow!("resolve skill proposal LLM credential `{name}`: {error}"),
         })
+}
+
+fn validate_llm_endpoint(endpoint: &str) -> Result<ValidatedUrl> {
+    let url = Url::parse(endpoint).with_context(|| {
+        format!(
+            "skill proposal LLM endpoint `{}` is invalid",
+            agentenv_core::security::ssrf::sanitize_untrusted_url_text(endpoint)
+        )
+    })?;
+    validate_outbound(&url, skill_proposer_ssrf_options()).map_err(|error| {
+        anyhow::anyhow!(
+            "skill proposal LLM endpoint was blocked by SSRF policy: {}",
+            error
+        )
+    })
+}
+
+fn skill_proposer_ssrf_options() -> SsrfOptions {
+    let mut options = SsrfOptions::default();
+    if env_flag_enabled(LOCAL_ENDPOINTS_ENV) {
+        options.allow_loopback = true;
+        options.allow_private = true;
+    }
+    options
+}
+
+fn build_http_client(endpoint: &ValidatedUrl) -> Result<Client> {
+    let timeout = skill_proposer_http_timeout()?;
+    let port = endpoint.url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<SocketAddr> = endpoint
+        .pinned_ips
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .resolve_to_addrs(&endpoint.host, &addrs)
+        .build()
+        .context("build skill proposal LLM HTTP client")
+}
+
+fn skill_proposer_http_timeout() -> Result<Duration> {
+    match std::env::var(HTTP_TIMEOUT_ENV) {
+        Ok(value) => {
+            let millis = value.parse::<u64>().with_context(|| {
+                format!("{HTTP_TIMEOUT_ENV} must be a positive integer number of milliseconds")
+            })?;
+            if millis == 0 {
+                bail!("{HTTP_TIMEOUT_ENV} must be greater than 0");
+            }
+            Ok(Duration::from_millis(millis))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_HTTP_TIMEOUT),
+        Err(error) => Err(error).context(format!("read {HTTP_TIMEOUT_ENV}")),
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => false,
+    }
 }
 
 fn default_events_db_path() -> PathBuf {

@@ -1120,9 +1120,11 @@ fn skills_propose_without_configured_llm_fails_clearly() {
 #[test]
 fn skills_propose_uses_configured_openai_compatible_provider_and_env_credential() {
     let temp_dir = make_temp_dir("skills-propose-http-provider");
+    let project_dir = temp_dir.join("project");
+    fs::create_dir_all(&project_dir).unwrap();
     let (endpoint, captured_request, server) =
         spawn_openai_compatible_skill_proposer(fixture_generalization_json());
-    let blueprint = temp_dir.join("agentenv.yaml");
+    let blueprint = project_dir.join("agentenv.yaml");
     fs::write(
         &blueprint,
         format!(
@@ -1167,6 +1169,7 @@ skills:
         .arg("--json")
         .env("HOME", &temp_dir)
         .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
         .env("AGENTENV_TEST_SKILL_PROPOSER_TOKEN", "test-token")
         .current_dir(&temp_dir)
         .output()
@@ -1186,6 +1189,145 @@ skills:
     assert!(
         request.contains(r#""model":"test-model""#),
         "request was: {request}"
+    );
+}
+
+#[test]
+fn skills_propose_http_provider_times_out_when_server_never_responds() {
+    let temp_dir = make_temp_dir("skills-propose-http-timeout");
+    let (endpoint, server) = spawn_never_responding_skill_proposer();
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        &endpoint,
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_TIMEOUT_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let started_at = Instant::now();
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_TIMEOUT_TOKEN",
+            "timeout-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    let elapsed = started_at.elapsed();
+    server.join().unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("timed out"),
+        "stderr was: {stderr}; elapsed: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "request should not wait for the production default timeout, elapsed: {elapsed:?}"
+    );
+    assert!(
+        stderr.contains("skill proposal LLM request failed"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_blocks_metadata_endpoint_before_http_request() {
+    let temp_dir = make_temp_dir("skills-propose-metadata-endpoint");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        "http://169.254.169.254/latest/meta-data",
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_METADATA_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_METADATA_TOKEN",
+            "metadata-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skill proposal LLM endpoint was blocked"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("169.254.169.254"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_redacts_and_bounds_non_success_provider_body() {
+    let temp_dir = make_temp_dir("skills-propose-http-error-redaction");
+    let (endpoint, server) = spawn_erroring_skill_proposer("test-token", "x".repeat(10_000));
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        &endpoint,
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_ERROR_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_TEST_SKILL_PROPOSER_ERROR_TOKEN", "test-token")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("test-token"), "stderr was: {stderr}");
+    assert!(stderr.contains("[REDACTED]"), "stderr was: {stderr}");
+    assert!(
+        stderr.len() < 6_000,
+        "stderr should include a bounded provider body, got {} bytes",
+        stderr.len()
     );
 }
 
@@ -5161,6 +5303,7 @@ fn spawn_openai_compatible_skill_proposer(
                 Err(error) => panic!("accept OpenAI-compatible test request: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
             .unwrap();
@@ -5180,6 +5323,113 @@ fn spawn_openai_compatible_skill_proposer(
     });
 
     (endpoint, captured_request, handle)
+}
+
+fn spawn_never_responding_skill_proposer() -> (String, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for never-responding test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept never-responding test request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let _request = read_http_request(&mut stream);
+        thread::sleep(Duration::from_secs(2));
+    });
+
+    (endpoint, handle)
+}
+
+fn spawn_erroring_skill_proposer(secret: &str, suffix: String) -> (String, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let body = format!("provider failed with token {secret}: {suffix}");
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for erroring test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept erroring test request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let _request = read_http_request(&mut stream);
+        write!(
+            stream,
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    (endpoint, handle)
+}
+
+fn write_skill_proposer_blueprint(blueprint: &Path, endpoint: &str, model: &str, credential: &str) {
+    fs::write(
+        blueprint,
+        format!(
+            r#"
+version: 0.1.0
+sandbox: {{ driver: openshell }}
+agent: {{ driver: codex }}
+context: {{ driver: filesystem, mount: . }}
+skills:
+  proposal:
+    llm:
+      provider: openai-compatible
+      endpoint: {endpoint}
+      model: {model}
+      credential: {credential}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn seed_propose_events(db_path: &Path, blueprint: &Path) {
+    let store = SqliteEventStore::open(db_path).unwrap();
+    let blueprint_id = blueprint_digest(blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {
