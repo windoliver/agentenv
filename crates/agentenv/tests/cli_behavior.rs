@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -1078,6 +1078,115 @@ fn skills_propose_from_traces_emits_local_proposal_with_fake_llm() {
     assert!(out.join("fs-edit-skill/SKILL.md").is_file());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+}
+
+#[test]
+fn skills_propose_without_configured_llm_fails_clearly() {
+    let temp_dir = make_temp_dir("skills-propose-missing-llm");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(&blueprint, "version: 0.1.0\n").unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skill proposal LLM provider is not configured"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_uses_configured_openai_compatible_provider_and_env_credential() {
+    let temp_dir = make_temp_dir("skills-propose-http-provider");
+    let (endpoint, captured_request, server) =
+        spawn_openai_compatible_skill_proposer(fixture_generalization_json());
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        format!(
+            r#"
+version: 0.1.0
+sandbox: {{ driver: openshell }}
+agent: {{ driver: codex }}
+context: {{ driver: filesystem, mount: . }}
+skills:
+  proposal:
+    llm:
+      provider: openai-compatible
+      endpoint: {endpoint}
+      model: test-model
+      credential: AGENTENV_TEST_SKILL_PROPOSER_TOKEN
+"#
+        ),
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let out = temp_dir.join("proposed");
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_TEST_SKILL_PROPOSER_TOKEN", "test-token")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(out.join("fs-edit-skill/SKILL.md").is_file());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+    let request = captured_request.lock().unwrap().clone().unwrap();
+    assert!(
+        request.contains("authorization: Bearer test-token")
+            || request.contains("Authorization: Bearer test-token"),
+        "request was: {request}"
+    );
+    assert!(
+        request.contains(r#""model":"test-model""#),
+        "request was: {request}"
+    );
 }
 
 #[test]
@@ -5024,6 +5133,88 @@ fn reserve_tcp_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn spawn_openai_compatible_skill_proposer(
+    content: String,
+) -> (String, Arc<Mutex<Option<String>>>, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let captured_request = Arc::new(Mutex::new(None));
+    let captured_for_thread = Arc::clone(&captured_request);
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for OpenAI-compatible test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept OpenAI-compatible test request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let request = read_http_request(&mut stream);
+        *captured_for_thread.lock().unwrap() = Some(request);
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}],
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    (endpoint, captured_request, handle)
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count != 0, "connection closed before request headers");
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(header_end) = find_header_end(&bytes) {
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let target_len = header_end + 4 + content_length;
+            while bytes.len() < target_len {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count != 0, "connection closed before request body");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            return String::from_utf8_lossy(&bytes).to_string();
+        }
+    }
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 struct ApprovalsServerChild {

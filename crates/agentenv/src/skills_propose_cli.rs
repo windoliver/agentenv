@@ -3,14 +3,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use agentenv_core::skills::propose::{
-    ProposalEmitOutput, ProposeRunInput, ProposeRunOutput, ProposedSkillService,
-    SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
+use agentenv_core::skills::{
+    load_project_skills_config, load_user_skills_config, merge_skills_config,
+    propose::{
+        ProposalEmitOutput, ProposeRunInput, ProposeRunOutput, ProposedSkillService,
+        SkillGeneralization, SkillGeneralizationRequest, SkillGeneralizer,
+    },
+    SkillError, SkillsConfig, SkillsConfigOverride,
 };
+use agentenv_credstore::{CredentialStore, CredentialStoreError};
 use agentenv_events::{SqliteEventStore, TraceQuery};
+use agentenv_proto::{CredentialKind, CredentialRequirement};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use clap::Args;
+use reqwest::Client;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -55,6 +62,13 @@ struct FixtureGeneralizer {
     value: SkillGeneralization,
 }
 
+struct HttpGeneralizer {
+    endpoint: String,
+    model: String,
+    bearer: String,
+    client: Client,
+}
+
 #[async_trait]
 impl SkillGeneralizer for FixtureGeneralizer {
     async fn generalize(
@@ -62,6 +76,60 @@ impl SkillGeneralizer for FixtureGeneralizer {
         _request: SkillGeneralizationRequest,
     ) -> Result<SkillGeneralization, agentenv_core::skills::SkillError> {
         Ok(self.value.clone())
+    }
+}
+
+#[async_trait]
+impl SkillGeneralizer for HttpGeneralizer {
+    async fn generalize(
+        &self,
+        request: SkillGeneralizationRequest,
+    ) -> Result<SkillGeneralization, SkillError> {
+        let request_json =
+            serde_json::to_string(&request).map_err(|source| SkillError::InvalidConfig {
+                message: format!("skill proposal LLM request failed to serialize: {source}"),
+            })?;
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.bearer)
+            .json(&serde_json::json!({
+                "model": self.model,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": "Return only JSON for an agentenv skill proposal."},
+                    {"role": "user", "content": request_json}
+                ]
+            }))
+            .send()
+            .await
+            .map_err(|source| SkillError::InvalidConfig {
+                message: format!("skill proposal LLM request failed: {source}"),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = http_error_body(response).await;
+            return Err(SkillError::InvalidConfig {
+                message: format!("skill proposal LLM request failed with status {status}: {body}"),
+            });
+        }
+        let value: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|source| SkillError::InvalidConfig {
+                    message: format!("skill proposal LLM response was not JSON: {source}"),
+                })?;
+        let content = value
+            .pointer("/choices/0/message/content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SkillError::InvalidConfig {
+                message: "skill proposal LLM response missing choices[0].message.content"
+                    .to_owned(),
+            })?;
+        serde_json::from_str(content).map_err(|source| SkillError::InvalidConfig {
+            message: format!("skill proposal LLM content failed schema validation: {source}"),
+        })
     }
 }
 
@@ -203,7 +271,97 @@ fn generalizer_for_args(args: &SkillsProposeArgs) -> Result<Box<dyn SkillGeneral
         let value = serde_json::from_str(&raw).context("parse fixture generalization JSON")?;
         return Ok(Box::new(FixtureGeneralizer { value }));
     }
-    bail!("skill proposal LLM provider is not configured")
+
+    let config = load_effective_skills_config()?;
+    let llm = config
+        .proposal
+        .and_then(|proposal| proposal.llm)
+        .ok_or_else(|| anyhow::anyhow!("skill proposal LLM provider is not configured"))?;
+    if let Some(provider) = &args.llm_provider {
+        if provider != &llm.provider {
+            bail!(
+                "skill proposal LLM provider `{provider}` does not match configured provider `{}`",
+                llm.provider
+            );
+        }
+    }
+    if llm.provider != "openai-compatible" {
+        bail!(
+            "unsupported skill proposal LLM provider `{}`; expected `openai-compatible`",
+            llm.provider
+        );
+    }
+    let bearer = resolve_llm_bearer(&llm.credential)?;
+
+    Ok(Box::new(HttpGeneralizer {
+        endpoint: llm.endpoint,
+        model: llm.model,
+        bearer,
+        client: Client::new(),
+    }))
+}
+
+async fn http_error_body(response: reqwest::Response) -> String {
+    match response.text().await {
+        Ok(body) => body,
+        Err(error) => format!("<failed to read response body: {error}>"),
+    }
+}
+
+fn load_effective_skills_config() -> Result<SkillsConfig> {
+    let user = match dirs::home_dir() {
+        Some(home) => {
+            let path = home.join(".config/agentenv/config.toml");
+            if path.is_file() {
+                load_user_skills_config(
+                    &fs::read_to_string(&path)
+                        .with_context(|| format!("read `{}`", path.display()))?,
+                )
+                .with_context(|| format!("load skills config `{}`", path.display()))?
+            } else {
+                SkillsConfig::default()
+            }
+        }
+        None => SkillsConfig::default(),
+    };
+
+    let project_path = std::env::current_dir()
+        .context("read current directory")?
+        .join("agentenv.yaml");
+    let project = if project_path.is_file() {
+        Some(
+            load_project_skills_config(
+                &fs::read_to_string(&project_path)
+                    .with_context(|| format!("read `{}`", project_path.display()))?,
+            )
+            .with_context(|| format!("load project skills config `{}`", project_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    merge_skills_config(user, project, SkillsConfigOverride { registry: None })
+        .context("merge skills config")
+}
+
+fn resolve_llm_bearer(name: &str) -> Result<String> {
+    let store = CredentialStore::from_default_paths().context("initialize credential store")?;
+    let requirement = CredentialRequirement {
+        name: name.to_owned(),
+        kind: CredentialKind::ApiKey,
+        required: true,
+        description: "skill proposal LLM bearer token".to_owned(),
+        validator: None,
+    };
+    store
+        .resolve(name, &requirement)
+        .map(|secret| secret.expose_secret().to_owned())
+        .map_err(|error| match error {
+            CredentialStoreError::MissingCredential { .. } => {
+                anyhow::anyhow!("skill proposal LLM credential `{name}` is not configured")
+            }
+            error => anyhow::anyhow!("resolve skill proposal LLM credential `{name}`: {error}"),
+        })
 }
 
 fn default_events_db_path() -> PathBuf {
