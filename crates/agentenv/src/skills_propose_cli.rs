@@ -366,16 +366,14 @@ fn resolve_open_pr_context(out: Option<&Path>) -> Result<OpenPrContext> {
     let output_root = match out {
         Some(path) => {
             let absolute = absolute_path(path)?;
-            if !absolute.starts_with(&repo_root) {
-                bail!(
-                    "--out must be inside the git worktree when --open-pr is set: `{}` is outside `{}`",
-                    absolute.display(),
-                    repo_root.display()
-                );
-            }
+            ensure_output_path_inside_worktree(&absolute, &repo_root)?;
             absolute
         }
-        None => repo_root.join(".agentenv/skills/proposed"),
+        None => {
+            let output_root = repo_root.join(".agentenv/skills/proposed");
+            ensure_output_path_inside_worktree(&output_root, &repo_root)?;
+            output_root
+        }
     };
     Ok(OpenPrContext {
         repo_root,
@@ -400,7 +398,9 @@ fn git_worktree_root() -> Result<PathBuf> {
     if root.is_empty() {
         bail!("git rev-parse --show-toplevel returned an empty path");
     }
-    absolute_path(Path::new(root))
+    let absolute = absolute_path(Path::new(root))?;
+    fs::canonicalize(&absolute)
+        .with_context(|| format!("canonicalize git worktree `{}`", absolute.display()))
 }
 
 fn run_git_command(repo_root: &Path, args: &[&OsStr]) -> Result<()> {
@@ -446,6 +446,37 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
         bail!("path `{}` is not absolute", path.display());
     }
     Ok(normalized)
+}
+
+fn ensure_output_path_inside_worktree(output_root: &Path, repo_root: &Path) -> Result<()> {
+    let ancestor = deepest_existing_ancestor(output_root)?;
+    let canonical_ancestor = fs::canonicalize(&ancestor).with_context(|| {
+        format!(
+            "canonicalize existing output path ancestor `{}`",
+            ancestor.display()
+        )
+    })?;
+    if !canonical_ancestor.starts_with(repo_root) {
+        bail!(
+            "--out must be inside the git worktree when --open-pr is set: `{}` resolves through `{}` outside `{}`",
+            output_root.display(),
+            canonical_ancestor.display(),
+            repo_root.display()
+        );
+    }
+    Ok(())
+}
+
+fn deepest_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        if !candidate.pop() {
+            bail!("no existing ancestor found for `{}`", path.display());
+        }
+    }
 }
 
 fn git_ref_safe_slug(name: &str) -> String {

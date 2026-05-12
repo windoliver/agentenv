@@ -1165,23 +1165,24 @@ fn skills_propose_open_pr_publishes_first_proposal_with_fake_git_and_gh() {
     );
 
     let log = fs::read_to_string(&log_path).unwrap();
+    let canonical_repo_root = fs::canonicalize(&repo_root).unwrap();
     let expected_commands = [
         "git rev-parse --show-toplevel".to_owned(),
         format!(
             "git -C {} checkout -B agentenv/proposed-skill/fs-edit-skill",
-            repo_root.display()
+            canonical_repo_root.display()
         ),
         format!(
             "git -C {} add -- .agentenv/skills/proposed/fs-edit-skill",
-            repo_root.display()
+            canonical_repo_root.display()
         ),
         format!(
             "git -C {} commit -m feat: propose trace-derived skill fs-edit-skill",
-            repo_root.display()
+            canonical_repo_root.display()
         ),
         format!(
             "git -C {} push -u origin agentenv/proposed-skill/fs-edit-skill",
-            repo_root.display()
+            canonical_repo_root.display()
         ),
         "gh pr create --repo owner/repo --draft --title feat: propose trace-derived skill fs-edit-skill --body Trace-derived skill proposal.".to_owned(),
     ];
@@ -1278,6 +1279,98 @@ fn skills_propose_open_pr_rejects_explicit_outside_repo_before_emitting() {
     );
     let log = fs::read_to_string(&log_path).unwrap();
     assert_eq!(log.trim(), "git rev-parse --show-toplevel");
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_propose_open_pr_rejects_default_output_through_symlinked_agentenv() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp_dir = make_temp_dir("skills-propose-open-pr-symlink-default");
+    let repo_root = temp_dir.join("repo");
+    let outside = temp_dir.join("outside-agentenv");
+    fs::create_dir_all(&repo_root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    run_git(&repo_root, &["init"]);
+    symlink(&outside, repo_root.join(".agentenv")).unwrap();
+
+    let blueprint = repo_root.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join("events.db");
+    let store = SqliteEventStore::open(&db_path).unwrap();
+    let blueprint_id = blueprint_digest(&blueprint);
+    store
+        .append_many(&[
+            propose_event("trace-1", &blueprint_id, "fs_read", "/repo/a.rs"),
+            propose_event("trace-2", &blueprint_id, "fs_read", "/repo/b.rs"),
+            propose_event("trace-3", &blueprint_id, "fs_read", "/repo/c.rs"),
+        ])
+        .unwrap();
+
+    let gh_log = temp_dir.join("gh.log");
+    let fake_bin = temp_dir.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let gh = fake_bin.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> '{}'\nprintf '%s\\n' 'https://github.com/owner/repo/pull/789'\n",
+            gh_log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&gh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh, permissions).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(&path));
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--open-pr")
+        .arg("--repo")
+        .arg("owner/repo")
+        .env("HOME", temp_dir.join("home"))
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inside the git worktree"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !outside
+            .join("skills/proposed/fs-edit-skill/SKILL.md")
+            .exists(),
+        "proposal should not be emitted through the .agentenv symlink"
+    );
+    assert!(
+        !gh_log.exists(),
+        "gh should not be reached when output preflight fails"
+    );
+    let head = git_stdout(&repo_root, &["symbolic-ref", "--short", "HEAD"]);
+    assert_ne!(head, "agentenv/proposed-skill/fs-edit-skill");
 }
 
 #[cfg(unix)]
