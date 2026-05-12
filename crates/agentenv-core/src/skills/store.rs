@@ -459,7 +459,10 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::InvalidVersion { .. }
         | SkillError::MissingDeclaredFile { .. }
         | SkillError::EmptyFilePattern { .. }
-        | SkillError::MissingManifestField { .. } => true,
+        | SkillError::MissingManifestField { .. }
+        | SkillError::MissingSelfTest
+        | SkillError::InvalidSelfTest { .. }
+        | SkillError::ConflictingSelfTestDeclarations { .. } => true,
         SkillError::UnsafeBundlePath { .. }
         | SkillError::DigestMismatch { .. }
         | SkillError::MissingSignature { .. }

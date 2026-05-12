@@ -70,6 +70,12 @@ pub enum SkillError {
     MissingManifestField { path: PathBuf, field: &'static str },
     #[error("skill digest mismatch: expected `{expected}`, found `{actual}`")]
     DigestMismatch { expected: String, actual: String },
+    #[error("skill self-test is missing")]
+    MissingSelfTest,
+    #[error("invalid skill self-test: {message}")]
+    InvalidSelfTest { message: String },
+    #[error("conflicting skill self-test declaration in `{declaration_source}`")]
+    ConflictingSelfTestDeclarations { declaration_source: String },
     #[error("missing Ed25519 signature for skill `{name}` version `{version}`")]
     MissingSignature { name: String, version: String },
     #[error("invalid Ed25519 signature for skill `{name}` version `{version}`: {message}")]
