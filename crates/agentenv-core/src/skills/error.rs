@@ -80,6 +80,18 @@ pub enum SkillError {
     SelfTestTimeout { timeout_seconds: u64 },
     #[error("skill self-test score {score:.3} is below required threshold {threshold:.3}")]
     SelfTestScoreBelowThreshold { score: f64, threshold: f64 },
+    #[error("invalid skill self-test signing key at `{path}`")]
+    InvalidSelfTestSigningKey { path: PathBuf },
+    #[error("invalid skill self-test attestation: {message}")]
+    InvalidSelfTestAttestation { message: String },
+    #[error("skill self-test attestation subject does not match published skill")]
+    SelfTestAttestationSubjectMismatch,
+    #[error("skill self-test attestation digest does not match published self-test")]
+    SelfTestAttestationDigestMismatch,
+    #[error(
+        "skill self-test attestation completed at `{completed_at}` is outside the allowed window"
+    )]
+    StaleSelfTestAttestation { completed_at: String },
     #[error("agent_produces self-test assertions are unavailable in this execution context")]
     UnsupportedAgentProduces,
     #[error("missing Ed25519 signature for skill `{name}` version `{version}`")]

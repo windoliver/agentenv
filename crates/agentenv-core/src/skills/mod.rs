@@ -1,3 +1,4 @@
+mod attestation;
 pub mod cache;
 mod config;
 mod digest;
@@ -14,6 +15,11 @@ mod service;
 mod signature;
 mod store;
 
+pub use attestation::{
+    sign_skill_self_test_attestation, validate_skill_publish_attestation,
+    SkillAttestationValidationOptions, SkillSelfTestAttestation, SkillSelfTestAttestationSignature,
+    SkillSelfTestSigningKey, SkillSelfTestSubject,
+};
 pub use cache::{
     execute_skill_prune, load_skill_trust_keys, plan_skill_prune, rebuild_skill_index,
     verify_all_installed_skills, verify_skill_pins, SkillArchive, SkillCacheError,

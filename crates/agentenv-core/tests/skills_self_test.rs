@@ -8,10 +8,13 @@ use std::{
 };
 
 use agentenv_core::skills::{
-    load_skill_self_test_spec, run_skill_self_test, AgentProduceRequest, AgentProduceRunner,
-    SkillAssertionStatus, SkillError, SkillSelfTestAssertion, SkillSelfTestOptions,
-    SkillSelfTestRunner, SkillSelfTestSpec,
+    load_skill_self_test_spec, run_skill_self_test, sign_skill_self_test_attestation,
+    validate_skill_publish_attestation, AgentProduceRequest, AgentProduceRunner,
+    SkillAssertionResult, SkillAssertionStatus, SkillAttestationValidationOptions, SkillError,
+    SkillSelfTestAssertion, SkillSelfTestOptions, SkillSelfTestReport, SkillSelfTestRunner,
+    SkillSelfTestSigningKey, SkillSelfTestSpec,
 };
+use time::OffsetDateTime;
 
 #[test]
 fn self_test_spec_loads_from_skill_test_yaml() {
@@ -898,6 +901,260 @@ fn self_test_runner_kills_command_descendants_on_timeout() {
     assert!(!late_file.exists());
 }
 
+#[test]
+fn self_test_attestation_signs_and_validates_report() {
+    let report = attestation_report();
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let public_key = key.public_key_hex();
+
+    let attestation = sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+
+    assert_eq!(attestation.signature.algorithm, "ed25519");
+    assert_eq!(attestation.signature.key_id, "local-agentenv");
+    assert_eq!(attestation.signature.public_key_ed25519, public_key);
+    assert_eq!(attestation.runner, "agentenv");
+    assert_eq!(attestation.score, 1.0);
+    assert!(attestation.publishable);
+    assert_eq!(attestation.completed_at, report.completed_at);
+
+    validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(public_key),
+    )
+    .expect("valid attestation should pass");
+}
+
+#[test]
+fn self_test_attestation_rejects_low_score() {
+    let mut report = attestation_report();
+    report.score = 0.5;
+    report.publishable = true;
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let attestation = sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+
+    let error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("low score must fail");
+
+    assert!(matches!(
+        error,
+        SkillError::SelfTestScoreBelowThreshold { .. }
+    ));
+}
+
+#[test]
+fn self_test_attestation_rejects_stale_report() {
+    let mut report = attestation_report();
+    report.completed_at = OffsetDateTime::now_utc() - time::Duration::days(30);
+    report.started_at = report.completed_at - time::Duration::seconds(1);
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let attestation = sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+
+    let error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("stale report must fail");
+
+    assert!(matches!(error, SkillError::StaleSelfTestAttestation { .. }));
+}
+
+#[test]
+fn self_test_attestation_rejects_future_report() {
+    let mut report = attestation_report();
+    report.completed_at = OffsetDateTime::now_utc() + time::Duration::days(1);
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let attestation = sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+
+    let error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("future report must fail");
+
+    assert!(matches!(error, SkillError::StaleSelfTestAttestation { .. }));
+}
+
+#[test]
+fn self_test_attestation_rejects_untrusted_public_key() {
+    let report = attestation_report();
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let attestation = sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+    let other_key = SkillSelfTestSigningKey::from_secret_bytes([8; 32]);
+
+    let error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(other_key.public_key_hex()),
+    )
+    .expect_err("untrusted key must fail");
+
+    assert!(matches!(
+        error,
+        SkillError::InvalidSelfTestAttestation { .. }
+    ));
+}
+
+#[test]
+fn self_test_attestation_rejects_tampered_payload() {
+    let report = attestation_report();
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let mut attestation =
+        sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+    attestation.assertions[0].message = "tampered".to_owned();
+
+    let error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("tampered payload must fail");
+
+    assert!(matches!(
+        error,
+        SkillError::InvalidSelfTestAttestation { .. }
+    ));
+}
+
+#[test]
+fn self_test_attestation_rejects_subject_and_digest_mismatches() {
+    let report = attestation_report();
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let attestation = sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+
+    let subject_error = validate_skill_publish_attestation(
+        "other",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &attestation,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("subject mismatch must fail");
+    assert!(matches!(
+        subject_error,
+        SkillError::SelfTestAttestationSubjectMismatch
+    ));
+
+    let digest_error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:other-self-test",
+        &attestation,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("self-test digest mismatch must fail");
+    assert!(matches!(
+        digest_error,
+        SkillError::SelfTestAttestationDigestMismatch
+    ));
+}
+
+#[test]
+fn self_test_attestation_rejects_wrong_algorithm_and_malformed_signature() {
+    let report = attestation_report();
+    let key = SkillSelfTestSigningKey::from_secret_bytes([7; 32]);
+    let mut wrong_algorithm =
+        sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+    wrong_algorithm.signature.algorithm = "rsa".to_owned();
+
+    let algorithm_error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &wrong_algorithm,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("wrong algorithm must fail");
+    assert!(matches!(
+        algorithm_error,
+        SkillError::InvalidSelfTestAttestation { .. }
+    ));
+
+    let mut malformed =
+        sign_skill_self_test_attestation(&report, &key).expect("report should sign");
+    malformed.signature.value = "not-hex".to_owned();
+    let malformed_error = validate_skill_publish_attestation(
+        "demo",
+        "0.1.0",
+        "sha256:bundle",
+        "sha256:self-test",
+        &malformed,
+        validation_options(key.public_key_hex()),
+    )
+    .expect_err("malformed signature must fail");
+    assert!(matches!(
+        malformed_error,
+        SkillError::InvalidSelfTestAttestation { .. }
+    ));
+}
+
+#[test]
+fn self_test_attestation_load_or_create_key_round_trips() {
+    let root = temp_dir("self-test-attestation-key-round-trip");
+    let key_path = root.join("self-test-signing-key");
+
+    let first =
+        SkillSelfTestSigningKey::load_or_create(&key_path).expect("key should be created");
+    let second =
+        SkillSelfTestSigningKey::load_or_create(&key_path).expect("key should be loaded");
+
+    assert_eq!(first.public_key_hex(), second.public_key_hex());
+    assert_eq!(fs::read(&key_path).expect("key should exist").len(), 32);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(&key_path).expect("key metadata").permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn self_test_attestation_rejects_insecure_existing_key_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("self-test-attestation-insecure-key");
+    let key_path = root.join("self-test-signing-key");
+    fs::write(&key_path, [1_u8; 32]).expect("write key");
+    let mut permissions = fs::metadata(&key_path).expect("key metadata").permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&key_path, permissions).expect("set insecure mode");
+
+    let error =
+        SkillSelfTestSigningKey::load_or_create(&key_path).expect_err("insecure key must fail");
+
+    assert!(matches!(error, SkillError::InvalidSelfTestSigningKey { .. }));
+}
+
 struct UnsupportedTestAgentRunner;
 
 impl AgentProduceRunner for UnsupportedTestAgentRunner {
@@ -978,4 +1235,34 @@ fn unique_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
+}
+
+fn attestation_report() -> SkillSelfTestReport {
+    let now = OffsetDateTime::now_utc();
+    SkillSelfTestReport {
+        name: "demo".to_owned(),
+        version: "0.1.0".to_owned(),
+        digest: "sha256:bundle".to_owned(),
+        self_test_digest: "sha256:self-test".to_owned(),
+        score: 1.0,
+        passed: 1,
+        total: 1,
+        publishable: true,
+        assertions: vec![SkillAssertionResult {
+            assertion_type: "file_exists".to_owned(),
+            status: SkillAssertionStatus::Passed,
+            message: "SKILL.md exists".to_owned(),
+        }],
+        started_at: now - time::Duration::seconds(1),
+        completed_at: now,
+    }
+}
+
+fn validation_options(public_key: String) -> SkillAttestationValidationOptions {
+    SkillAttestationValidationOptions {
+        trusted_public_keys: vec![public_key],
+        now: OffsetDateTime::now_utc(),
+        max_age_seconds: 86_400,
+        threshold: 0.8,
+    }
 }
