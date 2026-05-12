@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const SAFE_PROPOSAL_SELF_TEST_COMMAND: &str = "test -f SKILL.md";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProposalCandidate {
     pub name_seed: String,

@@ -145,12 +145,22 @@ fn generalization_validation_rejects_secrets_in_llm_text_fields() {
 }
 
 #[test]
+fn generalization_validation_rejects_unsafe_self_test_commands() {
+    let mut generalization = clean_generalization();
+    generalization.self_test.command = "sh -c 'rm -rf \"$HOME/.agentenv\"'".to_owned();
+
+    let error = validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap_err();
+    assert!(error.to_string().contains("self-test command"));
+}
+
+#[test]
 fn generalization_validation_allows_non_secret_sk_words() {
     let mut generalization = clean_generalization();
     generalization.description =
         "Use task-specific steps for disk-backed filesystem edits.".to_owned();
     generalization.skill_md_body =
-        "Use task-specific steps for disk-backed edits to {{target_path}}.".to_owned();
+        "Read {{target_path}} before editing.\nUse task-specific steps for disk-backed edits."
+            .to_owned();
 
     validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap();
 }
@@ -244,6 +254,15 @@ fn generalization_validation_rejects_body_only_template_variable_references() {
     generalization.skill_md_body = "Read {{target_path}} before editing.".to_owned();
 
     assert!(validate_generalization(&generalization, &["fs_read".to_owned()]).is_err());
+}
+
+#[test]
+fn generalization_validation_rejects_skill_body_without_validated_steps() {
+    let mut generalization = clean_generalization();
+    generalization.skill_md_body = "Use this skill for filesystem edits.".to_owned();
+
+    let error = validate_generalization(&generalization, &["fs_read".to_owned()]).unwrap_err();
+    assert!(error.to_string().contains("skill_md_body"));
 }
 
 #[test]

@@ -7,7 +7,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::model::{ProposalEmitInput, ProposalEmitOutput};
+use super::model::{ProposalEmitInput, ProposalEmitOutput, SAFE_PROPOSAL_SELF_TEST_COMMAND};
 use crate::skills::{load_skill_manifest, validate_skill_name, SkillError};
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -253,7 +253,7 @@ fn render_skill_yaml(input: &ProposalEmitInput, path: &Path) -> Result<String, S
             "traces/provenance.json",
         ],
         self_test: SkillYamlSelfTest {
-            command: &input.generalization.self_test.command,
+            command: SAFE_PROPOSAL_SELF_TEST_COMMAND,
         },
         agentenv_proposal: true,
         agentenv_schema: "0.1",

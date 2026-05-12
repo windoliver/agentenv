@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
-use super::model::SkillGeneralization;
+use super::model::{SkillGeneralization, SAFE_PROPOSAL_SELF_TEST_COMMAND};
 use crate::skills::{validate_skill_name, SkillError};
 
 #[async_trait]
@@ -61,6 +61,12 @@ pub fn validate_generalization(
     for step in &generalization.procedure_steps {
         require_non_empty("procedure step instruction", &step.instruction)?;
         reject_secret_text(&step.instruction)?;
+        if !generalization.skill_md_body.contains(&step.instruction) {
+            return Err(SkillError::InvalidConfig {
+                message: "skill_md_body must include every validated procedure step instruction"
+                    .to_owned(),
+            });
+        }
         step_referenced_variables.extend(template_variables_in(
             "procedure step instruction",
             &step.instruction,
@@ -93,6 +99,7 @@ pub fn validate_generalization(
     }
     require_non_empty("self-test command", &generalization.self_test.command)?;
     reject_secret_text(&generalization.self_test.command)?;
+    validate_self_test_command(&generalization.self_test.command)?;
     Ok(())
 }
 
@@ -116,6 +123,15 @@ fn reject_secret_text(value: &str) -> Result<(), SkillError> {
     {
         return Err(SkillError::InvalidConfig {
             message: "generalized skill text contains secret-like content".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_self_test_command(command: &str) -> Result<(), SkillError> {
+    if command != SAFE_PROPOSAL_SELF_TEST_COMMAND {
+        return Err(SkillError::InvalidConfig {
+            message: format!("self-test command must be `{SAFE_PROPOSAL_SELF_TEST_COMMAND}`"),
         });
     }
     Ok(())
