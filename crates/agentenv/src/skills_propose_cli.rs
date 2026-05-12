@@ -103,6 +103,12 @@ struct HttpGeneralizer {
     client: Client,
 }
 
+#[derive(Debug, Default)]
+struct ExistingSkillLoadResult {
+    summaries: Vec<ExistingSkillSummary>,
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SkillSummaryManifest {
     name: String,
@@ -218,10 +224,13 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         .map(|context| context.output_root.clone())
         .or_else(|| args.out.clone())
         .unwrap_or_else(default_proposed_dir);
-    let existing_skills = load_existing_skill_summaries(&output_root)?;
+    let ExistingSkillLoadResult {
+        summaries: existing_skills,
+        warnings: existing_skill_warnings,
+    } = load_existing_skill_summaries(&output_root)?;
     let generalizer = generalizer_for_args(&args, blueprint)?;
     let created_at = now_event_ts();
-    let output = ProposedSkillService::new(generalizer)
+    let mut output = ProposedSkillService::new(generalizer)
         .run(ProposeRunInput {
             traces,
             output_root,
@@ -235,6 +244,11 @@ pub async fn run_skills_propose(args: SkillsProposeArgs) -> Result<()> {
         })
         .await
         .context("run skill proposal service")?;
+    if !existing_skill_warnings.is_empty() {
+        let mut warnings = existing_skill_warnings;
+        warnings.extend(output.warnings);
+        output.warnings = warnings;
+    }
 
     finish_skills_propose(args.json, open_pr_context, args.repo.clone(), output)
 }
@@ -449,22 +463,24 @@ fn ensure_clean_git_index(repo_root: &Path) -> Result<()> {
     }
 }
 
-fn load_existing_skill_summaries(output_root: &Path) -> Result<Vec<ExistingSkillSummary>> {
-    let mut summaries = load_installed_skill_summaries()?;
-    summaries.extend(load_proposed_skill_summaries(output_root)?);
-    Ok(summaries)
+fn load_existing_skill_summaries(output_root: &Path) -> Result<ExistingSkillLoadResult> {
+    let mut result = load_installed_skill_summaries()?;
+    let proposed = load_proposed_skill_summaries(output_root)?;
+    result.summaries.extend(proposed.summaries);
+    result.warnings.extend(proposed.warnings);
+    Ok(result)
 }
 
-fn load_installed_skill_summaries() -> Result<Vec<ExistingSkillSummary>> {
+fn load_installed_skill_summaries() -> Result<ExistingSkillLoadResult> {
     let Some(home) = dirs::home_dir() else {
-        return Ok(Vec::new());
+        return Ok(ExistingSkillLoadResult::default());
     };
     let skills_root = home.join(".agentenv").join("skills");
     let Some(entries) = read_directory_if_exists(&skills_root)? else {
-        return Ok(Vec::new());
+        return Ok(ExistingSkillLoadResult::default());
     };
 
-    let mut summaries = Vec::new();
+    let mut result = ExistingSkillLoadResult::default();
     for name_entry in entries {
         let name_entry = name_entry.with_context(|| format!("read `{}`", skills_root.display()))?;
         let name_path = name_entry.path();
@@ -488,24 +504,27 @@ fn load_installed_skill_summaries() -> Result<Vec<ExistingSkillSummary>> {
             }
             let install_dir = version_entry.path();
             let content_root = install_dir.join(INSTALLED_CONTENT_DIR);
-            let fingerprint = skill_provenance_fingerprint(&content_root)?;
-            if let Some(summary) =
-                load_skill_summary_from_dir(&install_dir, &content_root, fingerprint)?
-            {
-                summaries.push(summary);
+            let fingerprint =
+                existing_skill_fingerprint_or_warn(&content_root, &mut result.warnings);
+            match load_skill_summary_from_dir(&install_dir, &content_root, fingerprint) {
+                Ok(Some(summary)) => result.summaries.push(summary),
+                Ok(None) => {}
+                Err(error) => {
+                    warn_existing_skill_summary(&install_dir, error, &mut result.warnings)
+                }
             }
         }
     }
 
-    Ok(summaries)
+    Ok(result)
 }
 
-fn load_proposed_skill_summaries(output_root: &Path) -> Result<Vec<ExistingSkillSummary>> {
+fn load_proposed_skill_summaries(output_root: &Path) -> Result<ExistingSkillLoadResult> {
     let Some(entries) = read_directory_if_exists(output_root)? else {
-        return Ok(Vec::new());
+        return Ok(ExistingSkillLoadResult::default());
     };
 
-    let mut summaries = Vec::new();
+    let mut result = ExistingSkillLoadResult::default();
     for entry in entries {
         let entry = entry.with_context(|| format!("read `{}`", output_root.display()))?;
         let path = entry.path();
@@ -518,13 +537,41 @@ fn load_proposed_skill_summaries(output_root: &Path) -> Result<Vec<ExistingSkill
         if name.starts_with('.') || !entry_file_type(&entry)?.is_dir() {
             continue;
         }
-        let fingerprint = skill_provenance_fingerprint(&path)?;
-        if let Some(summary) = load_skill_summary_from_dir(&path, &path, fingerprint)? {
-            summaries.push(summary);
+        let fingerprint = existing_skill_fingerprint_or_warn(&path, &mut result.warnings);
+        match load_skill_summary_from_dir(&path, &path, fingerprint) {
+            Ok(Some(summary)) => result.summaries.push(summary),
+            Ok(None) => {}
+            Err(error) => warn_existing_skill_summary(&path, error, &mut result.warnings),
         }
     }
 
-    Ok(summaries)
+    Ok(result)
+}
+
+fn existing_skill_fingerprint_or_warn(
+    content_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    match skill_provenance_fingerprint(content_root) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            warnings.push(format!(
+                "ignored existing skill provenance `{}`: {error:#}",
+                content_root
+                    .join("traces")
+                    .join("provenance.json")
+                    .display()
+            ));
+            None
+        }
+    }
+}
+
+fn warn_existing_skill_summary(path: &Path, error: anyhow::Error, warnings: &mut Vec<String>) {
+    warnings.push(format!(
+        "ignored existing skill summary `{}`: {error:#}",
+        path.display()
+    ));
 }
 
 fn load_skill_summary_from_dir(

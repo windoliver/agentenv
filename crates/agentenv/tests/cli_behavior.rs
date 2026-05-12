@@ -1323,6 +1323,69 @@ fn skills_propose_filters_duplicate_installed_skill_by_provenance_fingerprint() 
 }
 
 #[test]
+fn skills_propose_warns_and_continues_past_malformed_existing_proposal_provenance() {
+    let temp_dir = make_temp_dir("skills-propose-malformed-proposed-provenance");
+    let blueprint = temp_dir.join("myapp.yaml");
+    fs::write(
+        &blueprint,
+        "version: 0.1.0\nsandbox: { driver: openshell }\nagent: { driver: codex }\ncontext: { driver: filesystem, mount: . }\n",
+    )
+    .unwrap();
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let out = temp_dir.join("proposed");
+    let existing = out.join("broken-cache");
+    fs::create_dir_all(existing.join("traces")).unwrap();
+    fs::write(
+        existing.join("skill.yaml"),
+        "name: broken-cache\nversion: 0.1.0\ndescription: unrelated cached proposal\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\n",
+    )
+    .unwrap();
+    fs::write(
+        existing.join("SKILL.md"),
+        "This cached proposal is unrelated to filesystem reads.\n",
+    )
+    .unwrap();
+    fs::write(existing.join("traces/provenance.json"), "{not json").unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--out")
+        .arg(&out)
+        .arg("--llm-provider")
+        .arg("fixture")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env(
+            "AGENTENV_SKILL_PROPOSER_FIXTURE_JSON",
+            fixture_generalization_json(),
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["proposals"][0]["name"], "fs-edit-skill");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| {
+            let warning = warning.as_str().unwrap();
+            warning.contains("broken-cache") && warning.contains("provenance")
+        }),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn skills_propose_rejects_unsupported_semantic_backend() {
     let temp_dir = make_temp_dir("skills-propose-semantic-backend");
     let blueprint = temp_dir.join("myapp.yaml");
