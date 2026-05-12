@@ -4,7 +4,10 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{self, Command},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -1286,6 +1289,145 @@ fn skills_propose_blocks_metadata_endpoint_before_http_request() {
         "stderr was: {stderr}"
     );
     assert!(stderr.contains("169.254.169.254"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_does_not_follow_provider_redirect_to_metadata_endpoint() {
+    let temp_dir = make_temp_dir("skills-propose-redirect-ssrf");
+    let (endpoint, request_count, server) =
+        spawn_redirecting_skill_proposer("http://169.254.169.254/latest/meta-data");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        &endpoint,
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_REDIRECT_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_REDIRECT_TOKEN",
+            "redirect-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("307 Temporary Redirect"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("redirecting to metadata"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn skills_propose_blocks_private_endpoint_with_only_local_opt_in() {
+    let temp_dir = make_temp_dir("skills-propose-private-local-only");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        "http://10.0.0.1/v1/chat/completions",
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_LOCAL_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_LOCAL_TOKEN",
+            "private-local-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skill proposal LLM endpoint was blocked"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("10.0.0.1"), "stderr was: {stderr}");
+}
+
+#[test]
+fn skills_propose_private_endpoint_opt_in_reaches_request_layer() {
+    let temp_dir = make_temp_dir("skills-propose-private-opt-in");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    write_skill_proposer_blueprint(
+        &blueprint,
+        "http://10.0.0.1/v1/chat/completions",
+        "test-model",
+        "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_TOKEN",
+    );
+    let db_path = temp_dir.join(".agentenv/events.db");
+    seed_propose_events(&db_path, &blueprint);
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("propose")
+        .arg("--from-traces")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--events-db")
+        .arg(&db_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_DISABLE_KEYRING", "1")
+        .env("AGENTENV_SKILL_PROPOSER_ALLOW_PRIVATE_ENDPOINTS", "1")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env(
+            "AGENTENV_TEST_SKILL_PROPOSER_PRIVATE_TOKEN",
+            "private-token",
+        )
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("skill proposal LLM endpoint was blocked"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("skill proposal LLM request failed"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[test]
@@ -5396,6 +5538,52 @@ fn spawn_erroring_skill_proposer(secret: &str, suffix: String) -> (String, threa
     });
 
     (endpoint, handle)
+}
+
+fn spawn_redirecting_skill_proposer(
+    location: &str,
+) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_thread = Arc::clone(&request_count);
+    let location = location.to_owned();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for redirecting test request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept redirecting test request: {error}"),
+            }
+        };
+        request_count_for_thread.fetch_add(1, Ordering::SeqCst);
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let _request = read_http_request(&mut stream);
+        let body = format!("redirecting to metadata: {location}");
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    (endpoint, request_count, handle)
 }
 
 fn write_skill_proposer_blueprint(blueprint: &Path, endpoint: &str, model: &str, credential: &str) {

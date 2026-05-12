@@ -31,6 +31,7 @@ use url::Url;
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_ERROR_BODY_LIMIT: usize = 4096;
 const LOCAL_ENDPOINTS_ENV: &str = "AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS";
+const PRIVATE_ENDPOINTS_ENV: &str = "AGENTENV_SKILL_PROPOSER_ALLOW_PRIVATE_ENDPOINTS";
 const HTTP_TIMEOUT_ENV: &str = "AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS";
 
 #[derive(Debug, Args, Clone)]
@@ -418,6 +419,8 @@ fn skill_proposer_ssrf_options() -> SsrfOptions {
     let mut options = SsrfOptions::default();
     if env_flag_enabled(LOCAL_ENDPOINTS_ENV) {
         options.allow_loopback = true;
+    }
+    if env_flag_enabled(PRIVATE_ENDPOINTS_ENV) {
         options.allow_private = true;
     }
     options
@@ -435,6 +438,7 @@ fn build_http_client(endpoint: &ValidatedUrl) -> Result<Client> {
     Client::builder()
         .timeout(timeout)
         .connect_timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(&endpoint.host, &addrs)
         .build()
         .context("build skill proposal LLM HTTP client")
