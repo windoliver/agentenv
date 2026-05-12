@@ -514,7 +514,7 @@ pub mod self_test;
 
 pub use self_test::{
     load_skill_self_test_spec, normalized_self_test_digest, SkillSelfTestAssertion,
-    SkillSelfTestReport, SkillSelfTestRunner, SkillSelfTestSpec,
+    SkillSelfTestRunner, SkillSelfTestSpec,
 };
 ```
 
@@ -878,6 +878,16 @@ impl SkillSelfTestAssertion {
         }
     }
 }
+```
+
+Modify `crates/agentenv-core/src/skills/mod.rs` to export the runner/report types introduced in this task:
+
+```rust
+pub use self_test::{
+    AgentProduceRequest, AgentProduceRunner, SkillAssertionResult, SkillAssertionStatus,
+    SkillSelfTestOptions, SkillSelfTestReport, UnsupportedAgentProduceRunner,
+    SELF_TEST_PUBLISH_THRESHOLD,
+};
 ```
 
 - [ ] **Step 5: Run runner tests and commit**
