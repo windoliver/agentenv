@@ -14,14 +14,15 @@ use crate::security::ssrf::{validate_outbound, SsrfOptions};
 
 use super::{
     compute_bundle_digest,
-    manifest::{load_remote_skill_manifest, validated_bundle_file},
+    manifest::{load_remote_skill_manifest, normalize_bundle_path, validated_bundle_file},
     validate_skill_name, verify_ed25519_signature, FetchedSkill, RegistryAdapter, SkillError,
     SkillManifest, SkillSearchHit,
 };
 
 const BUNDLES_DIR: &str = "bundles";
 const CONTENT_DIR: &str = "content";
-const INDEX_FILE: &str = "index.yaml";
+const INDEX_JSON_FILE: &str = "index.json";
+const INDEX_YAML_FILE: &str = "index.yaml";
 const MANIFEST_FILE: &str = "skill.yaml";
 const SOURCE_TYPE: &str = "http";
 
@@ -38,6 +39,12 @@ pub(crate) struct HttpRegistryAdapter {
 struct HttpRegistryIndex {
     #[serde(default, alias = "entries")]
     skills: Vec<SkillSearchHit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HttpRegistryIndexFormat {
+    Json,
+    Yaml,
 }
 
 impl HttpRegistryAdapter {
@@ -69,12 +76,24 @@ impl HttpRegistryAdapter {
         })
     }
 
-    fn index_url(&self) -> Result<Url, SkillError> {
-        self.url_for(&[INDEX_FILE])
+    fn index_json_url(&self) -> Result<Url, SkillError> {
+        self.url_for(&[INDEX_JSON_FILE])
+    }
+
+    fn index_yaml_url(&self) -> Result<Url, SkillError> {
+        self.url_for(&[INDEX_YAML_FILE])
     }
 
     fn manifest_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
         self.url_for(&[BUNDLES_DIR, name, version, MANIFEST_FILE])
+    }
+
+    fn tarball_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
+        self.url_for(&["skills", name, &format!("{version}.tar.zst")])
+    }
+
+    fn tarball_signature_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
+        self.url_for(&["skills", name, &format!("{version}.tar.zst.sig")])
     }
 
     fn content_url(
@@ -122,29 +141,67 @@ impl HttpRegistryAdapter {
     }
 
     async fn read_index(&self) -> Result<HttpRegistryIndex, SkillError> {
-        let url = self.index_url()?;
-        let Some(content) = self.get_optional_text(url).await? else {
-            return Ok(HttpRegistryIndex::default());
+        self.read_index_with_format()
+            .await
+            .map(|(index, _format)| index)
+    }
+
+    async fn read_index_with_format(
+        &self,
+    ) -> Result<(HttpRegistryIndex, HttpRegistryIndexFormat), SkillError> {
+        if let Some(content) = self.get_optional_text(self.index_json_url()?).await? {
+            let mut index: HttpRegistryIndex =
+                serde_json::from_str(&content).map_err(|source| SkillError::InvalidConfig {
+                    message: format!("failed to parse HTTP registry index JSON: {source}"),
+                })?;
+            self.validate_index(&mut index)?;
+            return Ok((index, HttpRegistryIndexFormat::Json));
+        }
+
+        let Some(content) = self.get_optional_text(self.index_yaml_url()?).await? else {
+            return Ok((HttpRegistryIndex::default(), HttpRegistryIndexFormat::Json));
         };
         let mut index: HttpRegistryIndex =
             serde_yaml::from_str(&content).map_err(|source| SkillError::Yaml {
-                path: PathBuf::from(INDEX_FILE),
+                path: PathBuf::from(INDEX_YAML_FILE),
                 source,
             })?;
+        self.validate_index(&mut index)?;
+        Ok((index, HttpRegistryIndexFormat::Yaml))
+    }
+
+    fn validate_index(&self, index: &mut HttpRegistryIndex) -> Result<(), SkillError> {
         for hit in &mut index.skills {
             self.validate_hit(hit)?;
         }
-        Ok(index)
+        Ok(())
     }
 
-    async fn write_index(&self, mut index: HttpRegistryIndex) -> Result<(), SkillError> {
+    async fn write_index(
+        &self,
+        mut index: HttpRegistryIndex,
+        format: HttpRegistryIndexFormat,
+    ) -> Result<(), SkillError> {
         sort_hits(&mut index.skills);
-        let content = serde_yaml::to_string(&index).map_err(|source| SkillError::Serde {
-            path: PathBuf::from(INDEX_FILE),
-            source,
-        })?;
-        self.put_bytes(self.index_url()?, content.into_bytes())
-            .await
+        match format {
+            HttpRegistryIndexFormat::Json => {
+                let content = serde_json::to_vec_pretty(&index).map_err(|source| {
+                    SkillError::InvalidConfig {
+                        message: format!("failed to serialize HTTP registry index JSON: {source}"),
+                    }
+                })?;
+                self.put_bytes(self.index_json_url()?, content).await
+            }
+            HttpRegistryIndexFormat::Yaml => {
+                let content =
+                    serde_yaml::to_string(&index).map_err(|source| SkillError::Serde {
+                        path: PathBuf::from(INDEX_YAML_FILE),
+                        source,
+                    })?;
+                self.put_bytes(self.index_yaml_url()?, content.into_bytes())
+                    .await
+            }
+        }
     }
 
     fn validate_hit(&self, hit: &mut SkillSearchHit) -> Result<(), SkillError> {
@@ -239,6 +296,26 @@ impl HttpRegistryAdapter {
             })
     }
 
+    async fn get_optional_bytes(&self, url: Url) -> Result<Option<Vec<u8>>, SkillError> {
+        let url_text = url.to_string();
+        let response = self
+            .request(Method::GET, url.clone(), None)
+            .await
+            .map_err(|source| map_request_error(url_text.clone(), source))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        ensure_success(&url, response.status())?;
+        response
+            .bytes()
+            .await
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|source| SkillError::HttpRegistry {
+                url: url.to_string(),
+                source: Box::new(source),
+            })
+    }
+
     async fn get_bytes(&self, url: Url) -> Result<Vec<u8>, SkillError> {
         let response = self.request(Method::GET, url.clone(), None).await?;
         ensure_success(&url, response.status())?;
@@ -250,6 +327,85 @@ impl HttpRegistryAdapter {
                 url: url.to_string(),
                 source: Box::new(source),
             })
+    }
+
+    async fn fetch_expanded_bundle(
+        &self,
+        hit: &SkillSearchHit,
+        staging_path: &Path,
+    ) -> Result<(), SkillError> {
+        let manifest_url = self.manifest_url(&hit.name, &hit.version)?;
+        let manifest_content = self.get_text(manifest_url).await?;
+        let remote_manifest =
+            load_remote_skill_manifest(&manifest_content, Path::new(MANIFEST_FILE))?;
+        if remote_manifest.name != hit.name || remote_manifest.version.to_string() != hit.version {
+            return Err(SkillError::InvalidConfig {
+                message: format!(
+                    "HTTP registry index selected `{}` version `{}`, but manifest is `{}` version `{}`",
+                    hit.name, hit.version, remote_manifest.name, remote_manifest.version
+                ),
+            });
+        }
+        write_file(
+            &staging_path.join(MANIFEST_FILE),
+            manifest_content.as_bytes(),
+        )?;
+
+        for declared_file in &remote_manifest.declared_files {
+            let content = self
+                .get_bytes(self.content_url(&hit.name, &hit.version, declared_file)?)
+                .await?;
+            write_file(&staging_path.join(declared_file), &content)?;
+        }
+
+        Ok(())
+    }
+
+    async fn verify_tarball_signature_sidecar(
+        &self,
+        hit: &SkillSearchHit,
+        manifest: &SkillManifest,
+        digest: &str,
+    ) -> Result<(), SkillError> {
+        if hit.signature_ed25519.is_none() && hit.public_key_ed25519.is_none() {
+            return Ok(());
+        }
+
+        let public_key =
+            hit.public_key_ed25519
+                .as_deref()
+                .ok_or_else(|| SkillError::MissingSignature {
+                    name: hit.name.clone(),
+                    version: hit.version.clone(),
+                })?;
+        let signature_bytes = self
+            .get_bytes(self.tarball_signature_url(&hit.name, &hit.version)?)
+            .await?;
+        let signature = std::str::from_utf8(&signature_bytes)
+            .map_err(|source| SkillError::InvalidSignature {
+                name: hit.name.clone(),
+                version: hit.version.clone(),
+                message: format!("signature sidecar is not valid UTF-8: {source}"),
+            })?
+            .trim();
+        if signature.is_empty() {
+            return Err(SkillError::InvalidSignature {
+                name: hit.name.clone(),
+                version: hit.version.clone(),
+                message: "signature sidecar is empty".to_owned(),
+            });
+        }
+        if let Some(index_signature) = hit.signature_ed25519.as_deref() {
+            if index_signature != signature {
+                return Err(SkillError::InvalidSignature {
+                    name: hit.name.clone(),
+                    version: hit.version.clone(),
+                    message: "signature sidecar does not match index signature".to_owned(),
+                });
+            }
+        }
+
+        verify_ed25519_signature(manifest, digest, signature, public_key)
     }
 
     async fn put_bytes(&self, url: Url, body: Vec<u8>) -> Result<(), SkillError> {
@@ -308,31 +464,26 @@ impl RegistryAdapter for HttpRegistryAdapter {
             source,
         })?;
 
-        let manifest_url = self.manifest_url(&hit.name, &hit.version)?;
-        let manifest_content = self.get_text(manifest_url).await?;
-        let remote_manifest =
-            load_remote_skill_manifest(&manifest_content, Path::new(MANIFEST_FILE))?;
-        if remote_manifest.name != hit.name || remote_manifest.version.to_string() != hit.version {
+        let used_tarball = if let Some(bytes) = self
+            .get_optional_bytes(self.tarball_url(&hit.name, &hit.version)?)
+            .await?
+        {
+            unpack_tar_zst(&bytes, &staging_path)?;
+            true
+        } else {
+            self.fetch_expanded_bundle(&hit, &staging_path).await?;
+            false
+        };
+
+        let manifest = super::load_skill_manifest(&staging_path)?;
+        if manifest.name != hit.name || manifest.version.to_string() != hit.version {
             return Err(SkillError::InvalidConfig {
                 message: format!(
                     "HTTP registry index selected `{}` version `{}`, but manifest is `{}` version `{}`",
-                    hit.name, hit.version, remote_manifest.name, remote_manifest.version
+                    hit.name, hit.version, manifest.name, manifest.version
                 ),
             });
         }
-        write_file(
-            &staging_path.join(MANIFEST_FILE),
-            manifest_content.as_bytes(),
-        )?;
-
-        for declared_file in &remote_manifest.declared_files {
-            let content = self
-                .get_bytes(self.content_url(&hit.name, &hit.version, declared_file)?)
-                .await?;
-            write_file(&staging_path.join(declared_file), &content)?;
-        }
-
-        let manifest = super::load_skill_manifest(&staging_path)?;
         let digest = compute_bundle_digest(&staging_path, &manifest)?;
         if let Some(expected) = hit.digest.as_deref() {
             if expected != digest {
@@ -341,6 +492,10 @@ impl RegistryAdapter for HttpRegistryAdapter {
                     actual: digest,
                 });
             }
+        }
+        if used_tarball {
+            self.verify_tarball_signature_sidecar(&hit, &manifest, &digest)
+                .await?;
         }
 
         Ok(FetchedSkill {
@@ -362,7 +517,7 @@ impl RegistryAdapter for HttpRegistryAdapter {
         verify_publish_signature(&manifest, &digest, allow_unsigned)?;
         let version = manifest.version.to_string();
         let hit = self.hit_for_manifest(&manifest, digest.clone());
-        let mut index = self.read_index().await?;
+        let (mut index, index_format) = self.read_index_with_format().await?;
 
         if let Some(existing) = index
             .skills
@@ -398,9 +553,59 @@ impl RegistryAdapter for HttpRegistryAdapter {
             .skills
             .retain(|existing| existing.name != hit.name || existing.version != hit.version);
         index.skills.push(hit.clone());
-        self.write_index(index).await?;
+        self.write_index(index, index_format).await?;
         Ok(hit)
     }
+}
+
+fn unpack_tar_zst(bytes: &[u8], destination: &Path) -> Result<(), SkillError> {
+    let decoder = zstd::stream::read::Decoder::new(bytes).map_err(|source| SkillError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|source| SkillError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|source| SkillError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        let entry_path = entry
+            .path()
+            .map_err(|source| SkillError::Io {
+                path: destination.to_path_buf(),
+                source,
+            })?
+            .into_owned();
+        let normalized = normalize_bundle_path(&entry_path)?;
+        let target = destination.join(normalized);
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target).map_err(|source| SkillError::Io {
+                path: target,
+                source,
+            })?;
+        } else if entry_type.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|source| SkillError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            entry.unpack(&target).map_err(|source| SkillError::Io {
+                path: target,
+                source,
+            })?;
+        } else {
+            return Err(SkillError::UnsafeBundlePath { path: entry_path });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_registry_url(url: &Url, options: &SsrfOptions) -> Result<(), SkillError> {

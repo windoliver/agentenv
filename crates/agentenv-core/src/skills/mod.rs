@@ -7,6 +7,7 @@ mod manifest;
 pub mod propose;
 mod registry;
 mod registry_filesystem;
+mod registry_git;
 mod registry_http;
 mod registry_oci;
 mod service;

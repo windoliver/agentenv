@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -964,6 +964,76 @@ auth = "bearer-from-credstore:CORP_SKILLS_TOKEN"
 }
 
 #[test]
+fn skills_config_loads_git_registry_from_project_yaml() {
+    let yaml = r#"
+skills:
+  registries:
+    - name: git-dev
+      type: git
+      url: git+https://github.com/acme/skills
+"#;
+
+    let config = load_project_skills_config(yaml).unwrap();
+
+    assert_eq!(config.registries[0].name, "git-dev");
+    assert_eq!(config.registries[0].kind, RegistryKind::Git);
+    assert_eq!(
+        config.registries[0].url.as_deref(),
+        Some("git+https://github.com/acme/skills")
+    );
+}
+
+#[test]
+fn skills_config_loads_git_registry_from_user_toml() {
+    let toml = r#"
+[[skills.registries]]
+name = "git-dev"
+type = "git"
+url = "git+https://github.com/acme/skills"
+"#;
+
+    let config = load_user_skills_config(toml).unwrap();
+
+    assert_eq!(config.registries[0].kind, RegistryKind::Git);
+}
+
+#[test]
+fn cli_registry_override_parses_git_source() {
+    let merged = merge_skills_config(
+        SkillsConfig::default(),
+        None,
+        SkillsConfigOverride {
+            registry: Some("git+https://github.com/acme/skills".to_owned()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(merged.registries[0].name, "cli");
+    assert_eq!(merged.registries[0].kind, RegistryKind::Git);
+    assert_eq!(merged.registry_order, vec!["cli"]);
+}
+
+#[test]
+fn skills_config_rejects_unsafe_git_registry_urls() {
+    for url in [
+        "https://github.com/acme/skills",
+        "git+ssh://github.com/acme/skills",
+        "git+https://user:pass@github.com/acme/skills",
+        "git+https://github.com/acme/skills?branch=main",
+        "git+https://github.com/acme/skills#main",
+    ] {
+        let yaml = format!(
+            "skills:\n  registries:\n    - name: git-dev\n      type: git\n      url: {url}\n"
+        );
+
+        let error = load_project_skills_config(&yaml)
+            .expect_err("unsafe git registry URL must be rejected");
+
+        assert!(matches!(error, SkillError::InvalidConfig { .. }));
+    }
+}
+
+#[test]
 fn cli_registry_override_wins_over_project_and_user_config() {
     let user = SkillsConfig {
         registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
@@ -1260,6 +1330,171 @@ async fn filesystem_registry_search_add_and_publish_work() {
 }
 
 #[tokio::test]
+async fn filesystem_registry_search_scans_skill_subdirectories_without_index() {
+    let home = temp_dir("skill-fs-scan-home");
+    let registry = temp_dir("skill-fs-scan-registry");
+    write_file(
+        &registry.join("scan-skill/skill.yaml"),
+        "name: scan-skill\nversion: 0.2.0\ndescription: Scan demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("scan-skill/SKILL.md"), "# Scan demo\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let hits = service.search("scan").await.expect("search should scan");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "scan-skill");
+    assert_eq!(hits[0].version, "0.2.0");
+    assert_eq!(hits[0].registry, "local-dev");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filesystem_registry_scan_ignores_symlinked_manifest_files() {
+    let home = temp_dir("skill-fs-scan-symlink-manifest-home");
+    let registry = temp_dir("skill-fs-scan-symlink-manifest-registry");
+    let outside = temp_dir("skill-fs-scan-symlink-manifest-outside");
+    fs::create_dir_all(registry.join("linked-manifest")).unwrap();
+    write_file(
+        &outside.join("skill.yaml"),
+        "name: linked-manifest\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    std::os::unix::fs::symlink(
+        outside.join("skill.yaml"),
+        registry.join("linked-manifest/skill.yaml"),
+    )
+    .unwrap();
+    write_file(&registry.join("linked-manifest/SKILL.md"), "# Linked\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let hits = service
+        .search("linked")
+        .await
+        .expect("symlinked manifests should be skipped during scan");
+
+    assert!(hits.is_empty());
+}
+
+#[tokio::test]
+async fn filesystem_registry_add_uses_scanned_subdirectory_without_index() {
+    let home = temp_dir("skill-fs-scan-add-home");
+    let registry = temp_dir("skill-fs-scan-add-registry");
+    write_file(
+        &registry.join("scan-add/skill.yaml"),
+        "name: scan-add\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("scan-add/SKILL.md"), "# Scan add\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "scan-add".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should use scanned directory");
+
+    assert_eq!(installed.name, "scan-add");
+    assert_eq!(
+        installed.source_label,
+        "filesystem:local-dev:scan-add@0.1.0"
+    );
+}
+
+#[tokio::test]
+async fn filesystem_registry_publish_keeps_scanned_subdirectories_ephemeral() {
+    let home = temp_dir("skill-fs-scan-ephemeral-home");
+    let registry = temp_dir("skill-fs-scan-ephemeral-registry");
+    write_file(
+        &registry.join("scan-live/skill.yaml"),
+        "name: scan-live\nversion: 0.1.0\ndescription: Before publish\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("scan-live/SKILL.md"), "# Scan live\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("published-skill", "0.1.0", "Published"),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should succeed");
+
+    write_file(
+        &registry.join("scan-live/skill.yaml"),
+        "name: scan-live\nversion: 0.1.0\ndescription: After publish\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+
+    let hits = service
+        .search("After publish")
+        .await
+        .expect("search should use live scanned metadata");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "scan-live");
+    let index = fs::read_to_string(registry.join("index.yaml")).unwrap();
+    assert!(!index.contains("scan-live"));
+}
+
+#[tokio::test]
+async fn filesystem_registry_rejects_duplicate_scanned_skill_versions() {
+    let home = temp_dir("skill-fs-scan-duplicate-home");
+    let registry = temp_dir("skill-fs-scan-duplicate-registry");
+    write_file(
+        &registry.join("first/skill.yaml"),
+        "name: duplicate-scan\nversion: 0.1.0\ndescription: First duplicate\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("first/SKILL.md"), "# First duplicate\n");
+    write_file(
+        &registry.join("second/skill.yaml"),
+        "name: duplicate-scan\nversion: 0.1.0\ndescription: Second duplicate\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(&registry.join("second/SKILL.md"), "# Second duplicate\n");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .search("duplicate")
+        .await
+        .expect_err("duplicate scanned skill versions must be rejected");
+
+    assert!(matches!(&error, SkillError::InvalidConfig { message }
+            if message.contains("duplicate-scan") && message.contains("0.1.0")));
+}
+
+#[tokio::test]
+async fn filesystem_registry_fetch_does_not_fallback_to_shadowed_scanned_directory() {
+    let home = temp_dir("skill-fs-shadow-home");
+    let registry = temp_dir("skill-fs-shadow-registry");
+    write_file(
+        &registry.join("index.yaml"),
+        "skills:\n  - name: shadowed-skill\n    version: 0.1.0\n    registry: local-dev\n",
+    );
+    write_file(
+        &registry.join("dev-copy/skill.yaml"),
+        "name: shadowed-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(
+        &registry.join("dev-copy/SKILL.md"),
+        "# Should not install\n",
+    );
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "shadowed-skill@0.1.0".to_owned(),
+            registry: None,
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("indexed hit with missing bundle must not fall back to scanned directory");
+
+    assert!(matches!(error, SkillError::SkillNotInstalled { name } if name == "shadowed-skill"));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn skill_service_add_without_version_installs_highest_semver() {
     let home = temp_dir("skill-fs-highest-home");
     let registry = temp_dir("skill-fs-highest-registry");
@@ -1513,6 +1748,37 @@ async fn http_registry_search_reads_static_index() {
 }
 
 #[tokio::test]
+async fn http_registry_search_prefers_index_json() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"json-demo","version":"0.1.0","description":"JSON demo","registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    server
+        .add_response(
+            "GET",
+            "/index.yaml",
+            "skills:\n  - name: yaml-demo\n    version: 0.1.0\n    registry: ignored\n",
+        )
+        .await;
+    let home = temp_dir("skill-http-json-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let hits = service
+        .search("demo")
+        .await
+        .expect("search should use JSON");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "json-demo");
+    assert_eq!(hits[0].registry, "http-dev");
+}
+
+#[tokio::test]
 async fn http_registry_publish_and_add_round_trip() {
     let server = TestHttpRegistry::start().await;
     server
@@ -1543,6 +1809,293 @@ async fn http_registry_publish_and_add_round_trip() {
     assert_eq!(installed.name, "http-skill");
     assert_eq!(installed.source_type, "http");
     assert_eq!(installed.source_label, "http:http-dev:http-skill@0.1.0");
+}
+
+#[tokio::test]
+async fn http_registry_publish_updates_existing_index_json() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response("GET", "/index.json", r#"{"skills":[]}"#)
+        .await;
+    let home = temp_dir("skill-http-json-publish-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("json-published", "0.1.0", "JSON publish"),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should update existing JSON index");
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "json-published@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should read updated JSON index");
+
+    assert_eq!(installed.name, "json-published");
+}
+
+#[tokio::test]
+async fn http_registry_publish_defaults_missing_index_to_json() {
+    let server = TestHttpRegistry::start().await;
+    let home = temp_dir("skill-http-missing-index-json-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("json-default", "0.1.0", "JSON default"),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("publish should create a new JSON index");
+
+    let index_json = server
+        .response_body("GET", "/index.json")
+        .await
+        .expect("new HTTP registries should use index.json");
+    let index: serde_json::Value = serde_json::from_slice(&index_json).unwrap();
+    assert_eq!(index["skills"][0]["name"], "json-default");
+    assert!(server.response_body("GET", "/index.yaml").await.is_none());
+}
+
+#[tokio::test]
+async fn http_registry_add_downloads_tar_zst_skill_artifact() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("tarball-skill", "0.1.0", "Tarball skill");
+    let manifest = load_skill_manifest(&bundle).unwrap();
+    let digest = compute_bundle_digest(&bundle, &manifest).unwrap();
+    let index = format!(
+        r#"{{"skills":[{{"name":"tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":"{digest}","signature_ed25519":null,"public_key_ed25519":null}}]}}"#
+    );
+    server.add_response("GET", "/index.json", &index).await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes(&bundle),
+    )
+    .await;
+    let home = temp_dir("skill-http-tarball-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should unpack tar.zst artifact");
+
+    assert_eq!(installed.name, "tarball-skill");
+    assert_eq!(installed.source_label, "http:http-dev:tarball-skill@0.1.0");
+}
+
+#[tokio::test]
+async fn http_registry_add_verifies_tar_zst_signature_sidecar() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("signed-tarball-skill", "0.1.0", "Signed tarball skill");
+    let manifest = load_skill_manifest(&bundle).unwrap();
+    let digest = compute_bundle_digest(&bundle, &manifest).unwrap();
+    let signing_key = SigningKey::from_bytes(&[42; 32]);
+    let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let payload = agentenv_core::skills::signature_payload(&manifest, &digest).unwrap();
+    let signature = hex::encode(signing_key.sign(&payload).to_bytes());
+    let index = format!(
+        r#"{{"skills":[{{"name":"signed-tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":"{digest}","signature_ed25519":"{signature}","public_key_ed25519":"{public_key}"}}]}}"#
+    );
+    server.add_response("GET", "/index.json", &index).await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/signed-tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes(&bundle),
+    )
+    .await;
+    server
+        .add_response(
+            "GET",
+            "/skills/signed-tarball-skill/0.1.0.tar.zst.sig",
+            &signature,
+        )
+        .await;
+    let home = temp_dir("skill-http-signed-tarball-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "signed-tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect("add should verify the tar.zst signature sidecar");
+
+    assert_eq!(installed.name, "signed-tarball-skill");
+}
+
+#[tokio::test]
+async fn http_registry_add_rejects_invalid_tar_zst_signature_sidecar() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("bad-signature-tarball", "0.1.0", "Bad signature tarball");
+    let manifest = load_skill_manifest(&bundle).unwrap();
+    let digest = compute_bundle_digest(&bundle, &manifest).unwrap();
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let index = format!(
+        r#"{{"skills":[{{"name":"bad-signature-tarball","version":"0.1.0","description":null,"registry":"ignored","digest":"{digest}","signature_ed25519":null,"public_key_ed25519":"{public_key}"}}]}}"#
+    );
+    server.add_response("GET", "/index.json", &index).await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/bad-signature-tarball/0.1.0.tar.zst",
+        tar_zst_bundle_bytes(&bundle),
+    )
+    .await;
+    server
+        .add_response(
+            "GET",
+            "/skills/bad-signature-tarball/0.1.0.tar.zst.sig",
+            "00",
+        )
+        .await;
+    let home = temp_dir("skill-http-bad-signature-tarball-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "bad-signature-tarball@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("add should reject an invalid tar.zst signature sidecar");
+
+    assert!(matches!(error, SkillError::InvalidSignature { .. }));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_registry_add_rejects_tar_zst_parent_traversal_entry() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("unsafe-tarball-skill", "0.1.0", "Unsafe tarball skill");
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"unsafe-tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/unsafe-tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes_with_extra_file(&bundle, "../evil", b"evil"),
+    )
+    .await;
+    let home = temp_dir("skill-http-tarball-traversal-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "unsafe-tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("add should reject unsafe tar path");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsafeBundlePath { .. } | SkillError::InvalidConfig { .. }
+    ));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_registry_add_rejects_tar_zst_symlink_entry() {
+    let server = TestHttpRegistry::start().await;
+    let bundle = skill_bundle("symlink-tarball-skill", "0.1.0", "Symlink tarball skill");
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"symlink-tarball-skill","version":"0.1.0","description":null,"registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/symlink-tarball-skill/0.1.0.tar.zst",
+        tar_zst_bundle_bytes_with_symlink(&bundle, "linked-skill.md", "SKILL.md"),
+    )
+    .await;
+    let home = temp_dir("skill-http-tarball-symlink-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "symlink-tarball-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("add should reject tar symlink");
+
+    assert!(matches!(error, SkillError::UnsafeBundlePath { .. }));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_registry_rejects_tarball_hardlink_entries() {
+    let server = TestHttpRegistry::start().await;
+    server
+        .add_response(
+            "GET",
+            "/index.json",
+            r#"{"skills":[{"name":"hardlink-skill","version":"0.1.0","description":null,"registry":"ignored","digest":null,"signature_ed25519":null,"public_key_ed25519":null}]}"#,
+        )
+        .await;
+    add_binary_response(
+        &server,
+        "GET",
+        "/skills/hardlink-skill/0.1.0.tar.zst",
+        tar_zst_bundle_with_hardlink("hardlink-skill", "0.1.0"),
+    )
+    .await;
+    let home = temp_dir("skill-http-tar-hardlink-home");
+    let service =
+        http_skill_service(&home, &server).with_ssrf_options(test_http_registry_ssrf_options());
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "hardlink-skill@0.1.0".to_owned(),
+            registry: Some("http-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("hardlink tar entries must be rejected");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsafeBundlePath { .. } | SkillError::InvalidConfig { .. }
+    ));
+    assert!(service.list().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1630,6 +2183,65 @@ async fn oci_registry_search_add_and_publish_use_distribution_api() {
     assert_eq!(installed.name, "oci-skill");
     assert_eq!(installed.source_type, "oci");
     assert_eq!(installed.source_label, "oci:oci-dev:oci-skill@0.1.0");
+}
+
+#[tokio::test]
+async fn git_registry_publish_is_reported_as_unsupported() {
+    let home = temp_dir("skill-git-publish-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::git(
+                "git-dev",
+                "git+https://github.com/acme/skills",
+            )],
+            registry_order: vec!["git-dev".to_owned()],
+        },
+    );
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("git-publish", "0.1.0", "Git publish"),
+            registry: Some("git-dev".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("git publish should be read-only");
+
+    assert!(matches!(
+        error,
+        SkillError::UnsupportedRegistryPublish { registry, kind }
+            if registry == "git-dev" && kind == "git"
+    ));
+}
+
+#[tokio::test]
+async fn git_registry_rejects_invalid_registry_name_before_cache_path_use() {
+    let home = temp_dir("skill-git-invalid-registry-home");
+    let service = SkillService::new(
+        home.join(".agentenv"),
+        SkillsConfig {
+            registries: vec![agentenv_core::skills::RegistryConfig::git(
+                "../../outside",
+                "git+https://github.com/acme/skills",
+            )],
+            registry_order: vec!["../../outside".to_owned()],
+        },
+    );
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("git-name-reject", "0.1.0", "Git name reject"),
+            registry: Some("../../outside".to_owned()),
+            allow_unsigned: true,
+        })
+        .await
+        .expect_err("invalid registry names must be rejected before adapter construction");
+
+    assert!(matches!(
+        error,
+        SkillError::InvalidSkillName { name } if name == "../../outside"
+    ));
 }
 
 #[cfg(windows)]
@@ -1720,6 +2332,89 @@ fn skill_bundle(name: &str, version: &str, content: &str) -> PathBuf {
     bundle
 }
 
+fn tar_zst_bundle_bytes(bundle_path: &Path) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, bundle_path);
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn tar_zst_bundle_bytes_with_extra_file(
+    bundle_path: &Path,
+    entry_path: &str,
+    content: &[u8],
+) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, bundle_path);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.as_mut_bytes()[0..entry_path.len()].copy_from_slice(entry_path.as_bytes());
+        header.set_cksum();
+        builder.append(&header, io::Cursor::new(content)).unwrap();
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn tar_zst_bundle_bytes_with_symlink(
+    bundle_path: &Path,
+    entry_path: &str,
+    target_path: &str,
+) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, bundle_path);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_link_name(target_path).unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, entry_path, io::empty())
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn tar_zst_bundle_with_hardlink(name: &str, version: &str) -> Vec<u8> {
+    let bundle = skill_bundle(name, version, "Hardlink tarball skill");
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        append_bundle_minimal_files(&mut builder, &bundle);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_link_name("SKILL.md").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "hardlink-skill.md", io::empty())
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    zstd::stream::encode_all(tar_bytes.as_slice(), 0).unwrap()
+}
+
+fn append_bundle_minimal_files<W: io::Write>(builder: &mut tar::Builder<W>, bundle_path: &Path) {
+    builder
+        .append_path_with_name(bundle_path.join("skill.yaml"), "skill.yaml")
+        .unwrap();
+    builder
+        .append_path_with_name(bundle_path.join("SKILL.md"), "SKILL.md")
+        .unwrap();
+}
+
+async fn add_binary_response(server: &TestHttpRegistry, method: &str, path: &str, body: Vec<u8>) {
+    server.add_binary_response(method, path, body).await;
+}
+
 #[derive(Clone)]
 struct TestHttpRegistry {
     addr: SocketAddr,
@@ -1786,6 +2481,14 @@ impl TestHttpRegistry {
         );
     }
 
+    async fn add_binary_response(&self, method: &str, path: &str, body: Vec<u8>) {
+        self.state
+            .lock()
+            .unwrap()
+            .responses
+            .insert((method.to_owned(), path.to_owned()), body);
+    }
+
     async fn require_authorization(&self, token: &str) {
         self.state.lock().unwrap().required_authorization = Some(format!("Bearer {token}"));
     }
@@ -1798,6 +2501,15 @@ impl TestHttpRegistry {
             .iter()
             .map(|request| request.authorization.clone())
             .collect()
+    }
+
+    async fn response_body(&self, method: &str, path: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .responses
+            .get(&(method.to_owned(), path.to_owned()))
+            .cloned()
     }
 }
 

@@ -37,3 +37,5 @@ time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true }
 uuid.workspace = true
 semver = "1"
+tar.workspace = true
+zstd.workspace = true

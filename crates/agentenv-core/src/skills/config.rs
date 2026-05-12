@@ -200,6 +200,10 @@ fn registry_from_override_source(source: &str) -> Result<Option<RegistryConfig>,
             normalize_oci_reference(&oci_reference_from_url(&url)?)?,
             None,
         ))),
+        "git+https" => Ok(Some(RegistryConfig::git(
+            CLI_REGISTRY_NAME,
+            normalize_git_url(url.as_str())?,
+        ))),
         scheme => Err(invalid_config(format!(
             "unsupported registry URL scheme `{scheme}`"
         ))),
@@ -267,6 +271,11 @@ fn normalize_registry_values(config: &mut SkillsConfig) -> Result<(), SkillError
             RegistryKind::Oci => {
                 if let Some(reference) = registry.url.as_mut() {
                     *reference = normalize_oci_reference(reference)?;
+                }
+            }
+            RegistryKind::Git => {
+                if let Some(url) = registry.url.as_mut() {
+                    *url = normalize_git_url(url)?;
                 }
             }
         }
@@ -370,6 +379,20 @@ fn validate_registry_required_fields(registry: &RegistryConfig) -> Result<(), Sk
             };
             normalize_oci_reference(reference)?;
         }
+        RegistryKind::Git => {
+            let Some(url) = registry
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            else {
+                return Err(invalid_config(format!(
+                    "git registry `{}` requires url",
+                    registry.name
+                )));
+            };
+            normalize_git_url(url)?;
+        }
     }
 
     Ok(())
@@ -414,6 +437,43 @@ fn normalize_oci_reference(reference: &str) -> Result<String, SkillError> {
         )));
     }
     Ok(reference.to_owned())
+}
+
+fn normalize_git_url(value: &str) -> Result<String, SkillError> {
+    let value = value.trim();
+    let url = Url::parse(value).map_err(|source| {
+        invalid_config(format!("invalid git registry URL `{value}`: {source}"))
+    })?;
+    validate_git_url(&url)?;
+    Ok(url.to_string())
+}
+
+fn validate_git_url(url: &Url) -> Result<(), SkillError> {
+    if url.scheme() != "git+https" {
+        return Err(invalid_config(format!(
+            "git registry URL uses unsupported scheme `{}`",
+            url.scheme()
+        )));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(invalid_config("git registry URL must include a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid_config(
+            "git registry URL must not include user info",
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid_config(
+            "git registry URL must not include query or fragment",
+        ));
+    }
+    if url.path() == "/" || url.path().trim_matches('/').is_empty() {
+        return Err(invalid_config(
+            "git registry URL must include a repository path",
+        ));
+    }
+    Ok(())
 }
 
 fn is_bare_oci_reference(value: &str) -> bool {
