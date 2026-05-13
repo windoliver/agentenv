@@ -14,9 +14,9 @@ use super::{
     compute_bundle_digest, index, load_skill_self_test_spec,
     manifest::{normalize_bundle_path, validated_bundle_file},
     run_skill_self_test, sign_skill_self_test_attestation, validate_skill_name,
-    verify_ed25519_signature, SkillError, SkillManifest, SkillSelfTestAttestation,
-    SkillSelfTestOptions, SkillSelfTestSigningKey, UnsupportedAgentProduceRunner,
-    SELF_TEST_PUBLISH_THRESHOLD,
+    verify_ed25519_signature, AgentProduceRunner, SkillError, SkillManifest,
+    SkillSelfTestAttestation, SkillSelfTestOptions, SkillSelfTestSigningKey,
+    UnsupportedAgentProduceRunner, SELF_TEST_PUBLISH_THRESHOLD,
 };
 
 const MANIFEST_FILE: &str = "skill.yaml";
@@ -89,6 +89,20 @@ pub fn install_local_skill(
     bundle: impl AsRef<Path>,
     options: SkillInstallOptions,
 ) -> Result<InstalledSkill, SkillError> {
+    install_local_skill_with_runner(
+        root,
+        bundle,
+        options,
+        Arc::new(UnsupportedAgentProduceRunner),
+    )
+}
+
+pub(crate) fn install_local_skill_with_runner(
+    root: impl AsRef<Path>,
+    bundle: impl AsRef<Path>,
+    options: SkillInstallOptions,
+    agent_runner: Arc<dyn AgentProduceRunner>,
+) -> Result<InstalledSkill, SkillError> {
     let root = root.as_ref();
     let bundle = bundle.as_ref();
     let manifest = super::load_skill_manifest(bundle)?;
@@ -122,8 +136,14 @@ pub fn install_local_skill(
     let (self_test_score, self_test_attestation) = if options.unsafe_skip_self_test_gate {
         (None, None)
     } else {
-        let (score, attestation_path) =
-            run_self_test_gate(root, bundle, &manifest.name, &version, &digest)?;
+        let (score, attestation_path) = run_self_test_gate(
+            root,
+            bundle,
+            &manifest.name,
+            &version,
+            &digest,
+            agent_runner,
+        )?;
         (Some(score), Some(attestation_path))
     };
 
@@ -220,6 +240,14 @@ pub fn verify_installed_skill(
     root: impl AsRef<Path>,
     selector: InstalledSkillSelector,
 ) -> Result<InstalledSkill, SkillError> {
+    verify_installed_skill_with_runner(root, selector, Arc::new(UnsupportedAgentProduceRunner))
+}
+
+pub(crate) fn verify_installed_skill_with_runner(
+    root: impl AsRef<Path>,
+    selector: InstalledSkillSelector,
+    agent_runner: Arc<dyn AgentProduceRunner>,
+) -> Result<InstalledSkill, SkillError> {
     let root = root.as_ref();
     let mut installed = info_installed_skill(root, selector)?;
     ensure_content_directory(&installed.path)?;
@@ -235,7 +263,8 @@ pub fn verify_installed_skill(
     }
 
     verify_signature_if_required(&installed, &manifest)?;
-    let (score, attestation_path) = run_installed_self_test_gate(root, &installed, &actual_digest)?;
+    let (score, attestation_path) =
+        run_installed_self_test_gate(root, &installed, &actual_digest, agent_runner)?;
     installed.self_test_score = Some(score);
     installed.self_test_attestation = Some(attestation_path);
     index::write_record(&index::installed_record_path(&installed.path), &installed)?;
@@ -250,6 +279,7 @@ fn run_self_test_gate(
     name: &str,
     version: &str,
     digest: &str,
+    agent_runner: Arc<dyn AgentProduceRunner>,
 ) -> Result<(f64, PathBuf), SkillError> {
     let spec = load_skill_self_test_spec(skill_root)?;
     let report = run_skill_self_test(
@@ -259,7 +289,7 @@ fn run_self_test_gate(
         digest,
         &spec,
         SkillSelfTestOptions::default(),
-        Arc::new(UnsupportedAgentProduceRunner),
+        agent_runner,
     )?;
     if !report.publishable {
         return Err(SkillError::SelfTestScoreBelowThreshold {
@@ -277,6 +307,7 @@ fn run_installed_self_test_gate(
     root: &Path,
     installed: &InstalledSkill,
     digest: &str,
+    agent_runner: Arc<dyn AgentProduceRunner>,
 ) -> Result<(f64, PathBuf), SkillError> {
     let content_root = installed.path.join(CONTENT_DIR);
     let spec = match load_skill_self_test_spec(&content_root) {
@@ -291,7 +322,7 @@ fn run_installed_self_test_gate(
         digest,
         &spec,
         SkillSelfTestOptions::default(),
-        Arc::new(UnsupportedAgentProduceRunner),
+        agent_runner,
     )?;
     if !report.publishable {
         return Err(SkillError::SelfTestScoreBelowThreshold {

@@ -709,6 +709,46 @@ fn self_test_runner_scores_agent_produces_token_matches() {
 }
 
 #[test]
+fn agent_produces_uses_injected_runner() {
+    let root = temp_dir("agent-produces-injected-runner");
+    fs::create_dir_all(root.join("test")).unwrap();
+    write_file(&root.join("SKILL.md"), "# Demo\n");
+    write_file(&root.join("test/minimal.yaml"), "version: 0.1.0\n");
+    write_file(
+        &root.join("skill.yaml"),
+        "name: injected-agent\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - test/minimal.yaml\n",
+    );
+    write_file(
+        &root.join("skill-test.yaml"),
+        r#"self_test:
+  runner: agentenv
+  blueprint: test/minimal.yaml
+  assertions:
+    - type: agent_produces
+      prompt: "summarize"
+      expect_tokens_matching: ["src/"]
+      min_match_ratio: 1.0
+"#,
+    );
+    let manifest = agentenv_core::skills::load_skill_manifest(&root).unwrap();
+    let digest = agentenv_core::skills::compute_bundle_digest(&root, &manifest).unwrap();
+    let spec = load_skill_self_test_spec(&root).unwrap();
+
+    let report = run_skill_self_test(
+        &root,
+        "injected-agent",
+        "0.1.0",
+        &digest,
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(FakeAgentRunner::new("src/ exists")),
+    )
+    .unwrap();
+
+    assert!(report.publishable);
+}
+
+#[test]
 fn self_test_runner_passes_remaining_timeout_to_agent_produces() {
     let root = temp_dir("self-test-runner-agent-produces-timeout");
     write_file(&root.join("SKILL.md"), "# Demo\n");

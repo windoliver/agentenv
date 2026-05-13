@@ -9,11 +9,13 @@ use sha2::{Digest, Sha256};
 
 use crate::security::ssrf::SsrfOptions;
 
+use super::store::{install_local_skill_with_runner, verify_installed_skill_with_runner};
 use super::{
     info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
     registry_git, registry_http, registry_oci, remove_installed_skill, validate_skill_name,
-    verify_installed_skill, FetchedSkill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
+    AgentProduceRunner, FetchedSkill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
     RegistryConfig, RegistryKind, SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
+    UnsupportedAgentProduceRunner,
 };
 
 pub type SkillCredentialResolver =
@@ -25,6 +27,7 @@ pub struct SkillService {
     config: SkillsConfig,
     credential_resolver: SkillCredentialResolver,
     ssrf_options: SsrfOptions,
+    agent_produce_runner: Arc<dyn AgentProduceRunner>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +51,7 @@ impl SkillService {
             config,
             credential_resolver: Arc::new(|_| Ok(None)),
             ssrf_options: SsrfOptions::default(),
+            agent_produce_runner: Arc::new(UnsupportedAgentProduceRunner),
         }
     }
 
@@ -58,6 +62,11 @@ impl SkillService {
 
     pub fn with_ssrf_options(mut self, options: SsrfOptions) -> Self {
         self.ssrf_options = options;
+        self
+    }
+
+    pub fn with_agent_produce_runner(mut self, runner: Arc<dyn AgentProduceRunner>) -> Self {
+        self.agent_produce_runner = runner;
         self
     }
 
@@ -120,7 +129,7 @@ impl SkillService {
         allow_unsigned: bool,
         source_label: impl Into<String>,
     ) -> Result<InstalledSkill, SkillError> {
-        install_local_skill(
+        install_local_skill_with_runner(
             &self.root,
             bundle_path,
             SkillInstallOptions {
@@ -129,6 +138,7 @@ impl SkillService {
                 source_label: source_label.into(),
                 unsafe_skip_self_test_gate: false,
             },
+            Arc::clone(&self.agent_produce_runner),
         )
     }
 
@@ -145,7 +155,11 @@ impl SkillService {
     }
 
     pub fn verify(&self, selector: InstalledSkillSelector) -> Result<InstalledSkill, SkillError> {
-        verify_installed_skill(&self.root, selector)
+        verify_installed_skill_with_runner(
+            &self.root,
+            selector,
+            Arc::clone(&self.agent_produce_runner),
+        )
     }
 
     fn ordered_registries(&self) -> Result<Vec<&RegistryConfig>, SkillError> {
