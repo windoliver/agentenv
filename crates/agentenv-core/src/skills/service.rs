@@ -127,6 +127,7 @@ impl SkillService {
                 allow_unsigned,
                 source_type: "local".to_owned(),
                 source_label: source_label.into(),
+                unsafe_skip_self_test_gate: false,
             },
         )
     }
@@ -281,6 +282,7 @@ impl SkillService {
                 allow_unsigned,
                 source_type: fetched.source_type.clone(),
                 source_label,
+                unsafe_skip_self_test_gate: true,
             },
         );
         cleanup_staging_path(&fetched.staging_path);

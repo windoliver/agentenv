@@ -2,9 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
-    thread,
-    time::{Duration, Instant},
+    sync::Arc,
 };
 
 use semver::Version;
@@ -13,17 +11,22 @@ use serde_yaml::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
-    compute_bundle_digest, index,
+    compute_bundle_digest, index, load_skill_self_test_spec,
     manifest::{normalize_bundle_path, validated_bundle_file},
-    validate_skill_name, verify_ed25519_signature, SkillError, SkillManifest,
+    run_skill_self_test, sign_skill_self_test_attestation, validate_skill_name,
+    verify_ed25519_signature, SkillError, SkillManifest, SkillSelfTestAttestation,
+    SkillSelfTestOptions, SkillSelfTestSigningKey, UnsupportedAgentProduceRunner,
+    SELF_TEST_PUBLISH_THRESHOLD,
 };
 
 const MANIFEST_FILE: &str = "skill.yaml";
+const SKILL_TEST_FILE: &str = "skill-test.yaml";
 const CONTENT_DIR: &str = "content";
 const SIGNATURE_STATUS_UNSIGNED: &str = "unsigned";
-const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SELF_TEST_KEY_FILE: &str = "self-test-signing-key.ed25519";
+const SELF_TEST_ATTESTATIONS_DIR: &str = ".self-test-attestations";
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct InstalledSkill {
     pub name: String,
     pub version: String,
@@ -36,6 +39,10 @@ pub struct InstalledSkill {
     pub entry: PathBuf,
     pub installed_at: String,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_test_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_test_attestation: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,7 @@ pub struct SkillInstallOptions {
     pub allow_unsigned: bool,
     pub source_type: String,
     pub source_label: String,
+    pub unsafe_skip_self_test_gate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -105,10 +113,19 @@ pub fn install_local_skill(
                 existing: existing.digest,
             });
         }
-        if cached_install_matches_record(&existing)? {
+        let cache_matches = cached_install_matches_record(&existing)?;
+        if options.unsafe_skip_self_test_gate && cache_matches {
             return Ok(existing);
         }
     }
+
+    let (self_test_score, self_test_attestation) = if options.unsafe_skip_self_test_gate {
+        (None, None)
+    } else {
+        let (score, attestation_path) =
+            run_self_test_gate(root, bundle, &manifest.name, &version, &digest)?;
+        (Some(score), Some(attestation_path))
+    };
 
     let installed = InstalledSkill {
         name: manifest.name.clone(),
@@ -121,6 +138,8 @@ pub fn install_local_skill(
         entry: PathBuf::from(CONTENT_DIR).join(&manifest.entry),
         installed_at: installed_at_now(),
         path: install_dir.clone(),
+        self_test_score,
+        self_test_attestation,
     };
 
     let staging_dir = staging_install_dir(&install_dir)?;
@@ -144,6 +163,7 @@ pub fn install_local_skill(
         let destination = staging_dir.join(CONTENT_DIR).join(declared_file);
         copy_regular_file(&source, &destination)?;
     }
+    copy_structured_self_test_file_if_present(bundle, &staging_dir.join(CONTENT_DIR))?;
     index::write_record(&index::installed_record_path(&staging_dir), &installed)?;
     replace_install_dir(&staging_dir, &install_dir)?;
     index::rebuild(root)?;
@@ -200,7 +220,8 @@ pub fn verify_installed_skill(
     root: impl AsRef<Path>,
     selector: InstalledSkillSelector,
 ) -> Result<InstalledSkill, SkillError> {
-    let installed = info_installed_skill(root, selector)?;
+    let root = root.as_ref();
+    let mut installed = info_installed_skill(root, selector)?;
     ensure_content_directory(&installed.path)?;
     let manifest = load_cached_manifest(&installed.path)?;
     validate_installed_record(&installed, &manifest)?;
@@ -214,11 +235,109 @@ pub fn verify_installed_skill(
     }
 
     verify_signature_if_required(&installed, &manifest)?;
-    if let Some(command) = manifest.self_test_command.as_deref() {
-        run_self_test(&installed, command)?;
-    }
+    let (score, attestation_path) = run_installed_self_test_gate(root, &installed, &actual_digest)?;
+    installed.self_test_score = Some(score);
+    installed.self_test_attestation = Some(attestation_path);
+    index::write_record(&index::installed_record_path(&installed.path), &installed)?;
+    index::rebuild(root)?;
 
     Ok(installed)
+}
+
+fn run_self_test_gate(
+    root: &Path,
+    skill_root: &Path,
+    name: &str,
+    version: &str,
+    digest: &str,
+) -> Result<(f64, PathBuf), SkillError> {
+    let spec = load_skill_self_test_spec(skill_root)?;
+    let report = run_skill_self_test(
+        skill_root,
+        name,
+        version,
+        digest,
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedAgentProduceRunner),
+    )?;
+    if !report.publishable {
+        return Err(SkillError::SelfTestScoreBelowThreshold {
+            score: report.score,
+            threshold: SELF_TEST_PUBLISH_THRESHOLD,
+        });
+    }
+    let signing_key = SkillSelfTestSigningKey::load_or_create(&self_test_signing_key_path(root))?;
+    let attestation = sign_skill_self_test_attestation(&report, &signing_key)?;
+    let attestation_path = write_self_test_attestation(root, &attestation)?;
+    Ok((report.score, attestation_path))
+}
+
+fn run_installed_self_test_gate(
+    root: &Path,
+    installed: &InstalledSkill,
+    digest: &str,
+) -> Result<(f64, PathBuf), SkillError> {
+    let content_root = installed.path.join(CONTENT_DIR);
+    let spec = match load_skill_self_test_spec(&content_root) {
+        Ok(spec) => spec,
+        Err(SkillError::MissingSelfTest) => load_skill_self_test_spec(&installed.path)?,
+        Err(error) => return Err(error),
+    };
+    let report = run_skill_self_test(
+        &content_root,
+        &installed.name,
+        &installed.version,
+        digest,
+        &spec,
+        SkillSelfTestOptions::default(),
+        Arc::new(UnsupportedAgentProduceRunner),
+    )?;
+    if !report.publishable {
+        return Err(SkillError::SelfTestScoreBelowThreshold {
+            score: report.score,
+            threshold: SELF_TEST_PUBLISH_THRESHOLD,
+        });
+    }
+    let signing_key = SkillSelfTestSigningKey::load_or_create(&self_test_signing_key_path(root))?;
+    let attestation = sign_skill_self_test_attestation(&report, &signing_key)?;
+    let attestation_path = write_self_test_attestation(root, &attestation)?;
+    Ok((report.score, attestation_path))
+}
+
+pub fn self_test_signing_key_path(root: &Path) -> PathBuf {
+    index::skills_root(root).join(SELF_TEST_KEY_FILE)
+}
+
+pub fn write_self_test_attestation(
+    root: &Path,
+    attestation: &SkillSelfTestAttestation,
+) -> Result<PathBuf, SkillError> {
+    validate_skill_name(&attestation.subject.name)?;
+    attestation
+        .subject
+        .version
+        .parse::<Version>()
+        .map_err(|source| SkillError::InvalidVersion {
+            version: attestation.subject.version.clone(),
+            source,
+        })?;
+    let path = index::skills_root(root)
+        .join(SELF_TEST_ATTESTATIONS_DIR)
+        .join(&attestation.subject.name)
+        .join(format!("{}.json", attestation.subject.version));
+    write_self_test_attestation_json_atomic(&path, attestation)?;
+    Ok(path)
+}
+
+pub fn read_self_test_attestation(path: &Path) -> Result<SkillSelfTestAttestation, SkillError> {
+    let content = fs::read_to_string(path).map_err(|source| SkillError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    serde_json::from_str(&content).map_err(|source| SkillError::InvalidSelfTestAttestation {
+        message: format!("failed to parse `{}`: {source}", path.display()),
+    })
 }
 
 fn verify_signature_if_required(
@@ -249,59 +368,6 @@ fn verify_signature_if_required(
     verify_ed25519_signature(manifest, &installed.digest, signature, public_key)?;
 
     Ok(())
-}
-
-fn run_self_test(installed: &InstalledSkill, command: &str) -> Result<(), SkillError> {
-    let content_root = installed.path.join(CONTENT_DIR);
-    let mut command = shell_command(command);
-    command.current_dir(&content_root).env_clear();
-    let mut child = command.spawn().map_err(|source| SkillError::Io {
-        path: content_root.clone(),
-        source,
-    })?;
-    let deadline = Instant::now() + SELF_TEST_TIMEOUT;
-
-    loop {
-        if let Some(status) = child.try_wait().map_err(|source| SkillError::Io {
-            path: content_root.clone(),
-            source,
-        })? {
-            if status.success() {
-                return Ok(());
-            }
-            return Err(SkillError::SelfTestFailed {
-                name: installed.name.clone(),
-                version: installed.version.clone(),
-                status: status.code().map_or(-1, |code| code),
-            });
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(SkillError::SelfTestFailed {
-                name: installed.name.clone(),
-                version: installed.version.clone(),
-                status: -1,
-            });
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let mut shell = Command::new("cmd.exe");
-    shell.args(["/C", command]);
-    shell
-}
-
-#[cfg(not(windows))]
-fn shell_command(command: &str) -> Command {
-    let mut shell = Command::new("/bin/sh");
-    shell.args(["-c", command]);
-    shell
 }
 
 fn resolve_installed(
@@ -592,6 +658,55 @@ fn copy_regular_file(source: &Path, destination: &Path) -> Result<(), SkillError
         source,
     })?;
     Ok(())
+}
+
+fn copy_structured_self_test_file_if_present(
+    bundle: &Path,
+    content_root: &Path,
+) -> Result<(), SkillError> {
+    let source = bundle.join(SKILL_TEST_FILE);
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            copy_regular_file(&source, &content_root.join(SKILL_TEST_FILE))
+        }
+        Ok(_) => Err(SkillError::UnsafeBundlePath { path: source }),
+        Err(source_error) if source_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source_error) => Err(SkillError::Io {
+            path: source,
+            source: source_error,
+        }),
+    }
+}
+
+fn write_self_test_attestation_json_atomic(
+    path: &Path,
+    attestation: &SkillSelfTestAttestation,
+) -> Result<(), SkillError> {
+    let parent = path.parent().ok_or_else(|| SkillError::UnsafeBundlePath {
+        path: path.to_path_buf(),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| SkillError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let json = serde_json::to_vec_pretty(attestation).map_err(|source| {
+        SkillError::InvalidSelfTestAttestation {
+            message: format!("failed to serialize self-test attestation: {source}"),
+        }
+    })?;
+    let tmp_path = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        temporary_suffix()
+    ));
+    fs::write(&tmp_path, json).map_err(|source| SkillError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    fs::rename(&tmp_path, path).map_err(|source| SkillError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(unix)]

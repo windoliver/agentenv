@@ -44,6 +44,7 @@ pub use self_test::{
 pub use service::{SkillAddRequest, SkillCredentialResolver, SkillPublishRequest, SkillService};
 pub use signature::{signature_payload, verify_ed25519_signature};
 pub use store::{
-    info_installed_skill, install_local_skill, list_installed_skills, remove_installed_skill,
-    verify_installed_skill, InstalledSkill, InstalledSkillSelector, SkillInstallOptions,
+    info_installed_skill, install_local_skill, list_installed_skills, read_self_test_attestation,
+    remove_installed_skill, self_test_signing_key_path, verify_installed_skill,
+    write_self_test_attestation, InstalledSkill, InstalledSkillSelector, SkillInstallOptions,
 };

@@ -385,6 +385,7 @@ fn local_install_writes_cache_and_index() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .expect("install should succeed");
@@ -393,6 +394,65 @@ fn local_install_writes_cache_and_index() {
     assert_eq!(installed.version, "0.1.0");
     assert!(installed.path.join("content/SKILL.md").is_file());
     assert!(home.join(".agentenv/skills/index.yaml").is_file());
+}
+
+#[test]
+fn local_install_rejects_missing_self_test() {
+    let home = temp_dir("skill-install-missing-self-test-home");
+    let bundle = temp_dir("skill-install-missing-self-test-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Demo\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: missing-self-test-demo\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+
+    let error = install_local_skill(
+        home.join(".agentenv"),
+        &bundle,
+        SkillInstallOptions {
+            allow_unsigned: true,
+            source_type: "local".to_owned(),
+            source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: false,
+        },
+    )
+    .expect_err("install without a self-test must fail");
+
+    assert!(matches!(error, SkillError::MissingSelfTest));
+    assert!(!home
+        .join(".agentenv/skills/missing-self-test-demo/0.1.0")
+        .exists());
+}
+
+#[test]
+fn local_install_accepts_passing_self_test_and_records_score() {
+    let home = temp_dir("skill-install-passing-self-test-home");
+    let bundle = temp_dir("skill-install-passing-self-test-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Demo\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: passing-self-test-demo\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n",
+    );
+
+    let installed = install_local_skill(
+        home.join(".agentenv"),
+        &bundle,
+        SkillInstallOptions {
+            allow_unsigned: true,
+            source_type: "local".to_owned(),
+            source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: false,
+        },
+    )
+    .expect("passing self-test should install");
+
+    assert_eq!(installed.self_test_score, Some(1.0));
+    assert!(installed.self_test_attestation.is_some());
+    assert!(installed.self_test_attestation.as_ref().unwrap().is_file());
 }
 
 #[test]
@@ -411,6 +471,7 @@ fn local_reinstall_same_digest_keeps_existing_record() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "first-source".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -422,6 +483,7 @@ fn local_reinstall_same_digest_keeps_existing_record() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "second-source".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -431,10 +493,62 @@ fn local_reinstall_same_digest_keeps_existing_record() {
 }
 
 #[test]
+fn local_reinstall_reruns_self_test_when_digest_matches() {
+    let home = temp_dir("skill-install-rerun-self-test-home");
+    let bundle = temp_dir("skill-install-rerun-self-test-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Demo\n");
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n",
+    );
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: rerun-self-test-demo\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+
+    install_local_skill(
+        home.join(".agentenv"),
+        &bundle,
+        SkillInstallOptions {
+            allow_unsigned: true,
+            source_type: "local".to_owned(),
+            source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: false,
+        },
+    )
+    .expect("initial passing self-test should install");
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: missing.md\n",
+    );
+
+    let error = install_local_skill(
+        home.join(".agentenv"),
+        &bundle,
+        SkillInstallOptions {
+            allow_unsigned: true,
+            source_type: "local".to_owned(),
+            source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: false,
+        },
+    )
+    .expect_err("same-digest reinstall must rerun the current self-test");
+
+    assert!(matches!(
+        error,
+        SkillError::SelfTestScoreBelowThreshold { .. }
+    ));
+}
+
+#[test]
 fn local_reinstall_repairs_tampered_cached_content() {
     let home = temp_dir("skill-install-repair-home");
     let bundle = temp_dir("skill-install-repair-bundle");
     write_file(&bundle.join("SKILL.md"), "# Demo\n");
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n",
+    );
     write_file(
         &bundle.join("skill.yaml"),
         "name: repair-demo\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
@@ -446,6 +560,7 @@ fn local_reinstall_repairs_tampered_cached_content() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -458,6 +573,7 @@ fn local_reinstall_repairs_tampered_cached_content() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .expect("reinstall should repair tampered same-digest cache");
@@ -500,6 +616,7 @@ fn local_reinstall_rejects_symlinked_existing_version_directory() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .expect_err("reinstall must reject symlinked existing install dirs");
@@ -525,6 +642,7 @@ fn local_reinstall_rejects_symlinked_cached_content_directory() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -539,6 +657,7 @@ fn local_reinstall_rejects_symlinked_cached_content_directory() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .expect_err("reinstall must reject symlinked cached content dirs");
@@ -564,6 +683,7 @@ fn local_reinstall_rejects_symlinked_cached_content_with_missing_files() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -577,6 +697,7 @@ fn local_reinstall_rejects_symlinked_cached_content_with_missing_files() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .expect_err("broken symlinked content dirs must be rejected before repair");
@@ -607,6 +728,7 @@ fn local_install_treats_manifest_public_key_as_untrusted() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .expect("self-supplied keys should not be treated as trusted signatures");
@@ -630,6 +752,7 @@ fn installed_verify_detects_content_tampering() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -660,6 +783,7 @@ fn installed_verify_rejects_signed_record_without_public_key() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -696,6 +820,7 @@ fn installed_verify_rejects_symlinked_cached_content_directory() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -728,6 +853,7 @@ fn installed_verify_rejects_record_entry_tamper() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -752,6 +878,10 @@ fn installed_verify_rejects_signature_status_downgrade() {
     let bundle = temp_dir("skill-verify-signature-downgrade-bundle");
     write_file(&bundle.join("SKILL.md"), "# Demo\n");
     write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n",
+    );
+    write_file(
         &bundle.join("skill.yaml"),
         "name: signature-downgrade-demo\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
     );
@@ -774,6 +904,7 @@ fn installed_verify_rejects_signature_status_downgrade() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -847,6 +978,7 @@ fn installed_index_ignores_stale_staging_directories() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -882,6 +1014,7 @@ fn installed_verify_runs_self_test_command() {
             allow_unsigned: true,
             source_type: "local".to_owned(),
             source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: true,
         },
     )
     .unwrap();
@@ -893,6 +1026,47 @@ fn installed_verify_runs_self_test_command() {
     .expect("self-test command should pass");
 
     assert_eq!(verified.name, "self-test-demo");
+}
+
+#[test]
+fn installed_verify_runs_structured_skill_yaml_self_test() {
+    let home = temp_dir("skill-verify-structured-skill-yaml-home");
+    let bundle = temp_dir("skill-verify-structured-skill-yaml-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Demo\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        r#"name: structured-skill-yaml-demo
+version: 0.1.0
+entry: SKILL.md
+files:
+  - SKILL.md
+self_test:
+  runner: agentenv
+  assertions:
+    - type: file_exists
+      path: SKILL.md
+"#,
+    );
+    install_local_skill(
+        home.join(".agentenv"),
+        &bundle,
+        SkillInstallOptions {
+            allow_unsigned: true,
+            source_type: "local".to_owned(),
+            source_label: "local-dev".to_owned(),
+            unsafe_skip_self_test_gate: false,
+        },
+    )
+    .expect("structured skill.yaml self-test should install");
+
+    let verified = verify_installed_skill(
+        home.join(".agentenv"),
+        InstalledSkillSelector::Name("structured-skill-yaml-demo".to_owned()),
+    )
+    .expect("structured skill.yaml self-test should verify");
+
+    assert_eq!(verified.self_test_score, Some(1.0));
+    assert!(verified.self_test_attestation.is_some());
 }
 
 #[test]

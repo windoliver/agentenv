@@ -1120,10 +1120,8 @@ fn self_test_attestation_load_or_create_key_round_trips() {
     let root = temp_dir("self-test-attestation-key-round-trip");
     let key_path = root.join("self-test-signing-key");
 
-    let first =
-        SkillSelfTestSigningKey::load_or_create(&key_path).expect("key should be created");
-    let second =
-        SkillSelfTestSigningKey::load_or_create(&key_path).expect("key should be loaded");
+    let first = SkillSelfTestSigningKey::load_or_create(&key_path).expect("key should be created");
+    let second = SkillSelfTestSigningKey::load_or_create(&key_path).expect("key should be loaded");
 
     assert_eq!(first.public_key_hex(), second.public_key_hex());
     assert_eq!(fs::read(&key_path).expect("key should exist").len(), 32);
@@ -1132,7 +1130,10 @@ fn self_test_attestation_load_or_create_key_round_trips() {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = fs::metadata(&key_path).expect("key metadata").permissions().mode();
+        let mode = fs::metadata(&key_path)
+            .expect("key metadata")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o077, 0);
     }
 }
@@ -1152,7 +1153,10 @@ fn self_test_attestation_rejects_insecure_existing_key_file() {
     let error =
         SkillSelfTestSigningKey::load_or_create(&key_path).expect_err("insecure key must fail");
 
-    assert!(matches!(error, SkillError::InvalidSelfTestSigningKey { .. }));
+    assert!(matches!(
+        error,
+        SkillError::InvalidSelfTestSigningKey { .. }
+    ));
 }
 
 struct UnsupportedTestAgentRunner;
