@@ -41,6 +41,7 @@ mod bundle_cli;
 mod credentials_runtime;
 mod render;
 mod skills_cli;
+mod skills_propose_cli;
 mod term_backend;
 
 use credentials_runtime::{CliCredentialProvider, TerminalCredentialPrompter};

@@ -1094,6 +1094,29 @@ skills:
 }
 
 #[test]
+fn skills_config_loads_proposal_provider_settings() {
+    let yaml = r#"
+skills:
+  proposal:
+    llm:
+      provider: default
+      endpoint: https://llm.example.test/v1
+      model: proposal-generalizer
+      credential: AGENTENV_SKILL_PROPOSER_TOKEN
+    semantic:
+      backend: local
+    pr:
+      default_repo: owner/skills
+"#;
+
+    let config = load_project_skills_config(yaml).unwrap();
+    let proposal = config.proposal.unwrap();
+    assert_eq!(proposal.llm.unwrap().provider, "default");
+    assert_eq!(proposal.semantic.unwrap().backend, "local");
+    assert_eq!(proposal.pr.unwrap().default_repo.unwrap(), "owner/skills");
+}
+
+#[test]
 fn skills_config_loads_user_toml() {
     let toml = r#"
 [skills]
@@ -1193,6 +1216,7 @@ fn cli_registry_override_wins_over_project_and_user_config() {
             PathBuf::from("/user"),
         )],
         registry_order: vec!["user-local".to_owned()],
+        proposal: None,
     };
     let project = SkillsConfig {
         registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
@@ -1200,6 +1224,7 @@ fn cli_registry_override_wins_over_project_and_user_config() {
             PathBuf::from("/project"),
         )],
         registry_order: vec!["project-local".to_owned()],
+        proposal: None,
     };
 
     let merged = merge_skills_config(
@@ -1228,6 +1253,7 @@ fn cli_registry_override_selects_named_registry() {
             ),
         ],
         registry_order: vec!["local".to_owned(), "corp".to_owned()],
+        proposal: None,
     };
 
     let merged = merge_skills_config(
@@ -1256,6 +1282,7 @@ fn project_config_overrides_user_registries_by_name_without_erasing_others() {
             ),
         ],
         registry_order: vec!["local".to_owned(), "corp".to_owned()],
+        proposal: None,
     };
     let project = SkillsConfig {
         registries: vec![agentenv_core::skills::RegistryConfig::filesystem(
@@ -1263,6 +1290,7 @@ fn project_config_overrides_user_registries_by_name_without_erasing_others() {
             PathBuf::from("/project"),
         )],
         registry_order: vec!["local".to_owned()],
+        proposal: None,
     };
 
     let merged = merge_skills_config(
@@ -1286,6 +1314,7 @@ fn cli_registry_override_reports_missing_named_registry() {
             PathBuf::from("/local"),
         )],
         registry_order: vec!["local".to_owned()],
+        proposal: None,
     };
 
     let error = merge_skills_config(
@@ -1439,6 +1468,7 @@ async fn filesystem_registry_search_add_and_publish_work() {
                 registry.clone(),
             )],
             registry_order: vec!["local-dev".to_owned()],
+            proposal: None,
         },
     );
 
@@ -2094,6 +2124,7 @@ async fn http_registry_rejects_unsafe_url_before_request() {
                 None,
             )],
             registry_order: vec!["unsafe".to_owned()],
+            proposal: None,
         },
     );
 
@@ -2513,6 +2544,7 @@ async fn http_registry_uses_bearer_token_from_credential_resolver() {
                 Some("bearer-from-credstore:CUSTOM_SKILLS_TOKEN".to_owned()),
             )],
             registry_order: vec!["http-dev".to_owned()],
+            proposal: None,
         },
     )
     .with_ssrf_options(test_http_registry_ssrf_options())
@@ -2547,6 +2579,7 @@ async fn oci_registry_search_add_and_publish_use_distribution_api() {
                 None,
             )],
             registry_order: vec!["oci-dev".to_owned()],
+            proposal: None,
         },
     )
     .with_ssrf_options(test_http_registry_ssrf_options());
@@ -2593,6 +2626,7 @@ async fn git_registry_publish_is_reported_as_unsupported() {
                 "git+https://github.com/acme/skills",
             )],
             registry_order: vec!["git-dev".to_owned()],
+            proposal: None,
         },
     );
 
@@ -2625,6 +2659,7 @@ async fn git_registry_rejects_invalid_registry_name_before_cache_path_use() {
                 "git+https://github.com/acme/skills",
             )],
             registry_order: vec!["../../outside".to_owned()],
+            proposal: None,
         },
     );
 
@@ -2682,6 +2717,7 @@ fn filesystem_skill_service(home: &Path, registry: &Path) -> SkillService {
                 registry.to_path_buf(),
             )],
             registry_order: vec!["local-dev".to_owned()],
+            proposal: None,
         },
     )
 }
@@ -2709,6 +2745,7 @@ fn http_skill_service(home: &Path, server: &TestHttpRegistry) -> SkillService {
                 None,
             )],
             registry_order: vec!["http-dev".to_owned()],
+            proposal: None,
         },
     )
 }
