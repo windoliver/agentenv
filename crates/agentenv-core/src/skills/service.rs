@@ -9,13 +9,21 @@ use sha2::{Digest, Sha256};
 
 use crate::security::ssrf::SsrfOptions;
 
-use super::store::{install_local_skill_with_runner, verify_installed_skill_with_runner};
+use super::signature::verify_skill_package_signature;
+use super::store::{
+    install_local_skill_with_attestation, install_local_skill_with_runner,
+    verify_installed_skill_with_runner,
+};
 use super::{
-    info_installed_skill, install_local_skill, list_installed_skills, registry_filesystem,
-    registry_git, registry_http, registry_oci, remove_installed_skill, validate_skill_name,
-    AgentProduceRunner, FetchedSkill, InstalledSkill, InstalledSkillSelector, RegistryAdapter,
-    RegistryConfig, RegistryKind, SkillError, SkillInstallOptions, SkillSearchHit, SkillsConfig,
-    UnsupportedAgentProduceRunner,
+    compute_bundle_digest, info_installed_skill, list_installed_skills, load_skill_manifest,
+    load_skill_self_test_spec, normalized_self_test_digest, read_self_test_attestation,
+    registry_filesystem, registry_git, registry_http, registry_oci, remove_installed_skill,
+    run_skill_self_test, self_test_signing_key_path, sign_skill_self_test_attestation,
+    validate_skill_name, validate_skill_publish_attestation, AgentProduceRunner, FetchedSkill,
+    InstalledSkill, InstalledSkillSelector, RegistryAdapter, RegistryConfig, RegistryKind,
+    SkillAttestationValidationOptions, SkillError, SkillInstallOptions, SkillSearchHit,
+    SkillSelfTestAttestation, SkillSelfTestOptions, SkillSelfTestSigningKey, SkillsConfig,
+    UnsupportedAgentProduceRunner, SELF_TEST_PUBLISH_THRESHOLD,
 };
 
 pub type SkillCredentialResolver =
@@ -35,6 +43,7 @@ pub struct SkillAddRequest {
     pub handle: String,
     pub registry: Option<String>,
     pub allow_unsigned: bool,
+    pub self_test_attestation: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +51,8 @@ pub struct SkillPublishRequest {
     pub bundle_path: PathBuf,
     pub registry: Option<String>,
     pub allow_unsigned: bool,
+    pub self_test_attestation: Option<PathBuf>,
+    pub no_self_test_run: bool,
 }
 
 impl SkillService {
@@ -91,7 +102,23 @@ impl SkillService {
             let adapter = self.adapter_for(registry)?;
             match adapter.fetch(&parsed.name, parsed.version.as_deref()).await {
                 Ok(fetched) => {
-                    return self.install_fetched_skill(fetched, request.allow_unsigned);
+                    let attestation = match self.self_test_attestation_for_bundle(
+                        &fetched.staging_path,
+                        request.allow_unsigned,
+                        request.self_test_attestation.as_deref(),
+                        false,
+                    ) {
+                        Ok(attestation) => attestation,
+                        Err(error) => {
+                            cleanup_staging_path(&fetched.staging_path);
+                            return Err(error);
+                        }
+                    };
+                    return self.install_fetched_skill(
+                        fetched,
+                        request.allow_unsigned,
+                        Some(&attestation),
+                    );
                 }
                 Err(SkillError::SkillNotInstalled { .. }) => {
                     continue;
@@ -118,8 +145,24 @@ impl SkillService {
                 })?,
         };
         let adapter = self.adapter_for(registry)?;
+        if matches!(registry.kind, RegistryKind::Git) {
+            return Err(SkillError::UnsupportedRegistryPublish {
+                registry: registry.name.clone(),
+                kind: "git".to_owned(),
+            });
+        }
+        let attestation = self.self_test_attestation_for_bundle(
+            &request.bundle_path,
+            request.allow_unsigned,
+            request.self_test_attestation.as_deref(),
+            request.no_self_test_run,
+        )?;
         adapter
-            .publish(&request.bundle_path, request.allow_unsigned)
+            .publish(
+                &request.bundle_path,
+                request.allow_unsigned,
+                Some(&attestation),
+            )
             .await
     }
 
@@ -128,7 +171,29 @@ impl SkillService {
         bundle_path: impl AsRef<Path>,
         allow_unsigned: bool,
         source_label: impl Into<String>,
+        self_test_attestation: Option<&Path>,
     ) -> Result<InstalledSkill, SkillError> {
+        let bundle_path = bundle_path.as_ref();
+        if let Some(attestation_path) = self_test_attestation {
+            let attestation = self.self_test_attestation_for_bundle(
+                bundle_path,
+                allow_unsigned,
+                Some(attestation_path),
+                true,
+            )?;
+            return install_local_skill_with_attestation(
+                &self.root,
+                bundle_path,
+                SkillInstallOptions {
+                    allow_unsigned,
+                    source_type: "local".to_owned(),
+                    source_label: source_label.into(),
+                    unsafe_skip_self_test_gate: true,
+                },
+                &attestation,
+            );
+        }
+
         install_local_skill_with_runner(
             &self.root,
             bundle_path,
@@ -287,20 +352,104 @@ impl SkillService {
         &self,
         fetched: FetchedSkill,
         allow_unsigned: bool,
+        self_test_attestation: Option<&SkillSelfTestAttestation>,
     ) -> Result<InstalledSkill, SkillError> {
         let source_label = source_label_for_fetched(&fetched);
-        let installed = install_local_skill(
-            &self.root,
-            &fetched.staging_path,
-            SkillInstallOptions {
-                allow_unsigned,
-                source_type: fetched.source_type.clone(),
-                source_label,
-                unsafe_skip_self_test_gate: true,
-            },
-        );
+        let options = SkillInstallOptions {
+            allow_unsigned,
+            source_type: fetched.source_type.clone(),
+            source_label,
+            unsafe_skip_self_test_gate: true,
+        };
+        let installed = match self_test_attestation {
+            Some(attestation) => install_local_skill_with_attestation(
+                &self.root,
+                &fetched.staging_path,
+                options,
+                attestation,
+            ),
+            None => install_local_skill_with_runner(
+                &self.root,
+                &fetched.staging_path,
+                options,
+                Arc::clone(&self.agent_produce_runner),
+            ),
+        };
         cleanup_staging_path(&fetched.staging_path);
         installed
+    }
+
+    fn self_test_attestation_for_bundle(
+        &self,
+        bundle_path: &Path,
+        allow_unsigned: bool,
+        attestation_path: Option<&Path>,
+        no_self_test_run: bool,
+    ) -> Result<SkillSelfTestAttestation, SkillError> {
+        let manifest = load_skill_manifest(bundle_path)?;
+        let digest = compute_bundle_digest(bundle_path, &manifest)?;
+        verify_skill_package_signature(&manifest, &digest, allow_unsigned)?;
+        let spec = load_skill_self_test_spec(bundle_path)?;
+        let self_test_digest = normalized_self_test_digest(&spec)?;
+        let version = manifest.version.to_string();
+
+        if let Some(attestation_path) = attestation_path {
+            let attestation = read_self_test_attestation(attestation_path)?;
+            self.validate_self_test_attestation(
+                &manifest.name,
+                &version,
+                &digest,
+                &self_test_digest,
+                &attestation,
+            )?;
+            return Ok(attestation);
+        }
+
+        if no_self_test_run {
+            return Err(SkillError::MissingSelfTestAttestation);
+        }
+
+        let report = run_skill_self_test(
+            bundle_path,
+            manifest.name.clone(),
+            version,
+            digest,
+            &spec,
+            SkillSelfTestOptions::default(),
+            Arc::clone(&self.agent_produce_runner),
+        )?;
+        if !report.publishable {
+            return Err(SkillError::SelfTestScoreBelowThreshold {
+                score: report.score,
+                threshold: SELF_TEST_PUBLISH_THRESHOLD,
+            });
+        }
+        let signing_key =
+            SkillSelfTestSigningKey::load_or_create(&self_test_signing_key_path(&self.root))?;
+        sign_skill_self_test_attestation(&report, &signing_key)
+    }
+
+    fn validate_self_test_attestation(
+        &self,
+        name: &str,
+        version: &str,
+        digest: &str,
+        self_test_digest: &str,
+        attestation: &SkillSelfTestAttestation,
+    ) -> Result<(), SkillError> {
+        let signing_key =
+            SkillSelfTestSigningKey::load_or_create(&self_test_signing_key_path(&self.root))?;
+        validate_skill_publish_attestation(
+            name,
+            version,
+            digest,
+            self_test_digest,
+            attestation,
+            SkillAttestationValidationOptions {
+                trusted_public_keys: vec![signing_key.public_key_hex()],
+                ..SkillAttestationValidationOptions::default()
+            },
+        )
     }
 }
 
@@ -477,7 +626,7 @@ mod tests {
         };
 
         let installed = service
-            .install_fetched_skill(fetched, true)
+            .install_fetched_skill(fetched, true, None)
             .expect("fetched git skill should install");
 
         assert_eq!(installed.name, "provenance-git");

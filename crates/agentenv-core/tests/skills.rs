@@ -9,9 +9,10 @@ use std::{
 use agentenv_core::security::ssrf::SsrfOptions;
 use agentenv_core::skills::{
     compute_bundle_digest, install_local_skill, list_installed_skills, load_project_skills_config,
-    load_skill_manifest, load_user_skills_config, merge_skills_config, validate_skill_name,
-    verify_installed_skill, InstalledSkillSelector, RegistryKind, SkillAddRequest, SkillError,
-    SkillInstallOptions, SkillPublishRequest, SkillService, SkillsConfig, SkillsConfigOverride,
+    load_skill_manifest, load_user_skills_config, merge_skills_config, read_self_test_attestation,
+    validate_skill_name, verify_installed_skill, InstalledSkillSelector, RegistryKind,
+    SkillAddRequest, SkillError, SkillInstallOptions, SkillPublishRequest, SkillService,
+    SkillsConfig, SkillsConfigOverride,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -1429,12 +1430,7 @@ fn skills_config_rejects_oci_reference_with_invalid_parts() {
 async fn filesystem_registry_search_add_and_publish_work() {
     let home = temp_dir("skill-fs-home");
     let registry = temp_dir("skill-fs-registry");
-    let bundle = temp_dir("skill-fs-bundle");
-    write_file(&bundle.join("SKILL.md"), "# Searchable Skill\n");
-    write_file(
-        &bundle.join("skill.yaml"),
-        "name: searchable-skill\nversion: 0.1.0\ndescription: Searchable demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
-    );
+    let bundle = skill_bundle("searchable-skill", "0.1.0", "Searchable demo");
     let service = SkillService::new(
         home.join(".agentenv"),
         SkillsConfig {
@@ -1451,6 +1447,8 @@ async fn filesystem_registry_search_add_and_publish_work() {
             bundle_path: bundle,
             registry: Some("local-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should succeed");
@@ -1466,11 +1464,233 @@ async fn filesystem_registry_search_add_and_publish_work() {
             handle: "searchable-skill@0.1.0".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should install");
 
     assert_eq!(installed.name, "searchable-skill");
+}
+
+#[tokio::test]
+async fn skill_service_publish_rejects_missing_self_test() {
+    let home = temp_dir("skill-fs-publish-missing-self-test-home");
+    let registry = temp_dir("skill-fs-publish-missing-self-test-registry");
+    let bundle = temp_dir("skill-fs-publish-missing-self-test-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Missing self-test\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: missing-self-test\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle,
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
+        })
+        .await
+        .expect_err("publish must reject bundles without a self-test");
+
+    assert!(matches!(error, SkillError::MissingSelfTest));
+    assert!(service
+        .search("missing-self-test")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn skill_service_publish_checks_signature_before_self_test() {
+    let home = temp_dir("skill-fs-publish-signature-before-self-test-home");
+    let registry = temp_dir("skill-fs-publish-signature-before-self-test-registry");
+    let bundle = temp_dir("skill-fs-publish-signature-before-self-test-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Unsigned publish\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: unsigned-publish-order\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: touch self-test-ran\n",
+    );
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle.clone(),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: false,
+            self_test_attestation: None,
+            no_self_test_run: false,
+        })
+        .await
+        .expect_err("publish must reject unsigned bundles before running self-tests");
+
+    assert!(matches!(error, SkillError::MissingSignature { .. }));
+    assert!(!bundle.join("self-test-ran").exists());
+}
+
+#[tokio::test]
+async fn skill_service_add_checks_signature_before_self_test() {
+    let home = temp_dir("skill-fs-add-signature-before-self-test-home");
+    let registry = temp_dir("skill-fs-add-signature-before-self-test-registry");
+    write_file(
+        &registry.join("unsigned-add-order/skill.yaml"),
+        "name: unsigned-add-order\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: false\n",
+    );
+    write_file(
+        &registry.join("unsigned-add-order/SKILL.md"),
+        "# Unsigned add\n",
+    );
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .add(SkillAddRequest {
+            handle: "unsigned-add-order@0.1.0".to_owned(),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: false,
+            self_test_attestation: None,
+        })
+        .await
+        .expect_err("add must reject unsigned bundles before running self-tests");
+
+    assert!(matches!(error, SkillError::MissingSignature { .. }));
+    assert!(service.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn skill_service_publish_rejects_low_self_test_score() {
+    let home = temp_dir("skill-fs-publish-low-score-home");
+    let registry = temp_dir("skill-fs-publish-low-score-registry");
+    let bundle = temp_dir("skill-fs-publish-low-score-bundle");
+    write_file(&bundle.join("SKILL.md"), "# Low score\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: low-score-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n    - type: file_exists\n      path: missing.txt\n  timeout_seconds: 5\n",
+    );
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle,
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
+        })
+        .await
+        .expect_err("publish must reject scores below the threshold");
+
+    assert!(matches!(
+        error,
+        SkillError::SelfTestScoreBelowThreshold {
+            score,
+            threshold
+        } if (score - 0.5).abs() < f64::EPSILON && (threshold - 0.8).abs() < f64::EPSILON
+    ));
+    assert!(service.search("low-score-skill").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn skill_service_publish_no_self_test_run_requires_attestation() {
+    let home = temp_dir("skill-fs-publish-attestation-required-home");
+    let registry = temp_dir("skill-fs-publish-attestation-required-registry");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let error = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("attestation-required", "0.1.0", "Attestation required"),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: true,
+        })
+        .await
+        .expect_err("publish without running a self-test must require an attestation");
+
+    assert!(matches!(error, SkillError::MissingSelfTestAttestation));
+}
+
+#[tokio::test]
+async fn filesystem_registry_publish_stores_self_test_attestation() {
+    let home = temp_dir("skill-fs-publish-attestation-home");
+    let registry = temp_dir("skill-fs-publish-attestation-registry");
+    let service = filesystem_skill_service(&home, &registry);
+
+    let hit = service
+        .publish(SkillPublishRequest {
+            bundle_path: skill_bundle("attested-skill", "0.1.0", "Attested"),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
+        })
+        .await
+        .expect("publish should store the generated self-test attestation");
+
+    assert_eq!(hit.self_test_score, Some(1.0));
+    assert!(hit.self_test_attestation_digest.is_some());
+    let attestation_path = registry.join("bundles/attested-skill/0.1.0/self-test-attestation.json");
+    let attestation = read_self_test_attestation(&attestation_path).unwrap();
+    assert_eq!(attestation.subject.name, "attested-skill");
+    assert_eq!(attestation.subject.version, "0.1.0");
+    assert_eq!(
+        hit.self_test_attestation_digest.as_deref(),
+        Some(attestation.self_test_digest.as_str())
+    );
+}
+
+#[tokio::test]
+async fn filesystem_registry_publish_and_add_preserves_skill_test_yaml() {
+    let home = temp_dir("skill-fs-publish-skill-test-file-home");
+    let registry = temp_dir("skill-fs-publish-skill-test-file-registry");
+    let service = filesystem_skill_service(&home, &registry);
+    let bundle = skill_test_file_bundle("file-backed-self-test", "0.1.0", "File-backed self-test");
+
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle.clone(),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
+        })
+        .await
+        .expect("publish should accept skill-test.yaml backed self-tests");
+
+    assert!(registry
+        .join("bundles/file-backed-self-test/0.1.0/skill-test.yaml")
+        .is_file());
+
+    let updated_skill_test = "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n  timeout_seconds: 5\n";
+    write_file(&bundle.join("skill-test.yaml"), updated_skill_test);
+    service
+        .publish(SkillPublishRequest {
+            bundle_path: bundle,
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
+        })
+        .await
+        .expect("republishing the same digest should refresh undeclared self-test files");
+    let stored_skill_test =
+        fs::read_to_string(registry.join("bundles/file-backed-self-test/0.1.0/skill-test.yaml"))
+            .unwrap();
+    assert_eq!(stored_skill_test, updated_skill_test);
+
+    let installed = service
+        .add(SkillAddRequest {
+            handle: "file-backed-self-test@0.1.0".to_owned(),
+            registry: Some("local-dev".to_owned()),
+            allow_unsigned: true,
+            self_test_attestation: None,
+        })
+        .await
+        .expect("add should rerun the preserved skill-test.yaml");
+
+    assert_eq!(installed.self_test_score, Some(1.0));
+    assert!(installed.path.join("content/skill-test.yaml").is_file());
 }
 
 #[tokio::test]
@@ -1525,7 +1745,7 @@ async fn filesystem_registry_add_uses_scanned_subdirectory_without_index() {
     let registry = temp_dir("skill-fs-scan-add-registry");
     write_file(
         &registry.join("scan-add/skill.yaml"),
-        "name: scan-add\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: scan-add\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     );
     write_file(&registry.join("scan-add/SKILL.md"), "# Scan add\n");
     let service = filesystem_skill_service(&home, &registry);
@@ -1535,6 +1755,7 @@ async fn filesystem_registry_add_uses_scanned_subdirectory_without_index() {
             handle: "scan-add".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should use scanned directory");
@@ -1562,6 +1783,8 @@ async fn filesystem_registry_publish_keeps_scanned_subdirectories_ephemeral() {
             bundle_path: skill_bundle("published-skill", "0.1.0", "Published"),
             registry: Some("local-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should succeed");
@@ -1630,6 +1853,7 @@ async fn filesystem_registry_fetch_does_not_fallback_to_shadowed_scanned_directo
             handle: "shadowed-skill@0.1.0".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("indexed hit with missing bundle must not fall back to scanned directory");
@@ -1653,6 +1877,7 @@ async fn skill_service_add_without_version_installs_highest_semver() {
             handle: "versioned-skill".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add without version should install highest semver");
@@ -1671,6 +1896,7 @@ async fn skill_service_rejects_invalid_handle_before_registry_access() {
             handle: "../bad@0.1.0".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("invalid handles must fail before registry access");
@@ -1691,6 +1917,8 @@ async fn filesystem_registry_refuses_same_version_with_different_digest() {
             bundle_path: changed,
             registry: Some("local-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect_err("publishing a different digest over the same version must fail");
@@ -1716,6 +1944,8 @@ async fn skill_service_publish_uses_first_ordered_registry_when_unspecified() {
             bundle_path: skill_bundle("default-registry-skill", "0.1.0", "Default registry"),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish without registry should use configured registry order");
@@ -1749,6 +1979,7 @@ async fn filesystem_registry_rejects_index_hit_with_mismatched_manifest_identity
             handle: "requested-skill@0.1.0".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("index identity must match fetched manifest identity");
@@ -1786,6 +2017,7 @@ async fn filesystem_registry_rejects_symlinked_bundles_directory() {
             handle: "symlinked-skill@0.1.0".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("symlinked registry bundle parents must be rejected");
@@ -1813,6 +2045,8 @@ async fn filesystem_registry_publish_repairs_stale_index_without_bundle() {
             bundle_path: bundle,
             registry: Some("local-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should repair stale index entries whose bundle is missing");
@@ -1835,6 +2069,7 @@ async fn skill_service_add_records_registry_source_with_resolved_version() {
             handle: "provenance-skill".to_owned(),
             registry: None,
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should install from registry");
@@ -1933,9 +2168,11 @@ async fn http_registry_publish_and_add_round_trip() {
 
     service
         .publish(SkillPublishRequest {
-            bundle_path: skill_bundle("http-skill", "0.1.0", "HTTP skill"),
+            bundle_path: skill_test_file_bundle("http-skill", "0.1.0", "HTTP skill"),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should upload files");
@@ -1945,6 +2182,7 @@ async fn http_registry_publish_and_add_round_trip() {
             handle: "http-skill@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should download uploaded files");
@@ -1952,6 +2190,8 @@ async fn http_registry_publish_and_add_round_trip() {
     assert_eq!(installed.name, "http-skill");
     assert_eq!(installed.source_type, "http");
     assert_eq!(installed.source_label, "http:http-dev:http-skill@0.1.0");
+    assert_eq!(installed.self_test_score, Some(1.0));
+    assert!(installed.path.join("content/skill-test.yaml").is_file());
 }
 
 #[tokio::test]
@@ -1969,6 +2209,8 @@ async fn http_registry_publish_updates_existing_index_json() {
             bundle_path: skill_bundle("json-published", "0.1.0", "JSON publish"),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should update existing JSON index");
@@ -1978,6 +2220,7 @@ async fn http_registry_publish_updates_existing_index_json() {
             handle: "json-published@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should read updated JSON index");
@@ -1997,6 +2240,8 @@ async fn http_registry_publish_defaults_missing_index_to_json() {
             bundle_path: skill_bundle("json-default", "0.1.0", "JSON default"),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should create a new JSON index");
@@ -2036,6 +2281,7 @@ async fn http_registry_add_downloads_tar_zst_skill_artifact() {
             handle: "tarball-skill@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should unpack tar.zst artifact");
@@ -2081,6 +2327,7 @@ async fn http_registry_add_verifies_tar_zst_signature_sidecar() {
             handle: "signed-tarball-skill@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("add should verify the tar.zst signature sidecar");
@@ -2123,6 +2370,7 @@ async fn http_registry_add_rejects_invalid_tar_zst_signature_sidecar() {
             handle: "bad-signature-tarball@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("add should reject an invalid tar.zst signature sidecar");
@@ -2158,6 +2406,7 @@ async fn http_registry_add_rejects_tar_zst_parent_traversal_entry() {
             handle: "unsafe-tarball-skill@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("add should reject unsafe tar path");
@@ -2196,6 +2445,7 @@ async fn http_registry_add_rejects_tar_zst_symlink_entry() {
             handle: "symlink-tarball-skill@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("add should reject tar symlink");
@@ -2230,6 +2480,7 @@ async fn http_registry_rejects_tarball_hardlink_entries() {
             handle: "hardlink-skill@0.1.0".to_owned(),
             registry: Some("http-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect_err("hardlink tar entries must be rejected");
@@ -2302,9 +2553,11 @@ async fn oci_registry_search_add_and_publish_use_distribution_api() {
 
     service
         .publish(SkillPublishRequest {
-            bundle_path: skill_bundle("oci-skill", "0.1.0", "OCI skill"),
+            bundle_path: skill_test_file_bundle("oci-skill", "0.1.0", "OCI skill"),
             registry: Some("oci-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("OCI publish should work against fixture");
@@ -2317,6 +2570,7 @@ async fn oci_registry_search_add_and_publish_use_distribution_api() {
             handle: "oci-skill@0.1.0".to_owned(),
             registry: Some("oci-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
         })
         .await
         .expect("OCI add should install");
@@ -2324,6 +2578,8 @@ async fn oci_registry_search_add_and_publish_use_distribution_api() {
     assert_eq!(installed.name, "oci-skill");
     assert_eq!(installed.source_type, "oci");
     assert_eq!(installed.source_label, "oci:oci-dev:oci-skill@0.1.0");
+    assert_eq!(installed.self_test_score, Some(1.0));
+    assert!(installed.path.join("content/skill-test.yaml").is_file());
 }
 
 #[tokio::test]
@@ -2345,6 +2601,8 @@ async fn git_registry_publish_is_reported_as_unsupported() {
             bundle_path: skill_bundle("git-publish", "0.1.0", "Git publish"),
             registry: Some("git-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect_err("git publish should be read-only");
@@ -2375,6 +2633,8 @@ async fn git_registry_rejects_invalid_registry_name_before_cache_path_use() {
             bundle_path: skill_bundle("git-name-reject", "0.1.0", "Git name reject"),
             registry: Some("../../outside".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect_err("invalid registry names must be rejected before adapter construction");
@@ -2432,6 +2692,8 @@ async fn publish_test_skill(service: &SkillService, name: &str, version: &str, c
             bundle_path: skill_bundle(name, version, content),
             registry: Some("local-dev".to_owned()),
             allow_unsigned: true,
+            self_test_attestation: None,
+            no_self_test_run: false,
         })
         .await
         .expect("publish should succeed");
@@ -2465,8 +2727,24 @@ fn skill_bundle(name: &str, version: &str, content: &str) -> PathBuf {
     write_file(
         &bundle.join("skill.yaml"),
         &format!(
+            "name: {name}\nversion: {version}\ndescription: {content}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
+        ),
+    );
+    bundle
+}
+
+fn skill_test_file_bundle(name: &str, version: &str, content: &str) -> PathBuf {
+    let bundle = temp_dir(&format!("skill-test-file-bundle-{name}-{version}"));
+    write_file(&bundle.join("SKILL.md"), &format!("# {content}\n"));
+    write_file(
+        &bundle.join("skill.yaml"),
+        &format!(
             "name: {name}\nversion: {version}\ndescription: {content}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
         ),
+    );
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n",
     );
     bundle
 }
@@ -2548,6 +2826,12 @@ fn append_bundle_minimal_files<W: io::Write>(builder: &mut tar::Builder<W>, bund
     builder
         .append_path_with_name(bundle_path.join("SKILL.md"), "SKILL.md")
         .unwrap();
+    let skill_test_path = bundle_path.join("skill-test.yaml");
+    if skill_test_path.is_file() {
+        builder
+            .append_path_with_name(skill_test_path, "skill-test.yaml")
+            .unwrap();
+    }
 }
 
 async fn add_binary_response(server: &TestHttpRegistry, method: &str, path: &str, body: Vec<u8>) {

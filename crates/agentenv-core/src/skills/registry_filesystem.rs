@@ -8,15 +8,16 @@ use std::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use super::signature::verify_skill_package_signature;
 use super::{
-    compute_bundle_digest, manifest::validated_bundle_file, validate_skill_name,
-    verify_ed25519_signature, FetchedSkill, RegistryAdapter, SkillError, SkillManifest,
-    SkillSearchHit,
+    compute_bundle_digest, manifest::validated_bundle_file, validate_skill_name, FetchedSkill,
+    RegistryAdapter, SkillError, SkillManifest, SkillSearchHit, SkillSelfTestAttestation,
 };
 
 const BUNDLES_DIR: &str = "bundles";
 const INDEX_FILE: &str = "index.yaml";
 const MANIFEST_FILE: &str = "skill.yaml";
+const SKILL_TEST_FILE: &str = "skill-test.yaml";
 const SOURCE_TYPE: &str = "filesystem";
 
 #[derive(Debug, Clone)]
@@ -166,6 +167,8 @@ impl FilesystemRegistryAdapter {
             digest: Some(digest),
             signature_ed25519: manifest.signature_ed25519.clone(),
             public_key_ed25519: manifest.signature_public_key_ed25519.clone(),
+            self_test_score: None,
+            self_test_attestation_digest: None,
         }
     }
 
@@ -373,14 +376,17 @@ impl RegistryAdapter for FilesystemRegistryAdapter {
         &self,
         bundle_path: &Path,
         allow_unsigned: bool,
+        attestation: Option<&SkillSelfTestAttestation>,
     ) -> Result<SkillSearchHit, SkillError> {
         ensure_directory(&self.root)?;
         ensure_directory(&self.root.join(BUNDLES_DIR))?;
         let manifest = super::load_skill_manifest(bundle_path)?;
         let digest = compute_bundle_digest(bundle_path, &manifest)?;
         verify_publish_signature(&manifest, &digest, allow_unsigned)?;
+        let attestation = attestation.ok_or(SkillError::MissingSelfTestAttestation)?;
         let version = manifest.version.to_string();
-        let hit = self.hit_for_manifest(&manifest, digest.clone());
+        let mut hit = self.hit_for_manifest(&manifest, digest.clone());
+        hit.apply_self_test_attestation(Some(attestation));
 
         if let Some(existing_digest) = self.existing_bundle_digest(&manifest.name, &version)? {
             if existing_digest != digest {
@@ -390,6 +396,21 @@ impl RegistryAdapter for FilesystemRegistryAdapter {
                     existing: existing_digest,
                 });
             }
+            let destination =
+                existing_child_directory(&self.root, &[BUNDLES_DIR, &manifest.name, &version])?
+                    .ok_or_else(|| SkillError::SkillNotInstalled {
+                        name: manifest.name.clone(),
+                    })?;
+            copy_bundle_contents(bundle_path, &destination, &manifest)?;
+            write_json_atomic(
+                &self
+                    .root
+                    .join(BUNDLES_DIR)
+                    .join(&manifest.name)
+                    .join(&version)
+                    .join("self-test-attestation.json"),
+                attestation,
+            )?;
             self.upsert_hit(hit.clone())?;
             return Ok(hit);
         }
@@ -399,6 +420,7 @@ impl RegistryAdapter for FilesystemRegistryAdapter {
         let staging = staging_publish_path(&bundle_parent, &version)?;
         remove_directory_if_exists(&staging)?;
         copy_bundle_contents(bundle_path, &staging, &manifest)?;
+        write_json_atomic(&staging.join("self-test-attestation.json"), attestation)?;
         rename_directory(&staging, &destination)?;
         self.upsert_hit(hit.clone())?;
         Ok(hit)
@@ -410,27 +432,7 @@ fn verify_publish_signature(
     digest: &str,
     allow_unsigned: bool,
 ) -> Result<(), SkillError> {
-    if allow_unsigned {
-        return Ok(());
-    }
-
-    let signature =
-        manifest
-            .signature_ed25519
-            .as_deref()
-            .ok_or_else(|| SkillError::MissingSignature {
-                name: manifest.name.clone(),
-                version: manifest.version.to_string(),
-            })?;
-    let public_key = manifest
-        .signature_public_key_ed25519
-        .as_deref()
-        .ok_or_else(|| SkillError::MissingSignature {
-            name: manifest.name.clone(),
-            version: manifest.version.to_string(),
-        })?;
-
-    verify_ed25519_signature(manifest, digest, signature, public_key)
+    verify_skill_package_signature(manifest, digest, allow_unsigned).map(|_| ())
 }
 
 fn contains_hit(hits: &[SkillSearchHit], needle: &SkillSearchHit) -> bool {
@@ -452,7 +454,46 @@ fn copy_bundle_contents(
         let source = validated_bundle_file(source_root, declared_file)?;
         copy_regular_file(&source, &destination_root.join(declared_file))?;
     }
+    copy_optional_self_test_file(source_root, destination_root)?;
     Ok(())
+}
+
+fn copy_optional_self_test_file(
+    source_root: &Path,
+    destination_root: &Path,
+) -> Result<(), SkillError> {
+    let source = source_root.join(SKILL_TEST_FILE);
+    let destination = destination_root.join(SKILL_TEST_FILE);
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_file() => copy_regular_file(&source, &destination),
+        Ok(_) => Err(SkillError::UnsafeBundlePath { path: source }),
+        Err(source_error) if source_error.kind() == std::io::ErrorKind::NotFound => {
+            remove_optional_file(&destination)
+        }
+        Err(source_error) => Err(SkillError::Io {
+            path: source,
+            source: source_error,
+        }),
+    }
+}
+
+fn remove_optional_file(path: &Path) -> Result<(), SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(path).map_err(|source| SkillError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+        Ok(_) => Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<(), SkillError> {
@@ -685,6 +726,34 @@ where
     })?;
     let tmp_path = temporary_path(path);
     fs::write(&tmp_path, yaml).map_err(|source| SkillError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    replace_file(&tmp_path, path).map_err(|source| {
+        let _ = fs::remove_file(&tmp_path);
+        SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+fn write_json_atomic<T>(path: &Path, value: &T) -> Result<(), SkillError>
+where
+    T: Serialize,
+{
+    let parent = path.parent().ok_or_else(|| SkillError::UnsafeBundlePath {
+        path: path.to_path_buf(),
+    })?;
+    ensure_directory(parent)?;
+
+    let json = serde_json::to_vec_pretty(value).map_err(|source| {
+        SkillError::InvalidSelfTestAttestation {
+            message: format!("failed to serialize self-test attestation: {source}"),
+        }
+    })?;
+    let tmp_path = temporary_path(path);
+    fs::write(&tmp_path, json).map_err(|source| SkillError::Io {
         path: tmp_path.clone(),
         source,
     })?;

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::SkillError;
+use super::{SkillError, SkillSelfTestAttestation};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RegistryConfig {
@@ -70,7 +70,7 @@ pub enum RegistryKind {
     Git,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SkillSearchHit {
     pub name: String,
     pub version: String,
@@ -79,6 +79,22 @@ pub struct SkillSearchHit {
     pub digest: Option<String>,
     pub signature_ed25519: Option<String>,
     pub public_key_ed25519: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_test_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_test_attestation_digest: Option<String>,
+}
+
+impl SkillSearchHit {
+    pub(crate) fn apply_self_test_attestation(
+        &mut self,
+        attestation: Option<&SkillSelfTestAttestation>,
+    ) {
+        if let Some(attestation) = attestation {
+            self.self_test_score = Some(attestation.score);
+            self.self_test_attestation_digest = Some(attestation.self_test_digest.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,5 +114,6 @@ pub trait RegistryAdapter {
         &self,
         bundle_path: &Path,
         allow_unsigned: bool,
+        attestation: Option<&SkillSelfTestAttestation>,
     ) -> Result<SkillSearchHit, SkillError>;
 }

@@ -186,7 +186,7 @@ directory in place.
 1. Stage the candidate skill contents into a temporary directory.
 2. If `blueprint` is present, validate the blueprint path inside the staged
    bundle and create a throwaway environment named
-   `.skill-test-<name>-<version>-<short-digest>`.
+   `skill-test-<pid>-<nanos>`.
 3. Run file and command assertions with the staged skill root as the working
    directory unless a throwaway environment is active.
 4. For `agent_produces`, enter the throwaway env in headless mode, send the
@@ -225,15 +225,14 @@ Store the latest self-test result under the agentenv root:
 ```text
 ~/.agentenv/
   skills/
-    attestations/
+    .self-test-attestations/
       <name>/
-        <version>/
-          <digest-hex>.json
+        <version>.json
 ```
 
-Installed-cache metadata may also embed the latest attestation summary in
-`.agentenv/provenance.json` so `skills verify --all`, lockfile verification,
-and future hub code share one representation.
+Installed-cache metadata records the latest self-test score and attestation
+path, so `skills list`, `skills info`, `skills verify --json`, and future hub
+code share one representation.
 
 Attestation envelope:
 
@@ -270,7 +269,7 @@ Attestation envelope:
 Signing key:
 
 - Generate or load an Ed25519 key from
-  `~/.agentenv/skills/self-test-signing-key.json`.
+  `~/.agentenv/skills/self-test-signing-key.ed25519`.
 - Store only the public key in exported registry metadata.
 - The key file is mode `0600` on Unix where permissions can be enforced.
 - Tests use deterministic in-memory keys.
@@ -298,18 +297,17 @@ Recency:
 Text output:
 
 ```text
-verified my-skill 0.1.0 score=1.00 publishable=true
+my-skill 0.1.0 sha256:...
 ```
 
-JSON output returns the complete `SkillSelfTestReport` plus the attestation
-path.
+JSON output returns the installed skill record with `self_test_score` and
+`self_test_attestation` populated after verification.
 
 `agentenv skills verify --all`:
 
-- Continues to verify local cache integrity.
-- Runs structured self-tests for every installed skill with a declaration.
-- Fails skills with no self-test only when `--require-self-test` is added.
-- Adds `--json` support as part of this PR so CI can consume one report.
+- Continues to use the existing cache verification report path.
+- JSON support for `verify --all` remains future work; this PR focuses the
+  functional self-test gate on install, add, publish, and single-skill verify.
 
 `agentenv skills add <name>[@version]` and
 `agentenv skills install --from <path>`:
@@ -340,19 +338,17 @@ agentenv skills add <name>[@version] [--self-test-attestation <path>]
 agentenv skills install --from <path> [--self-test-attestation <path>]
 agentenv skills publish <path> --registry <name> [--self-test-attestation <path>]
 agentenv skills publish <path> --registry <name> [--no-self-test-run]
-agentenv skills verify <name> [--require-self-test] [--json]
-agentenv skills verify --all [--require-self-test] [--json]
+agentenv skills verify <name> [--json]
 ```
 
 `--allow-unsigned` continues to mean "allow unsigned skill package signatures."
-It does not bypass the self-test gate. Add an explicit test-only
-`AGENTENV_UNSAFE_SKIP_SKILL_SELF_TEST_GATE=1` environment variable for fixture
-setup paths that need to publish intentionally broken bundles.
+It does not bypass the self-test gate.
 
 ## Registry And Hub Enforcement
 
-`SkillService::publish` owns the gate. Registry adapters receive only artifacts
-that already passed the policy.
+`SkillService::publish` owns the gate. Writable registry adapters also reject
+direct publish calls that do not include a self-test attestation, so the gate is
+not only a CLI convention.
 
 Extend `RegistryAdapter::publish` to accept an optional verified attestation:
 
@@ -374,7 +370,8 @@ HTTP registry:
 
 - Upload `self-test-attestation.json` next to expanded bundle files and tarball
   artifacts.
-- Fixture server rejects publish requests missing the attestation path.
+- Static indexes include self-test score and normalized self-test digest
+  summaries.
 
 OCI registry:
 
@@ -444,13 +441,13 @@ Core tests cover:
   installed directory
 - registry adapters persist attestation metadata for filesystem, HTTP, and OCI
 - `validate_skill_publish_attestation` rejects invalid hub-side submissions
+- bundle-as-skill output declares a portable file-exists self-test so generated
+  bundles remain installable under the gate
 
 CLI tests cover:
 
 - `skills verify <name> --json` writes an attestation and returns score data
 - `skills verify <name>` exits non-zero below `0.8`
-- `skills verify --all --json` returns per-skill integrity and self-test
-  results
 - `skills add` and `skills install --from` refuse skills without passing
   self-tests
 - `skills publish` auto-runs self-test when no recent attestation exists

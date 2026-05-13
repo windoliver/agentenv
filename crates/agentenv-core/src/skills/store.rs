@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_yaml::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use super::signature::verify_skill_package_signature;
 use super::{
     compute_bundle_digest, index, load_skill_self_test_spec,
     manifest::{normalize_bundle_path, validated_bundle_file},
@@ -23,6 +24,7 @@ const MANIFEST_FILE: &str = "skill.yaml";
 const SKILL_TEST_FILE: &str = "skill-test.yaml";
 const CONTENT_DIR: &str = "content";
 const SIGNATURE_STATUS_UNSIGNED: &str = "unsigned";
+const SIGNATURE_STATUS_SIGNED: &str = "signed";
 const SELF_TEST_KEY_FILE: &str = "self-test-signing-key.ed25519";
 const SELF_TEST_ATTESTATIONS_DIR: &str = ".self-test-attestations";
 
@@ -108,13 +110,12 @@ pub(crate) fn install_local_skill_with_runner(
     let manifest = super::load_skill_manifest(bundle)?;
     let digest = compute_bundle_digest(bundle, &manifest)?;
 
-    let signature_status = if options.allow_unsigned {
-        SIGNATURE_STATUS_UNSIGNED.to_owned()
+    let signature_public_key_ed25519 =
+        verify_skill_package_signature(&manifest, &digest, options.allow_unsigned)?;
+    let signature_status = if signature_public_key_ed25519.is_some() {
+        SIGNATURE_STATUS_SIGNED.to_owned()
     } else {
-        return Err(SkillError::MissingSignature {
-            name: manifest.name,
-            version: manifest.version.to_string(),
-        });
+        SIGNATURE_STATUS_UNSIGNED.to_owned()
     };
 
     let version = manifest.version.to_string();
@@ -154,7 +155,7 @@ pub(crate) fn install_local_skill_with_runner(
         source_label: options.source_label,
         digest,
         signature_status,
-        signature_public_key_ed25519: None,
+        signature_public_key_ed25519,
         entry: PathBuf::from(CONTENT_DIR).join(&manifest.entry),
         installed_at: installed_at_now(),
         path: install_dir.clone(),
@@ -189,6 +190,18 @@ pub(crate) fn install_local_skill_with_runner(
     index::rebuild(root)?;
 
     Ok(installed)
+}
+
+pub(crate) fn install_local_skill_with_attestation(
+    root: impl AsRef<Path>,
+    bundle: impl AsRef<Path>,
+    mut options: SkillInstallOptions,
+    attestation: &SkillSelfTestAttestation,
+) -> Result<InstalledSkill, SkillError> {
+    options.unsafe_skip_self_test_gate = true;
+    let root = root.as_ref();
+    let installed = install_local_skill(root, bundle, options)?;
+    record_self_test_attestation(root, installed, attestation)
 }
 
 pub fn list_installed_skills(root: impl AsRef<Path>) -> Result<Vec<InstalledSkill>, SkillError> {
@@ -369,6 +382,28 @@ pub fn read_self_test_attestation(path: &Path) -> Result<SkillSelfTestAttestatio
     serde_json::from_str(&content).map_err(|source| SkillError::InvalidSelfTestAttestation {
         message: format!("failed to parse `{}`: {source}", path.display()),
     })
+}
+
+fn record_self_test_attestation(
+    root: &Path,
+    mut installed: InstalledSkill,
+    attestation: &SkillSelfTestAttestation,
+) -> Result<InstalledSkill, SkillError> {
+    if attestation.subject.name != installed.name
+        || attestation.subject.version != installed.version
+    {
+        return Err(SkillError::SelfTestAttestationSubjectMismatch);
+    }
+    if attestation.subject.digest != installed.digest {
+        return Err(SkillError::SelfTestAttestationDigestMismatch);
+    }
+
+    let attestation_path = write_self_test_attestation(root, attestation)?;
+    installed.self_test_score = Some(attestation.score);
+    installed.self_test_attestation = Some(attestation_path);
+    index::write_record(&index::installed_record_path(&installed.path), &installed)?;
+    index::rebuild(root)?;
+    Ok(installed)
 }
 
 fn verify_signature_if_required(
@@ -562,6 +597,7 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::ConflictingSelfTestDeclarations { .. }
         | SkillError::SelfTestTimeout { .. }
         | SkillError::SelfTestScoreBelowThreshold { .. }
+        | SkillError::MissingSelfTestAttestation
         | SkillError::InvalidSelfTestSigningKey { .. }
         | SkillError::InvalidSelfTestAttestation { .. }
         | SkillError::SelfTestAttestationSubjectMismatch

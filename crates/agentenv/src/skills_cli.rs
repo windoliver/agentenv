@@ -61,6 +61,8 @@ pub struct SkillsAddArgs {
     pub registry: Option<String>,
     #[arg(long)]
     pub allow_unsigned: bool,
+    #[arg(long, value_name = "PATH")]
+    pub self_test_attestation: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -71,6 +73,8 @@ pub struct SkillsInstallArgs {
     pub from: PathBuf,
     #[arg(long)]
     pub allow_unsigned: bool,
+    #[arg(long, value_name = "PATH")]
+    pub self_test_attestation: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -108,6 +112,10 @@ pub struct SkillsPublishArgs {
     pub registry: Option<String>,
     #[arg(long)]
     pub allow_unsigned: bool,
+    #[arg(long, value_name = "PATH")]
+    pub self_test_attestation: Option<PathBuf>,
+    #[arg(long)]
+    pub no_self_test_run: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -336,6 +344,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                     handle: args.handle,
                     registry: None,
                     allow_unsigned: args.allow_unsigned,
+                    self_test_attestation: args.self_test_attestation,
                 })
                 .await?;
             print_installed_result(&installed, args.json)
@@ -345,6 +354,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                 &args.from,
                 args.allow_unsigned,
                 format!("local:{}", args.from.display()),
+                args.self_test_attestation.as_deref(),
             )?;
             print_installed_result(&installed, args.json)
         }
@@ -379,6 +389,8 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                     bundle_path: args.path,
                     registry: None,
                     allow_unsigned: args.allow_unsigned,
+                    self_test_attestation: args.self_test_attestation,
+                    no_self_test_run: args.no_self_test_run,
                 })
                 .await?;
             if args.json {

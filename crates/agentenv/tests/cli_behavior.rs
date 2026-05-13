@@ -1065,7 +1065,7 @@ fn skills_install_list_info_verify_and_remove_local_bundle() {
     fs::write(bundle.join("SKILL.md"), "# CLI Skill\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
 
@@ -1134,7 +1134,7 @@ fn skills_search_add_and_publish_use_filesystem_registry_config() {
     fs::write(bundle.join("SKILL.md"), "# Registry Skill\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
     fs::write(
@@ -1191,7 +1191,7 @@ fn skills_registry_cli_path_override_publishes_searches_and_adds() {
     fs::write(bundle.join("SKILL.md"), "# Override Skill\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: override-skill\nversion: 0.1.0\ndescription: Override demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: override-skill\nversion: 0.1.0\ndescription: Override demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
 
@@ -1248,6 +1248,57 @@ fn skills_registry_cli_path_override_publishes_searches_and_adds() {
         add_json["source_label"],
         "filesystem:cli:override-skill@0.1.0"
     );
+}
+
+#[test]
+fn skills_publish_can_use_supplied_self_test_attestation_without_rerun() {
+    let temp_dir = make_temp_dir("skills-cli-publish-supplied-self-test-attestation");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    write_local_skill_bundle(
+        &bundle,
+        "supplied-attestation-skill",
+        "0.1.0",
+        "Supplied attestation",
+        Some("test -f SKILL.md"),
+    );
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+    let installed: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+    let attestation_path = installed["self_test_attestation"].as_str().unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--self-test-attestation")
+        .arg(attestation_path)
+        .arg("--no-self-test-run")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+    let published: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(published["self_test_score"], 1.0);
+    assert!(registry
+        .join("bundles/supplied-attestation-skill/0.1.0/self-test-attestation.json")
+        .is_file());
 }
 
 #[test]
@@ -1392,7 +1443,7 @@ fn skills_publish_reports_git_registry_override_as_read_only() {
     fs::write(bundle.join("SKILL.md"), "# Git Publish\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: git-publish-cli\nversion: 0.1.0\ndescription: Git publish CLI\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: git-publish-cli\nversion: 0.1.0\ndescription: Git publish CLI\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
 
@@ -1611,6 +1662,11 @@ fn skills_cli_enforces_trust_self_tests_version_selectors_and_remove_confirmatio
     );
     let verify_new_json: serde_json::Value = serde_json::from_slice(&verify_new.stdout).unwrap();
     assert_eq!(verify_new_json["version"], "0.2.0");
+    assert_eq!(verify_new_json["self_test_score"], 1.0);
+    assert!(verify_new_json["self_test_attestation"]
+        .as_str()
+        .unwrap()
+        .ends_with(".json"));
 
     let remove_without_yes = Command::new(agentenv_bin())
         .arg("skills")
@@ -4632,7 +4688,7 @@ fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, d
     fs::write(
         bundle.join("skill.yaml"),
         format!(
-            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
         ),
     )
     .unwrap();
@@ -4661,7 +4717,7 @@ fn write_indexless_filesystem_registry_skill(
     fs::write(
         bundle.join("skill.yaml"),
         format!(
-            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
         ),
     )
     .unwrap();

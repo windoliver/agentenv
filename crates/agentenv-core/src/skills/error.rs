@@ -80,6 +80,8 @@ pub enum SkillError {
     SelfTestTimeout { timeout_seconds: u64 },
     #[error("skill self-test score {score:.3} is below required threshold {threshold:.3}")]
     SelfTestScoreBelowThreshold { score: f64, threshold: f64 },
+    #[error("missing signed self-test attestation for skill publish")]
+    MissingSelfTestAttestation,
     #[error("invalid skill self-test signing key at `{path}`")]
     InvalidSelfTestSigningKey { path: PathBuf },
     #[error("invalid skill self-test attestation: {message}")]
