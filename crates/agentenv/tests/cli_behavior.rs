@@ -2139,7 +2139,7 @@ fn skills_propose_does_not_follow_provider_redirect_to_metadata_endpoint() {
         .env("HOME", &temp_dir)
         .env("AGENTENV_DISABLE_KEYRING", "1")
         .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
-        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "500")
         .env(
             "AGENTENV_TEST_SKILL_PROPOSER_REDIRECT_TOKEN",
             "redirect-token",
@@ -6865,13 +6865,16 @@ fn spawn_redirecting_skill_proposer(
             .unwrap();
         let _request = read_http_request(&mut stream);
         let body = format!("redirecting to metadata: {location}");
-        write!(
-            stream,
+        let response = format!(
             "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
-        )
-        .unwrap();
+        );
+        match stream.write_all(response.as_bytes()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write redirecting test response: {error}"),
+        }
     });
 
     (endpoint, request_count, handle)
