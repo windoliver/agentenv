@@ -29,7 +29,7 @@ rustix = { version = "1.1", features = ["fs"] }
 sha2.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
-rand_core.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
 dirs.workspace = true
 libc.workspace = true
 windows-sys.workspace = true

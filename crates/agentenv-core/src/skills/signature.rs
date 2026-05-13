@@ -92,6 +92,35 @@ pub fn verify_ed25519_signature(
         })
 }
 
+pub(crate) fn verify_skill_package_signature(
+    manifest: &SkillManifest,
+    digest: &str,
+    allow_unsigned: bool,
+) -> Result<Option<String>, SkillError> {
+    if allow_unsigned {
+        return Ok(None);
+    }
+
+    let signature =
+        manifest
+            .signature_ed25519
+            .as_deref()
+            .ok_or_else(|| SkillError::MissingSignature {
+                name: manifest.name.clone(),
+                version: manifest.version.to_string(),
+            })?;
+    let public_key = manifest
+        .signature_public_key_ed25519
+        .as_deref()
+        .ok_or_else(|| SkillError::MissingSignature {
+            name: manifest.name.clone(),
+            version: manifest.version.to_string(),
+        })?;
+
+    verify_ed25519_signature(manifest, digest, signature, public_key)?;
+    Ok(Some(public_key.to_owned()))
+}
+
 fn invalid_signature(manifest: &SkillManifest, source: impl std::fmt::Display) -> SkillError {
     SkillError::InvalidSignature {
         name: manifest.name.clone(),

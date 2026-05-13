@@ -14,21 +14,28 @@ use url::Url;
 
 use crate::security::ssrf::{validate_outbound, SsrfOptions};
 
+use super::signature::verify_skill_package_signature;
 use super::{
     compute_bundle_digest,
     manifest::{normalize_bundle_path, validated_bundle_file},
-    validate_skill_name, verify_ed25519_signature, FetchedSkill, RegistryAdapter, SkillError,
-    SkillManifest, SkillSearchHit,
+    validate_skill_name, FetchedSkill, RegistryAdapter, SkillError, SkillManifest, SkillSearchHit,
+    SkillSelfTestAttestation,
 };
 
 const OCI_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const AGENTENV_SKILL_CONFIG: &str = "application/vnd.agentenv.skill.config.v1+json";
 const AGENTENV_SKILL_MANIFEST: &str = "application/vnd.agentenv.skill.manifest.v1+yaml";
 const AGENTENV_SKILL_FILE: &str = "application/vnd.agentenv.skill.file.v1";
+const AGENTENV_SKILL_SELF_TEST_ATTESTATION: &str =
+    "application/vnd.agentenv.skill.self-test-attestation.v1+json";
 const AGENTENV_SKILLS_INDEX: &str = "application/vnd.agentenv.skills.index.v1+yaml";
 const SKILL_PATH_ANNOTATION: &str = "io.agentenv.skill.path";
+const OCI_ANNOTATION_SELF_TEST_SCORE: &str = "dev.agentenv.skill.self-test.score";
+const OCI_ANNOTATION_SELF_TEST_DIGEST: &str = "dev.agentenv.skill.self-test.digest";
+const OCI_ANNOTATION_SELF_TEST_COMPLETED_AT: &str = "dev.agentenv.skill.self-test.completed-at";
 const INDEX_TAG: &str = "skills-index";
 const MANIFEST_FILE: &str = "skill.yaml";
+const SKILL_TEST_FILE: &str = "skill-test.yaml";
 const SOURCE_TYPE: &str = "oci";
 
 #[derive(Debug, Clone)]
@@ -204,6 +211,8 @@ impl OciRegistryAdapter {
             digest: Some(digest),
             signature_ed25519: manifest.signature_ed25519.clone(),
             public_key_ed25519: manifest.signature_public_key_ed25519.clone(),
+            self_test_score: None,
+            self_test_attestation_digest: None,
         }
     }
 
@@ -490,12 +499,15 @@ impl RegistryAdapter for OciRegistryAdapter {
         &self,
         bundle_path: &Path,
         allow_unsigned: bool,
+        attestation: Option<&SkillSelfTestAttestation>,
     ) -> Result<SkillSearchHit, SkillError> {
         let manifest = super::load_skill_manifest(bundle_path)?;
         let digest = compute_bundle_digest(bundle_path, &manifest)?;
         verify_publish_signature(&manifest, &digest, allow_unsigned)?;
+        let attestation = attestation.ok_or(SkillError::MissingSelfTestAttestation)?;
         let version = manifest.version.to_string();
-        let hit = self.hit_for_manifest(&manifest, digest.clone());
+        let mut hit = self.hit_for_manifest(&manifest, digest.clone());
+        hit.apply_self_test_attestation(Some(attestation));
         let mut index = self.read_index().await?;
 
         if let Some(existing) = index
@@ -528,6 +540,13 @@ impl RegistryAdapter for OciRegistryAdapter {
             .upload_blob(AGENTENV_SKILL_MANIFEST, manifest_bytes)
             .await?;
         let mut layers = vec![manifest_layer];
+        if let Some(bytes) = read_optional_regular_file(&bundle_path.join(SKILL_TEST_FILE))? {
+            let mut descriptor = self.upload_blob(AGENTENV_SKILL_FILE, bytes).await?;
+            descriptor
+                .annotations
+                .insert(SKILL_PATH_ANNOTATION.to_owned(), SKILL_TEST_FILE.to_owned());
+            layers.push(descriptor);
+        }
         for declared_file in &manifest.declared_files {
             let source = validated_bundle_file(bundle_path, declared_file)?;
             let bytes = read_regular_file(&source)?;
@@ -538,6 +557,29 @@ impl RegistryAdapter for OciRegistryAdapter {
             );
             layers.push(descriptor);
         }
+        let mut descriptor = self
+            .upload_blob(
+                AGENTENV_SKILL_SELF_TEST_ATTESTATION,
+                serde_json::to_vec_pretty(attestation).map_err(|source| {
+                    SkillError::InvalidSelfTestAttestation {
+                        message: format!("failed to serialize self-test attestation: {source}"),
+                    }
+                })?,
+            )
+            .await?;
+        descriptor.annotations.insert(
+            OCI_ANNOTATION_SELF_TEST_SCORE.to_owned(),
+            attestation.score.to_string(),
+        );
+        descriptor.annotations.insert(
+            OCI_ANNOTATION_SELF_TEST_DIGEST.to_owned(),
+            attestation.self_test_digest.clone(),
+        );
+        descriptor.annotations.insert(
+            OCI_ANNOTATION_SELF_TEST_COMPLETED_AT.to_owned(),
+            attestation.completed_at.to_string(),
+        );
+        layers.push(descriptor);
         self.put_manifest(
             &skill_tag(&manifest.name, &version),
             OciImageManifest {
@@ -632,27 +674,7 @@ fn verify_publish_signature(
     digest: &str,
     allow_unsigned: bool,
 ) -> Result<(), SkillError> {
-    if allow_unsigned {
-        return Ok(());
-    }
-
-    let signature =
-        manifest
-            .signature_ed25519
-            .as_deref()
-            .ok_or_else(|| SkillError::MissingSignature {
-                name: manifest.name.clone(),
-                version: manifest.version.to_string(),
-            })?;
-    let public_key = manifest
-        .signature_public_key_ed25519
-        .as_deref()
-        .ok_or_else(|| SkillError::MissingSignature {
-            name: manifest.name.clone(),
-            version: manifest.version.to_string(),
-        })?;
-
-    verify_ed25519_signature(manifest, digest, signature, public_key)
+    verify_skill_package_signature(manifest, digest, allow_unsigned).map(|_| ())
 }
 
 fn sha256_digest(content: &[u8]) -> String {
@@ -713,6 +735,20 @@ fn write_file(path: &Path, content: &[u8]) -> Result<(), SkillError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn read_optional_regular_file(path: &Path) -> Result<Option<Vec<u8>>, SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => read_regular_file(path).map(Some),
+        Ok(_) => Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(unix)]

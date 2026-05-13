@@ -322,7 +322,7 @@ fn verify_all_accepts_valid_unsigned_skill_with_file_self_test() {
     manifest.self_test = Some(SkillSelfTest {
         timeout_seconds: 5,
         assertions: vec![SkillSelfTestAssertion::FileExists {
-            path: "SKILL.md".to_owned(),
+            path: "SKILL.md".into(),
         }],
     });
     write_manifest(&skill_dir, &manifest);
