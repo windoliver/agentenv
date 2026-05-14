@@ -96,7 +96,7 @@ Response:
       "supports_syscall_filter": true,
       "supports_native_inference_routing": true,
       "supports_remote_host": true,
-      "supports_host_egress_proxy": true,
+      "supports_host_egress_proxy": false,
       "supports_persistent_sessions": true,
       "supports_dns_egress_control": false,
       "supports_snapshots": false,
