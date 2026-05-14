@@ -151,6 +151,8 @@ pub struct SandboxCapabilities {
     pub supports_native_inference_routing: bool,
     pub supports_remote_host: bool,
     #[serde(default)]
+    pub supports_host_egress_proxy: bool,
+    #[serde(default)]
     pub supports_persistent_sessions: bool,
     #[serde(default)]
     pub supports_dns_egress_control: bool,
@@ -803,6 +805,22 @@ pub struct ApprovalDecisionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_capabilities_default_missing_host_egress_proxy_to_false() {
+        let json = serde_json::json!({
+            "supports_hot_reload_policy": true,
+            "supports_filesystem_lockdown": false,
+            "supports_syscall_filter": false,
+            "supports_native_inference_routing": true,
+            "supports_remote_host": false
+        });
+
+        let caps: SandboxCapabilities =
+            serde_json::from_value(json).expect("capabilities deserialize");
+
+        assert!(!caps.supports_host_egress_proxy);
+    }
 
     #[test]
     fn approval_kind_accepts_package_install_wire_value() {

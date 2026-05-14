@@ -1,4 +1,4 @@
-# agentenv Driver Protocol (v1.2 draft)
+# agentenv Driver Protocol (v1.3 draft)
 
 > JSON-RPC 2.0 over stdio. LSP-style framing. One contract for built-in Rust drivers and subprocess drivers in any language.
 
@@ -34,7 +34,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
 
 ```json
 {
-  "schema_version": "1.2",
+  "schema_version": "1.3",
   "name": "microvm",
   "kind": "sandbox",
   "version": "0.1.0",
@@ -48,6 +48,7 @@ Every subprocess driver ships with a `manifest.json` at the root of its install 
     "supports_syscall_filter": true,
     "supports_native_inference_routing": false,
     "supports_remote_host": false,
+    "supports_host_egress_proxy": false,
     "supports_persistent_sessions": false,
     "supports_dns_egress_control": false,
     "supports_snapshots": true,
@@ -68,7 +69,7 @@ Installed to `~/.agentenv/drivers/<name>/manifest.json`. The core discovers it a
   "id": 1,
   "method": "initialize",
   "params": {
-    "schema_version": "1.2",
+    "schema_version": "1.3",
     "core_version": "0.1.0",
     "workdir": "/home/alice/.agentenv/runs/myapp-01HXY",
     "log_level": "info"
@@ -87,7 +88,7 @@ Response:
       "name": "openshell",
       "kind": "sandbox",
       "version": "0.1.0",
-      "protocol_version": "1.2"
+      "protocol_version": "1.3"
     },
     "capabilities": {
       "supports_hot_reload_policy": true,
@@ -95,6 +96,7 @@ Response:
       "supports_syscall_filter": true,
       "supports_native_inference_routing": true,
       "supports_remote_host": true,
+      "supports_host_egress_proxy": true,
       "supports_persistent_sessions": true,
       "supports_dns_egress_control": false,
       "supports_snapshots": false,
@@ -145,6 +147,27 @@ Each driver kind (`sandbox` / `agent` / `context` / `inference`) has its own set
 | `fork_from_snapshot` | `ForkFromSnapshotParams {snapshot, spec}` | `SandboxHandle` |
 | `stop` | `{handle}` | `{}` |
 | `destroy` | `{handle}` | `{}` |
+
+Sandbox capabilities:
+
+| Capability | Type | Meaning |
+|---|---|---|
+| `supports_hot_reload_policy` | bool | Driver can apply supported policy changes without recreating the sandbox. |
+| `supports_filesystem_lockdown` | bool | Driver can enforce filesystem read-only/read-write restrictions. |
+| `supports_syscall_filter` | bool | Driver can enforce process syscall restrictions. |
+| `supports_native_inference_routing` | bool | Driver has native support for routing inference calls without an in-sandbox proxy. |
+| `supports_remote_host` | bool | Driver can connect to a sandbox hosted outside the local machine. |
+| `supports_host_egress_proxy` | bool | Driver can reach a host-owned local proxy endpoint from the sandbox and accepts proxy endpoint metadata/env rewrites. |
+| `supports_persistent_sessions` | bool | Driver can provide durable attach, detach, resume, and per-session kill semantics. |
+| `supports_dns_egress_control` | bool | Driver can enforce DNS resolver allowlists, DNS bypass blocking, and DNS answer pinning. |
+| `supports_snapshots` | bool | Driver can snapshot a sandbox into an opaque driver-owned snapshot id. |
+| `supports_fork` | bool | Driver can create a sandbox from a previously produced snapshot. |
+
+Schema `1.3` adds the `supports_host_egress_proxy` sandbox capability. If
+`supports_host_egress_proxy` is false, core must not route credentials through
+the host egress broker for that sandbox. Core either uses legacy env injection
+for explicitly permitted credentials or fails closed when policy requires
+brokered egress.
 
 Schema `1.2` adds DNS egress control to `NetworkPolicy.network.dns`.
 Sandbox drivers that advertise `supports_dns_egress_control = true` must
@@ -363,6 +386,7 @@ Errors include `data` with machine-readable context when relevant (e.g., which c
 - The `1.0` schema broke the old flat `NetworkPolicy` / `NetworkRule` wire shape. Drivers must speak the four-domain policy object with `network`, `filesystem`, `process`, and `inference`, and `approval_required` replaces the old `approval` field.
 - The `1.1` schema adds rich driver activity notifications. Drivers may continue sending the legacy `event/activity` shape while adopting structured `actor`, `subject`, `result`, `trace_id`, and `extras` fields.
 - The `1.2` schema adds DNS egress policy fields, the `supports_dns_egress_control` sandbox capability, and optional sandbox `snapshot` / `fork_from_snapshot` methods gated by `supports_snapshots` and `supports_fork`.
+- The `1.3` schema adds the `supports_host_egress_proxy` sandbox capability for host-brokered egress.
 
 ## Built-in drivers
 

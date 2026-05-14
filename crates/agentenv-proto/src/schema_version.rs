@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: &str = "1.2";
+pub const SCHEMA_VERSION: &str = "1.3";
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -72,5 +72,15 @@ pub fn assert_compatible_schema_version(version: &str) -> Result<(), SchemaVersi
                 expected_major
             ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SCHEMA_VERSION;
+
+    #[test]
+    fn schema_version_is_1_3() {
+        assert_eq!(SCHEMA_VERSION, "1.3");
     }
 }
