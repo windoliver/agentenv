@@ -673,6 +673,7 @@ impl SandboxDriver for RemoteSshDriver {
                 supports_syscall_filter: false,
                 supports_native_inference_routing: false,
                 supports_remote_host: true,
+                supports_host_egress_proxy: false,
                 supports_persistent_sessions: false,
                 supports_dns_egress_control: false,
                 supports_snapshots: false,
