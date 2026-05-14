@@ -9,6 +9,7 @@ pub mod digest;
 pub mod driver;
 pub mod driver_artifact;
 pub mod driver_catalog;
+pub mod egress_proxy;
 pub mod env;
 pub mod error;
 pub mod hardening;
