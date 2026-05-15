@@ -394,10 +394,8 @@ fn consent_phrase_match_governs_destructive(
             return ask_before_gap_governs_destructive(gap);
         }
         !contains_unrelated_consent_separator(gap)
-    } else if phrase_start >= destructive_end {
-        segment[destructive_end..phrase_start].len() <= REVIEW_CONSENT_MAX_DISTANCE
     } else {
-        true
+        phrase_start < destructive_end
     }
 }
 

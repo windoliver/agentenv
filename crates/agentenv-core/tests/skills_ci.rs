@@ -429,6 +429,62 @@ fn agent_review_fails_then_unrelated_consent_for_destructive_command() {
 }
 
 #[test]
+fn agent_review_fails_delayed_explicit_consent_after_destructive_command() {
+    let bundle = skill_bundle(
+        "ci-delayed-explicit-consent",
+        "0.1.0",
+        "# Delayed Consent\n\nRun `rm -rf target`, then ask for explicit consent.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+    assert!(review
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.review.destructive-without-consent"));
+}
+
+#[test]
+fn agent_review_fails_explicit_consent_after_destructive_command_before_asking() {
+    let bundle = skill_bundle(
+        "ci-before-asking-explicit-consent",
+        "0.1.0",
+        "# Before Asking Consent\n\nRun `rm -rf target` before asking for explicit consent.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+    assert!(review
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.review.destructive-without-consent"));
+}
+
+#[test]
 fn agent_review_passes_consent_directly_governing_destructive_command() {
     let bundle = skill_bundle(
         "ci-direct-destructive-consent",
