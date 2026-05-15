@@ -301,6 +301,8 @@ pub enum RuntimeError {
     UnsupportedDriver { kind: &'static str, name: String },
     #[error("unknown policy tier `{tier}`")]
     InvalidPolicyTier { tier: String },
+    #[error("invalid policy.egress_proxy: {details}")]
+    InvalidEgressProxyPolicy { details: String },
     #[error("missing credential `{name}`")]
     MissingCredential { name: String },
     #[error("host egress proxy is required for brokered {service} credentials, but sandbox driver `{driver}` does not support it")]
@@ -2527,9 +2529,9 @@ fn explicit_egress_routes_from_policy_extra(
 
     let config: RuntimeEgressProxyConfig =
         serde_yaml::from_value(value.clone()).map_err(|source| {
-            RuntimeError::Driver(DriverError::InvalidInput {
-                message: format!("policy.egress_proxy is invalid: {source}"),
-            })
+            RuntimeError::InvalidEgressProxyPolicy {
+                details: source.to_string(),
+            }
         })?;
     Ok(ExplicitEgressRoutes {
         github: config.github,
@@ -2540,6 +2542,13 @@ fn explicit_egress_routes_from_policy_extra(
 fn mcp_proxy_source_for_context_endpoint(
     endpoint: &agentenv_proto::McpEndpoint,
 ) -> Option<McpProxySource> {
+    if !matches!(
+        endpoint.transport,
+        agentenv_proto::McpTransport::Http | agentenv_proto::McpTransport::HttpSse
+    ) {
+        return None;
+    }
+
     let upstream_url = url::Url::parse(&endpoint.url).ok()?;
     if !matches!(upstream_url.scheme(), "http" | "https") {
         return None;
@@ -4881,6 +4890,7 @@ fn runtime_error_reason_code(error: &RuntimeError) -> &'static str {
         }
         RuntimeError::Env(EnvError::InvalidName { .. })
         | RuntimeError::InvalidPolicyTier { .. }
+        | RuntimeError::InvalidEgressProxyPolicy { .. }
         | RuntimeError::Lifecycle(_)
         | RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
@@ -6493,6 +6503,7 @@ policy:
 
     struct HttpMcpContextFactory {
         tracker: Arc<AgentSetupTracker>,
+        transport: agentenv_proto::McpTransport,
     }
 
     impl DriverFactory for HttpMcpContextFactory {
@@ -6505,13 +6516,17 @@ policy:
                 agent: Box::new(AgentSetupAgentDriver {
                     tracker: Arc::clone(&self.tracker),
                 }),
-                context: Box::new(HttpMcpContextDriver),
+                context: Box::new(HttpMcpContextDriver {
+                    transport: self.transport.clone(),
+                }),
                 inference: None,
             })
         }
     }
 
-    struct HttpMcpContextDriver;
+    struct HttpMcpContextDriver {
+        transport: agentenv_proto::McpTransport,
+    }
 
     #[async_trait]
     impl ContextDriver for HttpMcpContextDriver {
@@ -6536,7 +6551,7 @@ policy:
         ) -> DriverResult<agentenv_proto::McpEndpoint> {
             Ok(agentenv_proto::McpEndpoint {
                 url: "https://mcp.example.test/rpc".to_owned(),
-                transport: agentenv_proto::McpTransport::Http,
+                transport: self.transport.clone(),
                 headers: BTreeMap::from([(
                     "authorization".to_owned(),
                     "Bearer real-upstream-token".to_owned(),
@@ -8915,6 +8930,7 @@ policy:
             .store(true, Ordering::SeqCst);
         let factory = HttpMcpContextFactory {
             tracker: Arc::clone(&tracker),
+            transport: agentenv_proto::McpTransport::Http,
         };
         let mut credentials =
             ResolvingCredentialProvider::with_value("MCP_TOKEN", "mcp-real-provider-secret");
@@ -8964,6 +8980,125 @@ policy:
                 .values()
                 .any(|value| value.contains("mcp-real-provider-secret")),
             "real MCP token must not enter the sandbox env"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_does_not_proxy_ssh_http_mcp_endpoint_even_with_https_url() {
+        let root = unique_root("agentenv-create-ssh-http-mcp-no-proxy");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: mcp-generic
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        tracker
+            .supports_host_egress_proxy
+            .store(true, Ordering::SeqCst);
+        let factory = HttpMcpContextFactory {
+            tracker: Arc::clone(&tracker),
+            transport: agentenv_proto::McpTransport::SshHttp,
+        };
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("MCP_TOKEN", "mcp-real-provider-secret");
+
+        let result = super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect("ssh+http MCP endpoint should not be proxied by host egress broker");
+
+        assert_eq!(
+            result
+                .state
+                .endpoints
+                .context_mcp
+                .as_ref()
+                .map(|endpoint| endpoint.url.as_str()),
+            Some("https://mcp.example.test/rpc")
+        );
+        let resolved_names = credentials
+            .resolved
+            .iter()
+            .map(|requirement| requirement.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(resolved_names, vec!["MCP_TOKEN"]);
+
+        let endpoint_batches = tracker
+            .mcp_config_endpoints
+            .lock()
+            .expect("mcp config endpoint tracker");
+        assert_eq!(endpoint_batches.len(), 1);
+        assert_eq!(endpoint_batches[0][0].url, "https://mcp.example.test/rpc");
+        assert_eq!(
+            endpoint_batches[0][0]
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer real-upstream-token")
+        );
+
+        let specs = tracker.create_specs.lock().expect("create spec tracker");
+        assert_eq!(
+            specs[0].env.get("MCP_TOKEN").map(String::as_str),
+            Some("mcp-real-provider-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_invalid_egress_proxy_policy_maps_to_invalid_blueprint() {
+        let root = unique_root("agentenv-create-invalid-egress-proxy-policy");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+  egress_proxy:
+    unknown: true
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        tracker
+            .supports_host_egress_proxy
+            .store(true, Ordering::SeqCst);
+        let factory = AgentSetupFactory { tracker };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        let err = super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect_err("invalid egress proxy policy should fail");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidEgressProxyPolicy { ref details }
+                if details.contains("unknown field")
+        ));
+        assert_eq!(
+            super::runtime_error_reason_code(&err),
+            crate::admission::ReasonCode::InvalidBlueprint.as_str()
         );
     }
 
