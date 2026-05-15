@@ -574,6 +574,7 @@ impl SandboxDriver for OpenShellDriver {
                 supports_syscall_filter: true,
                 supports_native_inference_routing: true,
                 supports_remote_host: true,
+                supports_host_egress_proxy: false,
                 supports_persistent_sessions: true,
                 supports_dns_egress_control: false,
                 supports_snapshots: false,
@@ -4607,6 +4608,7 @@ mod driver_tests {
         assert!(capabilities.supports_syscall_filter);
         assert!(capabilities.supports_native_inference_routing);
         assert!(capabilities.supports_remote_host);
+        assert!(!capabilities.supports_host_egress_proxy);
         assert!(capabilities.supports_persistent_sessions);
         assert!(!capabilities.supports_dns_egress_control);
     }

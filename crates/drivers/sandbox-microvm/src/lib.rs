@@ -1694,6 +1694,7 @@ impl SandboxDriver for MicroVmDriver {
                 supports_syscall_filter: true,
                 supports_native_inference_routing: false,
                 supports_remote_host: false,
+                supports_host_egress_proxy: false,
                 supports_persistent_sessions: false,
                 supports_dns_egress_control: false,
                 supports_snapshots: true,
@@ -2456,6 +2457,7 @@ mod tests {
                 assert!(capabilities.supports_syscall_filter);
                 assert!(!capabilities.supports_native_inference_routing);
                 assert!(!capabilities.supports_remote_host);
+                assert!(!capabilities.supports_host_egress_proxy);
                 assert!(!capabilities.supports_persistent_sessions);
                 assert!(capabilities.supports_snapshots);
                 assert!(capabilities.supports_fork);
