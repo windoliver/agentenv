@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod guard;
+
 use agentenv_core::security::ssrf::{
     sanitize_untrusted_url_text, validate_outbound_with_resolver, DnsResolver, SsrfBlockReason,
     SsrfBlocked, SsrfOptions, ValidatedUrl,

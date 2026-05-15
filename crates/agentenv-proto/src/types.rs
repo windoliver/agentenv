@@ -135,6 +135,92 @@ pub enum McpTransport {
     SshHttp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpApprovalMode {
+    Never,
+    PerCall,
+    PerSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpGuardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mcp_approval")]
+    pub default_approval: McpApprovalMode,
+    #[serde(default)]
+    pub tool_policies: BTreeMap<String, McpToolPolicy>,
+    #[serde(default)]
+    pub cross_tool_flows: McpCrossToolFlowPolicy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolPolicy {
+    #[serde(default)]
+    pub approval: Option<McpApprovalMode>,
+    #[serde(default, deserialize_with = "deserialize_mcp_rate_limit")]
+    pub rate_limit: Option<McpSessionRateLimit>,
+    #[serde(default)]
+    pub url_allowlist: Vec<String>,
+    #[serde(default)]
+    pub redact_args: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpCrossToolFlowPolicy {
+    #[serde(default)]
+    pub forbid_read_to_write_turns: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct McpSessionRateLimit {
+    pub calls: u32,
+}
+
+fn default_mcp_approval() -> McpApprovalMode {
+    McpApprovalMode::Never
+}
+
+fn deserialize_mcp_rate_limit<'de, D>(
+    deserializer: D,
+) -> Result<Option<McpSessionRateLimit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RateLimitWire {
+        Text(String),
+        Object { calls: u32 },
+    }
+
+    let wire = Option::<RateLimitWire>::deserialize(deserializer)?;
+    match wire {
+        Some(RateLimitWire::Text(value)) => parse_mcp_session_rate_limit(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(RateLimitWire::Object { calls }) => Ok(Some(McpSessionRateLimit { calls })),
+        None => Ok(None),
+    }
+}
+
+fn parse_mcp_session_rate_limit(value: &str) -> Result<McpSessionRateLimit, String> {
+    let (calls, scope) = value
+        .split_once('/')
+        .ok_or_else(|| "expected MCP rate limit in the form <calls>/session".to_owned())?;
+    if scope != "session" {
+        return Err("only MCP rate limits scoped to /session are supported".to_owned());
+    }
+    let calls = calls
+        .parse::<u32>()
+        .map_err(|_| "MCP rate limit calls must be an unsigned integer".to_owned())?;
+    Ok(McpSessionRateLimit { calls })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct DriverInfo {
     pub name: String,
@@ -827,5 +913,56 @@ mod tests {
         let kind: ApprovalKind =
             serde_json::from_value(serde_json::json!("package_install")).unwrap();
         assert_eq!(kind, ApprovalKind::PackageInstall);
+    }
+
+    #[test]
+    fn mcp_guard_config_parses_full_yaml() {
+        let yaml = r#"
+enabled: true
+default_approval: per-call
+tool_policies:
+  "filesystem.read":
+    approval: never
+    rate_limit: 50/session
+  "web.fetch":
+    approval: per-call
+    url_allowlist: ["api.github.com", "crates.io"]
+    redact_args: true
+  "*.write":
+    approval: per-session
+cross_tool_flows:
+  forbid_read_to_write_turns: 5
+"#;
+
+        let config: McpGuardConfig = serde_yaml::from_str(yaml).expect("config parses");
+
+        assert!(config.enabled);
+        assert_eq!(config.default_approval, McpApprovalMode::PerCall);
+        assert_eq!(
+            config.tool_policies["filesystem.read"].approval,
+            Some(McpApprovalMode::Never)
+        );
+        assert_eq!(
+            config.tool_policies["filesystem.read"].rate_limit,
+            Some(McpSessionRateLimit { calls: 50 })
+        );
+        assert_eq!(
+            config.tool_policies["web.fetch"].url_allowlist,
+            vec!["api.github.com".to_owned(), "crates.io".to_owned()]
+        );
+        assert_eq!(config.cross_tool_flows.forbid_read_to_write_turns, Some(5));
+    }
+
+    #[test]
+    fn mcp_guard_config_rejects_unknown_fields() {
+        let yaml = r#"
+enabled: true
+surprise: true
+"#;
+
+        let error = serde_yaml::from_str::<McpGuardConfig>(yaml)
+            .expect_err("unknown fields must fail closed");
+
+        assert!(error.to_string().contains("surprise"));
     }
 }
