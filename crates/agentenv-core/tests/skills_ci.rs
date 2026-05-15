@@ -9,7 +9,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use agentenv_core::skills::{
     compute_bundle_digest, load_skill_manifest, run_skill_ci, signature_payload,
     AgentProduceRequest, AgentProduceRunner, SkillCiFinding, SkillCiRequest, SkillCiSeverity,
-    SkillCiStatus, SkillCiTier, SkillCiTierStatus, SkillError,
+    SkillCiStatus, SkillCiTier, SkillCiTierReport, SkillCiTierStatus, SkillError,
 };
 
 #[test]
@@ -629,6 +629,121 @@ fn semantic_dedup_reports_high_novelty_without_snapshot() {
     assert_eq!(dedup.details.as_ref().unwrap()["novelty_score"], 0.9);
 }
 
+#[test]
+fn semantic_dedup_ignores_blank_descriptions_as_similarity_signal() {
+    let bundle = skill_bundle_without_description(
+        "ci-blank-description",
+        "0.1.0",
+        "# Blank Description\n\nInspect shell scripts for portability.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: Some(agentenv_core::skills::SkillCiRegistrySnapshot {
+            skills: vec![
+                agentenv_core::skills::SkillCiRegistrySkill {
+                    name: "empty-existing".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    description: String::new(),
+                    procedure_text: String::new(),
+                    fingerprint: None,
+                },
+                agentenv_core::skills::SkillCiRegistrySkill {
+                    name: "whitespace-existing".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    description: " \n\t ".to_owned(),
+                    procedure_text: " \n\t ".to_owned(),
+                    fingerprint: None,
+                },
+            ],
+        }),
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let dedup = semantic_dedup_tier(&report);
+    assert_eq!(dedup.status, SkillCiTierStatus::Passed);
+    assert_eq!(dedup.details.as_ref().unwrap()["novelty_score"], 0.9);
+    assert_eq!(dedup.details.as_ref().unwrap()["probable_duplicate"], false);
+}
+
+#[test]
+fn semantic_dedup_exact_fingerprint_wins_over_earlier_semantic_tie() {
+    let bundle = skill_bundle("ci-tie-copy", "0.1.0", "# Tie\n\nSummarize Rust modules.\n");
+    let digest = {
+        let manifest = agentenv_core::skills::load_skill_manifest(&bundle).unwrap();
+        agentenv_core::skills::compute_bundle_digest(&bundle, &manifest).unwrap()
+    };
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: Some(agentenv_core::skills::SkillCiRegistrySnapshot {
+            skills: vec![
+                agentenv_core::skills::SkillCiRegistrySkill {
+                    name: "semantic-tie".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    description: "Semantic tie".to_owned(),
+                    procedure_text: "# Tie\n\nSummarize Rust modules.\n".to_owned(),
+                    fingerprint: None,
+                },
+                agentenv_core::skills::SkillCiRegistrySkill {
+                    name: "exact-tie".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    description: "Exact tie".to_owned(),
+                    procedure_text: "Unrelated procedure.".to_owned(),
+                    fingerprint: Some(digest),
+                },
+            ],
+        }),
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let dedup = semantic_dedup_tier(&report);
+    let nearest_neighbor = &dedup.details.as_ref().unwrap()["nearest_neighbors"][0];
+    assert_eq!(nearest_neighbor["name"], "exact-tie");
+    assert_eq!(nearest_neighbor["reason"], "exact fingerprint match");
+}
+
+#[test]
+fn semantic_dedup_fails_high_semantic_similarity_without_fingerprint_match() {
+    let bundle = skill_bundle(
+        "ci-semantic-copy",
+        "0.1.0",
+        "# Semantic Copy\n\nSummarize Rust modules for ownership risks.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: Some(agentenv_core::skills::SkillCiRegistrySnapshot {
+            skills: vec![agentenv_core::skills::SkillCiRegistrySkill {
+                name: "semantic-existing".to_owned(),
+                version: "0.1.0".to_owned(),
+                description: "Existing semantic copy".to_owned(),
+                procedure_text: "# Semantic Copy\n\nSummarize Rust modules for ownership risks.\n"
+                    .to_owned(),
+                fingerprint: None,
+            }],
+        }),
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let dedup = semantic_dedup_tier(&report);
+    assert_eq!(dedup.status, SkillCiTierStatus::Failed);
+    assert!(dedup
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.dedup.probable-duplicate"));
+    assert_eq!(
+        dedup.details.as_ref().unwrap()["nearest_neighbors"][0]["reason"],
+        "local semantic similarity"
+    );
+}
+
 #[derive(Debug)]
 struct PanicAgentRunner;
 
@@ -642,6 +757,19 @@ fn skill_bundle(name: &str, version: &str, skill_md: &str) -> PathBuf {
     skill_bundle_with_entry(name, version, "SKILL.md", skill_md)
 }
 
+fn skill_bundle_without_description(name: &str, version: &str, skill_md: &str) -> PathBuf {
+    let root = temp_dir(&format!("skill-ci-{name}-{version}"));
+    write_file(&root.join("SKILL.md"), skill_md);
+    write_file(
+        &root.join("skill.yaml"),
+        &format!(
+            "name: {name}\nversion: {version}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
+        ),
+    );
+    sign_skill_bundle(&root);
+    root
+}
+
 fn skill_bundle_with_entry(name: &str, version: &str, entry: &str, skill_md: &str) -> PathBuf {
     let root = temp_dir(&format!("skill-ci-{name}-{version}"));
     write_file(&root.join(entry), skill_md);
@@ -653,6 +781,14 @@ fn skill_bundle_with_entry(name: &str, version: &str, entry: &str, skill_md: &st
     );
     sign_skill_bundle(&root);
     root
+}
+
+fn semantic_dedup_tier(report: &agentenv_core::skills::SkillCiReport) -> &SkillCiTierReport {
+    report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::SemanticDedup)
+        .unwrap()
 }
 
 fn sign_skill_bundle(root: &Path) {

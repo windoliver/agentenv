@@ -541,39 +541,51 @@ fn run_semantic_dedup(
     skill_md: &str,
     snapshot: Option<&SkillCiRegistrySnapshot>,
 ) -> SkillCiTierReport {
-    let mut best: Option<(SkillCiRegistrySkill, f32, String)> = None;
+    let mut best: Option<(SkillCiRegistrySkill, f32, String, bool)> = None;
     let mut novelty = 0.9_f64;
 
     if let Some(snapshot) = snapshot {
         for existing in &snapshot.skills {
             let exact_fingerprint = existing.fingerprint.as_deref() == Some(digest);
-            let similarity = if exact_fingerprint {
-                1.0
-            } else {
-                jaccard(skill_md, &existing.procedure_text).max(jaccard(
+            let semantic_similarity = [
+                text_similarity(skill_md, &existing.procedure_text),
+                text_similarity(
                     manifest.description.as_deref().unwrap_or(""),
                     &existing.description,
-                ))
+                ),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(None, |best: Option<f32>, similarity| {
+                Some(best.map_or(similarity, |best| best.max(similarity)))
+            });
+
+            let (similarity, reason) = if exact_fingerprint {
+                (1.0, "exact fingerprint match".to_owned())
+            } else if let Some(similarity) = semantic_similarity {
+                (similarity, "local semantic similarity".to_owned())
+            } else {
+                continue;
             };
 
             if best
                 .as_ref()
-                .is_none_or(|(_, current, _)| similarity > *current)
+                .is_none_or(|(_, current_similarity, _, current_exact_fingerprint)| {
+                    similarity > *current_similarity
+                        || (similarity == *current_similarity
+                            && exact_fingerprint
+                            && !*current_exact_fingerprint)
+                })
             {
-                let reason = if exact_fingerprint {
-                    "exact fingerprint match".to_owned()
-                } else {
-                    "local semantic similarity".to_owned()
-                };
-                best = Some((existing.clone(), similarity, reason));
+                best = Some((existing.clone(), similarity, reason, exact_fingerprint));
             }
         }
     }
 
     let probable_duplicate = best
         .as_ref()
-        .is_some_and(|(_, similarity, _)| *similarity > 0.92);
-    if let Some((_, similarity, _)) = &best {
+        .is_some_and(|(_, similarity, _, _)| *similarity > 0.92);
+    if let Some((_, similarity, _, _)) = &best {
         novelty = if *similarity > 0.92 {
             0.0
         } else if *similarity >= 0.85 {
@@ -597,7 +609,7 @@ fn run_semantic_dedup(
 
     let nearest_neighbors: Vec<Value> = best
         .into_iter()
-        .map(|(skill, similarity, reason)| {
+        .map(|(skill, similarity, reason, _)| {
             json!({
                 "name": skill.name,
                 "version": skill.version,
@@ -615,15 +627,19 @@ fn run_semantic_dedup(
     report
 }
 
-fn jaccard(left: &str, right: &str) -> f32 {
+fn text_similarity(left: &str, right: &str) -> Option<f32> {
     let left = tokens(left);
     let right = tokens(right);
-    if left.is_empty() && right.is_empty() {
-        return 1.0;
+    if left.is_empty() || right.is_empty() {
+        return None;
     }
 
-    let intersection = left.intersection(&right).count() as f32;
-    let union = left.union(&right).count() as f32;
+    Some(jaccard_tokens(&left, &right))
+}
+
+fn jaccard_tokens(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f32 {
+    let intersection = left.intersection(right).count() as f32;
+    let union = left.union(right).count() as f32;
     if union == 0.0 {
         0.0
     } else {
