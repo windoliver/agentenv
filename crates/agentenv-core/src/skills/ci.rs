@@ -59,6 +59,18 @@ const REVIEW_UNSAFE_EXECUTION_PHRASES: &[&str] = &[
     "without consent",
     "without user consent",
 ];
+const ASK_BEFORE_DESTRUCTIVE_ACTIONS: &[&str] = &[
+    "run",
+    "running",
+    "execute",
+    "executing",
+    "delete",
+    "deleting",
+    "drop",
+    "dropping",
+    "format",
+    "formatting",
+];
 const REVIEW_CONSENT_MAX_DISTANCE: usize = 40;
 
 #[derive(Clone)]
@@ -351,6 +363,7 @@ fn consent_phrase_governs_destructive(
         let phrase_end = phrase_start + phrase.len();
         if consent_phrase_match_governs_destructive(
             segment,
+            phrase,
             phrase_end,
             phrase_start,
             destructive_start,
@@ -366,6 +379,7 @@ fn consent_phrase_governs_destructive(
 
 fn consent_phrase_match_governs_destructive(
     segment: &str,
+    phrase: &str,
     phrase_end: usize,
     phrase_start: usize,
     destructive_start: usize,
@@ -373,12 +387,62 @@ fn consent_phrase_match_governs_destructive(
 ) -> bool {
     if phrase_end <= destructive_start {
         let gap = &segment[phrase_end..destructive_start];
-        gap.len() <= REVIEW_CONSENT_MAX_DISTANCE && !gap.contains(" and ")
+        if gap.len() > REVIEW_CONSENT_MAX_DISTANCE {
+            return false;
+        }
+        if phrase == "ask before" {
+            return ask_before_gap_governs_destructive(gap);
+        }
+        !contains_unrelated_consent_separator(gap)
     } else if phrase_start >= destructive_end {
         segment[destructive_end..phrase_start].len() <= REVIEW_CONSENT_MAX_DISTANCE
     } else {
         true
     }
+}
+
+fn ask_before_gap_governs_destructive(gap: &str) -> bool {
+    if contains_unrelated_consent_separator(gap) {
+        return false;
+    }
+
+    let gap = gap.trim_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '`' | '"' | '\'' | ':' | '-' | '>')
+    });
+    gap.is_empty()
+        || ASK_BEFORE_DESTRUCTIVE_ACTIONS
+            .iter()
+            .any(|action| starts_with_word(gap, action))
+}
+
+fn contains_unrelated_consent_separator(text: &str) -> bool {
+    text.contains(',') || contains_word(text, "then") || contains_word(text, "and")
+}
+
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|tail| {
+        tail.chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    let mut cursor = 0;
+    while let Some(relative_start) = text[cursor..].find(word) {
+        let start = cursor + relative_start;
+        let end = start + word.len();
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        if before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+        cursor = end;
+    }
+
+    false
 }
 
 fn previous_char_boundary(text: &str, index: usize) -> usize {

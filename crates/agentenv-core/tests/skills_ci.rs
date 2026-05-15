@@ -373,6 +373,86 @@ fn agent_review_fails_same_sentence_unrelated_consent_for_automatic_destructive_
 }
 
 #[test]
+fn agent_review_fails_comma_then_unrelated_consent_for_destructive_command() {
+    let bundle = skill_bundle(
+        "ci-comma-then-unrelated-consent",
+        "0.1.0",
+        "# Comma Then Consent\n\nAsk before editing files, then run `rm -rf target`.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+    assert!(review
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.review.destructive-without-consent"));
+}
+
+#[test]
+fn agent_review_fails_then_unrelated_consent_for_destructive_command() {
+    let bundle = skill_bundle(
+        "ci-then-unrelated-consent",
+        "0.1.0",
+        "# Then Consent\n\nAsk before editing files then run `rm -rf target`.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+    assert!(review
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.review.destructive-without-consent"));
+}
+
+#[test]
+fn agent_review_passes_consent_directly_governing_destructive_command() {
+    let bundle = skill_bundle(
+        "ci-direct-destructive-consent",
+        "0.1.0",
+        "# Direct Consent\n\nAsk before running `rm -rf target`.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Passed);
+}
+
+#[test]
 fn agent_review_fails_api_key_variants_without_credential_language() {
     for (name, skill_md) in [
         (
