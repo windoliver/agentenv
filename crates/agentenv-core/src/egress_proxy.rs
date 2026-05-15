@@ -1,14 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    env, fs,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agentenv_proto::{CredentialRequirement, NetworkPolicy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::process::{Child, Command};
 use url::Url;
 
 const BROKERED_DUMMY_VALUE: &str = "agentenv-brokered";
+pub const EGRESS_PROXY_BIN_ENV: &str = "AGENTENV_EGRESS_PROXY_BIN";
+const DEFAULT_EGRESS_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENAI_CREDENTIAL: &str = "OPENAI_API_KEY";
 const ANTHROPIC_CREDENTIAL: &str = "ANTHROPIC_API_KEY";
 const GITHUB_CREDENTIAL: &str = "GITHUB_TOKEN";
@@ -96,10 +104,76 @@ pub struct EgressProxyPlan {
     pub redacted_policy_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressProxyLaunchConfig {
+    pub env_name: String,
+    #[serde(with = "url_serde")]
+    pub listen_url: Url,
+    pub routes: Vec<BrokerRoute>,
+    pub credential_names: Vec<String>,
+    pub policy_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressProxyLaunchFiles {
+    pub config_path: PathBuf,
+    pub policy_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct EgressProxyProcess {
+    pub pid: u32,
+    pub child: Child,
+}
+
 #[derive(Debug, Error)]
 pub enum EgressProxyPlanError {
     #[error("invalid proxy URL: {0}")]
     InvalidProxyUrl(String),
+}
+
+#[derive(Debug, Error)]
+pub enum EgressProxyLaunchError {
+    #[error("egress proxy launch file IO error at `{path}`: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to serialize egress proxy launch file `{path}`: {source}")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to locate current executable for egress proxy launch: {source}")]
+    CurrentExe {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("current executable path for egress proxy launch is not a file: `{path}`")]
+    InvalidCurrentExe { path: PathBuf },
+    #[error("egress proxy binary from {env_var} is not a file: `{path}`")]
+    InvalidProxyBinary {
+        env_var: &'static str,
+        path: PathBuf,
+    },
+    #[error("failed to spawn egress proxy process `{program}`: {source}")]
+    Spawn {
+        program: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("spawned egress proxy process did not report a pid")]
+    MissingPid,
+    #[error("failed to stop egress proxy process {pid}: {source}")]
+    Stop {
+        pid: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("timed out waiting {timeout:?} for egress proxy process {pid} to stop")]
+    StopTimeout { pid: u32, timeout: Duration },
 }
 
 impl EgressProxyPlan {
@@ -113,6 +187,114 @@ impl EgressProxyPlan {
 
     pub fn context_mcp_url(&self) -> Option<&Url> {
         self.rewritten_context_mcp_url.as_ref()
+    }
+}
+
+pub fn prepare_egress_proxy_launch_files<N>(
+    env_name: impl AsRef<str>,
+    env_dir: impl AsRef<Path>,
+    plan: &EgressProxyPlan,
+    credential_names: impl IntoIterator<Item = N>,
+    network_policy: &NetworkPolicy,
+) -> Result<EgressProxyLaunchFiles, EgressProxyLaunchError>
+where
+    N: AsRef<str>,
+{
+    let launch_dir = env_dir.as_ref().join("egress-proxy");
+    fs::create_dir_all(&launch_dir).map_err(|source| EgressProxyLaunchError::Io {
+        path: launch_dir.clone(),
+        source,
+    })?;
+
+    let config_path = launch_dir.join("config.json");
+    let policy_path = launch_dir.join("policy.json");
+    let mut credential_names = credential_names
+        .into_iter()
+        .map(|name| name.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    credential_names.sort();
+    credential_names.dedup();
+
+    let config = EgressProxyLaunchConfig {
+        env_name: env_name.as_ref().to_owned(),
+        listen_url: plan.listen_url.clone(),
+        routes: plan.routes.clone(),
+        credential_names,
+        policy_path: policy_path.clone(),
+    };
+
+    write_json_atomically(&policy_path, network_policy)?;
+    write_json_atomically(&config_path, &config)?;
+
+    Ok(EgressProxyLaunchFiles {
+        config_path,
+        policy_path,
+    })
+}
+
+pub async fn start_egress_proxy_process(
+    env_name: impl AsRef<str>,
+    config_path: impl AsRef<Path>,
+    events_db_path: impl AsRef<Path>,
+) -> Result<EgressProxyProcess, EgressProxyLaunchError> {
+    let program = egress_proxy_binary_path()?;
+    let mut command = Command::new(&program);
+    command
+        .arg("proxy")
+        .arg("run")
+        .arg("--env")
+        .arg(env_name.as_ref())
+        .arg("--config")
+        .arg(config_path.as_ref())
+        .arg("--events-db")
+        .arg(events_db_path.as_ref())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let child = command
+        .spawn()
+        .map_err(|source| EgressProxyLaunchError::Spawn {
+            program: program.clone(),
+            source,
+        })?;
+    let pid = child.id().ok_or(EgressProxyLaunchError::MissingPid)?;
+
+    Ok(EgressProxyProcess { pid, child })
+}
+
+pub async fn stop_egress_proxy_process(
+    handle: EgressProxyProcess,
+) -> Result<(), EgressProxyLaunchError> {
+    stop_egress_proxy_process_with_timeout(handle, DEFAULT_EGRESS_PROXY_STOP_TIMEOUT).await
+}
+
+pub async fn stop_egress_proxy_process_with_timeout(
+    mut handle: EgressProxyProcess,
+    timeout: Duration,
+) -> Result<(), EgressProxyLaunchError> {
+    let pid = handle.pid;
+    if handle
+        .child
+        .try_wait()
+        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if let Err(source) = handle.child.start_kill() {
+        if let Ok(Some(_)) = handle.child.try_wait() {
+            return Ok(());
+        }
+        return Err(EgressProxyLaunchError::Stop { pid, source });
+    }
+
+    match tokio::time::timeout(timeout, handle.child.wait()).await {
+        Ok(Ok(_status)) => Ok(()),
+        Ok(Err(source)) => Err(EgressProxyLaunchError::Stop { pid, source }),
+        Err(_elapsed) => Err(EgressProxyLaunchError::StopTimeout { pid, timeout }),
     }
 }
 
@@ -534,6 +716,119 @@ fn parse_route_url(value: &str) -> Result<Url, EgressProxyPlanError> {
     Url::parse(value).map_err(|err| EgressProxyPlanError::InvalidProxyUrl(err.to_string()))
 }
 
+fn write_json_atomically<T>(path: &Path, value: &T) -> Result<(), EgressProxyLaunchError>
+where
+    T: Serialize + ?Sized,
+{
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| EgressProxyLaunchError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let rendered =
+        serde_json::to_vec_pretty(value).map_err(|source| EgressProxyLaunchError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let temp_path = temporary_json_path(path)?;
+
+    let mut options = OpenOptions::new();
+    restrict_file_permissions(&mut options);
+    let mut tmp_file = options
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|source| EgressProxyLaunchError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        tmp_file.write_all(&rendered)?;
+        tmp_file.write_all(b"\n")?;
+        tmp_file.sync_all()
+    })();
+    if let Err(source) = write_result {
+        drop(tmp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(EgressProxyLaunchError::Io {
+            path: temp_path,
+            source,
+        });
+    }
+    drop(tmp_file);
+
+    fs::rename(&temp_path, path).map_err(|source| {
+        let _ = fs::remove_file(&temp_path);
+        EgressProxyLaunchError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| EgressProxyLaunchError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
+fn temporary_json_path(path: &Path) -> Result<PathBuf, EgressProxyLaunchError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| EgressProxyLaunchError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(source),
+        })?;
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "launch.json".into());
+    let temp_name = format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        timestamp.as_nanos()
+    );
+    Ok(path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(temp_name))
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_options: &mut OpenOptions) {}
+
+fn egress_proxy_binary_path() -> Result<PathBuf, EgressProxyLaunchError> {
+    if let Some(path) = env::var_os(EGRESS_PROXY_BIN_ENV).map(PathBuf::from) {
+        return validate_env_proxy_binary(path);
+    }
+
+    let path =
+        env::current_exe().map_err(|source| EgressProxyLaunchError::CurrentExe { source })?;
+    if path.as_os_str().is_empty() || !path.is_file() {
+        return Err(EgressProxyLaunchError::InvalidCurrentExe { path });
+    }
+
+    Ok(path)
+}
+
+fn validate_env_proxy_binary(path: PathBuf) -> Result<PathBuf, EgressProxyLaunchError> {
+    if path.as_os_str().is_empty() || !path.is_file() {
+        return Err(EgressProxyLaunchError::InvalidProxyBinary {
+            env_var: EGRESS_PROXY_BIN_ENV,
+            path,
+        });
+    }
+
+    Ok(path)
+}
+
 mod url_serde {
     use serde::{Deserialize, Deserializer, Serializer};
     use url::Url;
@@ -581,6 +876,12 @@ mod optional_url_serde {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
     use agentenv_proto::{
         CredentialKind, CredentialRequirement, DnsPolicy, FilesystemPolicy, InferencePolicy,
         NetworkAccessPolicy, NetworkPolicy, PolicyReloadability, ProcessPolicy,
@@ -603,6 +904,14 @@ mod tests {
             required: false,
             ..required(name)
         }
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 
     fn policy() -> NetworkPolicy {
@@ -1077,5 +1386,119 @@ mod tests {
             plan.credential_disposition("CUSTOM_TOKEN"),
             Some(CredentialDisposition::SandboxEnv)
         );
+    }
+
+    #[test]
+    fn launcher_writes_redacted_config_and_policy_files() {
+        let root = temp_dir("egress-proxy-launcher-redacted");
+        let env_dir = root.join("env");
+        fs::create_dir_all(&env_dir).expect("temp env dir should be created");
+
+        let fake_secret = "sk-real-secret";
+        let mut openai = required("OPENAI_API_KEY");
+        openai.description = fake_secret.to_owned();
+        let network_policy = policy();
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31017".parse().unwrap(),
+            credential_requirements: vec![openai],
+            network_policy: network_policy.clone(),
+            context_mcp: None,
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes::default(),
+        })
+        .expect("plan builds");
+
+        let files = prepare_egress_proxy_launch_files(
+            "demo",
+            &env_dir,
+            &plan,
+            vec!["OPENAI_API_KEY".to_owned()],
+            &network_policy,
+        )
+        .expect("launch files should be prepared");
+
+        assert_eq!(
+            files.config_path,
+            env_dir.join("egress-proxy").join("config.json")
+        );
+        assert_eq!(
+            files.policy_path,
+            env_dir.join("egress-proxy").join("policy.json")
+        );
+
+        let config_json =
+            fs::read_to_string(&files.config_path).expect("config should be readable");
+        assert!(config_json.contains("OPENAI_API_KEY"));
+        assert!(config_json.contains("openai"));
+        assert!(config_json.contains("api.openai.com"));
+        assert!(!config_json.contains(fake_secret));
+        assert!(!config_json.contains("sandbox_env"));
+
+        let config: EgressProxyLaunchConfig =
+            serde_json::from_str(&config_json).expect("config should deserialize");
+        assert_eq!(config.env_name, "demo");
+        assert_eq!(config.listen_url.as_str(), "http://127.0.0.1:31017/");
+        assert_eq!(config.policy_path, files.policy_path);
+        assert_eq!(config.credential_names, vec!["OPENAI_API_KEY"]);
+        assert!(config
+            .routes
+            .iter()
+            .any(|route| route.service == BrokerService::OpenAi));
+
+        let policy_json =
+            fs::read_to_string(&files.policy_path).expect("policy should be readable");
+        assert!(policy_json.contains("\"network\""));
+        assert!(!policy_json.contains(fake_secret));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launcher_uses_env_override_for_proxy_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct EnvVarGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let root = temp_dir("egress-proxy-launcher-env-override");
+        fs::create_dir_all(&root).expect("temp dir should be created");
+        let script_path = root.join("fake-agentenv-proxy.sh");
+        fs::write(&script_path, "#!/bin/sh\nsleep 30\n").expect("script should be written");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("script should be executable");
+        let config_path = root.join("config.json");
+        let events_db_path = root.join("events.db");
+        fs::write(&config_path, "{}").expect("config placeholder should be written");
+
+        let guard = EnvVarGuard {
+            key: EGRESS_PROXY_BIN_ENV,
+            previous: std::env::var_os(EGRESS_PROXY_BIN_ENV),
+        };
+        std::env::set_var(EGRESS_PROXY_BIN_ENV, &script_path);
+
+        let handle = start_egress_proxy_process("demo", &config_path, &events_db_path)
+            .await
+            .expect("proxy process should start");
+        assert!(handle.pid > 0);
+
+        stop_egress_proxy_process_with_timeout(handle, Duration::from_secs(2))
+            .await
+            .expect("proxy process should stop");
+
+        drop(guard);
+        let _ = fs::remove_dir_all(root);
     }
 }
