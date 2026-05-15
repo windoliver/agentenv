@@ -46,10 +46,13 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         RuntimeError::UnsupportedDriver { .. } | RuntimeError::MissingSelectedDriver { .. } => {
             ReasonCode::CapabilityMissing
         }
+        RuntimeError::HostEgressProxyUnsupported { .. } => ReasonCode::CapabilityMissing,
         RuntimeError::Lifecycle(_)
         | RuntimeError::Blueprint(_)
         | RuntimeError::Hardening(_)
         | RuntimeError::DnsPolicy(_)
+        | RuntimeError::InvalidEgressProxyPolicy { .. }
+        | RuntimeError::EgressProxyPlan(_)
         | RuntimeError::InvalidPolicyTier { .. } => ReasonCode::InvalidBlueprint,
         RuntimeError::Lockfile(_)
         | RuntimeError::PortableLockfile(_)
@@ -62,6 +65,8 @@ pub fn reason_for_error(error: &RuntimeError) -> ReasonCode {
         RuntimeError::Env(EnvError::Io { .. })
         | RuntimeError::Env(EnvError::Json { .. })
         | RuntimeError::ApprovalNotification(_)
+        | RuntimeError::EgressProxyListen { .. }
+        | RuntimeError::EgressProxyLaunch(_)
         | RuntimeError::DriverArtifact(_)
         | RuntimeError::CommandStatus { .. }
         | RuntimeError::MissingSandboxHandle { .. }

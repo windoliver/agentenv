@@ -26,3 +26,12 @@ pub mod snapshot;
 
 /// Placeholder surface for the M1 workspace scaffold.
 pub const CRATE_NAME: &str = "agentenv-core";
+
+#[cfg(test)]
+pub(crate) fn env_var_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("env var test lock")
+}

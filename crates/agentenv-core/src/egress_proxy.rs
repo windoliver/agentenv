@@ -3,6 +3,7 @@ use std::{
     env, fs,
     fs::OpenOptions,
     io::Write,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -22,6 +23,11 @@ const ANTHROPIC_CREDENTIAL: &str = "ANTHROPIC_API_KEY";
 const GITHUB_CREDENTIAL: &str = "GITHUB_TOKEN";
 const GH_CREDENTIAL: &str = "GH_TOKEN";
 const DEFAULT_MCP_CREDENTIAL: &str = "MCP_TOKEN";
+const DEFAULT_OPENAI_RATE_LIMIT: u32 = 60;
+const DEFAULT_ANTHROPIC_RATE_LIMIT: u32 = 60;
+const DEFAULT_GITHUB_RATE_LIMIT: u32 = 120;
+const DEFAULT_MCP_RATE_LIMIT: u32 = 120;
+const DEFAULT_OCI_RATE_LIMIT: u32 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredentialDisposition {
@@ -64,6 +70,8 @@ pub struct ExplicitEgressRoutes {
     pub github: bool,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub oci_registries: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rate_limits: BTreeMap<String, EgressProxyRateLimit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +97,8 @@ pub struct EgressProxyPlan {
     pub env_name: String,
     #[serde(with = "url_serde")]
     pub listen_url: Url,
+    #[serde(with = "url_serde")]
+    pub sandbox_base_url: Url,
     pub sandbox_env: BTreeMap<String, String>,
     pub routes: Vec<BrokerRoute>,
     pub credential_dispositions: BTreeMap<String, CredentialDisposition>,
@@ -102,6 +112,8 @@ pub struct EgressProxyPlan {
     pub rewritten_context_mcp_url: Option<Url>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redacted_policy_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rate_limits: BTreeMap<String, EgressProxyRateLimit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +124,13 @@ pub struct EgressProxyLaunchConfig {
     pub routes: Vec<BrokerRoute>,
     pub credential_names: Vec<String>,
     pub policy_path: PathBuf,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rate_limits: BTreeMap<String, EgressProxyRateLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressProxyRateLimit {
+    pub requests_per_minute: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,10 +183,18 @@ pub enum EgressProxyLaunchError {
         #[source]
         source: std::io::Error,
     },
+    #[error("egress proxy launch config `{path}` has invalid listen URL `{listen_url}`")]
+    InvalidListenUrl { path: PathBuf, listen_url: Url },
     #[error("egress proxy process `{program}` exited during startup with status {status}")]
     ExitedDuringStartup {
         program: PathBuf,
         status: std::process::ExitStatus,
+    },
+    #[error("egress proxy process {pid} did not listen on {listen_url} within {timeout:?}")]
+    StartupTimeout {
+        pid: u32,
+        listen_url: Url,
+        timeout: Duration,
     },
     #[error("spawned egress proxy process did not report a pid")]
     MissingPid,
@@ -226,6 +253,7 @@ where
         routes: plan.routes.clone(),
         credential_names,
         policy_path: policy_path.clone(),
+        rate_limits: rate_limits_for_routes(&plan.routes, &plan.rate_limits),
     };
 
     write_json_atomically(&policy_path, network_policy)?;
@@ -242,6 +270,12 @@ pub async fn start_egress_proxy_process(
     config_path: impl AsRef<Path>,
     events_db_path: impl AsRef<Path>,
 ) -> Result<EgressProxyProcess, EgressProxyLaunchError> {
+    let uses_proxy_bin_override = env::var_os(EGRESS_PROXY_BIN_ENV).is_some();
+    let listen_url = if uses_proxy_bin_override {
+        None
+    } else {
+        Some(read_launch_listen_url(config_path.as_ref())?)
+    };
     let program = egress_proxy_binary_path()?;
     let mut command = Command::new(&program);
     command
@@ -264,12 +298,24 @@ pub async fn start_egress_proxy_process(
             source,
         })?;
     let pid = child.id().ok_or(EgressProxyLaunchError::MissingPid)?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?
-    {
-        return Err(EgressProxyLaunchError::ExitedDuringStartup { program, status });
+    if let Some(listen_url) = listen_url {
+        wait_for_proxy_listener(
+            &mut child,
+            pid,
+            &program,
+            config_path.as_ref(),
+            &listen_url,
+            Duration::from_secs(5),
+        )
+        .await?;
+    } else {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?
+        {
+            return Err(EgressProxyLaunchError::ExitedDuringStartup { program, status });
+        }
     }
 
     Ok(EgressProxyProcess { pid, child })
@@ -325,8 +371,8 @@ pub fn build_egress_proxy_plan(
 ) -> Result<EgressProxyPlan, EgressProxyPlanError> {
     validate_proxy_base_url(&input.proxy_base_url)?;
 
-    let proxy_base_url = input.proxy_base_url;
-    let proxy_base = proxy_base_url.as_str().trim_end_matches('/').to_owned();
+    let sandbox_base_url = input.proxy_base_url;
+    let proxy_base = sandbox_base_url.as_str().trim_end_matches('/').to_owned();
     let declared_names = input
         .credential_requirements
         .iter()
@@ -410,12 +456,31 @@ pub fn build_egress_proxy_plan(
             "GITHUB_API_URL".to_owned(),
             proxy_url_string(&proxy_base, "/v1/github/api"),
         );
+        sandbox_env.insert("GIT_CONFIG_COUNT".to_owned(), "1".to_owned());
+        sandbox_env.insert(
+            "GIT_CONFIG_KEY_0".to_owned(),
+            format!(
+                "url.{}.insteadOf",
+                proxy_url_string(&proxy_base, "/v1/github/git/")
+            ),
+        );
+        sandbox_env.insert(
+            "GIT_CONFIG_VALUE_0".to_owned(),
+            "https://github.com/".to_owned(),
+        );
         routes.push(provider_route(
             "github.api",
             BrokerService::GitHub,
             "https://api.github.com",
             github_credential,
             "/v1/github/api",
+        )?);
+        routes.push(provider_route(
+            "github.git",
+            BrokerService::GitHub,
+            "https://github.com",
+            github_credential,
+            "/v1/github/git",
         )?);
     }
 
@@ -505,16 +570,51 @@ pub fn build_egress_proxy_plan(
         credential_dispositions.insert(brokered_name.clone(), CredentialDisposition::Brokered);
     }
 
+    let rate_limits = rate_limits_for_routes(&routes, &input.explicit_routes.rate_limits);
+
     Ok(EgressProxyPlan {
         env_name: input.env_name,
-        listen_url: proxy_base_url,
+        listen_url: sandbox_base_url.clone(),
+        sandbox_base_url,
         sandbox_env,
         routes,
         credential_dispositions,
         brokered_credentials,
         rewritten_context_mcp_url,
         redacted_policy_path: None,
+        rate_limits,
     })
+}
+
+fn rate_limits_for_routes(
+    routes: &[BrokerRoute],
+    overrides: &BTreeMap<String, EgressProxyRateLimit>,
+) -> BTreeMap<String, EgressProxyRateLimit> {
+    let mut limits = routes
+        .iter()
+        .map(|route| {
+            (
+                route.id.clone(),
+                EgressProxyRateLimit {
+                    requests_per_minute: default_rate_limit_for_service(&route.service),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (route_id, limit) in overrides {
+        limits.insert(route_id.clone(), limit.clone());
+    }
+    limits
+}
+
+fn default_rate_limit_for_service(service: &BrokerService) -> u32 {
+    match service {
+        BrokerService::OpenAi => DEFAULT_OPENAI_RATE_LIMIT,
+        BrokerService::Anthropic => DEFAULT_ANTHROPIC_RATE_LIMIT,
+        BrokerService::GitHub => DEFAULT_GITHUB_RATE_LIMIT,
+        BrokerService::Mcp { .. } => DEFAULT_MCP_RATE_LIMIT,
+        BrokerService::Oci { .. } => DEFAULT_OCI_RATE_LIMIT,
+    }
 }
 
 fn broker_credential(
@@ -851,6 +951,78 @@ fn validate_env_proxy_binary(path: PathBuf) -> Result<PathBuf, EgressProxyLaunch
     Ok(path)
 }
 
+fn read_launch_listen_url(path: &Path) -> Result<Url, EgressProxyLaunchError> {
+    let bytes = fs::read(path).map_err(|source| EgressProxyLaunchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let config: EgressProxyLaunchConfig =
+        serde_json::from_slice(&bytes).map_err(|source| EgressProxyLaunchError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(config.listen_url)
+}
+
+async fn wait_for_proxy_listener(
+    child: &mut Child,
+    pid: u32,
+    program: &Path,
+    config_path: &Path,
+    listen_url: &Url,
+    timeout: Duration,
+) -> Result<(), EgressProxyLaunchError> {
+    let addr = proxy_listen_socket_addr(listen_url, config_path)?;
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?
+        {
+            return Err(EgressProxyLaunchError::ExitedDuringStartup {
+                program: program.to_path_buf(),
+                status,
+            });
+        }
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(EgressProxyLaunchError::StartupTimeout {
+                pid,
+                listen_url: listen_url.clone(),
+                timeout,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn proxy_listen_socket_addr(
+    listen_url: &Url,
+    config_path: &Path,
+) -> Result<SocketAddr, EgressProxyLaunchError> {
+    let Some(host) = listen_url.host_str() else {
+        return Err(EgressProxyLaunchError::InvalidListenUrl {
+            path: config_path.to_path_buf(),
+            listen_url: listen_url.clone(),
+        });
+    };
+    let Some(port) = listen_url.port() else {
+        return Err(EgressProxyLaunchError::InvalidListenUrl {
+            path: config_path.to_path_buf(),
+            listen_url: listen_url.clone(),
+        });
+    };
+    let connect_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    format!("{connect_host}:{port}")
+        .parse()
+        .map_err(|_| EgressProxyLaunchError::InvalidListenUrl {
+            path: config_path.to_path_buf(),
+            listen_url: listen_url.clone(),
+        })
+}
+
 #[cfg(unix)]
 async fn terminate_process_pid(pid: u32) -> Result<(), EgressProxyLaunchError> {
     let status = Command::new("kill")
@@ -1130,6 +1302,7 @@ mod tests {
             explicit_routes: ExplicitEgressRoutes {
                 github: true,
                 oci_registries: ["ghcr.io".to_owned()].into_iter().collect(),
+                ..ExplicitEgressRoutes::default()
             },
         })
         .expect("plan builds");
@@ -1147,6 +1320,21 @@ mod tests {
             .iter()
             .any(|route| route.service == BrokerService::GitHub
                 && route.request_path_prefix == "/v1/github/api"));
+        assert!(plan
+            .routes
+            .iter()
+            .any(|route| route.service == BrokerService::GitHub
+                && route.request_path_prefix == "/v1/github/git"));
+        assert_eq!(
+            plan.sandbox_env.get("GIT_CONFIG_KEY_0").map(String::as_str),
+            Some("url.http://127.0.0.1:31003/v1/github/git/.insteadOf")
+        );
+        assert_eq!(
+            plan.sandbox_env
+                .get("GIT_CONFIG_VALUE_0")
+                .map(String::as_str),
+            Some("https://github.com/")
+        );
         let route = plan
             .routes
             .iter()
@@ -1173,6 +1361,7 @@ mod tests {
             explicit_routes: ExplicitEgressRoutes {
                 github: true,
                 oci_registries: BTreeSet::new(),
+                ..ExplicitEgressRoutes::default()
             },
         })
         .expect("plan builds");
@@ -1201,6 +1390,7 @@ mod tests {
             explicit_routes: ExplicitEgressRoutes {
                 github: false,
                 oci_registries: ["ghcr.io".to_owned()].into_iter().collect(),
+                ..ExplicitEgressRoutes::default()
             },
         })
         .expect("plan builds");
@@ -1321,6 +1511,7 @@ mod tests {
             explicit_routes: ExplicitEgressRoutes {
                 github: false,
                 oci_registries: ["localhost:5000".to_owned()].into_iter().collect(),
+                ..ExplicitEgressRoutes::default()
             },
         })
         .expect("plan builds");
@@ -1351,6 +1542,7 @@ mod tests {
             explicit_routes: ExplicitEgressRoutes {
                 github: false,
                 oci_registries: ["https://localhost:5000".to_owned()].into_iter().collect(),
+                ..ExplicitEgressRoutes::default()
             },
         })
         .expect("plan builds");
@@ -1389,6 +1581,7 @@ mod tests {
                 explicit_routes: ExplicitEgressRoutes {
                     github: false,
                     oci_registries: [registry.to_owned()].into_iter().collect(),
+                    ..ExplicitEgressRoutes::default()
                 },
             });
 
@@ -1416,6 +1609,7 @@ mod tests {
                 explicit_routes: ExplicitEgressRoutes {
                     github: false,
                     oci_registries: [registry.to_owned()].into_iter().collect(),
+                    ..ExplicitEgressRoutes::default()
                 },
             });
 
@@ -1546,12 +1740,136 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn launcher_writes_route_rate_limits_from_plan() {
+        let root = temp_dir("egress-proxy-launcher-rate-limits");
+        let env_dir = root.join("env");
+        fs::create_dir_all(&env_dir).expect("temp env dir should be created");
+        let mut rate_limits = BTreeMap::new();
+        rate_limits.insert(
+            "openai".to_owned(),
+            EgressProxyRateLimit {
+                requests_per_minute: 60,
+            },
+        );
+        let network_policy = policy();
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31018".parse().unwrap(),
+            credential_requirements: vec![required("OPENAI_API_KEY")],
+            network_policy: network_policy.clone(),
+            context_mcp: None,
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes {
+                rate_limits,
+                ..ExplicitEgressRoutes::default()
+            },
+        })
+        .expect("plan builds");
+
+        let files = prepare_egress_proxy_launch_files(
+            "demo",
+            &env_dir,
+            &plan,
+            vec!["OPENAI_API_KEY".to_owned()],
+            &network_policy,
+        )
+        .expect("launch files should be prepared");
+
+        let config_json =
+            fs::read_to_string(&files.config_path).expect("config should be readable");
+        let config: EgressProxyLaunchConfig =
+            serde_json::from_str(&config_json).expect("config should deserialize");
+
+        assert_eq!(
+            config
+                .rate_limits
+                .get("openai")
+                .map(|limit| limit.requests_per_minute),
+            Some(60)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launcher_writes_default_route_rate_limits() {
+        let root = temp_dir("egress-proxy-launcher-default-rate-limits");
+        let env_dir = root.join("env");
+        fs::create_dir_all(&env_dir).expect("temp env dir should be created");
+        let network_policy = policy();
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31019".parse().unwrap(),
+            credential_requirements: vec![
+                required("OPENAI_API_KEY"),
+                required("ANTHROPIC_API_KEY"),
+                required("GITHUB_TOKEN"),
+            ],
+            network_policy: network_policy.clone(),
+            context_mcp: None,
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes::default(),
+        })
+        .expect("plan builds");
+
+        let files = prepare_egress_proxy_launch_files(
+            "demo",
+            &env_dir,
+            &plan,
+            vec![
+                "OPENAI_API_KEY".to_owned(),
+                "ANTHROPIC_API_KEY".to_owned(),
+                "GITHUB_TOKEN".to_owned(),
+            ],
+            &network_policy,
+        )
+        .expect("launch files should be prepared");
+
+        let config_json =
+            fs::read_to_string(&files.config_path).expect("config should be readable");
+        let config: EgressProxyLaunchConfig =
+            serde_json::from_str(&config_json).expect("config should deserialize");
+
+        assert_eq!(
+            config
+                .rate_limits
+                .get("openai")
+                .map(|limit| limit.requests_per_minute),
+            Some(DEFAULT_OPENAI_RATE_LIMIT)
+        );
+        assert_eq!(
+            config
+                .rate_limits
+                .get("anthropic")
+                .map(|limit| limit.requests_per_minute),
+            Some(DEFAULT_ANTHROPIC_RATE_LIMIT)
+        );
+        assert_eq!(
+            config
+                .rate_limits
+                .get("github.api")
+                .map(|limit| limit.requests_per_minute),
+            Some(DEFAULT_GITHUB_RATE_LIMIT)
+        );
+        assert_eq!(
+            config
+                .rate_limits
+                .get("github.git")
+                .map(|limit| limit.requests_per_minute),
+            Some(DEFAULT_GITHUB_RATE_LIMIT)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn launcher_uses_env_override_for_proxy_binary() {
         use std::os::unix::fs::PermissionsExt;
 
         struct EnvVarGuard {
+            _lock: std::sync::MutexGuard<'static, ()>,
             key: &'static str,
             previous: Option<std::ffi::OsString>,
         }
@@ -1576,6 +1894,7 @@ mod tests {
         fs::write(&config_path, "{}").expect("config placeholder should be written");
 
         let guard = EnvVarGuard {
+            _lock: crate::env_var_test_lock(),
             key: EGRESS_PROXY_BIN_ENV,
             previous: std::env::var_os(EGRESS_PROXY_BIN_ENV),
         };

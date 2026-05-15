@@ -133,11 +133,9 @@ Sandbox drivers that advertise this capability accept these metadata keys in
 - `agentenv_egress_proxy_mode`: `loopback`, `host-gateway`, `uds`, or
   `unsupported`.
 
-OpenShell reports true and translates the proxy URL into a sandbox-reachable host or
-gateway-local endpoint. Remote SSH and microVM report false in this PR unless their
-reachable host path is implemented in the same PR. If a blueprint needs brokered
-credentials and the selected sandbox reports false, runtime rejects `create` with
-`CapabilityMissing`.
+Bundled sandbox drivers report false until they can prove a sandbox-reachable host
+or gateway-local endpoint. If a blueprint needs brokered credentials and the
+selected sandbox reports false, runtime rejects `create` with `CapabilityMissing`.
 
 The capability is additive, so older subprocess drivers deserialize missing fields as
 false and fail closed.
@@ -557,9 +555,8 @@ Use TDD for implementation. Key tests:
 ### Driver And Protocol
 
 - Sandbox capability defaults to false for older JSON.
-- OpenShell initializes with `supports_host_egress_proxy=true` once implemented.
-- Remote SSH and microVM either implement reachability or report false and fail
-  brokered create clearly.
+- OpenShell, Remote SSH, and microVM report false until they implement a verified
+  sandbox-reachable host proxy path.
 - Driver protocol docs and exported schemas include the additive capability.
 
 ### Verification Commands

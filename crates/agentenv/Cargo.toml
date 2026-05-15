@@ -24,6 +24,7 @@ agent-codex = { path = "../drivers/agent-codex" }
 agent-openclaw = { path = "../drivers/agent-openclaw" }
 anyhow.workspace = true
 async-trait.workspace = true
+axum = "0.7"
 bytes.workspace = true
 clap.workspace = true
 context-filesystem = { path = "../drivers/context-filesystem" }
@@ -39,7 +40,7 @@ inference-ollama = { path = "../drivers/inference-ollama" }
 inference-openai = { path = "../drivers/inference-openai" }
 inference-passthrough = { path = "../drivers/inference-passthrough" }
 rpassword = "7"
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
 sandbox-openshell = { path = "../drivers/sandbox-openshell" }
 sandbox-microvm = { path = "../drivers/sandbox-microvm" }
 sandbox-remote-ssh = { path = "../drivers/sandbox-remote-ssh" }

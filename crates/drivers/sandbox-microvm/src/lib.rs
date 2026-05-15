@@ -2457,6 +2457,7 @@ mod tests {
                 assert!(capabilities.supports_syscall_filter);
                 assert!(!capabilities.supports_native_inference_routing);
                 assert!(!capabilities.supports_remote_host);
+                assert!(!capabilities.supports_host_egress_proxy);
                 assert!(!capabilities.supports_persistent_sessions);
                 assert!(capabilities.supports_snapshots);
                 assert!(capabilities.supports_fork);

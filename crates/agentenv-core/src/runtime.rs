@@ -33,7 +33,7 @@ use crate::{
         build_egress_proxy_plan, prepare_egress_proxy_launch_files, start_egress_proxy_process,
         stop_egress_proxy_pid, stop_egress_proxy_process, CredentialDisposition,
         EgressProxyLaunchError, EgressProxyPlan, EgressProxyPlanInput, EgressProxyProcess,
-        ExplicitEgressRoutes, McpProxySource,
+        EgressProxyRateLimit, ExplicitEgressRoutes, McpProxySource,
     },
     env::EnvError,
 };
@@ -317,7 +317,7 @@ pub enum RuntimeError {
     #[error(transparent)]
     EgressProxyPlan(#[from] crate::egress_proxy::EgressProxyPlanError),
     #[error(transparent)]
-    EgressProxyLaunch(#[from] EgressProxyLaunchError),
+    EgressProxyLaunch(Box<EgressProxyLaunchError>),
     #[error("legacy 0.1.0 lockfiles are not portable; use `agentenv create --reproduce <lockfile>` with a companion blueprint")]
     LegacyLockfileReproduce,
     #[error("lockfile verification failed: {details}")]
@@ -357,6 +357,12 @@ pub enum RuntimeError {
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
+impl From<EgressProxyLaunchError> for RuntimeError {
+    fn from(error: EgressProxyLaunchError) -> Self {
+        Self::EgressProxyLaunch(Box::new(error))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CreateResult {
@@ -573,6 +579,35 @@ fn create_policy_for_agent_install(
         install_policy.network.allow.push(npm_rule);
     }
     install_policy
+}
+
+fn create_policy_for_egress_proxy(
+    policy: &agentenv_proto::NetworkPolicy,
+    plan: &EgressProxyPlan,
+) -> agentenv_proto::NetworkPolicy {
+    if plan.routes.is_empty() {
+        return policy.clone();
+    }
+
+    let mut sandbox_policy = policy.clone();
+    if let Some(rule) = egress_proxy_sandbox_network_rule(&plan.sandbox_base_url) {
+        if !sandbox_policy.network.allow.contains(&rule) {
+            sandbox_policy.network.allow.push(rule);
+        }
+    }
+    sandbox_policy
+}
+
+fn egress_proxy_sandbox_network_rule(url: &url::Url) -> Option<agentenv_proto::NetworkRule> {
+    let host = url.host_str()?.to_owned();
+    Some(agentenv_proto::NetworkRule {
+        target: agentenv_proto::NetworkTarget::Host {
+            host,
+            port: url.port_or_known_default(),
+            scheme: Some(url.scheme().to_owned()),
+            http_access: Some(agentenv_proto::HttpAccessLevel::Full),
+        },
+    })
 }
 
 fn agent_install_npm_registry_rule() -> agentenv_proto::NetworkRule {
@@ -1220,14 +1255,16 @@ async fn create_env_with_input(
         .await?;
 
         let supports_hot_reload_policy = supports_hot_reload_policy(&sandbox_init.capabilities);
+        let sandbox_runtime_policy = create_policy_for_egress_proxy(&policy, &egress_proxy_plan);
         let create_policy = if supports_hot_reload_policy {
-            create_policy_for_agent_install(&policy, &agent_setup)
+            create_policy_for_agent_install(&sandbox_runtime_policy, &agent_setup)
         } else {
-            policy.clone()
+            sandbox_runtime_policy.clone()
         };
         validate_runtime_dns_policy(&create_policy)?;
         ensure_dns_policy_supported(&sandbox_init.capabilities, &create_policy)?;
-        let restore_policy_after_install = supports_hot_reload_policy && create_policy != policy;
+        let restore_policy_after_install =
+            supports_hot_reload_policy && create_policy != sandbox_runtime_policy;
 
         let build_oneflight_seed = build_oneflight_seed_for_byo(
             blueprint_yaml,
@@ -1238,7 +1275,6 @@ async fn create_env_with_input(
             &resolved.blueprint.sandbox.extra,
         )?;
 
-        let sandbox_create_start = Instant::now();
         let sandbox_spec = sandbox_spec_for_create(
             name,
             &selection,
@@ -1249,8 +1285,64 @@ async fn create_env_with_input(
                 policy: Some(create_policy.clone()),
                 build_oneflight_seed,
                 resolved_hardening: resolved_hardening.as_ref(),
+                egress_proxy_sandbox_url: (!egress_proxy_plan.routes.is_empty())
+                    .then_some(&egress_proxy_plan.sandbox_base_url),
             },
         )?;
+        let mut registry_paths = temp_paths.clone();
+        let mut egress_proxy_state = None;
+        let env_dir_materialized = !egress_proxy_plan.routes.is_empty();
+        if env_dir_materialized {
+            fs::create_dir_all(paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
+                path: paths.envs_dir(),
+                source,
+            })?;
+            fs::create_dir(&env_dir).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    crate::env::EnvError::AlreadyExists {
+                        name: name.to_owned(),
+                    }
+                } else {
+                    crate::env::EnvError::Io {
+                        path: env_dir.clone(),
+                        source,
+                    }
+                }
+            })?;
+            rollback.set_final_env_dir(env_dir.clone());
+            move_registry_file(&temp_paths.blueprint_path(), &paths.blueprint_path())?;
+            move_registry_file(&temp_paths.lock_path(), &paths.lock_path())?;
+            registry_paths = paths.clone();
+
+            let launch = prepare_egress_proxy_launch_files(
+                name,
+                &env_dir,
+                &egress_proxy_plan,
+                credential_names.iter().map(String::as_str),
+                &policy,
+            )?;
+            let process = start_egress_proxy_process(
+                name,
+                &launch.config_path,
+                env_events_db_path(options, name)?,
+            )
+            .await?;
+            let proxy_pid = process.pid;
+            rollback.set_egress_proxy(process);
+            egress_proxy_state = Some(crate::env::EgressProxyState {
+                pid: Some(proxy_pid),
+                listen_url: egress_proxy_plan.listen_url.clone(),
+                config_path: launch.config_path,
+                policy_path: launch.policy_path,
+                routes: egress_proxy_plan
+                    .routes
+                    .iter()
+                    .map(|route| route.id.clone())
+                    .collect(),
+            });
+        }
+
+        let sandbox_create_start = Instant::now();
         let sandbox_handle = match set.sandbox.create(sandbox_spec).await {
             Ok(handle) => {
                 emit_runtime_event(
@@ -1296,21 +1388,21 @@ async fn create_env_with_input(
         let sandbox_handle_value = sandbox_handle.handle.clone();
         rollback.set_sandbox(set.sandbox.as_ref(), sandbox_handle_value.clone());
         record_computed_byo_image_digest(
-            &temp_paths,
+            &registry_paths,
             &options.root,
             name,
             &resolved.blueprint.sandbox.extra,
         )?;
         install_agent_in_sandbox(set.sandbox.as_ref(), &sandbox_handle_value, &agent_setup).await?;
         if restore_policy_after_install {
-            validate_runtime_dns_policy(&policy)?;
-            ensure_dns_policy_supported(&sandbox_init.capabilities, &policy)?;
+            validate_runtime_dns_policy(&sandbox_runtime_policy)?;
+            ensure_dns_policy_supported(&sandbox_init.capabilities, &sandbox_runtime_policy)?;
             let apply_policy_start = Instant::now();
             match set
                 .sandbox
                 .apply_policy(agentenv_proto::ApplyPolicyParams {
                     handle: sandbox_handle_value.clone(),
-                    policy: policy.clone(),
+                    policy: sandbox_runtime_policy.clone(),
                 })
                 .await
             {
@@ -1323,7 +1415,7 @@ async fn create_env_with_input(
                             Some(name),
                             &sandbox_handle_value,
                             "restore_after_install",
-                            &policy,
+                            &sandbox_runtime_policy,
                             elapsed_ms(apply_policy_start),
                         )
                         .with_subject_value("hot_reloaded", serde_json::json!(result.hot_reloaded)),
@@ -1338,7 +1430,7 @@ async fn create_env_with_input(
                             Some(name),
                             &sandbox_handle_value,
                             "restore_after_install",
-                            &policy,
+                            &sandbox_runtime_policy,
                             elapsed_ms(apply_policy_start),
                         )
                         .with_reason_code(
@@ -1369,7 +1461,7 @@ async fn create_env_with_input(
             }),
         };
 
-        let mut state = crate::env::EnvStateFile {
+        let state = crate::env::EnvStateFile {
             version: crate::env::STATE_VERSION.to_owned(),
             name: name.to_owned(),
             phase: crate::env::EnvPhase::Running,
@@ -1387,16 +1479,16 @@ async fn create_env_with_input(
                 )),
                 inference: inference_endpoint,
             },
-            egress_proxy: None,
+            egress_proxy: egress_proxy_state,
             resolved_policy: Some(policy.clone()),
             credential_names: credential_names.clone(),
             health: BTreeMap::new(),
             first_enter_hint_shown: false,
         };
 
-        crate::env::write_state(&temp_paths, &state)?;
+        crate::env::write_state(&registry_paths, &state)?;
         crate::env::append_event(
-            &temp_paths,
+            &registry_paths,
             serde_json::json!({
                 "kind": "admission",
                 "status": "accepted",
@@ -1405,61 +1497,32 @@ async fn create_env_with_input(
             }),
         )?;
 
-        fs::create_dir_all(paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
-            path: paths.envs_dir(),
-            source,
-        })?;
-        if env_dir.exists() {
-            return Err(crate::env::EnvError::AlreadyExists {
-                name: name.to_owned(),
-            }
-            .into());
-        }
-        fs::rename(temp_paths.env_dir(), &env_dir).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                crate::env::EnvError::AlreadyExists {
+        if !env_dir_materialized {
+            fs::create_dir_all(paths.envs_dir()).map_err(|source| crate::env::EnvError::Io {
+                path: paths.envs_dir(),
+                source,
+            })?;
+            if env_dir.exists() {
+                return Err(crate::env::EnvError::AlreadyExists {
                     name: name.to_owned(),
                 }
-            } else {
-                crate::env::EnvError::Io {
-                    path: env_dir.clone(),
-                    source,
-                }
+                .into());
             }
-        })?;
-        rollback.set_final_env_dir(env_dir.clone());
-        let _ = fs::remove_dir_all(&temp_workspace);
-
-        if !egress_proxy_plan.routes.is_empty() {
-            let launch = prepare_egress_proxy_launch_files(
-                name,
-                &env_dir,
-                &egress_proxy_plan,
-                credential_names.iter().map(String::as_str),
-                &policy,
-            )?;
-            let process = start_egress_proxy_process(
-                name,
-                &launch.config_path,
-                env_events_db_path(options, name)?,
-            )
-            .await?;
-            let proxy_pid = process.pid;
-            rollback.set_egress_proxy(process);
-            state.egress_proxy = Some(crate::env::EgressProxyState {
-                pid: Some(proxy_pid),
-                listen_url: egress_proxy_plan.listen_url.clone(),
-                config_path: launch.config_path,
-                policy_path: launch.policy_path,
-                routes: egress_proxy_plan
-                    .routes
-                    .iter()
-                    .map(|route| route.id.clone())
-                    .collect(),
-            });
-            state.updated_at = now_utc_string();
-            crate::env::write_state(&paths, &state)?;
+            fs::rename(temp_paths.env_dir(), &env_dir).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    crate::env::EnvError::AlreadyExists {
+                        name: name.to_owned(),
+                    }
+                } else {
+                    crate::env::EnvError::Io {
+                        path: env_dir.clone(),
+                        source,
+                    }
+                }
+            })?;
+            rollback.set_final_env_dir(env_dir.clone());
         }
+        let _ = fs::remove_dir_all(&temp_workspace);
 
         emit_runtime_event(
             events.as_ref(),
@@ -1700,6 +1763,20 @@ fn write_env_registry_file(content: &str, path: &Path) -> RuntimeResult<()> {
     }
     fs::write(path, content).map_err(|source| crate::env::EnvError::Io {
         path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn move_registry_file(src: &Path, dst: &Path) -> RuntimeResult<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|source| crate::env::EnvError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::rename(src, dst).map_err(|source| crate::env::EnvError::Io {
+        path: dst.to_path_buf(),
         source,
     })?;
     Ok(())
@@ -2547,18 +2624,26 @@ fn build_runtime_egress_proxy_plan(
         return sandbox_env_only_egress_proxy_plan(input.env_name, input.requirements);
     }
 
-    Ok(build_egress_proxy_plan(EgressProxyPlanInput {
+    let urls = allocate_egress_proxy_urls()?;
+    let mut plan = build_egress_proxy_plan(EgressProxyPlanInput {
         env_name: input.env_name.to_owned(),
-        proxy_base_url: allocate_egress_proxy_base_url()?,
+        proxy_base_url: urls.sandbox_base_url,
         credential_requirements: input.requirements.to_vec(),
         network_policy: input.policy.clone(),
         context_mcp: mcp_proxy_source_for_context_endpoint(input.context_endpoint),
         inference_endpoint: parse_inference_endpoint_url(input.inference_endpoint)?,
         explicit_routes,
-    })?)
+    })?;
+    plan.listen_url = urls.listen_url;
+    Ok(plan)
 }
 
-fn allocate_egress_proxy_base_url() -> RuntimeResult<url::Url> {
+struct RuntimeEgressProxyUrls {
+    listen_url: url::Url,
+    sandbox_base_url: url::Url,
+}
+
+fn allocate_egress_proxy_urls() -> RuntimeResult<RuntimeEgressProxyUrls> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|source| RuntimeError::EgressProxyListen { source })?;
     let port = listener
@@ -2566,10 +2651,20 @@ fn allocate_egress_proxy_base_url() -> RuntimeResult<url::Url> {
         .map_err(|source| RuntimeError::EgressProxyListen { source })?
         .port();
     drop(listener);
-    url::Url::parse(&format!("http://127.0.0.1:{port}")).map_err(|source| {
+    let listen_url = url::Url::parse(&format!("http://0.0.0.0:{port}")).map_err(|source| {
         RuntimeError::Driver(DriverError::InvalidInput {
-            message: format!("failed to parse allocated egress proxy base URL: {source}"),
+            message: format!("failed to parse allocated egress proxy listen URL: {source}"),
         })
+    })?;
+    let sandbox_base_url = url::Url::parse(&format!("http://host.docker.internal:{port}"))
+        .map_err(|source| {
+            RuntimeError::Driver(DriverError::InvalidInput {
+                message: format!("failed to parse allocated egress proxy sandbox URL: {source}"),
+            })
+        })?;
+    Ok(RuntimeEgressProxyUrls {
+        listen_url,
+        sandbox_base_url,
     })
 }
 
@@ -2588,19 +2683,22 @@ fn sandbox_env_only_egress_proxy_plan(
             (requirement.name.clone(), disposition)
         })
         .collect();
+    let disabled_url = url::Url::parse("http://127.0.0.1:0").map_err(|source| {
+        RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!("failed to parse disabled egress proxy URL: {source}"),
+        })
+    })?;
     Ok(EgressProxyPlan {
         env_name: env_name.to_owned(),
-        listen_url: url::Url::parse("http://127.0.0.1:0").map_err(|source| {
-            RuntimeError::Driver(DriverError::InvalidInput {
-                message: format!("failed to parse disabled egress proxy URL: {source}"),
-            })
-        })?,
+        listen_url: disabled_url.clone(),
+        sandbox_base_url: disabled_url,
         sandbox_env: BTreeMap::new(),
         routes: Vec::new(),
         credential_dispositions,
         brokered_credentials: BTreeMap::new(),
         rewritten_context_mcp_url: None,
         redacted_policy_path: None,
+        rate_limits: BTreeMap::new(),
     })
 }
 
@@ -2623,6 +2721,8 @@ struct RuntimeEgressProxyConfig {
     github: bool,
     #[serde(default)]
     oci: RuntimeEgressProxyOciConfig,
+    #[serde(default)]
+    rate_limits: BTreeMap<String, EgressProxyRateLimit>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2651,6 +2751,7 @@ fn explicit_egress_routes_from_policy_extra(
     Ok(ExplicitEgressRoutes {
         github: config.github,
         oci_registries: config.oci.registries,
+        rate_limits: config.rate_limits,
     })
 }
 
@@ -3044,6 +3145,7 @@ struct SandboxSpecCreateOptions<'a> {
     policy: Option<agentenv_proto::NetworkPolicy>,
     build_oneflight_seed: Option<String>,
     resolved_hardening: Option<&'a crate::hardening::ResolvedHardening>,
+    egress_proxy_sandbox_url: Option<&'a url::Url>,
 }
 
 fn sandbox_spec_for_create(
@@ -3058,6 +3160,7 @@ fn sandbox_spec_for_create(
         policy,
         build_oneflight_seed,
         resolved_hardening,
+        egress_proxy_sandbox_url,
     } = options;
     let mut metadata = BTreeMap::from([
         ("name".to_owned(), serde_json::json!(name)),
@@ -3146,6 +3249,16 @@ fn sandbox_spec_for_create(
         metadata.insert(
             "agentenv_build_seed_version".to_owned(),
             serde_json::json!(BUILD_ONEFLIGHT_SEED_VERSION),
+        );
+    }
+    if let Some(url) = egress_proxy_sandbox_url {
+        metadata.insert(
+            "agentenv_egress_proxy_url".to_owned(),
+            serde_json::json!(url.as_str()),
+        );
+        metadata.insert(
+            "agentenv_egress_proxy_mode".to_owned(),
+            serde_json::json!("host-gateway"),
         );
     }
 
@@ -4004,14 +4117,6 @@ pub async fn destroy_env_observed(
             crate::env::write_state(&paths, &state)?;
         }
 
-        if let Some(proxy) = state.egress_proxy.clone() {
-            if let Some(pid) = proxy.pid {
-                let _ = stop_egress_proxy_pid(pid).await;
-            }
-            state.egress_proxy = None;
-            crate::env::write_state(&paths, &state)?;
-        }
-
         if let Some(handle) = state.handles.inference.clone() {
             let Some(inference) = set.inference.as_mut() else {
                 return Err(missing_inference_driver(&state));
@@ -4030,6 +4135,14 @@ pub async fn destroy_env_observed(
                 .teardown(agentenv_proto::ContextHandleRequest { handle })
                 .await?;
             state.handles.context = None;
+            crate::env::write_state(&paths, &state)?;
+        }
+
+        if let Some(proxy) = state.egress_proxy.clone() {
+            if let Some(pid) = proxy.pid {
+                stop_egress_proxy_pid(pid).await?;
+            }
+            state.egress_proxy = None;
             crate::env::write_state(&paths, &state)?;
         }
 
@@ -5341,7 +5454,7 @@ mod tests {
         fs,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, MutexGuard, OnceLock,
+            Arc, Mutex, MutexGuard,
         },
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -5885,11 +5998,7 @@ policy:
 
     impl EnvVarGuard {
         fn unset(name: &'static str) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env var test lock");
+            let lock = crate::env_var_test_lock();
             let previous = std::env::var_os(name);
             std::env::remove_var(name);
             Self {
@@ -5900,11 +6009,7 @@ policy:
         }
 
         fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env var test lock");
+            let lock = crate::env_var_test_lock();
             let previous = std::env::var_os(name);
             std::env::set_var(name, value);
             Self {
@@ -5931,6 +6036,18 @@ policy:
         fs::create_dir_all(root).expect("create fake proxy root");
         let fake_proxy = root.join("fake-agentenv-proxy.sh");
         fs::write(&fake_proxy, "#!/bin/sh\nsleep 30\n").expect("write fake proxy");
+        fs::set_permissions(&fake_proxy, fs::Permissions::from_mode(0o755))
+            .expect("fake proxy executable");
+        EnvVarGuard::set(crate::egress_proxy::EGRESS_PROXY_BIN_ENV, &fake_proxy)
+    }
+
+    #[cfg(unix)]
+    fn failing_fake_egress_proxy_bin(root: &std::path::Path) -> EnvVarGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(root).expect("create fake proxy root");
+        let fake_proxy = root.join("failing-agentenv-proxy.sh");
+        fs::write(&fake_proxy, "#!/bin/sh\nexit 2\n").expect("write fake proxy");
         fs::set_permissions(&fake_proxy, fs::Permissions::from_mode(0o755))
             .expect("fake proxy executable");
         EnvVarGuard::set(crate::egress_proxy::EGRESS_PROXY_BIN_ENV, &fake_proxy)
@@ -8891,9 +9008,9 @@ policy:
             Some("agentenv-brokered")
         );
         assert!(
-            sandbox_env
-                .get("OPENAI_BASE_URL")
-                .is_some_and(|url| url.ends_with("/v1/openai")),
+            sandbox_env.get("OPENAI_BASE_URL").is_some_and(|url| {
+                url.starts_with("http://host.docker.internal:") && url.ends_with("/v1/openai")
+            }),
             "sandbox env should point OpenAI clients at the host egress proxy"
         );
         assert!(
@@ -9182,19 +9299,120 @@ policy:
         );
         assert!(proxy.config_path.is_file());
         assert!(proxy.policy_path.is_file());
+        let proxy_policy_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "host.docker.internal".to_owned(),
+                port: proxy.listen_url.port(),
+                scheme: Some("http".to_owned()),
+                http_access: Some(agentenv_proto::HttpAccessLevel::Full),
+            },
+        };
         let openai_base_url = {
             let specs = tracker.create_specs.lock().expect("create spec tracker");
+            assert_eq!(
+                specs[0]
+                    .metadata
+                    .get("agentenv_egress_proxy_url")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.contains("host.docker.internal")),
+                Some(true)
+            );
+            assert_eq!(
+                specs[0]
+                    .metadata
+                    .get("agentenv_egress_proxy_mode")
+                    .and_then(|value| value.as_str()),
+                Some("host-gateway")
+            );
+            assert!(
+                specs[0]
+                    .policy
+                    .as_ref()
+                    .expect("sandbox create policy should be present")
+                    .network
+                    .allow
+                    .contains(&proxy_policy_rule),
+                "sandbox create policy must allow the proxy endpoint"
+            );
             specs[0]
                 .env
                 .get("OPENAI_BASE_URL")
                 .expect("OpenAI base URL should be injected")
                 .clone()
         };
+        let applied_policies = tracker
+            .applied_policies
+            .lock()
+            .expect("applied policy tracker")
+            .clone();
+        assert!(
+            applied_policies[0]
+                .network
+                .allow
+                .contains(&proxy_policy_rule),
+            "restored runtime policy must keep the proxy endpoint reachable"
+        );
+        assert!(openai_base_url.starts_with("http://host.docker.internal:"));
         assert!(!openai_base_url.contains(":0/"));
+        assert_eq!(proxy.listen_url.host_str(), Some("0.0.0.0"));
 
         if let Some(pid) = proxy.pid {
             let _ = crate::egress_proxy::stop_egress_proxy_pid(pid).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_env_proxy_start_failure_prevents_sandbox_create() {
+        let root = unique_root("agentenv-create-egress-proxy-start-fails");
+        let _proxy_bin_guard = failing_fake_egress_proxy_bin(&root);
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        tracker
+            .supports_host_egress_proxy
+            .store(true, Ordering::SeqCst);
+        *tracker
+            .agent_credential_requirements
+            .lock()
+            .expect("agent credential requirements") =
+            vec![required_runtime_credential("OPENAI_API_KEY")];
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("OPENAI_API_KEY", "sk-real-provider-secret");
+
+        let err = super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect_err("proxy startup failure should abort create");
+
+        assert!(matches!(err, RuntimeError::EgressProxyLaunch(_)));
+        assert!(
+            tracker
+                .create_specs
+                .lock()
+                .expect("create spec tracker")
+                .is_empty(),
+            "sandbox must not be created when proxy startup fails"
+        );
     }
 
     #[cfg(unix)]
@@ -9242,7 +9460,7 @@ policy:
             .as_ref()
             .map(|endpoint| endpoint.url.as_str())
             .expect("context endpoint should be persisted");
-        assert!(rewritten.starts_with("http://127.0.0.1:"));
+        assert!(rewritten.starts_with("http://host.docker.internal:"));
         assert!(rewritten.ends_with("/v1/mcp/context"));
         assert!(!rewritten.contains(":0/"));
         assert!(
@@ -9395,6 +9613,41 @@ policy:
         assert_eq!(
             super::runtime_error_reason_code(&err),
             crate::admission::ReasonCode::InvalidBlueprint.as_str()
+        );
+    }
+
+    #[test]
+    fn egress_proxy_policy_extra_parses_route_rate_limits() {
+        let extra: BTreeMap<String, serde_yaml::Value> = serde_yaml::from_str(
+            r#"
+egress_proxy:
+  github: true
+  rate_limits:
+    openai:
+      requests_per_minute: 60
+    github.api:
+      requests_per_minute: 30
+"#,
+        )
+        .expect("policy extra should parse");
+
+        let routes =
+            super::explicit_egress_routes_from_policy_extra(&extra).expect("policy should parse");
+
+        assert!(routes.github);
+        assert_eq!(
+            routes
+                .rate_limits
+                .get("openai")
+                .map(|limit| limit.requests_per_minute),
+            Some(60)
+        );
+        assert_eq!(
+            routes
+                .rate_limits
+                .get("github.api")
+                .map(|limit| limit.requests_per_minute),
+            Some(30)
         );
     }
 

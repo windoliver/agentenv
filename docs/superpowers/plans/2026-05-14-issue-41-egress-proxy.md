@@ -1276,9 +1276,9 @@ Update driver tests:
 
 ```rust
 #[test]
-fn openshell_advertises_host_egress_proxy() {
+fn openshell_does_not_advertise_host_egress_proxy_without_reachability() {
     let caps = OpenShellDriver::test_capabilities();
-    assert!(caps.supports_host_egress_proxy);
+    assert!(!caps.supports_host_egress_proxy);
 }
 
 #[test]
@@ -1306,7 +1306,7 @@ Expected: tests fail until capabilities are set.
 In `crates/sandbox-openshell/src/lib.rs` initialize:
 
 ```rust
-supports_host_egress_proxy: true,
+supports_host_egress_proxy: false,
 ```
 
 In remote drivers initialize:
