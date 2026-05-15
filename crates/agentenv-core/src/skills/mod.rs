@@ -32,7 +32,7 @@ pub use cache::{
 pub use ci::{
     run_skill_ci, SkillCiCandidate, SkillCiFinding, SkillCiRegistrySkill, SkillCiRegistrySnapshot,
     SkillCiReport, SkillCiRequest, SkillCiSeverity, SkillCiStatus, SkillCiTier, SkillCiTierReport,
-    SkillCiTierStatus,
+    SkillCiTierStatus, SKILL_CI_SCHEMA_VERSION,
 };
 pub use config::{
     load_project_skills_config, load_user_skills_config, merge_skills_config, ProposalConfig,
