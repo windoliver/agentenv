@@ -12,6 +12,7 @@ const BROKERED_DUMMY_VALUE: &str = "agentenv-brokered";
 const OPENAI_CREDENTIAL: &str = "OPENAI_API_KEY";
 const ANTHROPIC_CREDENTIAL: &str = "ANTHROPIC_API_KEY";
 const GITHUB_CREDENTIAL: &str = "GITHUB_TOKEN";
+const GH_CREDENTIAL: &str = "GH_TOKEN";
 const DEFAULT_MCP_CREDENTIAL: &str = "MCP_TOKEN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,17 +109,17 @@ pub fn build_egress_proxy_plan(
 
     let proxy_base_url = input.proxy_base_url;
     let proxy_base = proxy_base_url.as_str().trim_end_matches('/').to_owned();
-    let required_names = input
+    let declared_names = input
         .credential_requirements
         .iter()
-        .map(|requirement| requirement.name.as_str())
+        .map(|requirement| requirement.name.clone())
         .collect::<BTreeSet<_>>();
 
     let mut routes = Vec::new();
     let mut sandbox_env = BTreeMap::new();
     let mut brokered_names = BTreeSet::new();
 
-    if required_names.contains(OPENAI_CREDENTIAL) {
+    if declared_names.contains(OPENAI_CREDENTIAL) {
         broker_credential(OPENAI_CREDENTIAL, &mut brokered_names, &mut sandbox_env);
         sandbox_env.insert(
             "OPENAI_BASE_URL".to_owned(),
@@ -127,13 +128,13 @@ pub fn build_egress_proxy_plan(
         routes.push(provider_route(
             "openai",
             BrokerService::OpenAi,
-            "https://api.openai.com",
+            "https://api.openai.com/v1",
             OPENAI_CREDENTIAL,
             "/v1/openai",
         )?);
     }
 
-    if required_names.contains(ANTHROPIC_CREDENTIAL) {
+    if declared_names.contains(ANTHROPIC_CREDENTIAL) {
         broker_credential(ANTHROPIC_CREDENTIAL, &mut brokered_names, &mut sandbox_env);
         sandbox_env.insert(
             "ANTHROPIC_BASE_URL".to_owned(),
@@ -148,8 +149,17 @@ pub fn build_egress_proxy_plan(
         )?);
     }
 
-    if input.explicit_routes.github || required_names.contains(GITHUB_CREDENTIAL) {
-        broker_credential(GITHUB_CREDENTIAL, &mut brokered_names, &mut sandbox_env);
+    if input.explicit_routes.github
+        || declared_names.contains(GITHUB_CREDENTIAL)
+        || declared_names.contains(GH_CREDENTIAL)
+    {
+        let github_credential = github_route_credential(&declared_names);
+        broker_credential(github_credential, &mut brokered_names, &mut sandbox_env);
+        for credential_name in [GITHUB_CREDENTIAL, GH_CREDENTIAL] {
+            if declared_names.contains(credential_name) {
+                broker_credential(credential_name, &mut brokered_names, &mut sandbox_env);
+            }
+        }
         sandbox_env.insert(
             "GITHUB_API_URL".to_owned(),
             proxy_url_string(&proxy_base, "/v1/github/api"),
@@ -158,7 +168,7 @@ pub fn build_egress_proxy_plan(
             "github.api",
             BrokerService::GitHub,
             "https://api.github.com",
-            GITHUB_CREDENTIAL,
+            github_credential,
             "/v1/github/api",
         )?);
     }
@@ -202,7 +212,7 @@ pub fn build_egress_proxy_plan(
         });
     }
 
-    let credential_dispositions = input
+    let mut credential_dispositions = input
         .credential_requirements
         .into_iter()
         .map(|requirement| {
@@ -215,7 +225,13 @@ pub fn build_egress_proxy_plan(
             };
             (requirement.name, disposition)
         })
-        .collect();
+        .collect::<BTreeMap<_, _>>();
+
+    for brokered_name in brokered_names {
+        credential_dispositions
+            .entry(brokered_name)
+            .or_insert(CredentialDisposition::Brokered);
+    }
 
     Ok(EgressProxyPlan {
         env_name: input.env_name,
@@ -235,6 +251,16 @@ fn broker_credential(
 ) {
     brokered_names.insert(credential_name.to_owned());
     sandbox_env.insert(credential_name.to_owned(), BROKERED_DUMMY_VALUE.to_owned());
+}
+
+fn github_route_credential(declared_names: &BTreeSet<String>) -> &'static str {
+    if declared_names.contains(GITHUB_CREDENTIAL) {
+        GITHUB_CREDENTIAL
+    } else if declared_names.contains(GH_CREDENTIAL) {
+        GH_CREDENTIAL
+    } else {
+        GITHUB_CREDENTIAL
+    }
 }
 
 fn provider_route(
@@ -423,6 +449,15 @@ mod tests {
             .routes
             .iter()
             .any(|route| route.service == BrokerService::OpenAi));
+        let openai_route = plan
+            .routes
+            .iter()
+            .find(|route| route.service == BrokerService::OpenAi)
+            .expect("OpenAI route should be present");
+        assert_eq!(
+            openai_route.upstream_base_url.as_str(),
+            "https://api.openai.com/v1"
+        );
         assert!(plan
             .routes
             .iter()
@@ -505,5 +540,92 @@ mod tests {
             .expect("OCI route should be present");
         assert_eq!(route.request_path_prefix, "/v1/oci/ghcr.io");
         assert!(route.allowed_hosts.contains("ghcr.io"));
+    }
+
+    #[test]
+    fn explicit_github_route_exposes_brokered_credential_without_driver_requirement() {
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31004".parse().unwrap(),
+            credential_requirements: Vec::new(),
+            network_policy: policy(),
+            context_mcp: None,
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes {
+                github: true,
+                oci_registries: BTreeSet::new(),
+            },
+        })
+        .expect("plan builds");
+
+        let route = plan
+            .routes
+            .iter()
+            .find(|route| route.service == BrokerService::GitHub)
+            .expect("GitHub route should be present");
+        assert_eq!(route.credential_name, "GITHUB_TOKEN");
+        assert_eq!(
+            plan.credential_disposition("GITHUB_TOKEN"),
+            Some(CredentialDisposition::Brokered)
+        );
+    }
+
+    #[test]
+    fn explicit_oci_route_exposes_brokered_credential_without_driver_requirement() {
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31005".parse().unwrap(),
+            credential_requirements: Vec::new(),
+            network_policy: policy(),
+            context_mcp: None,
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes {
+                github: false,
+                oci_registries: ["ghcr.io".to_owned()].into_iter().collect(),
+            },
+        })
+        .expect("plan builds");
+
+        let route = plan
+            .routes
+            .iter()
+            .find(|route| {
+                route.service
+                    == BrokerService::Oci {
+                        registry: "ghcr.io".to_owned(),
+                    }
+            })
+            .expect("OCI route should be present");
+        assert_eq!(route.credential_name, "oci.ghcr.io");
+        assert_eq!(
+            plan.credential_disposition("oci.ghcr.io"),
+            Some(CredentialDisposition::Brokered)
+        );
+    }
+
+    #[test]
+    fn github_route_uses_gh_token_when_github_token_is_absent() {
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31006".parse().unwrap(),
+            credential_requirements: vec![required("GH_TOKEN")],
+            network_policy: policy(),
+            context_mcp: None,
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes::default(),
+        })
+        .expect("plan builds");
+
+        let route = plan
+            .routes
+            .iter()
+            .find(|route| route.service == BrokerService::GitHub)
+            .expect("GitHub route should be present");
+        assert_eq!(route.credential_name, "GH_TOKEN");
+        assert_eq!(
+            plan.credential_disposition("GH_TOKEN"),
+            Some(CredentialDisposition::Brokered)
+        );
+        assert_eq!(plan.credential_disposition("GITHUB_TOKEN"), None);
     }
 }
