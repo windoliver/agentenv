@@ -499,6 +499,16 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
         let mut review_report = tier_from_findings(SkillCiTier::AgentReview, review.findings);
         review_report.duration_ms = review_started.elapsed().as_millis();
         tiers.push(review_report);
+
+        let dedup_started = Instant::now();
+        let mut dedup_report = run_semantic_dedup(
+            manifest,
+            &candidate.digest,
+            skill_md,
+            request.registry_snapshot.as_ref(),
+        );
+        dedup_report.duration_ms = dedup_started.elapsed().as_millis();
+        tiers.push(dedup_report);
     }
 
     let status = if tiers
@@ -523,6 +533,110 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
         started_at,
         completed_at: OffsetDateTime::now_utc(),
     })
+}
+
+fn run_semantic_dedup(
+    manifest: &super::SkillManifest,
+    digest: &str,
+    skill_md: &str,
+    snapshot: Option<&SkillCiRegistrySnapshot>,
+) -> SkillCiTierReport {
+    let mut best: Option<(SkillCiRegistrySkill, f32, String)> = None;
+    let mut novelty = 0.9_f64;
+
+    if let Some(snapshot) = snapshot {
+        for existing in &snapshot.skills {
+            let exact_fingerprint = existing.fingerprint.as_deref() == Some(digest);
+            let similarity = if exact_fingerprint {
+                1.0
+            } else {
+                jaccard(skill_md, &existing.procedure_text).max(jaccard(
+                    manifest.description.as_deref().unwrap_or(""),
+                    &existing.description,
+                ))
+            };
+
+            if best
+                .as_ref()
+                .is_none_or(|(_, current, _)| similarity > *current)
+            {
+                let reason = if exact_fingerprint {
+                    "exact fingerprint match".to_owned()
+                } else {
+                    "local semantic similarity".to_owned()
+                };
+                best = Some((existing.clone(), similarity, reason));
+            }
+        }
+    }
+
+    let probable_duplicate = best
+        .as_ref()
+        .is_some_and(|(_, similarity, _)| *similarity > 0.92);
+    if let Some((_, similarity, _)) = &best {
+        novelty = if *similarity > 0.92 {
+            0.0
+        } else if *similarity >= 0.85 {
+            0.3
+        } else if *similarity >= 0.45 {
+            0.6
+        } else {
+            0.9
+        };
+    }
+
+    let mut findings = Vec::new();
+    if probable_duplicate {
+        findings.push(error_finding(
+            "agentenv.skill.dedup.probable-duplicate",
+            "candidate is probably a duplicate of an existing skill",
+            Some(manifest.entry.clone()),
+            None,
+        ));
+    }
+
+    let nearest_neighbors: Vec<Value> = best
+        .into_iter()
+        .map(|(skill, similarity, reason)| {
+            json!({
+                "name": skill.name,
+                "version": skill.version,
+                "similarity": similarity,
+                "reason": reason
+            })
+        })
+        .collect();
+    let mut report = tier_from_findings(SkillCiTier::SemanticDedup, findings);
+    report.details = Some(json!({
+        "nearest_neighbors": nearest_neighbors,
+        "novelty_score": novelty,
+        "probable_duplicate": probable_duplicate
+    }));
+    report
+}
+
+fn jaccard(left: &str, right: &str) -> f32 {
+    let left = tokens(left);
+    let right = tokens(right);
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+
+    let intersection = left.intersection(&right).count() as f32;
+    let union = left.union(&right).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn tokens(value: &str) -> BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
 }
 
 fn tier_from_findings(tier: SkillCiTier, findings: Vec<SkillCiFinding>) -> SkillCiTierReport {

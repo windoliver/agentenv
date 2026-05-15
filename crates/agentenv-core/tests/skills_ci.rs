@@ -567,6 +567,68 @@ fn agent_review_passes_clear_bounded_non_destructive_skill() {
     assert_eq!(review.status, SkillCiTierStatus::Passed);
 }
 
+#[test]
+fn semantic_dedup_fails_exact_fingerprint_match() {
+    let bundle = skill_bundle("ci-copy", "0.1.0", "# Copy\n\nSummarize Rust modules.\n");
+    let digest = {
+        let manifest = agentenv_core::skills::load_skill_manifest(&bundle).unwrap();
+        agentenv_core::skills::compute_bundle_digest(&bundle, &manifest).unwrap()
+    };
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: Some(agentenv_core::skills::SkillCiRegistrySnapshot {
+            skills: vec![agentenv_core::skills::SkillCiRegistrySkill {
+                name: "existing-copy".to_owned(),
+                version: "0.1.0".to_owned(),
+                description: "Existing copy".to_owned(),
+                procedure_text: "Summarize Rust modules.".to_owned(),
+                fingerprint: Some(digest),
+            }],
+        }),
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let dedup = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::SemanticDedup)
+        .unwrap();
+    assert_eq!(dedup.status, SkillCiTierStatus::Failed);
+    assert!(dedup
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.dedup.probable-duplicate"));
+    assert_eq!(dedup.details.as_ref().unwrap()["novelty_score"], 0.0);
+}
+
+#[test]
+fn semantic_dedup_reports_high_novelty_without_snapshot() {
+    let bundle = skill_bundle(
+        "ci-new",
+        "0.1.0",
+        "# New\n\nInspect shell scripts for portability.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let dedup = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::SemanticDedup)
+        .unwrap();
+    assert_eq!(dedup.status, SkillCiTierStatus::Passed);
+    assert_eq!(dedup.details.as_ref().unwrap()["novelty_score"], 0.9);
+}
+
 #[derive(Debug)]
 struct PanicAgentRunner;
 
