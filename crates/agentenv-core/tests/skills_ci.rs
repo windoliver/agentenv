@@ -51,10 +51,37 @@ fn skill_ci_fail_fast_skips_later_tiers_after_static_failure() {
     assert_eq!(report.status, SkillCiStatus::Failed);
     assert_eq!(report.tiers[0].tier, SkillCiTier::StaticLint);
     assert_eq!(report.tiers[0].status, SkillCiTierStatus::Failed);
+    assert!(report.tiers[0].findings.iter().any(|finding| {
+        finding.rule_id == "agentenv.skill.markdown.unclosed-fence"
+            && finding.path.as_deref() == Some(Path::new("SKILL.md"))
+    }));
     assert!(report
         .tiers
         .iter()
         .any(|tier| tier.status == SkillCiTierStatus::Skipped));
+}
+
+#[test]
+fn skill_ci_static_tier_lints_nested_manifest_entry() {
+    let bundle = skill_bundle_with_entry(
+        "ci-nested-entry",
+        "0.1.0",
+        "docs/SKILL.md",
+        "# Nested entry\n\nUse this nested skill safely.\n",
+    );
+    assert!(!bundle.join("SKILL.md").exists());
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    assert_eq!(report.status, SkillCiStatus::Passed);
+    assert_eq!(report.tiers[0].tier, SkillCiTier::StaticLint);
+    assert_eq!(report.tiers[0].status, SkillCiTierStatus::Passed);
 }
 
 #[derive(Debug)]
@@ -67,12 +94,16 @@ impl AgentProduceRunner for PanicAgentRunner {
 }
 
 fn skill_bundle(name: &str, version: &str, skill_md: &str) -> PathBuf {
+    skill_bundle_with_entry(name, version, "SKILL.md", skill_md)
+}
+
+fn skill_bundle_with_entry(name: &str, version: &str, entry: &str, skill_md: &str) -> PathBuf {
     let root = temp_dir(&format!("skill-ci-{name}-{version}"));
-    write_file(&root.join("SKILL.md"), skill_md);
+    write_file(&root.join(entry), skill_md);
     write_file(
         &root.join("skill.yaml"),
         &format!(
-            "name: {name}\nversion: {version}\ndescription: {name} skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
+            "name: {name}\nversion: {version}\ndescription: {name} skill\nentry: {entry}\nfiles:\n  - {entry}\nself_test:\n  command: test -f {entry}\n"
         ),
     );
     sign_skill_bundle(&root);

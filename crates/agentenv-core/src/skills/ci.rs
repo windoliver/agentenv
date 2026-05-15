@@ -165,7 +165,7 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
 
     let mut tiers = Vec::new();
     let static_report = run_tier(SkillCiTier::StaticLint, || {
-        run_static_lint(&request.candidate_path)
+        run_static_lint(&request.candidate_path, &manifest.entry)
             .map(|findings| tier_from_findings(SkillCiTier::StaticLint, findings))
     })?;
     let static_failed = static_report.status == SkillCiTierStatus::Failed;
@@ -251,9 +251,12 @@ fn skipped_tier(tier: SkillCiTier, message: &str) -> SkillCiTierReport {
     }
 }
 
-fn run_static_lint(candidate_path: &std::path::Path) -> Result<Vec<SkillCiFinding>, SkillError> {
+fn run_static_lint(
+    candidate_path: &std::path::Path,
+    entry_path: &std::path::Path,
+) -> Result<Vec<SkillCiFinding>, SkillError> {
     let mut findings = Vec::new();
-    let skill_md = candidate_path.join("SKILL.md");
+    let skill_md = candidate_path.join(entry_path);
     let content = std::fs::read_to_string(&skill_md).map_err(|source| SkillError::Io {
         path: skill_md.clone(),
         source,
@@ -263,7 +266,7 @@ fn run_static_lint(candidate_path: &std::path::Path) -> Result<Vec<SkillCiFindin
             rule_id: "agentenv.skill.markdown.unclosed-fence".to_owned(),
             severity: SkillCiSeverity::Error,
             message: "Markdown fenced code block is not closed".to_owned(),
-            path: Some(skill_md),
+            path: Some(entry_path.to_path_buf()),
             line: None,
         });
     }
