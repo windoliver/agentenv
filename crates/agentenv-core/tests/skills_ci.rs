@@ -84,6 +84,90 @@ fn skill_ci_static_tier_lints_nested_manifest_entry() {
     assert_eq!(report.tiers[0].status, SkillCiTierStatus::Passed);
 }
 
+#[test]
+fn static_lint_rejects_secret_like_text_and_redacts_sarif() {
+    let bundle = skill_bundle(
+        "ci-secret",
+        "0.1.0",
+        "# Secret\n\nUse token sk-test-1234567890abcdefghijklmnop carefully.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let static_tier = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::StaticLint)
+        .unwrap();
+    assert_eq!(static_tier.status, SkillCiTierStatus::Failed);
+    assert!(static_tier
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.secret.detected"));
+
+    let sarif = agentenv_core::skills::skill_ci_sarif(&report).unwrap();
+    assert!(sarif.contains("agentenv.skill.secret.detected"));
+    assert!(!sarif.contains("sk-test-1234567890abcdefghijklmnop"));
+}
+
+#[test]
+fn static_lint_rejects_prerelease_versions() {
+    let bundle = skill_bundle("ci-prerelease", "1.0.0-alpha.1", "# Prerelease\n");
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let static_tier = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::StaticLint)
+        .unwrap();
+    assert_eq!(static_tier.status, SkillCiTierStatus::Failed);
+    assert!(static_tier
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.version.prerelease"));
+}
+
+#[test]
+fn static_lint_rejects_unclosed_frontmatter() {
+    let bundle = skill_bundle(
+        "ci-frontmatter",
+        "0.1.0",
+        "---\nname: ci-frontmatter\n# Missing close marker\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let static_tier = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::StaticLint)
+        .unwrap();
+    assert_eq!(static_tier.status, SkillCiTierStatus::Failed);
+    assert!(static_tier
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.frontmatter.unclosed"));
+}
+
 #[derive(Debug)]
 struct PanicAgentRunner;
 
