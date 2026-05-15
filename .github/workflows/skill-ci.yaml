@@ -1,0 +1,231 @@
+name: Skill CI
+
+on:
+  workflow_call:
+    inputs:
+      registry-snapshot:
+        description: Optional path to a registry snapshot JSON file.
+        required: false
+        type: string
+  pull_request:
+    # Run on all PR changes so bundled skill support files cannot bypass CI.
+
+jobs:
+  validate:
+    name: Validate skills
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      count: ${{ steps.discover.outputs.count }}
+      failed: ${{ steps.run.outputs.failed || '0' }}
+
+    steps:
+      - name: Checkout skill repository
+        uses: actions/checkout@v4
+        with:
+          path: skill-workspace
+          persist-credentials: false
+
+      - name: Checkout agentenv
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: agentenv-src
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build agentenv
+        working-directory: agentenv-src
+        run: cargo build -p agentenv
+
+      - name: Discover skill candidates
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p skill-ci-reports
+          : > skill-ci-candidates.txt
+          while IFS= read -r manifest; do
+            dirname "$manifest" >> skill-ci-candidates.txt
+          done < <(cd skill-workspace && find . \( -path ./target -o -path ./.git \) -prune -o -name skill.yaml -type f -print | sort)
+          count="$(wc -l < skill-ci-candidates.txt | tr -d ' ')"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [[ "${count}" == "0" ]]; then
+            echo "No skill.yaml candidates found." > skill-ci-summary.md
+          fi
+
+      - name: Run skill CI
+        id: run
+        if: steps.discover.outputs.count != '0'
+        shell: bash
+        env:
+          REGISTRY_SNAPSHOT: ${{ inputs['registry-snapshot'] || '' }}
+        run: |
+          set -u
+          failed=0
+          {
+            echo "## Skill CI"
+            echo
+            echo "| Skill | Status | Findings |"
+            echo "| --- | --- | ---: |"
+          } > skill-ci-summary.md
+
+          report_index=0
+          while IFS= read -r skill_dir; do
+            report_index=$((report_index + 1))
+            rel="${skill_dir#./}"
+            safe_name="$(printf '%s' "$rel" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/^_*//; s/_*$//')"
+            if [[ -z "${safe_name}" ]]; then
+              safe_name="skill"
+            fi
+            safe_name="$(printf '%04d_%s' "$report_index" "$safe_name")"
+            json_report="skill-ci-reports/${safe_name}.json"
+            sarif_report="skill-ci-reports/${safe_name}.sarif-part"
+            stderr_report="skill-ci-reports/${safe_name}.stderr"
+            args=()
+            if [[ -n "${REGISTRY_SNAPSHOT:-}" ]]; then
+              snapshot_path="${REGISTRY_SNAPSHOT}"
+              if [[ "${snapshot_path}" != /* ]]; then
+                snapshot_path="${GITHUB_WORKSPACE}/skill-workspace/${snapshot_path}"
+              fi
+              args+=(--registry-snapshot "${snapshot_path}")
+            fi
+
+            # Run agentenv skills ci from the checked-out agentenv source.
+            set +e
+            (
+              cd skill-workspace
+              "${GITHUB_WORKSPACE}/agentenv-src/target/debug/agentenv" skills ci "$skill_dir" --json --sarif "${GITHUB_WORKSPACE}/${sarif_report}" --no-fail-fast "${args[@]}"
+            ) > "$json_report" 2> "$stderr_report"
+            status_code=$?
+            set -e
+
+            if [[ -s "$sarif_report" ]]; then
+              jq --arg prefix "${rel}/" '
+                .runs[].results[]?.locations[]?.physicalLocation.artifactLocation.uri |=
+                  if . == null or startswith("/") or startswith($prefix) then . else $prefix + . end
+              ' "$sarif_report" > "${sarif_report}.tmp"
+              mv "${sarif_report}.tmp" "$sarif_report"
+            fi
+
+            if [[ "$status_code" -ne 0 ]]; then
+              failed=1
+            fi
+
+            status="error"
+            findings="0"
+            if command -v jq >/dev/null 2>&1 && [[ -s "$json_report" ]]; then
+              status="$(jq -r '.status // "error"' "$json_report" 2>/dev/null || echo "error")"
+              findings="$(jq '[.tiers[].findings[]?] | length' "$json_report" 2>/dev/null || echo "0")"
+            elif [[ "$status_code" -eq 0 ]]; then
+              status="passed"
+            fi
+            echo "| \`${rel}\` | ${status} | ${findings} |" >> skill-ci-summary.md
+          done < skill-ci-candidates.txt
+
+          echo "failed=${failed}" >> "$GITHUB_OUTPUT"
+          mapfile -t sarif_parts < <(find skill-ci-reports -name '*.sarif-part' -type f -print | sort)
+          if [[ "${#sarif_parts[@]}" -ne 0 ]]; then
+            jq -s '{
+              "version": "2.1.0",
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "runs": [{
+                "tool": {
+                  "driver": {
+                    "name": "agentenv skill ci"
+                  }
+                },
+                "results": [.[].runs[].results[]?]
+              }]
+            }' "${sarif_parts[@]}" > skill-ci-reports/agentenv-skill-ci.sarif
+          fi
+
+      - name: Upload skill CI reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-ci-reports
+          path: |
+            skill-ci-reports
+            skill-ci-summary.md
+          if-no-files-found: ignore
+
+      - name: Fail on skill CI errors
+        if: always() && steps.run.outputs.failed == '1'
+        run: exit 1
+
+  report:
+    name: Publish skill CI results
+    runs-on: ubuntu-latest
+    needs: validate
+    if: always()
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+      security-events: write
+
+    steps:
+      - name: Download skill CI reports
+        uses: actions/download-artifact@v4
+        with:
+          name: skill-ci-reports
+          path: .
+
+      - name: Upload SARIF
+        if: always() && needs.validate.outputs.count != '0' && hashFiles('skill-ci-reports/agentenv-skill-ci.sarif') != '' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: skill-ci-reports/agentenv-skill-ci.sarif
+          category: agentenv-skill-ci
+
+      - name: Comment PR summary
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- agentenv-skill-ci -->';
+            const summaryPath = 'skill-ci-summary.md';
+            const summary = fs.existsSync(summaryPath)
+              ? fs.readFileSync(summaryPath, 'utf8')
+              : 'Skill CI did not produce a summary.';
+            const body = `${marker}\n${summary}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user.type === 'Bot' && comment.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Fail on skill CI errors
+        if: always() && needs.validate.outputs.failed == '1'
+        run: exit 1

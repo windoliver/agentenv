@@ -2656,6 +2656,18 @@ fn skills_ci_registry_snapshot_drives_dedup_failure() {
 }
 
 #[test]
+fn skill_ci_workflow_references_cli_command() {
+    let workflow_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/skill-ci.yaml");
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    assert!(workflow.contains("workflow_call"));
+    assert!(workflow.contains("agentenv skills ci"));
+    assert!(workflow.contains("upload-sarif"));
+}
+
+#[test]
 fn skills_install_list_info_verify_and_remove_local_bundle() {
     let temp_dir = make_temp_dir("skills-cli-local");
     let bundle = temp_dir.join("bundle");

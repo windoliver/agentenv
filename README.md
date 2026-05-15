@@ -179,6 +179,38 @@ If neither OrbStack nor Docker Desktop is installed, `agentenv create` stops wit
 | `container_runtime_unavailable` | Open OrbStack or Docker Desktop and wait until Docker is running, then rerun `agentenv create`. |
 | `missing credential OPENAI_API_KEY` | Export it, run `agentenv credentials set OPENAI_API_KEY`, or omit `--non-interactive` and let create prompt. |
 
+### Skill CI
+
+Use `agentenv skills ci <path>` to validate a local skill bundle before publishing
+or reviewing it in a pull request. The path should point at a directory with
+`skill.yaml` and the declared skill files.
+
+Skill CI runs four tiers:
+
+- `static_lint` validates the manifest, bundled files, Markdown structure,
+  signatures, self-test metadata, and secret-like text.
+- `agent_review` applies a built-in review pass for unsafe or under-specified
+  skill instructions.
+- `semantic_dedup` compares the candidate against an optional registry snapshot
+  to catch duplicate or near-duplicate skills.
+- `functional_regression` runs the skill self-test and checks the score against
+  the publish threshold.
+
+For automation, emit machine-readable JSON and SARIF in one run:
+
+```bash
+agentenv skills ci .agents/skills/my-skill \
+  --json \
+  --sarif skill-ci-reports/my-skill.sarif
+```
+
+Pass `--registry-snapshot <path>` with a JSON registry snapshot to enable
+duplicate detection against already-published skills. Use `--no-fail-fast` when
+CI should report every tier even after an earlier failure.
+
+The built-in secret scan is part of `static_lint`; it does not require
+`gitleaks` or any other external scanner.
+
 ---
 
 ## How it compares
