@@ -744,6 +744,108 @@ fn semantic_dedup_fails_high_semantic_similarity_without_fingerprint_match() {
     );
 }
 
+#[test]
+fn functional_regression_fails_below_threshold() {
+    let bundle = skill_bundle_with_skill_test_file("ci-low-score", "0.1.0", "# Low Score\n");
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n    - type: file_exists\n      path: missing-one\n    - type: file_exists\n      path: missing-two\n    - type: file_exists\n      path: missing-three\n    - type: file_exists\n      path: missing-four\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let regression = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::FunctionalRegression)
+        .unwrap();
+    assert_eq!(regression.status, SkillCiTierStatus::Failed);
+    assert!(regression
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.self-test.score-below-threshold"));
+    assert_eq!(regression.details.as_ref().unwrap()["score"], 0.2);
+}
+
+#[test]
+fn functional_regression_passes_at_threshold() {
+    let bundle = skill_bundle_with_skill_test_file("ci-threshold", "0.1.0", "# Threshold\n");
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n    - type: file_exists\n      path: skill.yaml\n    - type: file_exists\n      path: SKILL.md\n    - type: file_exists\n      path: skill.yaml\n    - type: file_exists\n      path: missing-one\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let regression = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::FunctionalRegression)
+        .unwrap();
+    assert_eq!(regression.status, SkillCiTierStatus::Passed);
+    assert_eq!(regression.details.as_ref().unwrap()["score"], 0.8);
+}
+
+#[test]
+fn functional_regression_skips_invalid_self_test_without_fail_fast() {
+    let bundle =
+        skill_bundle_with_skill_test_file("ci-invalid-self-test", "0.1.0", "# Invalid Self Test\n");
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions: []\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should report static self-test failure without running regression");
+
+    let regression = functional_regression_tier(&report);
+    assert_eq!(regression.status, SkillCiTierStatus::Skipped);
+    assert!(regression.details.is_none());
+}
+
+#[test]
+fn functional_regression_reports_frontmatter_self_test_source() {
+    let bundle = skill_bundle_with_skill_test_file(
+        "ci-frontmatter-self-test",
+        "0.1.0",
+        "---\nself_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n    - type: file_exists\n      path: missing-one\n---\n# Frontmatter Self Test\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let regression = functional_regression_tier(&report);
+    assert_eq!(regression.status, SkillCiTierStatus::Failed);
+    let finding = regression
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id == "agentenv.skill.self-test.score-below-threshold")
+        .unwrap();
+    assert_eq!(finding.path.as_deref(), Some(Path::new("SKILL.md")));
+}
+
 #[derive(Debug)]
 struct PanicAgentRunner;
 
@@ -783,11 +885,32 @@ fn skill_bundle_with_entry(name: &str, version: &str, entry: &str, skill_md: &st
     root
 }
 
+fn skill_bundle_with_skill_test_file(name: &str, version: &str, skill_md: &str) -> PathBuf {
+    let root = temp_dir(&format!("skill-ci-{name}-{version}"));
+    write_file(&root.join("SKILL.md"), skill_md);
+    write_file(
+        &root.join("skill.yaml"),
+        &format!(
+            "name: {name}\nversion: {version}\ndescription: {name} skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+        ),
+    );
+    sign_skill_bundle(&root);
+    root
+}
+
 fn semantic_dedup_tier(report: &agentenv_core::skills::SkillCiReport) -> &SkillCiTierReport {
     report
         .tiers
         .iter()
         .find(|tier| tier.tier == SkillCiTier::SemanticDedup)
+        .unwrap()
+}
+
+fn functional_regression_tier(report: &agentenv_core::skills::SkillCiReport) -> &SkillCiTierReport {
+    report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::FunctionalRegression)
         .unwrap()
 }
 

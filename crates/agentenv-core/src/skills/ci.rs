@@ -8,6 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use serde_yaml::Value as YamlValue;
 use time::OffsetDateTime;
 
 use super::{
@@ -479,6 +480,8 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
         findings,
         manifest,
         entry_content,
+        functional_regression_ready,
+        self_test_source_path,
     } = run_static_lint(&request.candidate_path)?;
     let mut static_report = tier_from_findings(SkillCiTier::StaticLint, findings);
     static_report.duration_ms = static_started.elapsed().as_millis();
@@ -498,6 +501,7 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
         let review = RuleBasedSkillReviewJudge.review(SkillReviewInput { manifest, skill_md })?;
         let mut review_report = tier_from_findings(SkillCiTier::AgentReview, review.findings);
         review_report.duration_ms = review_started.elapsed().as_millis();
+        let review_failed = review_report.status == SkillCiTierStatus::Failed;
         tiers.push(review_report);
 
         let dedup_started = Instant::now();
@@ -508,7 +512,31 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
             request.registry_snapshot.as_ref(),
         );
         dedup_report.duration_ms = dedup_started.elapsed().as_millis();
+        let dedup_failed = dedup_report.status == SkillCiTierStatus::Failed;
         tiers.push(dedup_report);
+
+        if request.fail_fast && (static_failed || review_failed || dedup_failed) {
+            tiers.push(skipped_tier(
+                SkillCiTier::FunctionalRegression,
+                "skipped because an earlier tier failed",
+            ));
+        } else if !functional_regression_ready {
+            tiers.push(skipped_tier(
+                SkillCiTier::FunctionalRegression,
+                "skipped because static_lint found an invalid signature or self-test",
+            ));
+        } else {
+            let regression_started = Instant::now();
+            let mut regression_report = run_functional_regression(
+                &request.candidate_path,
+                manifest,
+                &candidate.digest,
+                self_test_source_path.unwrap_or_else(|| PathBuf::from("skill-test.yaml")),
+                Arc::clone(&request.agent_runner),
+            )?;
+            regression_report.duration_ms = regression_started.elapsed().as_millis();
+            tiers.push(regression_report);
+        }
     }
 
     let status = if tiers
@@ -625,6 +653,49 @@ fn run_semantic_dedup(
         "probable_duplicate": probable_duplicate
     }));
     report
+}
+
+fn run_functional_regression(
+    candidate_path: &std::path::Path,
+    manifest: &super::SkillManifest,
+    digest: &str,
+    self_test_source_path: PathBuf,
+    agent_runner: Arc<dyn AgentProduceRunner>,
+) -> Result<SkillCiTierReport, SkillError> {
+    let spec = load_skill_self_test_spec(candidate_path)?;
+    let report = super::run_skill_self_test(
+        candidate_path,
+        manifest.name.clone(),
+        manifest.version.to_string(),
+        digest.to_owned(),
+        &spec,
+        super::SkillSelfTestOptions::default(),
+        agent_runner,
+    )?;
+
+    let mut findings = Vec::new();
+    if !report.publishable {
+        findings.push(error_finding(
+            "agentenv.skill.self-test.score-below-threshold",
+            &format!(
+                "self-test score {:.3} is below required threshold {:.3}",
+                report.score,
+                super::SELF_TEST_PUBLISH_THRESHOLD
+            ),
+            Some(self_test_source_path),
+            None,
+        ));
+    }
+
+    let mut tier = tier_from_findings(SkillCiTier::FunctionalRegression, findings);
+    tier.details = Some(serde_json::json!({
+        "score": report.score,
+        "passed": report.passed,
+        "total": report.total,
+        "publishable": report.publishable,
+        "self_test_digest": report.self_test_digest
+    }));
+    Ok(tier)
 }
 
 fn text_similarity(left: &str, right: &str) -> Option<f32> {
@@ -897,6 +968,8 @@ struct StaticLintResult {
     findings: Vec<SkillCiFinding>,
     manifest: Option<SkillManifest>,
     entry_content: Option<String>,
+    functional_regression_ready: bool,
+    self_test_source_path: Option<PathBuf>,
 }
 
 fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError> {
@@ -917,6 +990,8 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
                 findings,
                 manifest: None,
                 entry_content: None,
+                functional_regression_ready: false,
+                self_test_source_path: None,
             });
         }
     };
@@ -933,12 +1008,14 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
         ));
     }
 
+    let mut functional_regression_ready = true;
     let digest = match compute_bundle_digest(candidate_path, &manifest) {
         Ok(digest) => {
             candidate.digest = digest.clone();
             Some(digest)
         }
         Err(_) => {
+            functional_regression_ready = false;
             findings.push(error_finding(
                 "agentenv.skill.signature.invalid",
                 "skill package signature could not be verified",
@@ -951,6 +1028,7 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
 
     if let Some(digest) = digest.as_deref() {
         if super::signature::verify_skill_package_signature(&manifest, digest, false).is_err() {
+            functional_regression_ready = false;
             findings.push(error_finding(
                 "agentenv.skill.signature.invalid",
                 "skill package signature is invalid",
@@ -960,14 +1038,19 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
         }
     }
 
-    if load_skill_self_test_spec(candidate_path).is_err() {
-        findings.push(error_finding(
-            "agentenv.skill.self-test.invalid",
-            "skill self-test is invalid",
-            Some(PathBuf::from("skill.yaml")),
-            None,
-        ));
-    }
+    let self_test_source_path = match load_skill_self_test_spec(candidate_path) {
+        Ok(_) => Some(self_test_source_path(candidate_path)),
+        Err(_) => {
+            functional_regression_ready = false;
+            findings.push(error_finding(
+                "agentenv.skill.self-test.invalid",
+                "skill self-test is invalid",
+                Some(PathBuf::from("skill.yaml")),
+                None,
+            ));
+            None
+        }
+    };
 
     let entry_content = match read_declared_text(candidate_path, &manifest.entry) {
         Ok(content) => {
@@ -992,7 +1075,41 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
         findings,
         manifest: Some(manifest),
         entry_content,
+        functional_regression_ready,
+        self_test_source_path,
     })
+}
+
+fn self_test_source_path(candidate_path: &Path) -> PathBuf {
+    if candidate_path.join("skill-test.yaml").is_file() {
+        return PathBuf::from("skill-test.yaml");
+    }
+
+    if skill_md_declares_self_test(candidate_path) {
+        return PathBuf::from("SKILL.md");
+    }
+
+    PathBuf::from("skill.yaml")
+}
+
+fn skill_md_declares_self_test(candidate_path: &Path) -> bool {
+    let Ok(content) = read_declared_text(candidate_path, Path::new("SKILL.md")) else {
+        return false;
+    };
+    let FrontmatterState::Closed(end_line) = frontmatter_end_line(&content) else {
+        return false;
+    };
+
+    let yaml = content
+        .lines()
+        .skip(1)
+        .take(end_line.saturating_sub(2))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(YamlValue::Mapping(mapping)) = serde_yaml::from_str::<YamlValue>(&yaml) else {
+        return false;
+    };
+    mapping.contains_key(YamlValue::String("self_test".to_owned()))
 }
 
 fn fallback_candidate(candidate_path: &Path) -> SkillCiCandidate {
