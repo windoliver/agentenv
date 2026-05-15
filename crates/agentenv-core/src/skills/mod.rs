@@ -1,5 +1,6 @@
 mod attestation;
 pub mod cache;
+mod ci;
 mod config;
 mod digest;
 mod error;
@@ -27,6 +28,11 @@ pub use cache::{
     SkillCacheLayout, SkillIndex, SkillIndexEntry, SkillProvenance, SkillProvenanceSubject,
     SkillPrunePlan, SkillSelfTest, SkillTrustKey, SkillVerifyEntry, SkillVerifyOptions,
     SkillVerifyReport, SkillVerifyStatus, SKILL_METADATA_SCHEMA_VERSION,
+};
+pub use ci::{
+    run_skill_ci, SkillCiCandidate, SkillCiFinding, SkillCiRegistrySkill, SkillCiRegistrySnapshot,
+    SkillCiReport, SkillCiRequest, SkillCiSeverity, SkillCiStatus, SkillCiTier, SkillCiTierReport,
+    SkillCiTierStatus,
 };
 pub use config::{
     load_project_skills_config, load_user_skills_config, merge_skills_config, ProposalConfig,

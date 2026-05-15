@@ -108,6 +108,12 @@ pub enum SkillError {
     SkillNotInstalled { name: String },
     #[error("skill `{name}` has multiple installed versions: {versions}")]
     AmbiguousInstalledVersion { name: String, versions: String },
+    #[error("invalid skill CI candidate `{path}`: {message}")]
+    InvalidSkillCiCandidate { path: PathBuf, message: String },
+    #[error("skill CI validation failed at tier `{tier}`")]
+    SkillCiFailed { tier: String },
+    #[error("failed to serialize skill CI SARIF: {message}")]
+    SkillCiSarif { message: String },
     #[error("skill `{name}` version `{version}` already exists with digest `{existing}`")]
     AlreadyInstalledDifferentDigest {
         name: String,
