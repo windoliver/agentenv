@@ -20,6 +20,7 @@ use super::{
 };
 
 const MANIFEST_FILE: &str = "skill.yaml";
+const SKILL_TEST_FILE: &str = "skill-test.yaml";
 const SOURCE_TYPE: &str = "git";
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -235,6 +236,8 @@ impl GitRegistryAdapter {
             digest: Some(digest),
             signature_ed25519: manifest.signature_ed25519.clone(),
             public_key_ed25519: manifest.signature_public_key_ed25519.clone(),
+            self_test_score: None,
+            self_test_attestation_digest: None,
         }
     }
 }
@@ -310,6 +313,7 @@ impl RegistryAdapter for GitRegistryAdapter {
         &self,
         _bundle_path: &Path,
         _allow_unsigned: bool,
+        _attestation: Option<&super::SkillSelfTestAttestation>,
     ) -> Result<SkillSearchHit, SkillError> {
         Err(SkillError::UnsupportedRegistryPublish {
             registry: self.name.clone(),
@@ -816,7 +820,28 @@ fn copy_bundle_contents(
             &destination_root.join(declared_file),
         )?;
     }
+    copy_optional_self_test_file(source_root, destination_root)?;
     Ok(())
+}
+
+fn copy_optional_self_test_file(
+    source_root: &Path,
+    destination_root: &Path,
+) -> Result<(), SkillError> {
+    let source = source_root.join(SKILL_TEST_FILE);
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_file() => copy_regular_file(
+            source_root,
+            Path::new(SKILL_TEST_FILE),
+            &destination_root.join(SKILL_TEST_FILE),
+        ),
+        Ok(_) => Err(SkillError::UnsafeBundlePath { path: source }),
+        Err(source_error) if source_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source_error) => Err(SkillError::Io {
+            path: source,
+            source: source_error,
+        }),
+    }
 }
 
 fn sort_hits(hits: &mut [SkillSearchHit]) {

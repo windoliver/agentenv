@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{self, Command},
+    process::{self, Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
@@ -25,7 +25,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PTY_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn agentenv_bin() -> &'static str {
@@ -1233,7 +1233,7 @@ fn skills_propose_filters_duplicate_installed_skill_by_provenance_fingerprint() 
     fs::create_dir_all(bundle.join("traces")).unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: existing-installed-skill\nversion: 0.1.0\ndescription: unrelated installed skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\n",
+        "name: existing-installed-skill\nversion: 0.1.0\ndescription: unrelated installed skill\nentry: SKILL.md\nfiles:\n  - SKILL.md\n  - traces/provenance.json\nself_test:\n  command: test -f traces/provenance.json\n",
     )
     .unwrap();
     fs::write(
@@ -2139,7 +2139,7 @@ fn skills_propose_does_not_follow_provider_redirect_to_metadata_endpoint() {
         .env("HOME", &temp_dir)
         .env("AGENTENV_DISABLE_KEYRING", "1")
         .env("AGENTENV_SKILL_PROPOSER_ALLOW_LOCAL_ENDPOINTS", "1")
-        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "100")
+        .env("AGENTENV_SKILL_PROPOSER_HTTP_TIMEOUT_MS", "500")
         .env(
             "AGENTENV_TEST_SKILL_PROPOSER_REDIRECT_TOKEN",
             "redirect-token",
@@ -2515,7 +2515,7 @@ fn skills_install_list_info_verify_and_remove_local_bundle() {
     fs::write(bundle.join("SKILL.md"), "# CLI Skill\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: cli-skill\nversion: 0.1.0\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
 
@@ -2584,7 +2584,7 @@ fn skills_search_add_and_publish_use_filesystem_registry_config() {
     fs::write(bundle.join("SKILL.md"), "# Registry Skill\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: registry-skill\nversion: 0.1.0\ndescription: Registry demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
     fs::write(
@@ -2641,7 +2641,7 @@ fn skills_registry_cli_path_override_publishes_searches_and_adds() {
     fs::write(bundle.join("SKILL.md"), "# Override Skill\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: override-skill\nversion: 0.1.0\ndescription: Override demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: override-skill\nversion: 0.1.0\ndescription: Override demo\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
 
@@ -2697,6 +2697,253 @@ fn skills_registry_cli_path_override_publishes_searches_and_adds() {
     assert_eq!(
         add_json["source_label"],
         "filesystem:cli:override-skill@0.1.0"
+    );
+}
+
+#[test]
+fn skills_cli_publish_rejects_missing_or_unattested_self_tests_e2e() {
+    let temp_dir = make_temp_dir("skills-cli-self-test-gate-errors");
+    let registry = temp_dir.join("registry");
+    let missing_bundle = temp_dir.join("missing-self-test");
+    write_local_skill_bundle(
+        &missing_bundle,
+        "missing-cli-self-test",
+        "0.1.0",
+        "Missing CLI self-test",
+        None,
+    );
+
+    let missing_publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&missing_bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!missing_publish.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_publish.stderr).contains("skill self-test is missing"),
+        "{}",
+        output_summary(&missing_publish)
+    );
+    assert!(
+        !registry.join("index.yaml").exists(),
+        "missing self-test publish should not create registry index"
+    );
+
+    let bundle = temp_dir.join("attestation-required");
+    write_local_skill_bundle(
+        &bundle,
+        "attestation-required-cli",
+        "0.1.0",
+        "Attestation required CLI",
+        Some("test -f SKILL.md"),
+    );
+    let no_run_publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--no-self-test-run")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(!no_run_publish.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_run_publish.stderr)
+            .contains("missing signed self-test attestation"),
+        "{}",
+        output_summary(&no_run_publish)
+    );
+    assert!(
+        !registry.join("index.yaml").exists(),
+        "unattested no-rerun publish should not create registry index"
+    );
+}
+
+#[test]
+fn skills_cli_skill_test_file_publish_add_verify_e2e() {
+    let temp_dir = make_temp_dir("skills-cli-skill-test-file-e2e");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    write_local_skill_bundle_with_skill_test_file(
+        &bundle,
+        "file-self-test-cli",
+        "0.1.0",
+        "File self-test CLI",
+    );
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+    let publish_json: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(publish_json["name"], "file-self-test-cli");
+    assert_eq!(publish_json["self_test_score"], 1.0);
+    assert!(publish_json["self_test_attestation_digest"].is_string());
+    assert!(registry
+        .join("bundles/file-self-test-cli/0.1.0/skill-test.yaml")
+        .is_file());
+    assert!(registry
+        .join("bundles/file-self-test-cli/0.1.0/self-test-attestation.json")
+        .is_file());
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("file-self")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", output_summary(&search));
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(search_json["skills"][0]["name"], "file-self-test-cli");
+    assert_eq!(search_json["skills"][0]["self_test_score"], 1.0);
+    assert!(search_json["skills"][0]["self_test_attestation_digest"].is_string());
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("file-self-test-cli@0.1.0")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+    let add_json: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    assert_eq!(add_json["name"], "file-self-test-cli");
+    assert_eq!(add_json["self_test_score"], 1.0);
+    let installed_path = PathBuf::from(add_json["path"].as_str().unwrap());
+    assert!(installed_path.join("content/skill-test.yaml").is_file());
+
+    let verify = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("verify")
+        .arg("file-self-test-cli")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{}", output_summary(&verify));
+    let verify_json: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify_json["name"], "file-self-test-cli");
+    assert_eq!(verify_json["self_test_score"], 1.0);
+    assert!(verify_json["self_test_attestation"].is_string());
+}
+
+#[test]
+fn skills_publish_can_use_supplied_self_test_attestation_without_rerun() {
+    let temp_dir = make_temp_dir("skills-cli-publish-supplied-self-test-attestation");
+    let registry = temp_dir.join("registry");
+    let bundle = temp_dir.join("bundle");
+    let sentinel = temp_dir.join("self-test-reran");
+    write_local_skill_bundle(
+        &bundle,
+        "supplied-attestation-skill",
+        "0.1.0",
+        "Supplied attestation",
+        Some(&format!("touch {}", sentinel.display())),
+    );
+
+    let install = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("install")
+        .arg("--from")
+        .arg(&bundle)
+        .arg("--allow-unsigned")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success(), "{}", output_summary(&install));
+    let installed: serde_json::Value = serde_json::from_slice(&install.stdout).unwrap();
+    let attestation_path = installed["self_test_attestation"].as_str().unwrap();
+    assert!(sentinel.is_file());
+    fs::remove_file(&sentinel).unwrap();
+
+    let publish = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("publish")
+        .arg(&bundle)
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--self-test-attestation")
+        .arg(attestation_path)
+        .arg("--no-self-test-run")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(publish.status.success(), "{}", output_summary(&publish));
+    let published: serde_json::Value = serde_json::from_slice(&publish.stdout).unwrap();
+    assert_eq!(published["self_test_score"], 1.0);
+    assert!(registry
+        .join("bundles/supplied-attestation-skill/0.1.0/self-test-attestation.json")
+        .is_file());
+    assert!(
+        !sentinel.exists(),
+        "publish with supplied attestation reran the self-test"
+    );
+
+    let remove = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("remove")
+        .arg("supplied-attestation-skill")
+        .arg("--yes")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(remove.status.success(), "{}", output_summary(&remove));
+
+    let add = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("add")
+        .arg("supplied-attestation-skill@0.1.0")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--allow-unsigned")
+        .arg("--self-test-attestation")
+        .arg(attestation_path)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{}", output_summary(&add));
+    let add_json: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    assert_eq!(add_json["self_test_score"], 1.0);
+    assert!(
+        !sentinel.exists(),
+        "add with supplied attestation reran the self-test"
     );
 }
 
@@ -2842,7 +3089,7 @@ fn skills_publish_reports_git_registry_override_as_read_only() {
     fs::write(bundle.join("SKILL.md"), "# Git Publish\n").unwrap();
     fs::write(
         bundle.join("skill.yaml"),
-        "name: git-publish-cli\nversion: 0.1.0\ndescription: Git publish CLI\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+        "name: git-publish-cli\nversion: 0.1.0\ndescription: Git publish CLI\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
     )
     .unwrap();
 
@@ -3061,6 +3308,11 @@ fn skills_cli_enforces_trust_self_tests_version_selectors_and_remove_confirmatio
     );
     let verify_new_json: serde_json::Value = serde_json::from_slice(&verify_new.stdout).unwrap();
     assert_eq!(verify_new_json["version"], "0.2.0");
+    assert_eq!(verify_new_json["self_test_score"], 1.0);
+    assert!(verify_new_json["self_test_attestation"]
+        .as_str()
+        .unwrap()
+        .ends_with(".json"));
 
     let remove_without_yes = Command::new(agentenv_bin())
         .arg("skills")
@@ -4485,9 +4737,9 @@ fn term_once_does_not_create_missing_approval_database() {
 fn approvals_serve_healthz_responds_ok() {
     let temp = tempfile::tempdir().unwrap();
     let port = reserve_tcp_port();
-    let _server = spawn_approvals_server(temp.path(), port);
+    let mut server = spawn_approvals_server(temp.path(), port);
 
-    wait_for_http_ok(port, "/healthz");
+    server.wait_for_http_ok(port, "/healthz");
 }
 
 #[test]
@@ -4497,8 +4749,8 @@ fn approvals_serve_unsigned_decision_callback_returns_401_without_deciding() {
     write_approval_callback_config(temp.path(), "callback-test-secret");
     write_minimal_env_state(temp.path(), "demo");
     seed_pending_approval(temp.path(), "demo", "req-unsigned");
-    let _server = spawn_approvals_server(temp.path(), port);
-    wait_for_http_ok(port, "/healthz");
+    let mut server = spawn_approvals_server(temp.path(), port);
+    server.wait_for_http_ok(port, "/healthz");
     let body = decision_callback_body("req-unsigned");
 
     let response = post_decision_callback(port, "req-unsigned", body, None);
@@ -4516,8 +4768,8 @@ fn approvals_serve_mismatched_signed_request_id_rejects_without_deciding_url_req
     write_minimal_env_state(temp.path(), "demo");
     seed_pending_approval(temp.path(), "demo", "req-url");
     seed_pending_approval(temp.path(), "demo", "req-body");
-    let _server = spawn_approvals_server(temp.path(), port);
-    wait_for_http_ok(port, "/healthz");
+    let mut server = spawn_approvals_server(temp.path(), port);
+    server.wait_for_http_ok(port, "/healthz");
     let body = decision_callback_body("req-body");
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
     let headers = signed_callback_headers(secret, timestamp, "delivery-mismatch", body.as_bytes());
@@ -4537,8 +4789,8 @@ fn approvals_serve_stale_signed_decision_callback_returns_401_without_deciding()
     write_approval_callback_config(temp.path(), secret);
     write_minimal_env_state(temp.path(), "demo");
     seed_pending_approval(temp.path(), "demo", "req-stale");
-    let _server = spawn_approvals_server(temp.path(), port);
-    wait_for_http_ok(port, "/healthz");
+    let mut server = spawn_approvals_server(temp.path(), port);
+    server.wait_for_http_ok(port, "/healthz");
     let body = decision_callback_body("req-stale");
     let timestamp = OffsetDateTime::now_utc().unix_timestamp() - 600;
     let headers = signed_callback_headers(secret, timestamp, "delivery-stale", body.as_bytes());
@@ -4557,8 +4809,8 @@ fn approvals_serve_valid_signed_decision_callback_records_decision() {
     write_approval_callback_config(temp.path(), secret);
     write_minimal_env_state(temp.path(), "demo");
     seed_pending_approval(temp.path(), "demo", "req-valid");
-    let _server = spawn_approvals_server(temp.path(), port);
-    wait_for_http_ok(port, "/healthz");
+    let mut server = spawn_approvals_server(temp.path(), port);
+    server.wait_for_http_ok(port, "/healthz");
     let body = decision_callback_body("req-valid");
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();
     let headers = signed_callback_headers(secret, timestamp, "delivery-valid", body.as_bytes());
@@ -6071,6 +6323,28 @@ fn write_local_skill_bundle(
     .unwrap();
 }
 
+fn write_local_skill_bundle_with_skill_test_file(
+    bundle: &Path,
+    name: &str,
+    version: &str,
+    description: &str,
+) {
+    fs::create_dir_all(bundle).unwrap();
+    fs::write(bundle.join("SKILL.md"), format!("# {description}\n")).unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: file_exists\n      path: SKILL.md\n  timeout_seconds: 5\n",
+    )
+    .unwrap();
+}
+
 fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, description: &str) {
     let bundle = registry.join("bundles").join(name).join(version);
     fs::create_dir_all(&bundle).unwrap();
@@ -6082,7 +6356,7 @@ fn write_filesystem_registry_skill(registry: &Path, name: &str, version: &str, d
     fs::write(
         bundle.join("skill.yaml"),
         format!(
-            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
         ),
     )
     .unwrap();
@@ -6111,7 +6385,7 @@ fn write_indexless_filesystem_registry_skill(
     fs::write(
         bundle.join("skill.yaml"),
         format!(
-            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\n"
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
         ),
     )
     .unwrap();
@@ -6591,13 +6865,16 @@ fn spawn_redirecting_skill_proposer(
             .unwrap();
         let _request = read_http_request(&mut stream);
         let body = format!("redirecting to metadata: {location}");
-        write!(
-            stream,
+        let response = format!(
             "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
-        )
-        .unwrap();
+        );
+        match stream.write_all(response.as_bytes()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write redirecting test response: {error}"),
+        }
     });
 
     (endpoint, request_count, handle)
@@ -6686,11 +6963,48 @@ impl Drop for ApprovalsServerChild {
     }
 }
 
+impl ApprovalsServerChild {
+    fn wait_for_http_ok(&mut self, port: u16, path: &str) {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let deadline = std::time::Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let mut last_error = None;
+
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                let stderr = child_stderr(&mut self.child);
+                panic!(
+                    "approvals server exited before {url} responded: {status}; stderr was: {stderr}"
+                );
+            }
+
+            match client.get(&url).send() {
+                Ok(response) if response.status().is_success() => return,
+                Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        panic!(
+            "timed out waiting for {url}: {}",
+            last_error.unwrap_or_else(|| "no attempts were made".to_owned())
+        );
+    }
+}
+
 fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
-    let guard = APPROVALS_SERVER_TEST_LOCK.lock().unwrap();
+    let guard = APPROVALS_SERVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let child = Command::new(agentenv_bin())
         .env("HOME", home)
         .args(["approvals", "serve", "--addr", &format!("127.0.0.1:{port}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     ApprovalsServerChild {
@@ -6699,28 +7013,12 @@ fn spawn_approvals_server(home: &Path, port: u16) -> ApprovalsServerChild {
     }
 }
 
-fn wait_for_http_ok(port: u16, path: &str) {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let deadline = std::time::Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
-    let mut last_error = None;
-
-    while std::time::Instant::now() < deadline {
-        match client.get(&url).send() {
-            Ok(response) if response.status().is_success() => return,
-            Ok(response) => last_error = Some(format!("HTTP {}", response.status())),
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        thread::sleep(Duration::from_millis(50));
+fn child_stderr(child: &mut process::Child) -> String {
+    let mut stderr = String::new();
+    if let Some(pipe) = child.stderr.as_mut() {
+        let _ = pipe.read_to_string(&mut stderr);
     }
-
-    panic!(
-        "timed out waiting for {url}: {}",
-        last_error.unwrap_or_else(|| "no attempts were made".to_owned())
-    );
+    stderr
 }
 
 fn write_approval_callback_config(home: &Path, secret: &str) {

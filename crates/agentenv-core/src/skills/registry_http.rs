@@ -12,11 +12,12 @@ use url::Url;
 
 use crate::security::ssrf::{validate_outbound, SsrfOptions};
 
+use super::signature::verify_skill_package_signature;
 use super::{
     compute_bundle_digest,
     manifest::{load_remote_skill_manifest, normalize_bundle_path, validated_bundle_file},
     validate_skill_name, verify_ed25519_signature, FetchedSkill, RegistryAdapter, SkillError,
-    SkillManifest, SkillSearchHit,
+    SkillManifest, SkillSearchHit, SkillSelfTestAttestation,
 };
 
 const BUNDLES_DIR: &str = "bundles";
@@ -24,6 +25,7 @@ const CONTENT_DIR: &str = "content";
 const INDEX_JSON_FILE: &str = "index.json";
 const INDEX_YAML_FILE: &str = "index.yaml";
 const MANIFEST_FILE: &str = "skill.yaml";
+const SKILL_TEST_FILE: &str = "skill-test.yaml";
 const SOURCE_TYPE: &str = "http";
 
 #[derive(Debug, Clone)]
@@ -86,6 +88,14 @@ impl HttpRegistryAdapter {
 
     fn manifest_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
         self.url_for(&[BUNDLES_DIR, name, version, MANIFEST_FILE])
+    }
+
+    fn skill_test_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
+        self.url_for(&[BUNDLES_DIR, name, version, SKILL_TEST_FILE])
+    }
+
+    fn attestation_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
+        self.url_for(&[BUNDLES_DIR, name, version, "self-test-attestation.json"])
     }
 
     fn tarball_url(&self, name: &str, version: &str) -> Result<Url, SkillError> {
@@ -225,6 +235,8 @@ impl HttpRegistryAdapter {
             digest: Some(digest),
             signature_ed25519: manifest.signature_ed25519.clone(),
             public_key_ed25519: manifest.signature_public_key_ed25519.clone(),
+            self_test_score: None,
+            self_test_attestation_digest: None,
         }
     }
 
@@ -356,6 +368,12 @@ impl HttpRegistryAdapter {
                 .get_bytes(self.content_url(&hit.name, &hit.version, declared_file)?)
                 .await?;
             write_file(&staging_path.join(declared_file), &content)?;
+        }
+        if let Some(content) = self
+            .get_optional_bytes(self.skill_test_url(&hit.name, &hit.version)?)
+            .await?
+        {
+            write_file(&staging_path.join(SKILL_TEST_FILE), &content)?;
         }
 
         Ok(())
@@ -511,12 +529,15 @@ impl RegistryAdapter for HttpRegistryAdapter {
         &self,
         bundle_path: &Path,
         allow_unsigned: bool,
+        attestation: Option<&SkillSelfTestAttestation>,
     ) -> Result<SkillSearchHit, SkillError> {
         let manifest = super::load_skill_manifest(bundle_path)?;
         let digest = compute_bundle_digest(bundle_path, &manifest)?;
         verify_publish_signature(&manifest, &digest, allow_unsigned)?;
+        let attestation = attestation.ok_or(SkillError::MissingSelfTestAttestation)?;
         let version = manifest.version.to_string();
-        let hit = self.hit_for_manifest(&manifest, digest.clone());
+        let mut hit = self.hit_for_manifest(&manifest, digest.clone());
+        hit.apply_self_test_attestation(Some(attestation));
         let (mut index, index_format) = self.read_index_with_format().await?;
 
         if let Some(existing) = index
@@ -539,6 +560,10 @@ impl RegistryAdapter for HttpRegistryAdapter {
         let manifest_bytes = read_regular_file(&bundle_path.join(MANIFEST_FILE))?;
         self.put_bytes(self.manifest_url(&manifest.name, &version)?, manifest_bytes)
             .await?;
+        if let Some(bytes) = read_optional_regular_file(&bundle_path.join(SKILL_TEST_FILE))? {
+            self.put_bytes(self.skill_test_url(&manifest.name, &version)?, bytes)
+                .await?;
+        }
         for declared_file in &manifest.declared_files {
             let source = validated_bundle_file(bundle_path, declared_file)?;
             let bytes = read_regular_file(&source)?;
@@ -548,6 +573,13 @@ impl RegistryAdapter for HttpRegistryAdapter {
             )
             .await?;
         }
+        let bytes = serde_json::to_vec_pretty(attestation).map_err(|source| {
+            SkillError::InvalidSelfTestAttestation {
+                message: format!("failed to serialize self-test attestation: {source}"),
+            }
+        })?;
+        self.put_bytes(self.attestation_url(&manifest.name, &version)?, bytes)
+            .await?;
 
         index
             .skills
@@ -640,27 +672,7 @@ fn verify_publish_signature(
     digest: &str,
     allow_unsigned: bool,
 ) -> Result<(), SkillError> {
-    if allow_unsigned {
-        return Ok(());
-    }
-
-    let signature =
-        manifest
-            .signature_ed25519
-            .as_deref()
-            .ok_or_else(|| SkillError::MissingSignature {
-                name: manifest.name.clone(),
-                version: manifest.version.to_string(),
-            })?;
-    let public_key = manifest
-        .signature_public_key_ed25519
-        .as_deref()
-        .ok_or_else(|| SkillError::MissingSignature {
-            name: manifest.name.clone(),
-            version: manifest.version.to_string(),
-        })?;
-
-    verify_ed25519_signature(manifest, digest, signature, public_key)
+    verify_skill_package_signature(manifest, digest, allow_unsigned).map(|_| ())
 }
 
 fn remove_directory_if_exists(path: &Path) -> Result<(), SkillError> {
@@ -693,6 +705,20 @@ fn write_file(path: &Path, content: &[u8]) -> Result<(), SkillError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn read_optional_regular_file(path: &Path) -> Result<Option<Vec<u8>>, SkillError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => read_regular_file(path).map(Some),
+        Ok(_) => Err(SkillError::UnsafeBundlePath {
+            path: path.to_path_buf(),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SkillError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(unix)]

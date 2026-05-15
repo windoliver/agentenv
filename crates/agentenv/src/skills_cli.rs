@@ -1,19 +1,31 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
+use agentenv_core::admission::AdmissionStatus;
+use agentenv_core::runtime::RuntimeOptions;
 use agentenv_core::skills::{
     execute_skill_prune, load_project_skills_config, load_skill_trust_keys,
     load_user_skills_config, merge_skills_config, plan_skill_prune, rebuild_skill_index,
-    verify_all_installed_skills, InstalledSkill, InstalledSkillSelector, SkillAddRequest,
-    SkillCacheLayout, SkillError, SkillPublishRequest, SkillSearchHit, SkillService,
-    SkillVerifyOptions, SkillVerifyStatus, SkillsConfig, SkillsConfigOverride,
+    verify_all_installed_skills, AgentProduceRequest, AgentProduceRunner, InstalledSkill,
+    InstalledSkillSelector, SkillAddRequest, SkillCacheLayout, SkillError, SkillPublishRequest,
+    SkillSearchHit, SkillService, SkillVerifyOptions, SkillVerifyStatus, SkillsConfig,
+    SkillsConfigOverride,
 };
 use agentenv_credstore::{CredentialStore, CredentialStoreError};
-use agentenv_proto::{CredentialKind, CredentialRequirement};
+use agentenv_proto::{CredentialKind, CredentialRequirement, LogLevel};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::skills_propose_cli::{run_skills_propose, SkillsProposeArgs};
+use crate::{
+    builtin_factory,
+    credentials_runtime::{CliCredentialProvider, TerminalCredentialPrompter},
+};
 
 #[derive(Debug, Args)]
 pub struct SkillsArgs {
@@ -51,6 +63,8 @@ pub struct SkillsAddArgs {
     pub registry: Option<String>,
     #[arg(long)]
     pub allow_unsigned: bool,
+    #[arg(long, value_name = "PATH")]
+    pub self_test_attestation: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -61,6 +75,8 @@ pub struct SkillsInstallArgs {
     pub from: PathBuf,
     #[arg(long)]
     pub allow_unsigned: bool,
+    #[arg(long, value_name = "PATH")]
+    pub self_test_attestation: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -98,6 +114,10 @@ pub struct SkillsPublishArgs {
     pub registry: Option<String>,
     #[arg(long)]
     pub allow_unsigned: bool,
+    #[arg(long, value_name = "PATH")]
+    pub self_test_attestation: Option<PathBuf>,
+    #[arg(long)]
+    pub no_self_test_run: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -139,8 +159,178 @@ pub async fn run_skills(args: SkillsArgs) -> Result<()> {
     let registry_override = registry_override_for_command(&args.command);
     let config = load_effective_config(registry_override)?;
     let service = SkillService::new(root.clone(), config)
-        .with_credential_resolver(Arc::new(resolve_skill_credential));
+        .with_credential_resolver(Arc::new(resolve_skill_credential))
+        .with_agent_produce_runner(Arc::new(CliAgentProduceRunner {
+            root: root.clone(),
+            non_interactive: true,
+            runtime_handle: tokio::runtime::Handle::current(),
+        }));
     dispatch(args.command, service, root).await
+}
+
+struct CliAgentProduceRunner {
+    root: PathBuf,
+    non_interactive: bool,
+    runtime_handle: tokio::runtime::Handle,
+}
+
+impl AgentProduceRunner for CliAgentProduceRunner {
+    fn run_agent_prompt(&self, request: AgentProduceRequest<'_>) -> Result<String, SkillError> {
+        self.runtime_handle
+            .block_on(self.run_agent_prompt_async(request))
+    }
+}
+
+impl CliAgentProduceRunner {
+    async fn run_agent_prompt_async(
+        &self,
+        request: AgentProduceRequest<'_>,
+    ) -> Result<String, SkillError> {
+        let deadline = Instant::now().checked_add(request.timeout).ok_or_else(|| {
+            SkillError::InvalidSelfTest {
+                message: "agent_produces timeout is too large".to_owned(),
+            }
+        })?;
+        if request.cancelled.load(Ordering::Relaxed) {
+            return Err(SkillError::SelfTestTimeout {
+                timeout_seconds: request.timeout.as_secs(),
+            });
+        }
+
+        let blueprint_path = if request.blueprint.is_absolute() {
+            request.blueprint.to_path_buf()
+        } else {
+            request.skill_root.join(request.blueprint)
+        };
+        let blueprint_yaml =
+            fs::read_to_string(&blueprint_path).map_err(|source| SkillError::InvalidSelfTest {
+                message: format!(
+                    "failed to read self-test blueprint `{}`: {source}",
+                    blueprint_path.display()
+                ),
+            })?;
+        let env_name = unique_self_test_env_name();
+        let options = RuntimeOptions {
+            root: self.root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: self.non_interactive,
+        };
+        let store = CredentialStore::from_default_paths().map_err(|source| {
+            SkillError::InvalidSelfTest {
+                message: format!("failed to initialize credential store: {source}"),
+            }
+        })?;
+        let mut provider = CliCredentialProvider {
+            store,
+            non_interactive: self.non_interactive,
+            prompter: Box::new(TerminalCredentialPrompter),
+        };
+        let created = agentenv_core::runtime::create_env(
+            &options,
+            &builtin_factory::BuiltInDriverFactory,
+            &mut provider,
+            &env_name,
+            &blueprint_yaml,
+        )
+        .await
+        .map_err(runtime_error_to_skill_error)?;
+        if created.admission.status != AdmissionStatus::Accepted {
+            return Err(SkillError::InvalidSelfTest {
+                message: format!(
+                    "self-test environment `{env_name}` was rejected: {}",
+                    created.admission.reason_code.as_str()
+                ),
+            });
+        }
+
+        let run_result = if request.cancelled.load(Ordering::Relaxed) {
+            Err(SkillError::SelfTestTimeout {
+                timeout_seconds: request.timeout.as_secs(),
+            })
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining == Duration::ZERO {
+                Err(SkillError::SelfTestTimeout {
+                    timeout_seconds: request.timeout.as_secs(),
+                })
+            } else {
+                match tokio::time::timeout(
+                    remaining,
+                    agentenv_core::runtime::run_agent_prompt_once(
+                        &options,
+                        &builtin_factory::BuiltInDriverFactory,
+                        &env_name,
+                        request.prompt,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(runtime_error_to_skill_error),
+                    Err(_) => Err(SkillError::SelfTestTimeout {
+                        timeout_seconds: request.timeout.as_secs(),
+                    }),
+                }
+            }
+        };
+
+        let destroy_result = agentenv_core::runtime::destroy_env(
+            &options,
+            &builtin_factory::BuiltInDriverFactory,
+            &env_name,
+        )
+        .await
+        .map_err(runtime_error_to_skill_error);
+
+        match (run_result, destroy_result) {
+            (Ok(result), Ok(_)) if result.status == 0 => {
+                Ok(bounded_agent_output(result.stdout, result.stderr))
+            }
+            (Ok(result), Ok(_)) => Err(SkillError::InvalidSelfTest {
+                message: format!(
+                    "agent_produces prompt exited with status {}: {}",
+                    result.status,
+                    bounded_agent_output(result.stdout, result.stderr)
+                ),
+            }),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+}
+
+fn unique_self_test_env_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("skill-test-{}-{nanos}", std::process::id())
+}
+
+fn bounded_agent_output(stdout: String, stderr: String) -> String {
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+    let mut output = stdout;
+    if !stderr.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&stderr);
+    }
+    if output.len() <= MAX_OUTPUT_BYTES {
+        return output;
+    }
+    let mut boundary = MAX_OUTPUT_BYTES;
+    while !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    output.push_str("\n[agent output truncated]");
+    output
+}
+
+fn runtime_error_to_skill_error(error: agentenv_core::runtime::RuntimeError) -> SkillError {
+    SkillError::InvalidSelfTest {
+        message: error.to_string(),
+    }
 }
 
 async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) -> Result<()> {
@@ -161,6 +351,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                     handle: args.handle,
                     registry: None,
                     allow_unsigned: args.allow_unsigned,
+                    self_test_attestation: args.self_test_attestation,
                 })
                 .await?;
             print_installed_result(&installed, args.json)
@@ -170,6 +361,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                 &args.from,
                 args.allow_unsigned,
                 format!("local:{}", args.from.display()),
+                args.self_test_attestation.as_deref(),
             )?;
             print_installed_result(&installed, args.json)
         }
@@ -204,6 +396,8 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                     bundle_path: args.path,
                     registry: None,
                     allow_unsigned: args.allow_unsigned,
+                    self_test_attestation: args.self_test_attestation,
+                    no_self_test_run: args.no_self_test_run,
                 })
                 .await?;
             if args.json {

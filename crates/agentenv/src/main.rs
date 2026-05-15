@@ -38,11 +38,14 @@ use tracing_subscriber::EnvFilter;
 
 mod builtin_factory;
 mod bundle_cli;
+mod credentials_runtime;
 mod proxy_cli;
 mod render;
 mod skills_cli;
 mod skills_propose_cli;
 mod term_backend;
+
+use credentials_runtime::{CliCredentialProvider, TerminalCredentialPrompter};
 
 const SELF_ENV_SENTINEL: &str = "__self__";
 
@@ -3340,98 +3343,6 @@ fn new_cli_trace_id() -> String {
     }
 }
 
-struct CliCredentialProvider {
-    store: CredentialStore,
-    non_interactive: bool,
-    prompter: Box<dyn CredentialPrompter>,
-}
-
-trait CredentialPrompter {
-    fn prompt(
-        &mut self,
-        requirement: &agentenv_proto::CredentialRequirement,
-    ) -> agentenv_core::runtime::RuntimeResult<SecretString>;
-}
-
-struct TerminalCredentialPrompter;
-
-impl CredentialPrompter for TerminalCredentialPrompter {
-    fn prompt(
-        &mut self,
-        requirement: &agentenv_proto::CredentialRequirement,
-    ) -> agentenv_core::runtime::RuntimeResult<SecretString> {
-        let mut prompt = format!("Enter value for `{}`", requirement.name);
-        if !requirement.description.trim().is_empty() {
-            prompt.push_str(&format!(" ({})", requirement.description));
-        }
-        prompt.push_str(": ");
-        let value = rpassword::prompt_password(prompt).map_err(|source| {
-            agentenv_core::runtime::RuntimeError::Driver(
-                agentenv_core::driver::DriverError::InvalidInput {
-                    message: format!(
-                        "failed to prompt for credential `{}`: {source}",
-                        requirement.name
-                    ),
-                },
-            )
-        })?;
-        Ok(SecretString::new(value))
-    }
-}
-
-impl agentenv_core::runtime::CredentialProvider for CliCredentialProvider {
-    fn resolve(
-        &mut self,
-        requirement: &agentenv_proto::CredentialRequirement,
-    ) -> agentenv_core::runtime::RuntimeResult<Option<agentenv_core::runtime::RuntimeSecret>> {
-        let name = &requirement.name;
-        match self.store.resolve(name, requirement) {
-            Ok(secret) => Ok(Some(agentenv_core::runtime::RuntimeSecret::new(
-                secret.expose_secret().to_owned(),
-            ))),
-            Err(CredentialStoreError::MissingCredential { .. }) if !requirement.required => {
-                Ok(None)
-            }
-            Err(CredentialStoreError::MissingCredential { .. }) if self.non_interactive => {
-                Err(agentenv_core::runtime::RuntimeError::MissingCredential {
-                    name: name.to_owned(),
-                })
-            }
-            Err(CredentialStoreError::MissingCredential { .. }) => {
-                let prompted = self.prompter.prompt(requirement)?;
-                self.store
-                    .store(name, &prompted)
-                    .map_err(credential_store_runtime_error)?;
-                let resolved = self
-                    .store
-                    .resolve(name, requirement)
-                    .map_err(credential_store_runtime_error)?;
-                Ok(Some(agentenv_core::runtime::RuntimeSecret::new(
-                    resolved.expose_secret().to_owned(),
-                )))
-            }
-            Err(error) => Err(credential_store_runtime_error(error)),
-        }
-    }
-
-    fn backend_name(&self, name: &str) -> agentenv_core::runtime::RuntimeResult<Option<String>> {
-        Ok(self
-            .store
-            .where_is(name)
-            .ok()
-            .flatten()
-            .map(|backend| backend.to_string()))
-    }
-}
-
-fn credential_store_runtime_error(
-    error: CredentialStoreError,
-) -> agentenv_core::runtime::RuntimeError {
-    agentenv_core::runtime::RuntimeError::Driver(agentenv_core::driver::DriverError::InvalidInput {
-        message: error.to_string(),
-    })
-}
-
 async fn run_credentials(args: CredentialsArgs, event_sink_args: &[String]) -> Result<()> {
     let options = runtime_options(true)?;
     let dispatcher = build_event_dispatcher(&options, None, event_sink_args)?;
@@ -4319,7 +4230,7 @@ policy:
         value: SecretString,
     }
 
-    impl super::CredentialPrompter for StaticCredentialPrompt {
+    impl super::credentials_runtime::CredentialPrompter for StaticCredentialPrompt {
         fn prompt(
             &mut self,
             _requirement: &CredentialRequirement,

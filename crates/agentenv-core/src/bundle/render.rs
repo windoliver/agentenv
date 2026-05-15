@@ -29,8 +29,23 @@ struct SkillYaml<'a> {
     files: Vec<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tags: Vec<&'a str>,
+    self_test: SkillYamlSelfTest,
     agentenv_bundle: bool,
     agentenv_schema: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillYamlSelfTest {
+    runner: &'static str,
+    assertions: Vec<SkillYamlSelfTestAssertion>,
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillYamlSelfTestAssertion {
+    #[serde(rename = "type")]
+    assertion_type: &'static str,
+    path: &'static str,
 }
 
 pub(crate) fn render_skill_md(
@@ -107,6 +122,20 @@ pub(crate) fn render_skill_yaml(
         entry: "SKILL.md",
         files,
         tags: metadata.tags.iter().map(String::as_str).collect(),
+        self_test: SkillYamlSelfTest {
+            runner: "agentenv",
+            assertions: vec![
+                SkillYamlSelfTestAssertion {
+                    assertion_type: "file_exists",
+                    path: "agentenv.lock",
+                },
+                SkillYamlSelfTestAssertion {
+                    assertion_type: "file_exists",
+                    path: "scripts/bootstrap.sh",
+                },
+            ],
+            timeout_seconds: 30,
+        },
         agentenv_bundle: true,
         agentenv_schema: AGENTENV_BUNDLE_SCHEMA,
     };

@@ -17,6 +17,8 @@ use thiserror::Error;
 
 use crate::digest::{parse_sha256_digest, parse_sha256_hex, DigestError};
 
+pub use super::self_test::SkillSelfTestAssertion;
+
 pub const SKILL_METADATA_SCHEMA_VERSION: &str = "0.1";
 
 #[derive(Debug, Error)]
@@ -108,7 +110,7 @@ impl SkillCacheLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillManifest {
     pub schema_version: String,
@@ -131,20 +133,13 @@ pub struct SkillArchive {
     pub cache_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillSelfTest {
     #[serde(default = "default_self_test_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assertions: Vec<SkillSelfTestAssertion>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SkillSelfTestAssertion {
-    FileExists { path: String },
-    CommandExitsZero { cmd: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1113,11 +1108,16 @@ fn verify_self_tests(skill_dir: &Path, manifest: &SkillManifest, errors: &mut Ve
                     errors.push(error);
                 }
             }
+            SkillSelfTestAssertion::AgentProduces { .. } => {
+                errors.push(
+                    "agent_produces self-test assertions require the self-test runner".to_owned(),
+                );
+            }
         }
     }
 }
 
-fn verify_self_test_file_exists(skill_dir: &Path, path: &str, errors: &mut Vec<String>) {
+fn verify_self_test_file_exists(skill_dir: &Path, path: &Path, errors: &mut Vec<String>) {
     let relative_path = match safe_relative_path(path) {
         Ok(path) => path,
         Err(error) => {
@@ -1126,12 +1126,14 @@ fn verify_self_test_file_exists(skill_dir: &Path, path: &str, errors: &mut Vec<S
         }
     };
     if !skill_dir.join(&relative_path).is_file() {
-        errors.push(format!("self-test file does not exist `{path}`"));
+        errors.push(format!(
+            "self-test file does not exist `{}`",
+            path.display()
+        ));
     }
 }
 
-fn safe_relative_path(path: &str) -> Result<PathBuf, String> {
-    let source = Path::new(path);
+fn safe_relative_path(source: &Path) -> Result<PathBuf, String> {
     if source.as_os_str().is_empty() {
         return Err("self-test path must not be empty".to_owned());
     }
@@ -1142,7 +1144,8 @@ fn safe_relative_path(path: &str) -> Result<PathBuf, String> {
             Component::Normal(segment) => relative.push(segment),
             _ => {
                 return Err(format!(
-                    "self-test path must be a safe relative path `{path}`"
+                    "self-test path must be a safe relative path `{}`",
+                    source.display()
                 ))
             }
         }

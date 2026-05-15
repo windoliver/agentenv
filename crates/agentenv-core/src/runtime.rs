@@ -3497,6 +3497,29 @@ pub async fn exec_env_observed(
     }
 }
 
+pub async fn run_agent_prompt_once(
+    options: &RuntimeOptions,
+    factory: &dyn DriverFactory,
+    name: &str,
+    prompt: &str,
+) -> RuntimeResult<agentenv_proto::ExecResult> {
+    let state = describe_env(options, name)?.state;
+    let selection = selection_from_state(&state);
+    let handle = required_sandbox_handle(&state, name)?;
+    let mut set = factory.build(&selection)?;
+    initialize_sandbox_driver(options, set.sandbox.as_mut()).await?;
+    let cmd = format!("{} {}", AGENT_ENTRYPOINT_PATH, shell_quote(prompt));
+    set.sandbox
+        .exec(agentenv_proto::ExecParams {
+            handle,
+            cmd,
+            tty: false,
+            env: BTreeMap::new(),
+        })
+        .await
+        .map_err(RuntimeError::Driver)
+}
+
 pub async fn enter_env(
     options: &RuntimeOptions,
     factory: &dyn DriverFactory,
@@ -11679,6 +11702,55 @@ policy:
                 .join("agent")
                 .exists(),
             "rendered agent files can contain credentials and must not persist in the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_prompt_once_uses_entrypoint_with_quoted_prompt() {
+        let root = unique_root("agentenv-agent-prompt-once");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+        tracker.exec_cmds.lock().expect("exec tracker").clear();
+
+        let result = super::run_agent_prompt_once(&options, &factory, "demo", "summarize 'quotes'")
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, 0);
+        let exec_cmds = tracker.exec_cmds.lock().expect("exec tracker").clone();
+        assert_eq!(
+            exec_cmds,
+            vec![format!(
+                "{} {}",
+                super::AGENT_ENTRYPOINT_PATH,
+                super::shell_quote("summarize 'quotes'")
+            )]
         );
     }
 

@@ -121,7 +121,8 @@ Core owns the skill lifecycle:
 - Resolve blueprint skill references or CLI handles to exact artifact versions.
 - Fetch from trusted sources such as local paths, HTTP, OCI, or git through
   lightweight registry adapters.
-- Verify digests, signatures, versions, and revocation policy before injection.
+- Verify digests, signatures, versions, revocation policy, and functional
+  self-tests before injection.
 - Cache immutable artifacts and record exact pins in `agentenv.lock`.
 - Expose only the selected skill bundle to the sandbox; credential values do
   not flow through skill fetching or generic driver RPC.
@@ -134,6 +135,12 @@ Registry adapters are not JSON-RPC drivers. They are core-managed fetch and
 verify backends, analogous to package registries in Cargo, npm, and pip. If a
 registry adapter needs network access, its URLs pass through the SSRF validator
 and its output becomes an artifact pin in the lockfile.
+
+Published and locally installed skills must declare an `agentenv` self-test and
+score at least `0.8`. Successful runs are signed as self-test attestations tied
+to the exact bundle digest and normalized self-test digest; writable registry
+adapters persist those attestations with the published artifact so hub-style
+publish APIs can reject missing, stale, mismatched, or low-score submissions.
 
 At runtime, agents discover skills through the conventions their `AgentDriver`
 supports. Agent drivers may render config or install steps that point the agent
