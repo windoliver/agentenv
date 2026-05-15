@@ -164,6 +164,11 @@ pub enum EgressProxyLaunchError {
         #[source]
         source: std::io::Error,
     },
+    #[error("egress proxy process `{program}` exited during startup with status {status}")]
+    ExitedDuringStartup {
+        program: PathBuf,
+        status: std::process::ExitStatus,
+    },
     #[error("spawned egress proxy process did not report a pid")]
     MissingPid,
     #[error("failed to stop egress proxy process {pid}: {source}")]
@@ -250,16 +255,22 @@ pub async fn start_egress_proxy_process(
         .arg(events_db_path.as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|source| EgressProxyLaunchError::Spawn {
             program: program.clone(),
             source,
         })?;
     let pid = child.id().ok_or(EgressProxyLaunchError::MissingPid)?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?
+    {
+        return Err(EgressProxyLaunchError::ExitedDuringStartup { program, status });
+    }
 
     Ok(EgressProxyProcess { pid, child })
 }
@@ -296,6 +307,17 @@ pub async fn stop_egress_proxy_process_with_timeout(
         Ok(Err(source)) => Err(EgressProxyLaunchError::Stop { pid, source }),
         Err(_elapsed) => Err(EgressProxyLaunchError::StopTimeout { pid, timeout }),
     }
+}
+
+pub async fn stop_egress_proxy_pid(pid: u32) -> Result<(), EgressProxyLaunchError> {
+    stop_egress_proxy_pid_with_timeout(pid, DEFAULT_EGRESS_PROXY_STOP_TIMEOUT).await
+}
+
+pub async fn stop_egress_proxy_pid_with_timeout(
+    pid: u32,
+    _timeout: Duration,
+) -> Result<(), EgressProxyLaunchError> {
+    terminate_process_pid(pid).await
 }
 
 pub fn build_egress_proxy_plan(
@@ -827,6 +849,76 @@ fn validate_env_proxy_binary(path: PathBuf) -> Result<PathBuf, EgressProxyLaunch
     }
 
     Ok(path)
+}
+
+#[cfg(unix)]
+async fn terminate_process_pid(pid: u32) -> Result<(), EgressProxyLaunchError> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?;
+    if !status.success() && process_is_running(pid).await? {
+        return Err(EgressProxyLaunchError::Stop {
+            pid,
+            source: std::io::Error::other(format!("kill exited with status {status}")),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn terminate_process_pid(pid: u32) -> Result<(), EgressProxyLaunchError> {
+    let status = Command::new("taskkill")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .arg("/T")
+        .arg("/F")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?;
+    if !status.success() && process_is_running(pid).await? {
+        return Err(EgressProxyLaunchError::Stop {
+            pid,
+            source: std::io::Error::other(format!("taskkill exited with status {status}")),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn process_is_running(pid: u32) -> Result<bool, EgressProxyLaunchError> {
+    let status = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?;
+    Ok(status.success())
+}
+
+#[cfg(windows)]
+async fn process_is_running(pid: u32) -> Result<bool, EgressProxyLaunchError> {
+    let status = Command::new("tasklist")
+        .arg("/FI")
+        .arg(format!("PID eq {pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|source| EgressProxyLaunchError::Stop { pid, source })?;
+    Ok(status.success())
 }
 
 mod url_serde {
