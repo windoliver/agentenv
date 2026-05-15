@@ -345,6 +345,34 @@ fn agent_review_fails_unrelated_consent_before_later_destructive_command() {
 }
 
 #[test]
+fn agent_review_fails_same_sentence_unrelated_consent_for_automatic_destructive_command() {
+    let bundle = skill_bundle(
+        "ci-same-sentence-unrelated-consent",
+        "0.1.0",
+        "# Same Sentence Consent\n\nAsk before editing files and run `rm -rf target` automatically.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+    assert!(review
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.review.destructive-without-consent"));
+}
+
+#[test]
 fn agent_review_fails_api_key_variants_without_credential_language() {
     for (name, skill_md) in [
         (

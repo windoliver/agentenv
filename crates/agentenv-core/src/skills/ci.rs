@@ -51,6 +51,15 @@ const REVIEW_CONSENT_NEGATIONS: &[&str] = &[
     "without confirmation",
     "no confirmation",
 ];
+const REVIEW_UNSAFE_EXECUTION_PHRASES: &[&str] = &[
+    "automatically",
+    "immediately",
+    "without asking",
+    "without confirmation",
+    "without consent",
+    "without user consent",
+];
+const REVIEW_CONSENT_MAX_DISTANCE: usize = 40;
 
 #[derive(Clone)]
 pub struct SkillCiRequest {
@@ -267,8 +276,9 @@ fn destructive_matches_without_consent(text: &str, needle: &str) -> bool {
     while let Some(relative_start) = text[cursor..].find(needle) {
         let start = cursor + relative_start;
         let end = start + needle.len();
-        let segment = review_segment_around(text, start, end);
-        if !segment_has_valid_consent(segment) {
+        let (segment_start, segment_end) = review_segment_bounds(text, start, end);
+        let segment = &text[segment_start..segment_end];
+        if !segment_has_valid_consent(segment, start - segment_start, end - segment_start) {
             return true;
         }
         cursor = end;
@@ -277,7 +287,7 @@ fn destructive_matches_without_consent(text: &str, needle: &str) -> bool {
     false
 }
 
-fn review_segment_around(text: &str, start: usize, end: usize) -> &str {
+fn review_segment_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
     let segment_start = text[..start]
         .char_indices()
         .rev()
@@ -288,20 +298,109 @@ fn review_segment_around(text: &str, start: usize, end: usize) -> &str {
         .find_map(|(offset, ch)| review_segment_boundary(ch).then_some(end + offset))
         .unwrap_or(text.len());
 
-    text[segment_start..segment_end].trim()
+    (segment_start, segment_end)
 }
 
 fn review_segment_boundary(ch: char) -> bool {
     matches!(ch, '.' | '!' | '?' | ';' | '\n' | '\r')
 }
 
-fn segment_has_valid_consent(segment: &str) -> bool {
+fn segment_has_valid_consent(
+    segment: &str,
+    destructive_start: usize,
+    destructive_end: usize,
+) -> bool {
     !REVIEW_CONSENT_NEGATIONS
         .iter()
         .any(|negation| segment.contains(negation))
-        && REVIEW_CONSENT_PHRASES
-            .iter()
-            .any(|phrase| segment.contains(phrase))
+        && !destructive_window_has_unsafe_execution(segment, destructive_start, destructive_end)
+        && REVIEW_CONSENT_PHRASES.iter().any(|phrase| {
+            consent_phrase_governs_destructive(segment, phrase, destructive_start, destructive_end)
+        })
+}
+
+fn destructive_window_has_unsafe_execution(
+    segment: &str,
+    destructive_start: usize,
+    destructive_end: usize,
+) -> bool {
+    let window_start = previous_char_boundary(
+        segment,
+        destructive_start.saturating_sub(REVIEW_CONSENT_MAX_DISTANCE),
+    );
+    let window_end = next_char_boundary(
+        segment,
+        (destructive_end + REVIEW_CONSENT_MAX_DISTANCE).min(segment.len()),
+    );
+    let window = &segment[window_start..window_end];
+
+    REVIEW_UNSAFE_EXECUTION_PHRASES
+        .iter()
+        .any(|phrase| window.contains(phrase))
+}
+
+fn consent_phrase_governs_destructive(
+    segment: &str,
+    phrase: &str,
+    destructive_start: usize,
+    destructive_end: usize,
+) -> bool {
+    let mut cursor = 0;
+    while let Some(relative_start) = segment[cursor..].find(phrase) {
+        let phrase_start = cursor + relative_start;
+        let phrase_end = phrase_start + phrase.len();
+        if consent_phrase_match_governs_destructive(
+            segment,
+            phrase_end,
+            phrase_start,
+            destructive_start,
+            destructive_end,
+        ) {
+            return true;
+        }
+        cursor = phrase_end;
+    }
+
+    false
+}
+
+fn consent_phrase_match_governs_destructive(
+    segment: &str,
+    phrase_end: usize,
+    phrase_start: usize,
+    destructive_start: usize,
+    destructive_end: usize,
+) -> bool {
+    if phrase_end <= destructive_start {
+        let gap = &segment[phrase_end..destructive_start];
+        gap.len() <= REVIEW_CONSENT_MAX_DISTANCE && !gap.contains(" and ")
+    } else if phrase_start >= destructive_end {
+        segment[destructive_end..phrase_start].len() <= REVIEW_CONSENT_MAX_DISTANCE
+    } else {
+        true
+    }
+}
+
+fn previous_char_boundary(text: &str, index: usize) -> usize {
+    if text.is_char_boundary(index) {
+        return index;
+    }
+
+    text.char_indices()
+        .take_while(|(boundary, _)| *boundary < index)
+        .last()
+        .map(|(boundary, _)| boundary)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    if text.is_char_boundary(index) {
+        return index;
+    }
+
+    text.char_indices()
+        .find_map(|(boundary, _)| (boundary > index).then_some(boundary))
+        .unwrap_or(text.len())
 }
 
 fn contains_api_key_reference(text: &str) -> bool {
