@@ -34,6 +34,23 @@ const SECRET_KEYWORDS: &[&str] = &[
     "password",
     "token",
 ];
+const DESTRUCTIVE_REVIEW_PATTERNS: &[&str] =
+    &["rm -rf", "delete all", "drop database", "format disk"];
+const REVIEW_CONSENT_PHRASES: &[&str] = &[
+    "ask before",
+    "with user consent",
+    "after confirmation",
+    "explicit consent",
+];
+const REVIEW_CONSENT_NEGATIONS: &[&str] = &[
+    "do not ask",
+    "don't ask",
+    "without consent",
+    "without user consent",
+    "no consent",
+    "without confirmation",
+    "no confirmation",
+];
 
 #[derive(Clone)]
 pub struct SkillCiRequest {
@@ -183,7 +200,7 @@ pub trait SkillReviewJudge: Send + Sync {
 }
 
 pub struct SkillReviewInput<'a> {
-    pub manifest: &'a super::SkillManifest,
+    pub manifest: &'a SkillManifest,
     pub skill_md: &'a str,
 }
 
@@ -217,12 +234,7 @@ impl SkillReviewJudge for RuleBasedSkillReviewJudge {
             ));
         }
 
-        let destructive = ["rm -rf", "delete all", "drop database", "format disk"];
-        let asks_consent = text.contains("ask before")
-            || text.contains("with user consent")
-            || text.contains("after confirmation")
-            || text.contains("explicit consent");
-        if destructive.iter().any(|needle| text.contains(needle)) && !asks_consent {
+        if contains_destructive_without_consent(&text) {
             findings.push(error_finding(
                 "agentenv.skill.review.destructive-without-consent",
                 "destructive operation is described without explicit user consent",
@@ -231,7 +243,7 @@ impl SkillReviewJudge for RuleBasedSkillReviewJudge {
             ));
         }
 
-        if text.contains("api key") && !text.contains("credential") {
+        if contains_api_key_reference(&text) && !text.contains("credential") {
             findings.push(error_finding(
                 "agentenv.skill.review.credential-handling",
                 "credential handling must use agentenv credential language",
@@ -242,6 +254,58 @@ impl SkillReviewJudge for RuleBasedSkillReviewJudge {
 
         Ok(SkillReviewReport { findings })
     }
+}
+
+fn contains_destructive_without_consent(text: &str) -> bool {
+    DESTRUCTIVE_REVIEW_PATTERNS
+        .iter()
+        .any(|needle| destructive_matches_without_consent(text, needle))
+}
+
+fn destructive_matches_without_consent(text: &str, needle: &str) -> bool {
+    let mut cursor = 0;
+    while let Some(relative_start) = text[cursor..].find(needle) {
+        let start = cursor + relative_start;
+        let end = start + needle.len();
+        let segment = review_segment_around(text, start, end);
+        if !segment_has_valid_consent(segment) {
+            return true;
+        }
+        cursor = end;
+    }
+
+    false
+}
+
+fn review_segment_around(text: &str, start: usize, end: usize) -> &str {
+    let segment_start = text[..start]
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| review_segment_boundary(ch).then_some(index + ch.len_utf8()))
+        .unwrap_or(0);
+    let segment_end = text[end..]
+        .char_indices()
+        .find_map(|(offset, ch)| review_segment_boundary(ch).then_some(end + offset))
+        .unwrap_or(text.len());
+
+    text[segment_start..segment_end].trim()
+}
+
+fn review_segment_boundary(ch: char) -> bool {
+    matches!(ch, '.' | '!' | '?' | ';' | '\n' | '\r')
+}
+
+fn segment_has_valid_consent(segment: &str) -> bool {
+    !REVIEW_CONSENT_NEGATIONS
+        .iter()
+        .any(|negation| segment.contains(negation))
+        && REVIEW_CONSENT_PHRASES
+            .iter()
+            .any(|phrase| segment.contains(phrase))
+}
+
+fn contains_api_key_reference(text: &str) -> bool {
+    text.contains("api key") || text.contains("api-key") || text.contains("apikey")
 }
 
 pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError> {

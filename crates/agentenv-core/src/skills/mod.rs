@@ -30,9 +30,10 @@ pub use cache::{
     SkillVerifyReport, SkillVerifyStatus, SKILL_METADATA_SCHEMA_VERSION,
 };
 pub use ci::{
-    run_skill_ci, skill_ci_sarif, SkillCiCandidate, SkillCiFinding, SkillCiRegistrySkill,
-    SkillCiRegistrySnapshot, SkillCiReport, SkillCiRequest, SkillCiSeverity, SkillCiStatus,
-    SkillCiTier, SkillCiTierReport, SkillCiTierStatus, SKILL_CI_SCHEMA_VERSION,
+    run_skill_ci, skill_ci_sarif, RuleBasedSkillReviewJudge, SkillCiCandidate, SkillCiFinding,
+    SkillCiRegistrySkill, SkillCiRegistrySnapshot, SkillCiReport, SkillCiRequest, SkillCiSeverity,
+    SkillCiStatus, SkillCiTier, SkillCiTierReport, SkillCiTierStatus, SkillReviewInput,
+    SkillReviewJudge, SkillReviewReport, SKILL_CI_SCHEMA_VERSION,
 };
 pub use config::{
     load_project_skills_config, load_user_skills_config, merge_skills_config, ProposalConfig,
