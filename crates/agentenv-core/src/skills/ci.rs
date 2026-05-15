@@ -504,38 +504,49 @@ pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError
         let review_failed = review_report.status == SkillCiTierStatus::Failed;
         tiers.push(review_report);
 
-        let dedup_started = Instant::now();
-        let mut dedup_report = run_semantic_dedup(
-            manifest,
-            &candidate.digest,
-            skill_md,
-            request.registry_snapshot.as_ref(),
-        );
-        dedup_report.duration_ms = dedup_started.elapsed().as_millis();
-        let dedup_failed = dedup_report.status == SkillCiTierStatus::Failed;
-        tiers.push(dedup_report);
-
-        if request.fail_fast && (static_failed || review_failed || dedup_failed) {
+        if request.fail_fast && review_failed {
+            tiers.push(skipped_tier(
+                SkillCiTier::SemanticDedup,
+                "skipped because agent_review failed",
+            ));
             tiers.push(skipped_tier(
                 SkillCiTier::FunctionalRegression,
                 "skipped because an earlier tier failed",
             ));
-        } else if !functional_regression_ready {
-            tiers.push(skipped_tier(
-                SkillCiTier::FunctionalRegression,
-                "skipped because static_lint found an invalid signature or self-test",
-            ));
         } else {
-            let regression_started = Instant::now();
-            let mut regression_report = run_functional_regression(
-                &request.candidate_path,
+            let dedup_started = Instant::now();
+            let mut dedup_report = run_semantic_dedup(
                 manifest,
                 &candidate.digest,
-                self_test_source_path.unwrap_or_else(|| PathBuf::from("skill-test.yaml")),
-                Arc::clone(&request.agent_runner),
-            )?;
-            regression_report.duration_ms = regression_started.elapsed().as_millis();
-            tiers.push(regression_report);
+                skill_md,
+                request.registry_snapshot.as_ref(),
+            );
+            dedup_report.duration_ms = dedup_started.elapsed().as_millis();
+            let dedup_failed = dedup_report.status == SkillCiTierStatus::Failed;
+            tiers.push(dedup_report);
+
+            if request.fail_fast && dedup_failed {
+                tiers.push(skipped_tier(
+                    SkillCiTier::FunctionalRegression,
+                    "skipped because an earlier tier failed",
+                ));
+            } else if !functional_regression_ready {
+                tiers.push(skipped_tier(
+                    SkillCiTier::FunctionalRegression,
+                    "skipped because static_lint found an invalid signature or self-test",
+                ));
+            } else {
+                let regression_started = Instant::now();
+                let mut regression_report = run_functional_regression(
+                    &request.candidate_path,
+                    manifest,
+                    &candidate.digest,
+                    self_test_source_path.unwrap_or_else(|| PathBuf::from("skill-test.yaml")),
+                    Arc::clone(&request.agent_runner),
+                )?;
+                regression_report.duration_ms = regression_started.elapsed().as_millis();
+                tiers.push(regression_report);
+            }
         }
     }
 
@@ -1370,20 +1381,28 @@ fn has_prefixed_secret(text: &str, prefix: &str, minimum_suffix: usize) -> bool 
 fn has_keyword_assigned_secret(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     SECRET_KEYWORDS.iter().any(|keyword| {
-        let Some(index) = lower.find(keyword) else {
-            return false;
-        };
-        let tail = &text[index + keyword.len()..];
-        let Some(separator_index) = tail.find([':', '=']) else {
-            return false;
-        };
-        let candidate = tail[separator_index + 1..]
-            .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\''));
-        candidate
-            .chars()
-            .take_while(|ch| is_secret_char(*ch))
-            .count()
-            >= 20
+        let mut cursor = 0;
+        while let Some(relative_index) = lower[cursor..].find(keyword) {
+            let index = cursor + relative_index;
+            let tail = &text[index + keyword.len()..];
+
+            if let Some(separator_index) = tail.find([':', '=']) {
+                let candidate = tail[separator_index + 1..]
+                    .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\''));
+                if candidate
+                    .chars()
+                    .take_while(|ch| is_secret_char(*ch))
+                    .count()
+                    >= 20
+                {
+                    return true;
+                }
+            }
+
+            cursor = index + keyword.len();
+        }
+
+        false
     })
 }
 

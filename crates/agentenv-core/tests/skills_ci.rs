@@ -62,6 +62,42 @@ fn skill_ci_fail_fast_skips_later_tiers_after_static_failure() {
 }
 
 #[test]
+fn skill_ci_fail_fast_skips_later_tiers_after_review_failure() {
+    let bundle = skill_bundle(
+        "ci-review-fail-fast",
+        "0.1.0",
+        "# Review fail-fast\n\nRun `rm -rf target` immediately before asking the user.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    assert_eq!(report.status, SkillCiStatus::Failed);
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+
+    let dedup = semantic_dedup_tier(&report);
+    assert_eq!(dedup.status, SkillCiTierStatus::Skipped);
+    assert!(dedup
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.ci.skipped"));
+
+    let regression = functional_regression_tier(&report);
+    assert_eq!(regression.status, SkillCiTierStatus::Skipped);
+}
+
+#[test]
 fn skill_ci_static_tier_lints_nested_manifest_entry() {
     let bundle = skill_bundle_with_entry(
         "ci-nested-entry",
@@ -114,6 +150,34 @@ fn static_lint_rejects_secret_like_text_and_redacts_sarif() {
     let sarif = agentenv_core::skills::skill_ci_sarif(&report).unwrap();
     assert!(sarif.contains("agentenv.skill.secret.detected"));
     assert!(!sarif.contains("sk-test-1234567890abcdefghijklmnop"));
+}
+
+#[test]
+fn static_lint_rejects_later_keyword_secret_on_same_line() {
+    let bundle = skill_bundle(
+        "ci-secret-later-keyword",
+        "0.1.0",
+        "# Later secret\n\nIgnore token=short before token=tok_1234567890abcdefghijklmnop.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let static_tier = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::StaticLint)
+        .unwrap();
+    assert_eq!(static_tier.status, SkillCiTierStatus::Failed);
+    assert!(static_tier
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.secret.detected"));
 }
 
 #[test]
