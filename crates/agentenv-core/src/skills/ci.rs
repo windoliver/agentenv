@@ -178,26 +178,102 @@ pub enum SkillCiSeverity {
     Note,
 }
 
+pub trait SkillReviewJudge: Send + Sync {
+    fn review(&self, input: SkillReviewInput<'_>) -> Result<SkillReviewReport, SkillError>;
+}
+
+pub struct SkillReviewInput<'a> {
+    pub manifest: &'a super::SkillManifest,
+    pub skill_md: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillReviewReport {
+    pub findings: Vec<SkillCiFinding>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RuleBasedSkillReviewJudge;
+
+impl SkillReviewJudge for RuleBasedSkillReviewJudge {
+    fn review(&self, input: SkillReviewInput<'_>) -> Result<SkillReviewReport, SkillError> {
+        let mut findings = Vec::new();
+        let text = input.skill_md.to_ascii_lowercase();
+
+        if input
+            .manifest
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .len()
+            < 8
+        {
+            findings.push(warning_finding(
+                "agentenv.skill.review.description-vague",
+                "description is too short to describe behavior",
+                Some(PathBuf::from("skill.yaml")),
+                None,
+            ));
+        }
+
+        let destructive = ["rm -rf", "delete all", "drop database", "format disk"];
+        let asks_consent = text.contains("ask before")
+            || text.contains("with user consent")
+            || text.contains("after confirmation")
+            || text.contains("explicit consent");
+        if destructive.iter().any(|needle| text.contains(needle)) && !asks_consent {
+            findings.push(error_finding(
+                "agentenv.skill.review.destructive-without-consent",
+                "destructive operation is described without explicit user consent",
+                Some(input.manifest.entry.clone()),
+                None,
+            ));
+        }
+
+        if text.contains("api key") && !text.contains("credential") {
+            findings.push(error_finding(
+                "agentenv.skill.review.credential-handling",
+                "credential handling must use agentenv credential language",
+                Some(input.manifest.entry.clone()),
+                None,
+            ));
+        }
+
+        Ok(SkillReviewReport { findings })
+    }
+}
+
 pub fn run_skill_ci(request: SkillCiRequest) -> Result<SkillCiReport, SkillError> {
     let started_at = OffsetDateTime::now_utc();
 
     let mut tiers = Vec::new();
     let static_started = Instant::now();
-    let static_lint = run_static_lint(&request.candidate_path)?;
-    let candidate = static_lint.candidate;
-    let mut static_report = tier_from_findings(SkillCiTier::StaticLint, static_lint.findings);
+    let StaticLintResult {
+        candidate,
+        findings,
+        manifest,
+        entry_content,
+    } = run_static_lint(&request.candidate_path)?;
+    let mut static_report = tier_from_findings(SkillCiTier::StaticLint, findings);
     static_report.duration_ms = static_started.elapsed().as_millis();
     let static_failed = static_report.status == SkillCiTierStatus::Failed;
     tiers.push(static_report);
 
-    for tier in [
-        SkillCiTier::AgentReview,
-        SkillCiTier::SemanticDedup,
-        SkillCiTier::FunctionalRegression,
-    ] {
-        if request.fail_fast && static_failed {
+    if request.fail_fast && static_failed {
+        for tier in [
+            SkillCiTier::AgentReview,
+            SkillCiTier::SemanticDedup,
+            SkillCiTier::FunctionalRegression,
+        ] {
             tiers.push(skipped_tier(tier, "skipped because static_lint failed"));
         }
+    } else if let (Some(manifest), Some(skill_md)) = (manifest.as_ref(), entry_content.as_deref()) {
+        let review_started = Instant::now();
+        let review = RuleBasedSkillReviewJudge.review(SkillReviewInput { manifest, skill_md })?;
+        let mut review_report = tier_from_findings(SkillCiTier::AgentReview, review.findings);
+        review_report.duration_ms = review_started.elapsed().as_millis();
+        tiers.push(review_report);
     }
 
     let status = if tiers
@@ -464,6 +540,8 @@ fn secret_token_end(message: &str, start_at: usize) -> usize {
 struct StaticLintResult {
     candidate: SkillCiCandidate,
     findings: Vec<SkillCiFinding>,
+    manifest: Option<SkillManifest>,
+    entry_content: Option<String>,
 }
 
 fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError> {
@@ -482,6 +560,8 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
             return Ok(StaticLintResult {
                 candidate,
                 findings,
+                manifest: None,
+                entry_content: None,
             });
         }
     };
@@ -534,21 +614,29 @@ fn run_static_lint(candidate_path: &Path) -> Result<StaticLintResult, SkillError
         ));
     }
 
-    match read_declared_text(candidate_path, &manifest.entry) {
-        Ok(content) => lint_markdown(&manifest.entry, &content, &mut findings),
-        Err(_) => findings.push(error_finding(
-            "agentenv.skill.manifest.invalid",
-            "skill manifest entry cannot be read as text",
-            Some(manifest.entry.clone()),
-            None,
-        )),
-    }
+    let entry_content = match read_declared_text(candidate_path, &manifest.entry) {
+        Ok(content) => {
+            lint_markdown(&manifest.entry, &content, &mut findings);
+            Some(content)
+        }
+        Err(_) => {
+            findings.push(error_finding(
+                "agentenv.skill.manifest.invalid",
+                "skill manifest entry cannot be read as text",
+                Some(manifest.entry.clone()),
+                None,
+            ));
+            None
+        }
+    };
 
     lint_declared_text_secrets(candidate_path, &manifest, &mut findings);
 
     Ok(StaticLintResult {
         candidate,
         findings,
+        manifest: Some(manifest),
+        entry_content,
     })
 }
 
@@ -573,6 +661,21 @@ fn error_finding(
         rule_id: rule_id.to_owned(),
         severity: SkillCiSeverity::Error,
         message: message.to_owned(),
+        path,
+        line,
+    }
+}
+
+fn warning_finding(
+    rule_id: impl Into<String>,
+    message: impl Into<String>,
+    path: Option<PathBuf>,
+    line: Option<usize>,
+) -> SkillCiFinding {
+    SkillCiFinding {
+        rule_id: rule_id.into(),
+        severity: SkillCiSeverity::Warning,
+        message: message.into(),
         path,
         line,
     }

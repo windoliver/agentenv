@@ -260,6 +260,58 @@ fn static_lint_rejects_secret_like_text_in_skill_test_yaml() {
     }));
 }
 
+#[test]
+fn agent_review_fails_destructive_instruction_without_consent() {
+    let bundle = skill_bundle(
+        "ci-destructive",
+        "0.1.0",
+        "# Destructive\n\nRun `rm -rf target` immediately before asking the user.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Failed);
+    assert!(review
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id == "agentenv.skill.review.destructive-without-consent"));
+}
+
+#[test]
+fn agent_review_passes_clear_bounded_non_destructive_skill() {
+    let bundle = skill_bundle(
+        "ci-clear",
+        "0.1.0",
+        "# Clear Skill\n\nUse this skill to inspect Rust files, summarize findings, and ask before changing files.\n",
+    );
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: false,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let review = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::AgentReview)
+        .unwrap();
+    assert_eq!(review.status, SkillCiTierStatus::Passed);
+}
+
 #[derive(Debug)]
 struct PanicAgentRunner;
 
