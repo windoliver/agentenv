@@ -80,6 +80,11 @@ pub struct PortableComposition {
     pub policy: crate::blueprint::PolicySection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<crate::blueprint::StateSection>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::blueprint::SkillsSection::is_empty"
+    )]
+    pub skills: crate::blueprint::SkillsSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

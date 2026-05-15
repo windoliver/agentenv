@@ -13,7 +13,7 @@ use crate::security::ssrf::{
 use crate::{
     blueprint::{
         Blueprint, ComponentSection, CredentialRef as BlueprintCredentialRef, PolicySection,
-        StateSection,
+        SkillsSection, StateSection,
     },
     digest::{parse_sha256_digest, sha256_hex, DigestError},
     error::BlueprintError,
@@ -81,6 +81,8 @@ struct CanonicalBlueprint {
     policy: PolicySection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state: Option<StateSection>,
+    #[serde(default, skip_serializing_if = "SkillsSection::is_empty")]
+    skills: SkillsSection,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -176,6 +178,14 @@ pub enum LifecycleError {
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("invalid skill runtime discovery endpoint at `{path}`: {source}")]
+    InvalidSkillRuntimeDiscoveryEndpoint {
+        path: String,
+        #[source]
+        source: crate::blueprint::SkillRuntimeDiscoveryEndpointError,
+    },
+    #[error("invalid skill runtime discovery scope `{scope}` at `{path}`")]
+    InvalidSkillRuntimeDiscoveryScope { path: String, scope: String },
     #[error(transparent)]
     Hardening(#[from] crate::hardening::HardeningError),
     #[error("failed to serialize canonical resolved blueprint: {0}")]
@@ -289,11 +299,50 @@ fn validate_blueprint_urls(blueprint: &Blueprint) -> Result<(), LifecycleError> 
     if let Some(inference) = blueprint.inference.as_ref() {
         validate_inference_blueprint_urls(inference, &options)?;
     }
+    validate_skill_runtime_discovery(&blueprint.skills, &options)?;
     validate_policy_url_overrides(&blueprint.policy, &options)?;
     validate_blueprint_dns_policy(&blueprint.policy)?;
     validate_mcp_guard_policy_extra(&blueprint.policy)?;
 
     Ok(())
+}
+
+fn validate_skill_runtime_discovery(
+    skills: &SkillsSection,
+    options: &SsrfOptions,
+) -> Result<(), LifecycleError> {
+    let Some(runtime_discovery) = skills.runtime_discovery.as_ref() else {
+        return Ok(());
+    };
+    let endpoint = runtime_discovery.mcp_endpoint().map_err(|source| {
+        LifecycleError::InvalidSkillRuntimeDiscoveryEndpoint {
+            path: "skills.runtime_discovery.mcp_endpoint".to_owned(),
+            source,
+        }
+    })?;
+    validate_url_with_ssrf(
+        "skills.runtime_discovery.mcp_endpoint",
+        &endpoint.url,
+        options,
+    )?;
+
+    for (index, scope) in runtime_discovery.scopes.iter().enumerate() {
+        if !is_allowed_skill_runtime_discovery_scope(scope) {
+            return Err(LifecycleError::InvalidSkillRuntimeDiscoveryScope {
+                path: format!("skills.runtime_discovery.scopes[{index}]"),
+                scope: scope.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn is_allowed_skill_runtime_discovery_scope(scope: &str) -> bool {
+    matches!(
+        scope,
+        "search" | "find_similar" | "get_manifest" | "suggest_for_task"
+    )
 }
 
 fn validate_blueprint_dns_policy(policy: &PolicySection) -> Result<(), LifecycleError> {
@@ -524,6 +573,7 @@ fn canonical_blueprint(resolved: &ResolvedBlueprint) -> Result<CanonicalBlueprin
             .transpose()?,
         policy: blueprint.policy.clone(),
         state: blueprint.state.clone(),
+        skills: blueprint.skills.clone(),
     })
 }
 
@@ -561,6 +611,7 @@ pub(crate) fn portable_canonical_blueprint(
         inference: canonical.inference.map(portable_component),
         policy: canonical.policy,
         state: canonical.state,
+        skills: canonical.skills,
     })
 }
 

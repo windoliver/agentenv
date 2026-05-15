@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const APPROVALS_SERVER_START_TIMEOUT: Duration = Duration::from_secs(60);
 const PTY_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn agentenv_bin() -> &'static str {
@@ -3030,6 +3031,73 @@ fn skills_search_reports_http_registry_override_ssrf_block() {
         stderr.contains("blocked by SSRF policy"),
         "stderr was: {stderr}"
     );
+}
+
+#[test]
+fn skills_search_allows_loopback_registry_when_env_opted_in() {
+    let temp_dir = make_temp_dir("skills-cli-http-registry-loopback-opt-in");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let registry = format!("http://{}/skills", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for skill registry request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept skill registry request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let request = read_http_request(&mut stream);
+        assert!(
+            request.starts_with("GET /skills/index.json "),
+            "request was: {request}"
+        );
+        let body = serde_json::json!({
+            "skills": [{
+                "name": "loopback-cli-skill",
+                "version": "0.1.0",
+                "description": "Loopback registry test",
+                "registry": "ignored",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("loopback")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_SKILLS_ALLOW_LOOPBACK_REGISTRIES", "1")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(search.status.success(), "{}", output_summary(&search));
+    assert_skill_search_names(&search.stdout, &["loopback-cli-skill"]);
+    handle.join().unwrap();
 }
 
 #[test]
@@ -7344,7 +7412,7 @@ impl ApprovalsServerChild {
             .build()
             .unwrap();
         let url = format!("http://127.0.0.1:{port}{path}");
-        let deadline = std::time::Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let deadline = std::time::Instant::now() + APPROVALS_SERVER_START_TIMEOUT;
         let mut last_error = None;
 
         while std::time::Instant::now() < deadline {
