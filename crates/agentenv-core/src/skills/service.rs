@@ -81,6 +81,10 @@ impl SkillService {
         self
     }
 
+    pub fn agent_produce_runner(&self) -> Arc<dyn AgentProduceRunner> {
+        Arc::clone(&self.agent_produce_runner)
+    }
+
     pub async fn search(&self, query: &str) -> Result<Vec<SkillSearchHit>, SkillError> {
         let mut hits = Vec::new();
         for registry in self.ordered_registries()? {
