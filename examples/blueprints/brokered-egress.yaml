@@ -1,0 +1,56 @@
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+
+# Requires a sandbox driver that advertises supports_host_egress_proxy.
+# Bundled sandbox drivers fail closed until host-proxy reachability is implemented.
+sandbox:
+  driver: openshell
+  version: ">=0.0.1-alpha0,<0.1"
+
+agent:
+  driver: codex
+  credentials:
+    OPENAI_API_KEY:
+      source: env
+      required: true
+    GITHUB_TOKEN:
+      source: env
+      required: false
+
+context:
+  driver: mcp-generic
+  endpoint:
+    url: https://93.184.216.34/rpc
+    transport: http
+  credentials:
+    MCP_TOKEN:
+      source: env
+      required: true
+
+inference:
+  driver: openai
+
+policy:
+  tier: restricted
+  presets:
+    - github_read
+  overrides:
+    - allow: https://api.openai.com
+    - allow: https://api.github.com
+    - allow: https://ghcr.io
+    - allow: https://93.184.216.34
+  egress_proxy:
+    github: true
+    oci:
+      registries:
+        - ghcr.io
+    rate_limits:
+      openai:
+        requests_per_minute: 60
+      github.api:
+        requests_per_minute: 120
+      oci.ghcr.io:
+        requests_per_minute: 30
+
+state:
+  persist_home: true

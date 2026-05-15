@@ -67,7 +67,7 @@ Responsibilities:
 - Apply, update, and optionally hot-reload policy
 - Surface egress denials into the approvals queue
 
-Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`, `supports_persistent_sessions`, `supports_dns_egress_control`, `supports_snapshots`, `supports_fork`.
+Capability flags: `supports_hot_reload_policy`, `supports_filesystem_lockdown`, `supports_syscall_filter`, `supports_native_inference_routing`, `supports_remote_host`, `supports_host_egress_proxy`, `supports_persistent_sessions`, `supports_dns_egress_control`, `supports_snapshots`, `supports_fork`.
 
 ### `AgentDriver` — what runs inside the sandbox?
 
@@ -323,6 +323,10 @@ Sensitive flows:
 - `agentenv freeze` **strips credential values** from the lockfile (preserves references only).
 
 This is the same pattern OpenShell Providers use, applied consistently across all driver kinds.
+
+### Host Egress Broker
+
+When a sandbox driver advertises `supports_host_egress_proxy`, core can launch a host-owned proxy and rewrite inference, MCP, GitHub, and OCI endpoints to local unauthenticated URLs before sandbox creation. The sandbox receives dummy credential values for brokered services. The proxy resolves credentials from the host credential store at request time, injects provider-specific auth headers, checks the live network policy file on each request, applies route rate limits, strips identity-bearing response headers, and emits redacted activity events. Drivers must only advertise the capability after they have a verified sandbox-reachable path to the host proxy; otherwise runtime fails closed for explicit brokered routes.
 
 ---
 

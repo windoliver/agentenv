@@ -145,6 +145,10 @@
           "default": false,
           "type": "boolean"
         },
+        "supports_host_egress_proxy": {
+          "default": false,
+          "type": "boolean"
+        },
         "supports_hot_reload_policy": {
           "type": "boolean"
         },

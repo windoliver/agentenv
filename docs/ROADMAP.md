@@ -63,6 +63,7 @@ Exit criterion: an env created on machine A can be frozen, committed to git, and
 - **M5-4** — Reference blueprints + sample projects
 - **M5-5** — SSRF validation for outbound paths
 - **M5-6** — Image hardening profiles
+- **H-5** — Brokered host egress proxy for credential injection and audited provider/MCP/GitHub/OCI traffic ([#41](https://github.com/windoliver/agentenv/issues/41))
 
 Exit criterion: zero-to-working-agent in one shell command on macOS / Linux.
 

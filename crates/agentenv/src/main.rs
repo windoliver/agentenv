@@ -39,6 +39,7 @@ use tracing_subscriber::EnvFilter;
 mod builtin_factory;
 mod bundle_cli;
 mod credentials_runtime;
+mod proxy_cli;
 mod render;
 mod skills_cli;
 mod skills_propose_cli;
@@ -86,6 +87,8 @@ enum Commands {
     Drivers(DriversArgs),
     Skills(skills_cli::SkillsArgs),
     Bundle(bundle_cli::BundleArgs),
+    #[command(hide = true)]
+    Proxy(ProxyArgs),
     VerifyBlueprint {
         file: PathBuf,
     },
@@ -98,6 +101,27 @@ enum Commands {
         output: Option<PathBuf>,
     },
     Reproduce(ReproduceArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ProxyArgs {
+    #[command(subcommand)]
+    command: ProxyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProxyCommand {
+    Run(ProxyRunArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct ProxyRunArgs {
+    #[arg(long)]
+    env: String,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long = "events-db")]
+    events_db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -596,6 +620,7 @@ async fn run() -> Result<()> {
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::Skills(args)) => skills_cli::run_skills(args).await,
         Some(Commands::Bundle(args)) => bundle_cli::run_bundle(args),
+        Some(Commands::Proxy(args)) => proxy_cli::run(args).await,
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
         Some(Commands::Freeze { name, output }) => freeze(&name, output.as_deref()),
@@ -3775,6 +3800,7 @@ mod tests {
         let command = Cli::command();
         let subcommands = command
             .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
             .map(|subcommand| subcommand.get_name().to_string())
             .collect::<Vec<_>>();
 
@@ -3810,6 +3836,33 @@ mod tests {
                 "reproduce".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn proxy_command_parses_run_args() {
+        let cli = Cli::try_parse_from([
+            "agentenv",
+            "proxy",
+            "run",
+            "--env",
+            "demo",
+            "--config",
+            "/tmp/config.json",
+            "--events-db",
+            "/tmp/events.sqlite",
+        ])
+        .expect("proxy command parses");
+
+        match cli.command {
+            Some(Commands::Proxy(ProxyArgs {
+                command: ProxyCommand::Run(args),
+            })) => {
+                assert_eq!(args.env, "demo");
+                assert_eq!(args.config, PathBuf::from("/tmp/config.json"));
+                assert_eq!(args.events_db, PathBuf::from("/tmp/events.sqlite"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

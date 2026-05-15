@@ -137,6 +137,7 @@ fn state_file(name: &str) -> EnvStateFile {
         },
         handles: DriverHandles::default(),
         endpoints: EndpointState::default(),
+        egress_proxy: None,
         resolved_policy: None,
         credential_names: vec!["OPENAI_API_KEY".to_owned()],
         health: Default::default(),

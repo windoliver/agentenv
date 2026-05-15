@@ -95,6 +95,7 @@ fn handle_request(request: RpcRequestEnvelope) -> Result<RpcResponseEnvelope> {
                             supports_syscall_filter: true,
                             supports_native_inference_routing: false,
                             supports_remote_host: false,
+                            supports_host_egress_proxy: false,
                             supports_persistent_sessions: false,
                             supports_dns_egress_control: false,
                             supports_snapshots: false,

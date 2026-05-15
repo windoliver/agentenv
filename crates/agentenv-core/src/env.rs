@@ -189,6 +189,36 @@ pub struct EndpointState {
     pub inference: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressProxyState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(with = "url_as_string")]
+    pub listen_url: url::Url,
+    pub config_path: PathBuf,
+    pub policy_path: PathBuf,
+    pub routes: Vec<String>,
+}
+
+mod url_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(url: &url::Url, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(url.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<url::Url, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        url::Url::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthRecord {
     pub healthy: bool,
@@ -209,6 +239,8 @@ pub struct EnvStateFile {
     pub drivers: StateDriverSet,
     pub handles: DriverHandles,
     pub endpoints: EndpointState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_proxy: Option<EgressProxyState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_policy: Option<NetworkPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -342,8 +374,8 @@ mod tests {
 
     use super::{
         append_event, read_state, validate_env_name, write_state, DriverHandles, DriverRecord,
-        EndpointState, EnvPaths, EnvPhase, EnvStateFile, HealthRecord, PersistedMcpEndpoint,
-        StateDriverSet, STATE_VERSION,
+        EgressProxyState, EndpointState, EnvPaths, EnvPhase, EnvStateFile, HealthRecord,
+        PersistedMcpEndpoint, StateDriverSet, STATE_VERSION,
     };
     use agentenv_proto::{McpEndpoint, McpTransport};
 
@@ -430,6 +462,7 @@ mod tests {
                 skill_hub_mcp: None,
                 inference: Some("http://inference.local".to_owned()),
             },
+            egress_proxy: None,
             resolved_policy: None,
             credential_names: vec!["OPENAI_API_KEY".to_owned()],
             health: BTreeMap::from([(
@@ -456,6 +489,92 @@ mod tests {
 
         let loaded = read_state(&paths).unwrap();
         assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn env_state_serializes_egress_proxy_state_when_present() {
+        let state = EnvStateFile {
+            version: STATE_VERSION.to_owned(),
+            name: "demo".to_owned(),
+            phase: EnvPhase::Running,
+            created_at: "2026-04-21T00:00:00Z".to_owned(),
+            updated_at: "2026-04-21T00:01:00Z".to_owned(),
+            drivers: StateDriverSet {
+                sandbox: DriverRecord::new("openshell", "0.0.1-alpha0"),
+                agent: DriverRecord::new("codex", "0.0.1-alpha0"),
+                context: DriverRecord::new("filesystem", "0.0.1-alpha0"),
+                inference: None,
+            },
+            handles: DriverHandles::default(),
+            endpoints: EndpointState::default(),
+            egress_proxy: Some(EgressProxyState {
+                pid: Some(4242),
+                listen_url: "http://127.0.0.1:44117".parse().unwrap(),
+                config_path: "/tmp/agentenv/egress/config.json".into(),
+                policy_path: "/tmp/agentenv/egress/policy.json".into(),
+                routes: vec![
+                    "https://api.openai.com".to_owned(),
+                    "https://github.com".to_owned(),
+                ],
+            }),
+            resolved_policy: None,
+            credential_names: Vec::new(),
+            health: BTreeMap::new(),
+            first_enter_hint_shown: false,
+        };
+
+        let rendered = serde_json::to_value(&state).unwrap();
+        assert_eq!(rendered["egress_proxy"]["pid"], 4242);
+        assert_eq!(
+            rendered["egress_proxy"]["listen_url"],
+            "http://127.0.0.1:44117/"
+        );
+        assert_eq!(
+            rendered["egress_proxy"]["config_path"],
+            "/tmp/agentenv/egress/config.json"
+        );
+        assert_eq!(
+            rendered["egress_proxy"]["policy_path"],
+            "/tmp/agentenv/egress/policy.json"
+        );
+        assert_eq!(
+            rendered["egress_proxy"]["routes"],
+            serde_json::json!(["https://api.openai.com", "https://github.com"])
+        );
+
+        let loaded: EnvStateFile = serde_json::from_value(rendered).unwrap();
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn env_state_defaults_missing_egress_proxy_to_none() {
+        let state: EnvStateFile = serde_json::from_value(serde_json::json!({
+            "version": STATE_VERSION,
+            "name": "demo",
+            "phase": "running",
+            "created_at": "2026-04-21T00:00:00Z",
+            "updated_at": "2026-04-21T00:01:00Z",
+            "drivers": {
+                "sandbox": {
+                    "name": "openshell",
+                    "version": "0.0.1-alpha0"
+                },
+                "agent": {
+                    "name": "codex",
+                    "version": "0.0.1-alpha0"
+                },
+                "context": {
+                    "name": "filesystem",
+                    "version": "0.0.1-alpha0"
+                }
+            },
+            "handles": {},
+            "endpoints": {},
+            "first_enter_hint_shown": false
+        }))
+        .unwrap();
+
+        assert_eq!(state.egress_proxy, None);
     }
 
     #[test]
