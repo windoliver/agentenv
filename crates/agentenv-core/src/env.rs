@@ -184,6 +184,8 @@ pub struct EndpointState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_mcp: Option<PersistedMcpEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_hub_mcp: Option<PersistedMcpEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<String>,
 }
 
@@ -425,6 +427,7 @@ mod tests {
             },
             endpoints: EndpointState {
                 context_mcp: Some(context_mcp),
+                skill_hub_mcp: None,
                 inference: Some("http://inference.local".to_owned()),
             },
             resolved_policy: None,

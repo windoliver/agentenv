@@ -1105,11 +1105,17 @@ async fn create_env_with_input(
                 handle: context_handle.handle.clone(),
             })
             .await?;
+        let skill_runtime_discovery_endpoint =
+            skill_runtime_discovery_mcp_endpoint(&resolved.blueprint)?;
+        let mut mcp_endpoints = vec![context_endpoint.clone()];
+        if let Some(endpoint) = skill_runtime_discovery_endpoint.clone() {
+            mcp_endpoints.push(endpoint);
+        }
         let agent_setup = prepare_agent_sandbox_setup(
             &temp_workspace,
             set.agent.as_ref(),
             agent_spec.clone(),
-            vec![context_endpoint.clone()],
+            mcp_endpoints,
         )
         .await?;
         let context_network_rules = set
@@ -1118,6 +1124,10 @@ async fn create_env_with_input(
                 handle: context_handle.handle.clone(),
             })
             .await?;
+        let skill_runtime_discovery_network_rule = skill_runtime_discovery_endpoint
+            .as_ref()
+            .map(crate::context_common::endpoint_host_rule)
+            .transpose()?;
         let send_hardening_metadata = input.resolved_policy.is_none()
             || crate::hardening::sandbox_hardening_declared(&resolved.blueprint.sandbox);
         let resolved_hardening = if send_hardening_metadata {
@@ -1180,6 +1190,9 @@ async fn create_env_with_input(
                 persist_home,
             )?;
             policy.network.allow.extend(context_network_rules.rules);
+            if let Some(rule) = skill_runtime_discovery_network_rule {
+                policy.network.allow.push(rule);
+            }
         }
 
         let supports_hot_reload_policy = supports_hot_reload_policy(&sandbox_init.capabilities);
@@ -1346,6 +1359,8 @@ async fn create_env_with_input(
             },
             endpoints: crate::env::EndpointState {
                 context_mcp: Some(crate::env::PersistedMcpEndpoint::from_mcp(context_endpoint)),
+                skill_hub_mcp: skill_runtime_discovery_endpoint
+                    .map(crate::env::PersistedMcpEndpoint::from_mcp),
                 inference: inference_endpoint,
             },
             resolved_policy: Some(policy.clone()),
@@ -2531,6 +2546,7 @@ fn blueprint_yaml_from_portable_lockfile(
             .map(blueprint_component_from_portable),
         policy: composition.policy.clone(),
         state: composition.state.clone(),
+        skills: composition.skills.clone(),
     };
 
     serde_yaml::to_string(&blueprint).map_err(RuntimeError::lockfile_serialize)
@@ -4209,6 +4225,24 @@ pub fn inference_spec(extra: BTreeMap<String, serde_yaml::Value>) -> RuntimeResu
     Ok(InferenceSpec {
         config: component_spec(extra)?.into_iter().collect(),
     })
+}
+
+fn skill_runtime_discovery_mcp_endpoint(
+    blueprint: &crate::blueprint::Blueprint,
+) -> RuntimeResult<Option<agentenv_proto::McpEndpoint>> {
+    let Some(runtime_discovery) = blueprint.skills.runtime_discovery.as_ref() else {
+        return Ok(None);
+    };
+
+    runtime_discovery
+        .mcp_endpoint()
+        .map(Some)
+        .map_err(|source| {
+            RuntimeError::Driver(DriverError::InvalidConfig {
+                field: "skills.runtime_discovery.mcp_endpoint".to_owned(),
+                message: source.to_string(),
+            })
+        })
 }
 
 async fn prepare_agent_sandbox_setup(
@@ -6089,6 +6123,7 @@ policy:
     struct AgentSetupTracker {
         copied_paths: Mutex<Vec<String>>,
         exec_cmds: Mutex<Vec<String>>,
+        mcp_endpoints: Mutex<Vec<Vec<agentenv_proto::McpEndpoint>>>,
         agent_spec_versions: Mutex<Vec<Option<String>>>,
         create_specs: Mutex<Vec<agentenv_proto::SandboxSpec>>,
         create_policies: Mutex<Vec<agentenv_proto::NetworkPolicy>>,
@@ -6358,8 +6393,13 @@ policy:
 
         async fn render_mcp_config(
             &self,
-            _params: agentenv_proto::RenderMcpConfigParams,
+            params: agentenv_proto::RenderMcpConfigParams,
         ) -> DriverResult<agentenv_proto::RenderMcpConfigResult> {
+            self.tracker
+                .mcp_endpoints
+                .lock()
+                .expect("mcp endpoint tracker")
+                .push(params.endpoints);
             Ok(agentenv_proto::RenderMcpConfigResult {
                 content: "[mcp_servers.endpoint_0]\ncommand = \"agentenv-fs-mcp\"\n".to_owned(),
             })
@@ -10309,6 +10349,86 @@ policy:
                 .join("agent")
                 .exists(),
             "rendered agent files can contain credentials and must not persist in the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_wires_skill_runtime_discovery_mcp_endpoint() {
+        let root = unique_root("agentenv-skill-runtime-discovery");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+skills:
+  runtime_discovery:
+    mcp_endpoint: mcp+https://93.184.216.34/mcp
+    scopes: ["search", "get_manifest"]
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .unwrap();
+
+        let mcp_endpoints = tracker
+            .mcp_endpoints
+            .lock()
+            .expect("mcp endpoint tracker")
+            .clone();
+        assert_eq!(mcp_endpoints.len(), 1);
+        assert_eq!(mcp_endpoints[0].len(), 2);
+        assert_eq!(mcp_endpoints[0][0].url, "agentenv-fs-mcp");
+        assert_eq!(
+            mcp_endpoints[0][1],
+            agentenv_proto::McpEndpoint {
+                url: "https://93.184.216.34/mcp".to_owned(),
+                transport: agentenv_proto::McpTransport::Http,
+                headers: BTreeMap::new(),
+            }
+        );
+
+        let skill_rule = agentenv_proto::NetworkRule {
+            target: NetworkTarget::Host {
+                host: "93.184.216.34".to_owned(),
+                port: Some(443),
+                scheme: Some("https".to_owned()),
+                http_access: Some(agentenv_proto::HttpAccessLevel::Full),
+            },
+        };
+        let applied_policies = tracker
+            .applied_policies
+            .lock()
+            .expect("apply policy tracker")
+            .clone();
+        assert_eq!(applied_policies.len(), 1);
+        assert!(applied_policies[0].network.allow.contains(&skill_rule));
+
+        let paths = crate::env::EnvPaths::new(root, crate::env::validate_env_name("demo").unwrap());
+        let state = crate::env::read_state(&paths).unwrap();
+        assert_eq!(
+            state.endpoints.skill_hub_mcp,
+            Some(crate::env::PersistedMcpEndpoint {
+                url: "https://93.184.216.34/mcp".to_owned(),
+                transport: agentenv_proto::McpTransport::Http,
+            })
         );
     }
 

@@ -1190,6 +1190,7 @@ mod tests {
                     extra: BTreeMap::new(),
                 },
                 state: None,
+                skills: agentenv_core::blueprint::SkillsSection::default(),
             },
             policy: PortablePolicy {
                 declared: agentenv_core::blueprint::PolicySection {
