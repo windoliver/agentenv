@@ -15,6 +15,23 @@ use super::{
 };
 
 pub const SKILL_CI_SCHEMA_VERSION: &str = "0.1";
+const SECRET_REDACTION: &str = "[REDACTED]";
+const SECRET_PREFIX_PATTERNS: &[(&str, usize)] = &[
+    ("sk-", 20),
+    ("ghp_", 20),
+    ("github_pat_", 20),
+    ("xoxb-", 20),
+    ("xoxp-", 20),
+    ("AKIA", 16),
+];
+const SECRET_KEYWORDS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_token",
+    "secret",
+    "password",
+    "token",
+];
 
 #[derive(Clone)]
 pub struct SkillCiRequest {
@@ -276,12 +293,13 @@ pub fn skill_ci_sarif(report: &SkillCiReport) -> Result<String, SkillError> {
 
 fn sarif_result(finding: &SkillCiFinding) -> Value {
     let mut result = Map::new();
+    let message = redact_sarif_message(&finding.message);
     result.insert("ruleId".to_owned(), json!(finding.rule_id));
     result.insert("level".to_owned(), json!(sarif_level(finding.severity)));
     result.insert(
         "message".to_owned(),
         json!({
-            "text": finding.message,
+            "text": message,
         }),
     );
 
@@ -324,6 +342,123 @@ fn sarif_level(severity: SkillCiSeverity) -> &'static str {
 
 fn sarif_uri(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn redact_sarif_message(message: &str) -> String {
+    redact_labeled_secrets(&redact_prefixed_secrets(message))
+}
+
+fn redact_prefixed_secrets(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut cursor = 0;
+
+    while let Some((start, end)) = find_next_prefixed_secret(message, cursor) {
+        redacted.push_str(&message[cursor..start]);
+        redacted.push_str(SECRET_REDACTION);
+        cursor = end;
+    }
+
+    redacted.push_str(&message[cursor..]);
+    redacted
+}
+
+fn find_next_prefixed_secret(message: &str, start_at: usize) -> Option<(usize, usize)> {
+    SECRET_PREFIX_PATTERNS
+        .iter()
+        .filter_map(|(prefix, minimum_suffix)| {
+            find_next_prefixed_secret_for_prefix(message, start_at, prefix, *minimum_suffix)
+        })
+        .min_by_key(|(start, _)| *start)
+}
+
+fn find_next_prefixed_secret_for_prefix(
+    message: &str,
+    start_at: usize,
+    prefix: &str,
+    minimum_suffix: usize,
+) -> Option<(usize, usize)> {
+    let mut cursor = start_at;
+    loop {
+        let start = cursor + message[cursor..].find(prefix)?;
+        let suffix_start = start + prefix.len();
+        let end = secret_token_end(message, suffix_start);
+        let suffix_length = message[suffix_start..end].chars().count();
+        if suffix_length >= minimum_suffix {
+            return Some((start, end));
+        }
+        cursor = suffix_start;
+    }
+}
+
+fn redact_labeled_secrets(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut cursor = 0;
+
+    while let Some((start, end)) = find_next_labeled_secret(message, cursor) {
+        redacted.push_str(&message[cursor..start]);
+        redacted.push_str(SECRET_REDACTION);
+        cursor = end;
+    }
+
+    redacted.push_str(&message[cursor..]);
+    redacted
+}
+
+fn find_next_labeled_secret(message: &str, start_at: usize) -> Option<(usize, usize)> {
+    let lower = message.to_ascii_lowercase();
+    let mut cursor = start_at;
+
+    loop {
+        let (keyword_start, keyword) = SECRET_KEYWORDS
+            .iter()
+            .filter_map(|keyword| {
+                lower[cursor..]
+                    .find(keyword)
+                    .map(|relative| (cursor + relative, *keyword))
+            })
+            .min_by_key(|(start, _)| *start)?;
+
+        let keyword_end = keyword_start + keyword.len();
+        let tail = &message[keyword_end..];
+        let Some(separator_index) = tail.find([':', '=']) else {
+            return None;
+        };
+        let value_start = keyword_end + separator_index + 1;
+        let secret_start = secret_value_start(message, value_start);
+        let secret_end = secret_token_end(message, secret_start);
+        let secret_length = message[secret_start..secret_end].chars().count();
+        if secret_length >= 20 {
+            return Some((secret_start, secret_end));
+        }
+
+        cursor = keyword_end;
+    }
+}
+
+fn secret_value_start(message: &str, start_at: usize) -> usize {
+    message[start_at..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            if ch.is_whitespace() || matches!(ch, '"' | '\'') {
+                None
+            } else {
+                Some(start_at + offset)
+            }
+        })
+        .unwrap_or(message.len())
+}
+
+fn secret_token_end(message: &str, start_at: usize) -> usize {
+    message[start_at..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            if is_secret_char(ch) {
+                None
+            } else {
+                Some(start_at + offset)
+            }
+        })
+        .unwrap_or(message.len())
 }
 
 struct StaticLintResult {
@@ -631,16 +766,9 @@ fn is_text_path(path: &Path) -> bool {
 }
 
 fn contains_secret_like_text(text: &str) -> bool {
-    [
-        ("sk-", 20),
-        ("ghp_", 20),
-        ("github_pat_", 20),
-        ("xoxb-", 20),
-        ("xoxp-", 20),
-        ("AKIA", 16),
-    ]
-    .iter()
-    .any(|(prefix, minimum_suffix)| has_prefixed_secret(text, prefix, *minimum_suffix))
+    SECRET_PREFIX_PATTERNS
+        .iter()
+        .any(|(prefix, minimum_suffix)| has_prefixed_secret(text, prefix, *minimum_suffix))
         || has_keyword_assigned_secret(text)
 }
 
@@ -653,16 +781,7 @@ fn has_prefixed_secret(text: &str, prefix: &str, minimum_suffix: usize) -> bool 
 
 fn has_keyword_assigned_secret(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    [
-        "api_key",
-        "apikey",
-        "access_token",
-        "secret",
-        "password",
-        "token",
-    ]
-    .iter()
-    .any(|keyword| {
+    SECRET_KEYWORDS.iter().any(|keyword| {
         let Some(index) = lower.find(keyword) else {
             return false;
         };

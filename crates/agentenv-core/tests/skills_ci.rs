@@ -8,8 +8,8 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use agentenv_core::skills::{
     compute_bundle_digest, load_skill_manifest, run_skill_ci, signature_payload,
-    AgentProduceRequest, AgentProduceRunner, SkillCiRequest, SkillCiStatus, SkillCiTier,
-    SkillCiTierStatus, SkillError,
+    AgentProduceRequest, AgentProduceRunner, SkillCiFinding, SkillCiRequest, SkillCiSeverity,
+    SkillCiStatus, SkillCiTier, SkillCiTierStatus, SkillError,
 };
 
 #[test]
@@ -166,6 +166,34 @@ fn static_lint_rejects_unclosed_frontmatter() {
         .findings
         .iter()
         .any(|finding| finding.rule_id == "agentenv.skill.frontmatter.unclosed"));
+}
+
+#[test]
+fn static_lint_sarif_redacts_secret_values_in_finding_messages() {
+    let bundle = skill_bundle("ci-sarif-redaction", "0.1.0", "# Redaction\n");
+
+    let mut report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+    report.tiers[0].findings.push(SkillCiFinding {
+        rule_id: "agentenv.skill.synthetic".to_owned(),
+        severity: SkillCiSeverity::Error,
+        message:
+            "review output included sk-test-1234567890abcdefghijklmnop and token=tok_1234567890abcdefghijklmnop"
+                .to_owned(),
+        path: Some(PathBuf::from("SKILL.md")),
+        line: Some(1),
+    });
+
+    let sarif = agentenv_core::skills::skill_ci_sarif(&report).unwrap();
+
+    assert!(!sarif.contains("sk-test-1234567890abcdefghijklmnop"));
+    assert!(!sarif.contains("tok_1234567890abcdefghijklmnop"));
+    assert!(sarif.contains("[REDACTED]"));
 }
 
 #[derive(Debug)]
