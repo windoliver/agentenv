@@ -22,6 +22,8 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: cargo fmt --check
         run: cargo +${{ matrix.toolchain }} fmt --check
       - name: cargo clippy --workspace --all-targets -- -D warnings

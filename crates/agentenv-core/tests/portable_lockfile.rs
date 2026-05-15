@@ -65,6 +65,47 @@ fn portable_lockfile_builder_records_resolved_policy_and_driver_sources() {
 }
 
 #[test]
+fn portable_lockfile_builder_preserves_skill_runtime_discovery() {
+    let lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: runtime_discovery_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build lockfile");
+
+    let runtime_discovery = lockfile
+        .composition
+        .skills
+        .runtime_discovery
+        .as_ref()
+        .expect("runtime discovery config is portable");
+    assert_eq!(
+        runtime_discovery.mcp_endpoint,
+        "mcp+https://93.184.216.34/mcp"
+    );
+    assert_eq!(runtime_discovery.scopes, vec!["search", "get_manifest"]);
+    assert!(lockfile.policy.resolved.network.allow.iter().any(|rule| {
+        matches!(
+            &rule.target,
+            NetworkTarget::Host {
+                host,
+                port: Some(443),
+                scheme: Some(scheme),
+                http_access: Some(agentenv_proto::HttpAccessLevel::Full),
+            } if host == "93.184.216.34" && scheme == "https"
+        )
+    }));
+
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render portable lockfile");
+    assert!(rendered.contains("runtime_discovery:"));
+    let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
+        .expect("verify portable lockfile");
+    assert!(report.is_clean());
+}
+
+#[test]
 fn portable_lockfile_builder_applies_declared_policy_overrides() {
     let lockfile = build_portable_lockfile(PortableLockfileInput {
         name: "demo".to_owned(),
@@ -879,6 +920,28 @@ policy:
     - allow: https://example.com:8443
       deny: blocked.internal
       approval: https://example.com/path
+"#
+    .to_owned()
+}
+
+fn runtime_discovery_yaml() -> String {
+    r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+skills:
+  runtime_discovery:
+    mcp_endpoint: mcp+https://93.184.216.34/mcp
+    scopes: ["search", "get_manifest"]
 "#
     .to_owned()
 }

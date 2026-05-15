@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use agentenv_policy::{compose_policy, PresetRegistry, PresetSelection, Tier};
-use agentenv_proto::{NetworkPolicy, NetworkRule, NetworkTarget, SCHEMA_VERSION};
+use agentenv_proto::{HttpAccessLevel, NetworkPolicy, NetworkRule, NetworkTarget, SCHEMA_VERSION};
 use semver::Version;
 use thiserror::Error;
+use url::Url;
 
 use crate::{
     driver_artifact::DriverArtifact,
@@ -90,6 +91,10 @@ pub enum PortableLockfileError {
         name: String,
         version: String,
     },
+    #[error("invalid skill runtime discovery endpoint: {0}")]
+    SkillRuntimeDiscoveryEndpoint(#[from] crate::blueprint::SkillRuntimeDiscoveryEndpointError),
+    #[error("invalid skill runtime discovery policy rule: {message}")]
+    SkillRuntimeDiscoveryPolicyRule { message: String },
 }
 
 pub fn build_portable_lockfile(
@@ -552,7 +557,38 @@ fn resolved_policy_for_composition(
         &PresetRegistry::load_builtin()?,
     )?;
     apply_portable_hardening_to_policy(&mut policy, composition)?;
+    if let Some(rule) = skill_runtime_discovery_policy_rule(&composition.skills)? {
+        policy.network.allow.push(rule);
+    }
     Ok(policy)
+}
+
+fn skill_runtime_discovery_policy_rule(
+    skills: &crate::blueprint::SkillsSection,
+) -> Result<Option<NetworkRule>, PortableLockfileError> {
+    let Some(runtime_discovery) = skills.runtime_discovery.as_ref() else {
+        return Ok(None);
+    };
+    let endpoint = runtime_discovery.mcp_endpoint()?;
+    let parsed = Url::parse(&endpoint.url).map_err(|_| {
+        PortableLockfileError::SkillRuntimeDiscoveryPolicyRule {
+            message: "endpoint URL must be valid".to_owned(),
+        }
+    })?;
+    let host = parsed.host_str().map(str::to_owned).ok_or_else(|| {
+        PortableLockfileError::SkillRuntimeDiscoveryPolicyRule {
+            message: "endpoint URL must include a host".to_owned(),
+        }
+    })?;
+
+    Ok(Some(NetworkRule {
+        target: NetworkTarget::Host {
+            host,
+            port: parsed.port_or_known_default(),
+            scheme: Some(parsed.scheme().to_owned()),
+            http_access: Some(HttpAccessLevel::Full),
+        },
+    }))
 }
 
 fn apply_portable_hardening_to_policy(
@@ -589,6 +625,7 @@ fn blueprint_yaml_from_portable_composition(
             .map(blueprint_component_from_portable),
         policy: composition.policy.clone(),
         state: composition.state.clone(),
+        skills: composition.skills.clone(),
     };
 
     serde_yaml::to_string(&blueprint)
