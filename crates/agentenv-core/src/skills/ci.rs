@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,8 +11,9 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use super::{
-    compute_bundle_digest, load_skill_manifest, load_skill_self_test_spec, AgentProduceRunner,
-    SkillError, SkillManifest,
+    compute_bundle_digest, load_skill_manifest, load_skill_self_test_spec,
+    manifest::{normalize_bundle_path, validated_bundle_file},
+    AgentProduceRunner, SkillError, SkillManifest,
 };
 
 pub const SKILL_CI_SCHEMA_VERSION: &str = "0.1";
@@ -420,9 +422,7 @@ fn find_next_labeled_secret(message: &str, start_at: usize) -> Option<(usize, us
 
         let keyword_end = keyword_start + keyword.len();
         let tail = &message[keyword_end..];
-        let Some(separator_index) = tail.find([':', '=']) else {
-            return None;
-        };
+        let separator_index = tail.find([':', '='])?;
         let value_start = keyword_end + separator_index + 1;
         let secret_start = secret_value_start(message, value_start);
         let secret_end = secret_token_end(message, secret_start);
@@ -579,7 +579,8 @@ fn error_finding(
 }
 
 fn read_declared_text(root: &Path, declared: &Path) -> Result<String, SkillError> {
-    let path = root.join(declared);
+    let declared = normalize_bundle_path(declared)?;
+    let path = validated_bundle_file(root, &declared)?;
     std::fs::read_to_string(&path).map_err(|source| SkillError::Io { path, source })
 }
 
@@ -696,15 +697,27 @@ fn lint_declared_text_secrets(
     manifest: &SkillManifest,
     findings: &mut Vec<SkillCiFinding>,
 ) {
-    for declared in &manifest.declared_files {
-        if !is_text_path(declared) {
-            continue;
-        }
-        let Ok(content) = read_declared_text(candidate_path, declared) else {
+    for declared in secret_scan_paths(manifest) {
+        let Ok(content) = read_declared_text(candidate_path, &declared) else {
             continue;
         };
-        lint_secrets(declared, &content, findings);
+        lint_secrets(&declared, &content, findings);
     }
+}
+
+fn secret_scan_paths(manifest: &SkillManifest) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    paths.insert(PathBuf::from("skill.yaml"));
+    paths.insert(PathBuf::from("skill-test.yaml"));
+    paths.insert(manifest.entry.clone());
+
+    for declared in &manifest.declared_files {
+        if is_text_path(declared) {
+            paths.insert(declared.clone());
+        }
+    }
+
+    paths
 }
 
 fn lint_secrets(path: &Path, content: &str, findings: &mut Vec<SkillCiFinding>) {

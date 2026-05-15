@@ -196,6 +196,70 @@ fn static_lint_sarif_redacts_secret_values_in_finding_messages() {
     assert!(sarif.contains("[REDACTED]"));
 }
 
+#[test]
+fn static_lint_rejects_secret_like_text_in_skill_yaml() {
+    let bundle = temp_dir("skill-ci-secret-skill-yaml");
+    write_file(&bundle.join("SKILL.md"), "# Secret metadata\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: ci-secret-skill-yaml\nversion: 0.1.0\ndescription: token=tok_1234567890abcdefghijklmnop\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n",
+    );
+    sign_skill_bundle(&bundle);
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let static_tier = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::StaticLint)
+        .unwrap();
+    assert_eq!(static_tier.status, SkillCiTierStatus::Failed);
+    assert!(static_tier.findings.iter().any(|finding| {
+        finding.rule_id == "agentenv.skill.secret.detected"
+            && finding.path.as_deref() == Some(Path::new("skill.yaml"))
+    }));
+}
+
+#[test]
+fn static_lint_rejects_secret_like_text_in_skill_test_yaml() {
+    let bundle = temp_dir("skill-ci-secret-skill-test-yaml");
+    write_file(&bundle.join("SKILL.md"), "# Secret self-test\n");
+    write_file(
+        &bundle.join("skill.yaml"),
+        "name: ci-secret-skill-test-yaml\nversion: 0.1.0\ndescription: self-test secret fixture\nentry: SKILL.md\nfiles:\n  - SKILL.md\n",
+    );
+    write_file(
+        &bundle.join("skill-test.yaml"),
+        "self_test:\n  runner: agentenv\n  assertions:\n    - type: agent_produces\n      prompt: \"Use sk-test-1234567890abcdefghijklmnop\"\n      expect_tokens_matching:\n        - ok\n      min_match_ratio: 1.0\n",
+    );
+    sign_skill_bundle(&bundle);
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: bundle,
+        registry_snapshot: None,
+        fail_fast: true,
+        agent_runner: Arc::new(PanicAgentRunner),
+    })
+    .expect("ci should run");
+
+    let static_tier = report
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == SkillCiTier::StaticLint)
+        .unwrap();
+    assert_eq!(static_tier.status, SkillCiTierStatus::Failed);
+    assert!(static_tier.findings.iter().any(|finding| {
+        finding.rule_id == "agentenv.skill.secret.detected"
+            && finding.path.as_deref() == Some(Path::new("skill-test.yaml"))
+    }));
+}
+
 #[derive(Debug)]
 struct PanicAgentRunner;
 
