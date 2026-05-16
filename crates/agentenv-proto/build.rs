@@ -25,6 +25,7 @@ fn main() {
     write_schema::<types::NetworkPolicy>(&schema_dir, "network-policy");
     write_schema::<types::DnsPolicy>(&schema_dir, "dns-policy");
     write_schema::<types::McpEndpoint>(&schema_dir, "mcp-endpoint");
+    write_schema::<types::McpGuardConfig>(&schema_dir, "mcp-guard-config");
     write_schema::<types::SandboxSpec>(&schema_dir, "sandbox-spec");
     write_schema::<types::SandboxHandle>(&schema_dir, "sandbox-handle");
     write_schema::<types::SnapshotParams>(&schema_dir, "snapshot-params");

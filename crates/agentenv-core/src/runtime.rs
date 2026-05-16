@@ -538,6 +538,8 @@ impl<'a> CreateEnvRollback<'a> {
 
 static CREATE_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_ENTRYPOINT_PATH: &str = "/sandbox/.agentenv/bin/agentenv-agent";
+const MCP_GUARD_CONFIG_SANDBOX_PATH: &str = "/sandbox/.agentenv/mcp-guard/context.json";
+const MCP_GUARD_EVENTS_DB_SANDBOX_PATH: &str = "/sandbox/.agentenv/mcp-guard/events.db";
 const BUILD_ONEFLIGHT_KIND: &str = "byo-openshell-v1";
 const BUILD_ONEFLIGHT_SEED_VERSION: &str = "1";
 
@@ -557,7 +559,14 @@ struct AgentSandboxSetup {
     mcp_config_host_path: PathBuf,
     mcp_config_sandbox_path: String,
     entrypoint_host_path: PathBuf,
+    extra_files: Vec<AgentSandboxFile>,
     health_probe: agentenv_proto::AgentHealthCheckProbe,
+}
+
+struct AgentSandboxFile {
+    host_path: PathBuf,
+    sandbox_path: String,
+    mode: &'static str,
 }
 
 struct AgentInstallCommand {
@@ -1233,6 +1242,8 @@ async fn create_env_with_input(
             }
         }
 
+        let mcp_guard_config =
+            mcp_guard_config_from_policy_extra(&resolved.blueprint.policy.extra)?;
         let egress_proxy_plan = build_runtime_egress_proxy_plan(RuntimeEgressProxyPlanInput {
             env_name: name,
             requirements: &requirements,
@@ -1240,11 +1251,18 @@ async fn create_env_with_input(
             context_endpoint: &context_endpoint,
             inference_endpoint: inference_endpoint.as_deref(),
             policy_extra: &resolved.blueprint.policy.extra,
+            mcp_guard_config: mcp_guard_config.as_ref(),
             sandbox_capabilities: &sandbox_init.capabilities,
             sandbox_driver: &selection.sandbox,
         })?;
         let context_endpoint_for_sandbox =
             rewrite_context_endpoint_for_proxy(&context_endpoint, &egress_proxy_plan);
+        let (guarded_context_endpoint, mcp_guard_files) = rewrite_context_endpoint_for_mcp_guard(
+            name,
+            &context_endpoint_for_sandbox,
+            mcp_guard_config.as_ref(),
+            &temp_workspace,
+        )?;
         let mut env = sandbox_env_for_credential_plan(
             credentials,
             &requirements,
@@ -1255,7 +1273,7 @@ async fn create_env_with_input(
         )?;
         env.extend(egress_proxy_plan.sandbox_env.clone());
         let credential_names = credential_names_for_plan(&requirements, &egress_proxy_plan);
-        let mut mcp_endpoints = vec![context_endpoint_for_sandbox.clone()];
+        let mut mcp_endpoints = vec![guarded_context_endpoint.clone()];
         if let Some(endpoint) = skill_runtime_discovery_endpoint.clone() {
             mcp_endpoints.push(endpoint);
         }
@@ -1264,6 +1282,7 @@ async fn create_env_with_input(
             set.agent.as_ref(),
             agent_spec.clone(),
             mcp_endpoints,
+            mcp_guard_files,
         )
         .await?;
 
@@ -1284,7 +1303,7 @@ async fn create_env_with_input(
             &lock_yaml,
             &selection,
             &resolved,
-            &context_endpoint_for_sandbox,
+            &guarded_context_endpoint,
             &resolved.blueprint.sandbox.extra,
         )?;
 
@@ -1292,7 +1311,7 @@ async fn create_env_with_input(
             name,
             &selection,
             &resolved.blueprint.sandbox.extra,
-            &context_endpoint_for_sandbox,
+            &guarded_context_endpoint,
             SandboxSpecCreateOptions {
                 env,
                 policy: Some(create_policy.clone()),
@@ -1488,7 +1507,7 @@ async fn create_env_with_input(
             },
             endpoints: crate::env::EndpointState {
                 context_mcp: Some(crate::env::PersistedMcpEndpoint::from_mcp(
-                    context_endpoint_for_sandbox,
+                    guarded_context_endpoint,
                 )),
                 skill_hub_mcp: skill_runtime_discovery_endpoint
                     .map(crate::env::PersistedMcpEndpoint::from_mcp),
@@ -2617,6 +2636,7 @@ struct RuntimeEgressProxyPlanInput<'a> {
     context_endpoint: &'a agentenv_proto::McpEndpoint,
     inference_endpoint: Option<&'a str>,
     policy_extra: &'a BTreeMap<String, serde_yaml::Value>,
+    mcp_guard_config: Option<&'a agentenv_proto::McpGuardConfig>,
     sandbox_capabilities: &'a Capabilities,
     sandbox_driver: &'a str,
 }
@@ -2645,7 +2665,10 @@ fn build_runtime_egress_proxy_plan(
         proxy_base_url: urls.sandbox_base_url,
         credential_requirements: input.requirements.to_vec(),
         network_policy: input.policy.clone(),
-        context_mcp: mcp_proxy_source_for_context_endpoint(input.context_endpoint),
+        context_mcp: mcp_proxy_source_for_context_endpoint(
+            input.context_endpoint,
+            input.mcp_guard_config,
+        ),
         inference_endpoint: parse_inference_endpoint_url(input.inference_endpoint)?,
         explicit_routes,
     })?;
@@ -2770,6 +2793,30 @@ fn explicit_egress_routes_from_policy_extra(
     })
 }
 
+fn mcp_guard_config_from_policy_extra(
+    policy_extra: &BTreeMap<String, serde_yaml::Value>,
+) -> RuntimeResult<Option<agentenv_proto::McpGuardConfig>> {
+    let Some(mcp) = policy_extra.get("mcp") else {
+        return Ok(None);
+    };
+    let mcp = mcp.as_mapping().ok_or_else(|| {
+        RuntimeError::Driver(DriverError::InvalidInput {
+            message: "policy.mcp must be a mapping".to_owned(),
+        })
+    })?;
+    let Some(guards) = yaml_mapping_value(mcp, "confused_deputy_guards") else {
+        return Ok(None);
+    };
+    let config = serde_yaml::from_value::<agentenv_proto::McpGuardConfig>(guards.clone()).map_err(
+        |source| {
+            RuntimeError::Driver(DriverError::InvalidInput {
+                message: format!("invalid policy.mcp.confused_deputy_guards: {source}"),
+            })
+        },
+    )?;
+    Ok(config.enabled.then_some(config))
+}
+
 fn egress_proxy_required_by_policy_extra(
     policy_extra: &BTreeMap<String, serde_yaml::Value>,
 ) -> bool {
@@ -2801,7 +2848,7 @@ fn required_egress_proxy_service_label(
     {
         return "anthropic".to_owned();
     }
-    if mcp_proxy_source_for_context_endpoint(context_endpoint).is_some() {
+    if mcp_proxy_source_for_context_endpoint(context_endpoint, None).is_some() {
         return "mcp".to_owned();
     }
     "egress_proxy".to_owned()
@@ -2809,6 +2856,7 @@ fn required_egress_proxy_service_label(
 
 fn mcp_proxy_source_for_context_endpoint(
     endpoint: &agentenv_proto::McpEndpoint,
+    guard_config: Option<&agentenv_proto::McpGuardConfig>,
 ) -> Option<McpProxySource> {
     if !matches!(
         endpoint.transport,
@@ -2826,6 +2874,7 @@ fn mcp_proxy_source_for_context_endpoint(
         route_id: "context".to_owned(),
         upstream_url,
         token_credential_name: Some("MCP_TOKEN".to_owned()),
+        guard_config: guard_config.cloned(),
     })
 }
 
@@ -2841,6 +2890,59 @@ fn rewrite_context_endpoint_for_proxy(
     rewritten.url = url.as_str().to_owned();
     rewritten.headers.clear();
     rewritten
+}
+
+fn rewrite_context_endpoint_for_mcp_guard(
+    env_name: &str,
+    endpoint: &agentenv_proto::McpEndpoint,
+    guard_config: Option<&agentenv_proto::McpGuardConfig>,
+    temp_workspace: &Path,
+) -> RuntimeResult<(agentenv_proto::McpEndpoint, Vec<AgentSandboxFile>)> {
+    let Some(guard_config) = guard_config else {
+        return Ok((endpoint.clone(), Vec::new()));
+    };
+    if endpoint.transport != agentenv_proto::McpTransport::Stdio {
+        return Ok((endpoint.clone(), Vec::new()));
+    }
+
+    let file = write_mcp_guard_config_file(temp_workspace, guard_config)?;
+    let mut rewritten = endpoint.clone();
+    rewritten.url = format!(
+        "agentenv mcp-guard run --env {} --config {} --events-db {} --stdio-upstream {}",
+        shell_quote(env_name),
+        shell_quote(MCP_GUARD_CONFIG_SANDBOX_PATH),
+        shell_quote(MCP_GUARD_EVENTS_DB_SANDBOX_PATH),
+        shell_quote(&endpoint.url),
+    );
+    rewritten.headers.clear();
+    Ok((rewritten, vec![file]))
+}
+
+fn write_mcp_guard_config_file(
+    temp_workspace: &Path,
+    guard_config: &agentenv_proto::McpGuardConfig,
+) -> RuntimeResult<AgentSandboxFile> {
+    let agent_dir = temp_workspace.join("agent-assets");
+    fs::create_dir_all(&agent_dir).map_err(|source| crate::env::EnvError::Io {
+        path: agent_dir.clone(),
+        source,
+    })?;
+    let host_path = agent_dir.join("mcp-guard-context.json");
+    let content = serde_json::to_vec_pretty(guard_config).map_err(|source| {
+        RuntimeError::Driver(DriverError::InvalidInput {
+            message: format!("serialize MCP guard config: {source}"),
+        })
+    })?;
+    fs::write(&host_path, content).map_err(|source| crate::env::EnvError::Io {
+        path: host_path.clone(),
+        source,
+    })?;
+
+    Ok(AgentSandboxFile {
+        host_path,
+        sandbox_path: MCP_GUARD_CONFIG_SANDBOX_PATH.to_owned(),
+        mode: "0600",
+    })
 }
 
 fn sandbox_env_for_credential_plan(
@@ -4781,6 +4883,7 @@ async fn prepare_agent_sandbox_setup(
     agent: &dyn AgentDriver,
     spec: AgentSpec,
     endpoints: Vec<agentenv_proto::McpEndpoint>,
+    extra_files: Vec<AgentSandboxFile>,
 ) -> RuntimeResult<AgentSandboxSetup> {
     let can_skip_install_if_probe_passes = spec.version.is_none();
     let install_steps = agent.install_steps(spec.clone()).await?;
@@ -4820,6 +4923,7 @@ async fn prepare_agent_sandbox_setup(
         mcp_config_host_path,
         mcp_config_sandbox_path: normalize_agent_sandbox_path(&mcp_config_path.path)?,
         entrypoint_host_path,
+        extra_files,
         health_probe,
     })
 }
@@ -4862,6 +4966,16 @@ async fn install_agent_in_sandbox(
         "0755",
     )
     .await?;
+    for file in &setup.extra_files {
+        copy_agent_file_into_sandbox(
+            sandbox,
+            handle,
+            &file.host_path,
+            &file.sandbox_path,
+            file.mode,
+        )
+        .await?;
+    }
 
     let result = sandbox
         .exec(agentenv_proto::ExecParams {
@@ -6100,13 +6214,9 @@ policy:
 
     #[cfg(unix)]
     fn failing_fake_egress_proxy_bin(root: &std::path::Path) -> EnvVarGuard {
-        use std::os::unix::fs::PermissionsExt;
-
         fs::create_dir_all(root).expect("create fake proxy root");
         let fake_proxy = root.join("failing-agentenv-proxy.sh");
         fs::write(&fake_proxy, "#!/bin/sh\nexit 2\n").expect("write fake proxy");
-        fs::set_permissions(&fake_proxy, fs::Permissions::from_mode(0o755))
-            .expect("fake proxy executable");
         EnvVarGuard::set(crate::egress_proxy::EGRESS_PROXY_BIN_ENV, &fake_proxy)
     }
 
@@ -9416,6 +9526,54 @@ policy:
         if let Some(pid) = proxy.pid {
             let _ = crate::egress_proxy::stop_egress_proxy_pid(pid).await;
         }
+    }
+
+    #[tokio::test]
+    async fn create_env_rewrites_stdio_mcp_endpoint_when_guard_enabled() {
+        let root = unique_root("agentenv-mcp-guard-stdio");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  mcp:
+    confused_deputy_guards:
+      enabled: true
+      default_approval: per-call
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect("env create should succeed");
+
+        let endpoint_batches = tracker
+            .mcp_config_endpoints
+            .lock()
+            .expect("mcp config endpoint tracker");
+        assert!(endpoint_batches[0][0]
+            .url
+            .contains("agentenv mcp-guard run"));
+        assert_eq!(
+            endpoint_batches[0][0].transport,
+            agentenv_proto::McpTransport::Stdio
+        );
     }
 
     #[cfg(unix)]

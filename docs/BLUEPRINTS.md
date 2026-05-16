@@ -69,6 +69,40 @@ When DNS policy is active, the sandbox must use the driver-managed DNS guard,
 and direct DNS, DoT, or DoH bypass traffic must be denied. Drivers that cannot
 enforce those controls must report `supports_dns_egress_control = false`.
 
+## MCP Tool-Call Guards
+
+Blueprints may opt into core-mediated MCP tool-call guards under
+`policy.mcp.confused_deputy_guards`. Reference blueprints keep this block
+commented out by default so existing templates remain runnable without approval
+prompts.
+
+```yaml
+policy:
+  tier: restricted
+  mcp:
+    confused_deputy_guards:
+      enabled: true
+      default_approval: per-call
+      tool_policies:
+        "filesystem.read":
+          approval: never
+          rate_limit: 50/session
+        "web.fetch":
+          approval: per-call
+          url_allowlist:
+            - api.github.com
+            - crates.io
+          redact_args: true
+        "*.write":
+          approval: per-session
+      cross_tool_flows:
+        forbid_read_to_write_turns: 5
+```
+
+When enabled, HTTP and HTTP+SSE MCP endpoints are guarded in the host egress
+proxy. Stdio MCP endpoints are wrapped with `agentenv mcp-guard run` before the
+agent driver renders MCP config.
+
 ## Getting-Started Filesystem Blueprints
 
 `claude+filesystem+openshell.yaml`, `codex+filesystem+openshell.yaml`, and `openclaw+filesystem+openshell.yaml` mount `~/projects` through the filesystem context driver and expose it over MCP inside OpenShell. They are the lowest-friction templates because they do not require remote context infrastructure.

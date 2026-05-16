@@ -173,6 +173,11 @@ pub enum LifecycleError {
         #[source]
         source: DnsPolicyError,
     },
+    #[error("invalid MCP guard policy at `policy.mcp.confused_deputy_guards`: {source}")]
+    McpGuardPolicy {
+        #[source]
+        source: serde_yaml::Error,
+    },
     #[error("invalid skill runtime discovery endpoint at `{path}`: {source}")]
     InvalidSkillRuntimeDiscoveryEndpoint {
         path: String,
@@ -297,6 +302,7 @@ fn validate_blueprint_urls(blueprint: &Blueprint) -> Result<(), LifecycleError> 
     validate_skill_runtime_discovery(&blueprint.skills, &options)?;
     validate_policy_url_overrides(&blueprint.policy, &options)?;
     validate_blueprint_dns_policy(&blueprint.policy)?;
+    validate_mcp_guard_policy_extra(&blueprint.policy)?;
 
     Ok(())
 }
@@ -352,6 +358,25 @@ fn validate_blueprint_dns_policy(policy: &PolicySection) -> Result<(), Lifecycle
         pin_resolved_ips: dns.pin_resolved_ips,
     })
     .map_err(|source| LifecycleError::DnsPolicy { source })
+}
+
+fn validate_mcp_guard_policy_extra(policy: &PolicySection) -> Result<(), LifecycleError> {
+    let Some(mcp) = policy.extra.get("mcp") else {
+        return Ok(());
+    };
+    let mcp = mcp
+        .as_mapping()
+        .ok_or_else(|| LifecycleError::InvalidFieldType {
+            path: "policy.mcp".to_owned(),
+            expected: "mapping",
+        })?;
+    let Some(config) = mapping_value(mcp, "confused_deputy_guards") else {
+        return Ok(());
+    };
+
+    serde_yaml::from_value::<agentenv_proto::McpGuardConfig>(config.clone())
+        .map(|_| ())
+        .map_err(|source| LifecycleError::McpGuardPolicy { source })
 }
 
 fn validate_context_blueprint_urls(

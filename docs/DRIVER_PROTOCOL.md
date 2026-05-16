@@ -232,6 +232,10 @@ the no-context sentinel and should be skipped when rendering agent MCP config.
 Filesystem context endpoints encode the stdio command in `McpEndpoint.url` until a
 future protocol version splits stdio command and arguments into separate fields.
 
+Core may rewrite an `McpEndpoint` for guard mediation before passing it to an
+agent driver. This is not a driver protocol change; context drivers continue to
+report the unmediated endpoint they provision.
+
 #### `InferenceDriver`
 
 | Method | Params | Result |

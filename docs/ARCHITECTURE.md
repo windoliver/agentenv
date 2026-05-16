@@ -180,6 +180,14 @@ MCP runs over several transports; drivers shouldn't know or care. We abstract th
 
 This is the same pattern VNC uses (RFB over TCP / TLS / SSH / WebSocket). Transport is orthogonal to content.
 
+### MCP tool-call guards
+
+When `policy.mcp.confused_deputy_guards.enabled` is true, core rewrites the
+agent-visible `McpEndpoint` through a guard. HTTP and HTTP+SSE endpoints are
+guarded in the host egress proxy; stdio endpoints are guarded by an
+`agentenv mcp-guard run` wrapper. Context drivers still return ordinary
+`McpEndpoint` values and agent drivers still render ordinary MCP config.
+
 ---
 
 ## Driver architecture

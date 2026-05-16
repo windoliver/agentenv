@@ -62,6 +62,8 @@ pub struct BrokerRoute {
     pub credential_name: String,
     pub request_path_prefix: String,
     pub allowed_hosts: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_guard: Option<agentenv_proto::McpGuardConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ pub struct McpProxySource {
     pub route_id: String,
     pub upstream_url: Url,
     pub token_credential_name: Option<String>,
+    pub guard_config: Option<agentenv_proto::McpGuardConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +514,7 @@ pub fn build_egress_proxy_plan(
             credential_name,
             request_path_prefix,
             allowed_hosts: allowed_hosts_for_url(&source.upstream_url),
+            mcp_guard: source.guard_config,
         });
         Some(rewritten_url)
     } else {
@@ -545,6 +549,7 @@ pub fn build_egress_proxy_plan(
             credential_name,
             request_path_prefix,
             allowed_hosts: allowed_hosts_for_url(&registry.upstream_base_url),
+            mcp_guard: None,
         });
     }
 
@@ -680,6 +685,7 @@ fn provider_route(
         upstream_base_url,
         credential_name: credential_name.to_owned(),
         request_path_prefix: request_path_prefix.to_owned(),
+        mcp_guard: None,
     })
 }
 
@@ -1261,6 +1267,7 @@ mod tests {
             route_id: "primary".to_owned(),
             upstream_url: "https://mcp.example.test/rpc".parse().unwrap(),
             token_credential_name: Some("MCP_TOKEN".to_owned()),
+            guard_config: None,
         };
 
         let plan = build_egress_proxy_plan(EgressProxyPlanInput {
@@ -1288,6 +1295,39 @@ mod tests {
             .find(|route| route.id == "mcp.primary")
             .expect("MCP route should be present");
         assert!(route.allowed_hosts.contains("mcp.example.test"));
+    }
+
+    #[test]
+    fn mcp_route_carries_guard_config_when_supplied() {
+        let endpoint = McpProxySource {
+            route_id: "primary".to_owned(),
+            upstream_url: "https://mcp.example.test/rpc".parse().unwrap(),
+            token_credential_name: Some("MCP_TOKEN".to_owned()),
+            guard_config: Some(agentenv_proto::McpGuardConfig {
+                enabled: true,
+                default_approval: agentenv_proto::McpApprovalMode::PerCall,
+                tool_policies: BTreeMap::new(),
+                cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+            }),
+        };
+
+        let plan = build_egress_proxy_plan(EgressProxyPlanInput {
+            env_name: "demo".to_owned(),
+            proxy_base_url: "http://127.0.0.1:31002".parse().unwrap(),
+            credential_requirements: vec![required("MCP_TOKEN")],
+            network_policy: policy(),
+            context_mcp: Some(endpoint),
+            inference_endpoint: None,
+            explicit_routes: ExplicitEgressRoutes::default(),
+        })
+        .expect("plan builds");
+
+        let route = plan
+            .routes
+            .iter()
+            .find(|route| route.id == "mcp.primary")
+            .expect("MCP route should be present");
+        assert!(route.mcp_guard.as_ref().is_some_and(|guard| guard.enabled));
     }
 
     #[test]
@@ -1629,6 +1669,7 @@ mod tests {
                     route_id: route_id.to_owned(),
                     upstream_url: "https://mcp.example.test/rpc".parse().unwrap(),
                     token_credential_name: Some("MCP_TOKEN".to_owned()),
+                    guard_config: None,
                 }),
                 inference_endpoint: None,
                 explicit_routes: ExplicitEgressRoutes::default(),
