@@ -610,6 +610,9 @@ fn cache_can_be_repaired(error: &SkillError) -> bool {
         | SkillError::InvalidSignature { .. }
         | SkillError::SkillNotInstalled { .. }
         | SkillError::AmbiguousInstalledVersion { .. }
+        | SkillError::InvalidSkillCiCandidate { .. }
+        | SkillError::SkillCiFailed { .. }
+        | SkillError::SkillCiSarif { .. }
         | SkillError::AlreadyInstalledDifferentDigest { .. }
         | SkillError::Serde { .. }
         | SkillError::Toml { .. }

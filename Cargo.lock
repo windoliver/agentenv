@@ -76,6 +76,7 @@ dependencies = [
  "context-none",
  "crossterm",
  "dirs",
+ "ed25519-dalek",
  "hex",
  "http-body-util",
  "hyper 1.9.0",

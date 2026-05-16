@@ -1,6 +1,8 @@
 use std::{
     fs,
+    io::{self, Write},
     path::PathBuf,
+    process,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -11,10 +13,11 @@ use agentenv_core::security::ssrf::SsrfOptions;
 use agentenv_core::skills::{
     execute_skill_prune, load_project_skills_config, load_skill_trust_keys,
     load_user_skills_config, merge_skills_config, plan_skill_prune, rebuild_skill_index,
-    verify_all_installed_skills, AgentProduceRequest, AgentProduceRunner, InstalledSkill,
-    InstalledSkillSelector, SkillAddRequest, SkillCacheLayout, SkillError, SkillPublishRequest,
-    SkillSearchHit, SkillService, SkillVerifyOptions, SkillVerifyStatus, SkillsConfig,
-    SkillsConfigOverride,
+    run_skill_ci, skill_ci_sarif, verify_all_installed_skills, AgentProduceRequest,
+    AgentProduceRunner, InstalledSkill, InstalledSkillSelector, SkillAddRequest, SkillCacheLayout,
+    SkillCiRegistrySnapshot, SkillCiRequest, SkillCiSeverity, SkillCiStatus, SkillCiTier,
+    SkillCiTierStatus, SkillError, SkillPublishRequest, SkillSearchHit, SkillService,
+    SkillVerifyOptions, SkillVerifyStatus, SkillsConfig, SkillsConfigOverride,
 };
 use agentenv_credstore::{CredentialStore, CredentialStoreError};
 use agentenv_proto::{CredentialKind, CredentialRequirement, LogLevel};
@@ -45,6 +48,7 @@ pub enum SkillsCommand {
     Remove(SkillsRemoveArgs),
     Publish(SkillsPublishArgs),
     Verify(SkillsVerifyArgs),
+    Ci(SkillsCiArgs),
     Prune(SkillsPruneArgs),
 }
 
@@ -132,6 +136,19 @@ pub struct SkillsVerifyArgs {
     pub all: bool,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillsCiArgs {
+    pub path: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub registry_snapshot: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub sarif: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub no_fail_fast: bool,
 }
 
 #[derive(Debug, Args)]
@@ -425,6 +442,7 @@ async fn dispatch(command: SkillsCommand, service: SkillService, root: PathBuf) 
                 print_installed_result(&installed, args.json)
             }
         }
+        SkillsCommand::Ci(args) => run_ci(&service, args),
         SkillsCommand::Prune(args) => run_prune(&root, args),
     }
 }
@@ -440,8 +458,48 @@ fn registry_override_for_command(command: &SkillsCommand) -> Option<String> {
         | SkillsCommand::Info(_)
         | SkillsCommand::Remove(_)
         | SkillsCommand::Verify(_)
+        | SkillsCommand::Ci(_)
         | SkillsCommand::Prune(_) => None,
     }
+}
+
+fn run_ci(service: &SkillService, args: SkillsCiArgs) -> Result<()> {
+    let registry_snapshot = match args.registry_snapshot.as_deref() {
+        Some(path) => Some(
+            serde_json::from_str::<SkillCiRegistrySnapshot>(
+                &fs::read_to_string(path).with_context(|| format!("read `{}`", path.display()))?,
+            )
+            .with_context(|| format!("parse registry snapshot `{}`", path.display()))?,
+        ),
+        None => None,
+    };
+
+    let report = run_skill_ci(SkillCiRequest {
+        candidate_path: args.path,
+        registry_snapshot,
+        fail_fast: !args.no_fail_fast,
+        agent_runner: service.agent_produce_runner(),
+    })?;
+
+    if let Some(path) = args.sarif.as_deref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create SARIF directory `{}`", parent.display()))?;
+        }
+        fs::write(path, skill_ci_sarif(&report)?)
+            .with_context(|| format!("write SARIF `{}`", path.display()))?;
+    }
+
+    if args.json {
+        print_json(&report)?;
+    } else {
+        print_ci_summary(&report);
+    }
+
+    if report.status != SkillCiStatus::Passed {
+        exit_process(1);
+    }
+    Ok(())
 }
 
 fn run_verify_all(root: &std::path::Path, json: bool) -> Result<()> {
@@ -642,4 +700,90 @@ fn print_installed_info(installed: &InstalledSkill) {
     println!("entry: {}", installed.entry.display());
     println!("installed_at: {}", installed.installed_at);
     println!("path: {}", installed.path.display());
+}
+
+fn print_ci_summary(report: &agentenv_core::skills::SkillCiReport) {
+    println!("status: {}", ci_status(report.status));
+    println!(
+        "candidate: {} {} {}",
+        report.candidate.name, report.candidate.version, report.candidate.digest
+    );
+    println!("TIER STATUS FINDINGS");
+    for tier in &report.tiers {
+        println!(
+            "{} {} {}",
+            ci_tier(tier.tier),
+            ci_tier_status(tier.status),
+            tier.findings.len()
+        );
+        for finding in tier
+            .findings
+            .iter()
+            .filter(|finding| finding.severity != SkillCiSeverity::Note)
+            .take(3)
+        {
+            match (&finding.path, finding.line) {
+                (Some(path), Some(line)) => println!(
+                    "  {} {} {}:{} {}",
+                    ci_severity(finding.severity),
+                    finding.rule_id,
+                    path.display(),
+                    line,
+                    finding.message
+                ),
+                (Some(path), None) => println!(
+                    "  {} {} {} {}",
+                    ci_severity(finding.severity),
+                    finding.rule_id,
+                    path.display(),
+                    finding.message
+                ),
+                (None, _) => println!(
+                    "  {} {} {}",
+                    ci_severity(finding.severity),
+                    finding.rule_id,
+                    finding.message
+                ),
+            }
+        }
+    }
+}
+
+fn ci_status(status: SkillCiStatus) -> &'static str {
+    match status {
+        SkillCiStatus::Passed => "passed",
+        SkillCiStatus::Failed => "failed",
+        SkillCiStatus::Skipped => "skipped",
+    }
+}
+
+fn ci_tier(tier: SkillCiTier) -> &'static str {
+    match tier {
+        SkillCiTier::StaticLint => "static_lint",
+        SkillCiTier::AgentReview => "agent_review",
+        SkillCiTier::SemanticDedup => "semantic_dedup",
+        SkillCiTier::FunctionalRegression => "functional_regression",
+    }
+}
+
+fn ci_tier_status(status: SkillCiTierStatus) -> &'static str {
+    match status {
+        SkillCiTierStatus::Passed => "passed",
+        SkillCiTierStatus::Failed => "failed",
+        SkillCiTierStatus::Skipped => "skipped",
+    }
+}
+
+fn ci_severity(severity: SkillCiSeverity) -> &'static str {
+    match severity {
+        SkillCiSeverity::Error => "error",
+        SkillCiSeverity::Warning => "warning",
+        SkillCiSeverity::Note => "note",
+    }
+}
+
+fn exit_process(code: i32) -> ! {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    process::exit(code);
 }

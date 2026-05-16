@@ -16,6 +16,7 @@ use agentenv_approvals::{
     sign_payload, ApprovalKind, ApprovalRequest, ApprovalScope, ApprovalStore,
 };
 use agentenv_core::egress_proxy::{BrokerRoute, BrokerService, EgressProxyLaunchConfig};
+use agentenv_core::skills::{compute_bundle_digest, load_skill_manifest, signature_payload};
 use agentenv_events::{
     audit::{AuditSigningKey, AuditStore},
     store::{EventQuery, SqliteEventStore},
@@ -26,6 +27,7 @@ use agentenv_proto::{
     McpCrossToolFlowPolicy, McpGuardConfig, McpToolPolicy, NetworkAccessPolicy, NetworkPolicy,
     NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -2512,6 +2514,244 @@ fn skills_prune_deletes_unreferenced_archive() {
         !archive.exists(),
         "prune should delete unreferenced archive"
     );
+}
+
+#[test]
+fn skills_ci_json_passes_valid_bundle() {
+    let temp_dir = make_temp_dir("skills-ci-json-pass");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(&bundle, "ci-cli-pass", "0.1.0", "CI pass fixture");
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(report["status"], "passed");
+    assert_eq!(report["candidate"]["name"], "ci-cli-pass");
+    assert_eq!(report["candidate"]["version"], "0.1.0");
+    assert_ci_tier_status(&report, "static_lint", "passed");
+    assert_ci_tier_status(&report, "functional_regression", "passed");
+}
+
+#[test]
+fn skills_ci_summary_reports_valid_bundle_tiers() {
+    let temp_dir = make_temp_dir("skills-ci-summary-pass");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(&bundle, "ci-cli-summary", "0.1.0", "CI summary fixture");
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: passed"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("candidate: ci-cli-summary 0.1.0 sha256:"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("static_lint passed 0"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("agent_review passed 0"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("semantic_dedup passed 0"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("functional_regression passed 0"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn skills_ci_json_exits_one_for_invalid_bundle() {
+    let temp_dir = make_temp_dir("skills-ci-json-invalid");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(&bundle, "ci-cli-invalid", "0.1.0", "CI invalid fixture");
+    fs::write(
+        bundle.join("SKILL.md"),
+        "# Invalid\n\n```rust\nfn main() {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(report["status"], "failed");
+    assert_ci_tier_status(&report, "static_lint", "failed");
+    assert_ci_tier_status(&report, "agent_review", "skipped");
+    assert_ci_tier_status(&report, "semantic_dedup", "skipped");
+    assert_ci_tier_status(&report, "functional_regression", "skipped");
+    assert_ci_findings_include(
+        &report,
+        "static_lint",
+        "agentenv.skill.markdown.unclosed-fence",
+    );
+}
+
+#[test]
+fn skills_ci_no_fail_fast_continues_after_static_failure() {
+    let temp_dir = make_temp_dir("skills-ci-no-fail-fast-static");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(
+        &bundle,
+        "ci-cli-no-fail-fast-static",
+        "0.1.0",
+        "CI no fail-fast fixture",
+    );
+    fs::write(
+        bundle.join("SKILL.md"),
+        "# Invalid but reviewable\n\nUse this skill safely.\n\n```rust\nfn main() {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .arg("--no-fail-fast")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(report["status"], "failed");
+    assert_ci_tier_status(&report, "static_lint", "failed");
+    assert_ci_tier_status(&report, "agent_review", "passed");
+    assert_ci_tier_status(&report, "semantic_dedup", "passed");
+    assert_ci_tier_status(&report, "functional_regression", "skipped");
+}
+
+#[test]
+fn skills_ci_writes_sarif_file() {
+    let temp_dir = make_temp_dir("skills-ci-sarif");
+    let bundle = temp_dir.join("bundle");
+    let sarif_path = temp_dir.join("reports/nested/skill-ci.sarif");
+    write_signed_ci_skill_bundle(&bundle, "ci-cli-sarif", "0.1.0", "CI SARIF fixture");
+    fs::write(
+        bundle.join("SKILL.md"),
+        "# SARIF\n\nUse token sk-test-1234567890abcdefghijklmnop carefully.\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .arg("--sarif")
+        .arg(&sarif_path)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    assert!(sarif_path.is_file(), "SARIF file was not written");
+    let sarif: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&sarif_path).unwrap()).unwrap();
+    assert_eq!(sarif["version"], "2.1.0");
+    let results = sarif["runs"][0]["results"].as_array().unwrap();
+    assert!(results
+        .iter()
+        .any(|result| { result["ruleId"].as_str() == Some("agentenv.skill.secret.detected") }));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status"), "stdout was: {stdout}");
+}
+
+#[test]
+fn skills_ci_registry_snapshot_drives_dedup_failure() {
+    let temp_dir = make_temp_dir("skills-ci-dedup");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(&bundle, "ci-cli-dedup", "0.1.0", "CI dedup fixture");
+    let manifest = load_skill_manifest(&bundle).unwrap();
+    let digest = compute_bundle_digest(&bundle, &manifest).unwrap();
+    let snapshot = temp_dir.join("registry-snapshot.json");
+    fs::write(
+        &snapshot,
+        serde_json::to_string_pretty(&json!({
+            "skills": [
+                {
+                    "name": "existing-dedup",
+                    "version": "1.0.0",
+                    "description": "CI dedup fixture",
+                    "procedure_text": "# CI dedup fixture\n\nUse this skill safely. Ask before destructive actions.\n",
+                    "fingerprint": digest,
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .arg("--registry-snapshot")
+        .arg(&snapshot)
+        .arg("--no-fail-fast")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(report["status"], "failed");
+    assert_ci_tier_status(&report, "semantic_dedup", "failed");
+    assert_ci_tier_status(&report, "functional_regression", "passed");
+    assert_ci_findings_include(
+        &report,
+        "semantic_dedup",
+        "agentenv.skill.dedup.probable-duplicate",
+    );
+}
+
+#[test]
+fn skill_ci_workflow_references_cli_command() {
+    let workflow_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/skill-ci.yaml");
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    assert!(workflow.contains("workflow_call"));
+    assert!(workflow.contains("agentenv skills ci"));
+    assert!(workflow.contains("upload-sarif"));
 }
 
 #[test]
@@ -6551,6 +6791,37 @@ fn write_local_skill_bundle(
     .unwrap();
 }
 
+fn write_signed_ci_skill_bundle(bundle: &Path, name: &str, version: &str, description: &str) {
+    fs::create_dir_all(bundle).unwrap();
+    fs::write(
+        bundle.join("SKILL.md"),
+        format!("# {description}\n\nUse this skill safely. Ask before destructive actions.\n"),
+    )
+    .unwrap();
+    fs::write(
+        bundle.join("skill.yaml"),
+        format!(
+            "name: {name}\nversion: {version}\ndescription: {description}\nentry: SKILL.md\nfiles:\n  - SKILL.md\nself_test:\n  command: test -f SKILL.md\n"
+        ),
+    )
+    .unwrap();
+    sign_local_skill_bundle(bundle);
+}
+
+fn sign_local_skill_bundle(bundle: &Path) {
+    let manifest = load_skill_manifest(bundle).unwrap();
+    let digest = compute_bundle_digest(bundle, &manifest).unwrap();
+    let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+    let payload = signature_payload(&manifest, &digest).unwrap();
+    let signature = hex::encode(signing_key.sign(&payload).to_bytes());
+    let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+    let mut manifest_text = fs::read_to_string(bundle.join("skill.yaml")).unwrap();
+    manifest_text.push_str(&format!(
+        "signatures:\n  ed25519: {signature}\n  public_key_ed25519: {public_key}\n"
+    ));
+    fs::write(bundle.join("skill.yaml"), manifest_text).unwrap();
+}
+
 fn write_local_skill_bundle_with_skill_test_file(
     bundle: &Path,
     name: &str,
@@ -6617,6 +6888,35 @@ fn write_indexless_filesystem_registry_skill(
         ),
     )
     .unwrap();
+}
+
+fn assert_ci_tier_status(report: &serde_json::Value, tier_name: &str, expected_status: &str) {
+    let tier = ci_tier(report, tier_name);
+    assert_eq!(
+        tier["status"].as_str(),
+        Some(expected_status),
+        "report was: {report}"
+    );
+}
+
+fn assert_ci_findings_include(report: &serde_json::Value, tier_name: &str, rule_id: &str) {
+    let tier = ci_tier(report, tier_name);
+    let findings = tier["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["rule_id"].as_str() == Some(rule_id)),
+        "missing {rule_id}; tier was: {tier}"
+    );
+}
+
+fn ci_tier<'a>(report: &'a serde_json::Value, tier_name: &str) -> &'a serde_json::Value {
+    report["tiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tier| tier["tier"].as_str() == Some(tier_name))
+        .unwrap_or_else(|| panic!("missing {tier_name}; report was: {report}"))
 }
 
 fn assert_skill_search_names(stdout: &[u8], expected: &[&str]) {
