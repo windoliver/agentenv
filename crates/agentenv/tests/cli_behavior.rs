@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::{
@@ -15,11 +15,17 @@ use std::{
 use agentenv_approvals::{
     sign_payload, ApprovalKind, ApprovalRequest, ApprovalScope, ApprovalStore,
 };
+use agentenv_core::egress_proxy::{BrokerRoute, BrokerService, EgressProxyLaunchConfig};
 use agentenv_core::skills::{compute_bundle_digest, load_skill_manifest, signature_payload};
 use agentenv_events::{
     audit::{AuditSigningKey, AuditStore},
     store::{EventQuery, SqliteEventStore},
     ActivityEvent, ActivityKind, ActivityResult,
+};
+use agentenv_proto::{
+    DnsPolicy, FilesystemPolicy, HttpAccessLevel, InferencePolicy, McpApprovalMode,
+    McpCrossToolFlowPolicy, McpGuardConfig, McpToolPolicy, NetworkAccessPolicy, NetworkPolicy,
+    NetworkRule, NetworkTarget, PolicyReloadability, ProcessPolicy,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -28,6 +34,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+const APPROVALS_SERVER_START_TIMEOUT: Duration = Duration::from_secs(60);
 const PTY_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn agentenv_bin() -> &'static str {
@@ -3267,6 +3274,73 @@ fn skills_search_reports_http_registry_override_ssrf_block() {
 }
 
 #[test]
+fn skills_search_allows_loopback_registry_when_env_opted_in() {
+    let temp_dir = make_temp_dir("skills-cli-http-registry-loopback-opt-in");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let registry = format!("http://{}/skills", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for skill registry request"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept skill registry request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(LOCAL_HTTP_TEST_TIMEOUT))
+            .unwrap();
+        let request = read_http_request(&mut stream);
+        assert!(
+            request.starts_with("GET /skills/index.json "),
+            "request was: {request}"
+        );
+        let body = serde_json::json!({
+            "skills": [{
+                "name": "loopback-cli-skill",
+                "version": "0.1.0",
+                "description": "Loopback registry test",
+                "registry": "ignored",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let search = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("search")
+        .arg("loopback")
+        .arg("--registry")
+        .arg(&registry)
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .env("AGENTENV_SKILLS_ALLOW_LOOPBACK_REGISTRIES", "1")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(search.status.success(), "{}", output_summary(&search));
+    assert_skill_search_names(&search.stdout, &["loopback-cli-skill"]);
+    handle.join().unwrap();
+}
+
+#[test]
 fn skills_search_accepts_git_registry_override_syntax() {
     let temp_dir = make_temp_dir("skills-cli-git-registry-override");
 
@@ -4901,6 +4975,160 @@ fn approvals_approve_fails_when_request_was_already_denied() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("already decided as deny"));
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_guard_stdio_cli_forwards_allowed_tool_call_e2e() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("mcp-guard.json");
+    let events_db = temp.path().join("events.db");
+    let upstream = temp.path().join("upstream.sh");
+    let marker = temp.path().join("forwarded.marker");
+    write_mcp_guard_config(&config_path, mcp_guard_config_for_cli_e2e());
+    write_mcp_upstream_script(&upstream);
+
+    let mut child = Command::new(agentenv_bin())
+        .args([
+            "mcp-guard",
+            "run",
+            "--env",
+            "demo",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--events-db",
+            events_db.to_str().unwrap(),
+            "--stdio-upstream",
+            &format!("{} {}", shell_quote(&upstream), shell_quote(&marker)),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let response_rx = spawn_mcp_frame_reader(child.stdout.take().unwrap());
+    write_mcp_frame(
+        child.stdin.as_mut().unwrap(),
+        br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"fs_read","arguments":{"path":"README.md"}}}"#,
+    );
+    drop(child.stdin.take());
+
+    let response = response_rx.recv_timeout(LOCAL_HTTP_TEST_TIMEOUT).unwrap();
+    wait_for_child_exit(&mut child, "mcp-guard allowed stdio e2e");
+    let response_json: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response_json["id"], json!(7));
+    assert_eq!(response_json["result"]["ok"], json!(true));
+    assert!(marker.is_file(), "allowed call was not forwarded upstream");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_guard_stdio_cli_denies_blocked_tool_call_e2e() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("mcp-guard.json");
+    let events_db = temp.path().join("events.db");
+    let upstream = temp.path().join("upstream.sh");
+    let marker = temp.path().join("forwarded.marker");
+    write_mcp_guard_config(&config_path, mcp_guard_config_for_cli_e2e());
+    write_mcp_upstream_script(&upstream);
+
+    let mut child = Command::new(agentenv_bin())
+        .args([
+            "mcp-guard",
+            "run",
+            "--env",
+            "demo",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--events-db",
+            events_db.to_str().unwrap(),
+            "--stdio-upstream",
+            &format!("{} {}", shell_quote(&upstream), shell_quote(&marker)),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let response_rx = spawn_mcp_frame_reader(child.stdout.take().unwrap());
+    write_mcp_frame(
+        child.stdin.as_mut().unwrap(),
+        br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"web_fetch","arguments":{"url":"https://blocked.example.test/private"}}}"#,
+    );
+    drop(child.stdin.take());
+
+    let response = response_rx.recv_timeout(LOCAL_HTTP_TEST_TIMEOUT).unwrap();
+    wait_for_child_exit(&mut child, "mcp-guard denied stdio e2e");
+    let response_json: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response_json["id"], json!(8));
+    assert_eq!(response_json["error"]["code"], json!(-32004));
+    assert!(
+        !marker.exists(),
+        "denied call must not be forwarded to upstream"
+    );
+}
+
+#[test]
+fn proxy_cli_enforces_mcp_guard_policy_e2e() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime_root = temp.path().join(".agentenv");
+    let env_dir = runtime_root.join("envs").join("demo");
+    fs::create_dir_all(&env_dir).unwrap();
+    let events_db = env_dir.join("events.db");
+    let policy_path = temp.path().join("policy.json");
+    let config_path = temp.path().join("proxy-config.json");
+    let port = reserve_tcp_port();
+    let listen_url = format!("http://127.0.0.1:{port}").parse().unwrap();
+    let config = EgressProxyLaunchConfig {
+        env_name: "demo".to_owned(),
+        listen_url,
+        routes: vec![BrokerRoute {
+            id: "mcp.context".to_owned(),
+            service: BrokerService::Mcp {
+                route_id: "context".to_owned(),
+            },
+            upstream_base_url: "https://93.184.216.34/rpc".parse().unwrap(),
+            credential_name: "MCP_TOKEN".to_owned(),
+            request_path_prefix: "/v1/mcp/context".to_owned(),
+            allowed_hosts: BTreeSet::from(["93.184.216.34".to_owned()]),
+            mcp_guard: Some(mcp_guard_config_for_cli_e2e()),
+        }],
+        credential_names: Vec::new(),
+        policy_path: policy_path.clone(),
+        rate_limits: BTreeMap::new(),
+    };
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    fs::write(
+        &policy_path,
+        serde_json::to_vec_pretty(&mcp_proxy_policy_for_cli_e2e()).unwrap(),
+    )
+    .unwrap();
+
+    let mut proxy = spawn_proxy_run(temp.path(), &config_path, &events_db, port);
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(LOCAL_HTTP_TEST_TIMEOUT)
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/mcp/context"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "web_fetch",
+                "arguments": {"url": "https://blocked.example.test/private"}
+            }
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(response.text().unwrap(), "mcp tool denied\n");
+
+    proxy.stop();
 }
 
 #[test]
@@ -7002,6 +7230,220 @@ fn seed_pending_approval(home: &Path, env: &str, request_id: &str) {
     store.insert_request(&request).unwrap();
 }
 
+fn mcp_guard_config_for_cli_e2e() -> McpGuardConfig {
+    McpGuardConfig {
+        enabled: true,
+        default_approval: McpApprovalMode::Never,
+        tool_policies: BTreeMap::from([
+            (
+                "fs_read".to_owned(),
+                McpToolPolicy {
+                    approval: Some(McpApprovalMode::Never),
+                    ..McpToolPolicy::default()
+                },
+            ),
+            (
+                "web_fetch".to_owned(),
+                McpToolPolicy {
+                    approval: Some(McpApprovalMode::Never),
+                    url_allowlist: vec!["https://allowed.example.test".to_owned()],
+                    ..McpToolPolicy::default()
+                },
+            ),
+        ]),
+        cross_tool_flows: McpCrossToolFlowPolicy::default(),
+    }
+}
+
+fn write_mcp_guard_config(path: &Path, config: McpGuardConfig) {
+    fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+}
+
+fn mcp_proxy_policy_for_cli_e2e() -> NetworkPolicy {
+    NetworkPolicy {
+        network: NetworkAccessPolicy {
+            reloadability: PolicyReloadability::HotReload,
+            allow: vec![NetworkRule {
+                target: NetworkTarget::Host {
+                    host: "93.184.216.34".to_owned(),
+                    port: Some(443),
+                    scheme: Some("https".to_owned()),
+                    http_access: Some(HttpAccessLevel::Full),
+                },
+            }],
+            deny: Vec::new(),
+            approval_required: Vec::new(),
+            dns: DnsPolicy::default(),
+        },
+        filesystem: FilesystemPolicy {
+            reloadability: PolicyReloadability::LockedAtCreate,
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+        },
+        process: ProcessPolicy {
+            reloadability: PolicyReloadability::LockedAtCreate,
+            run_as_user: "agent".to_owned(),
+            run_as_group: "agent".to_owned(),
+            profile: "default".to_owned(),
+            allow_syscalls: Vec::new(),
+            deny_syscalls: Vec::new(),
+        },
+        inference: InferencePolicy {
+            reloadability: PolicyReloadability::HotReload,
+            routes: Vec::new(),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn write_mcp_upstream_script(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let body = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+IFS= read -r header || exit 0
+IFS= read -r blank || exit 0
+len=$(printf '%s' "$header" | tr -dc '0-9')
+dd bs=1 count="$len" of=/dev/null 2>/dev/null
+touch "$1"
+printf 'Content-Length: {}\r\n\r\n{}'
+"#,
+            body.len(),
+            body
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn write_mcp_frame(writer: &mut impl Write, body: &[u8]) {
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+    writer.write_all(body).unwrap();
+    writer.flush().unwrap();
+}
+
+fn spawn_mcp_frame_reader(stdout: process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let frame = read_mcp_frame(&mut reader);
+        let _ = tx.send(frame);
+    });
+    rx
+}
+
+fn read_mcp_frame(reader: &mut impl BufRead) -> Vec<u8> {
+    let mut content_length = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let count = reader.read_line(&mut line).unwrap();
+        assert!(count != 0, "MCP child closed stdout before frame headers");
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+    }
+    let length = content_length.expect("MCP frame should include content length");
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    body
+}
+
+fn wait_for_child_exit(child: &mut process::Child, label: &str) {
+    let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(status) if status.success() => return,
+            Some(status) => {
+                let stderr = child_stderr(child);
+                panic!("{label} exited with {status}; stderr was: {stderr}");
+            }
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = child_stderr(child);
+                panic!("{label} did not exit; stderr was: {stderr}");
+            }
+        }
+    }
+}
+
+struct ProxyRunChild {
+    child: process::Child,
+}
+
+impl Drop for ProxyRunChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl ProxyRunChild {
+    fn stop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_proxy_run(home: &Path, config_path: &Path, events_db: &Path, port: u16) -> ProxyRunChild {
+    let mut child = Command::new(agentenv_bin())
+        .env("HOME", home)
+        .args([
+            "proxy",
+            "run",
+            "--env",
+            "demo",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--events-db",
+            events_db.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/__ready");
+    let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            let stderr = child_stderr(&mut child);
+            panic!("proxy run exited before listening: {status}; stderr was: {stderr}");
+        }
+        if client.get(&url).send().is_ok() {
+            return ProxyRunChild { child };
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = child_stderr(&mut child);
+    panic!("timed out waiting for proxy run to listen; stderr was: {stderr}");
+}
+
 fn reserve_tcp_port() -> u16 {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -7270,7 +7712,7 @@ impl ApprovalsServerChild {
             .build()
             .unwrap();
         let url = format!("http://127.0.0.1:{port}{path}");
-        let deadline = std::time::Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+        let deadline = std::time::Instant::now() + APPROVALS_SERVER_START_TIMEOUT;
         let mut last_error = None;
 
         while std::time::Instant::now() < deadline {

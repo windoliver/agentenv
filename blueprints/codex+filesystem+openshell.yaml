@@ -34,6 +34,18 @@ policy:
   presets:
     - github_read
     - npm_read
+  # mcp:
+  #   confused_deputy_guards:
+  #     enabled: true
+  #     default_approval: per-call
+  #     tool_policies:
+  #       "filesystem.read":
+  #         approval: never
+  #         rate_limit: 50/session
+  #       "*.write":
+  #         approval: per-session
+  #     cross_tool_flows:
+  #       forbid_read_to_write_turns: 5
 
 state:
   persist_home: true

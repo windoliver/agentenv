@@ -9,6 +9,7 @@ use std::{
 
 use agentenv_core::admission::AdmissionStatus;
 use agentenv_core::runtime::RuntimeOptions;
+use agentenv_core::security::ssrf::SsrfOptions;
 use agentenv_core::skills::{
     execute_skill_prune, load_project_skills_config, load_skill_trust_keys,
     load_user_skills_config, merge_skills_config, plan_skill_prune, rebuild_skill_index,
@@ -177,6 +178,7 @@ pub async fn run_skills(args: SkillsArgs) -> Result<()> {
     let config = load_effective_config(registry_override)?;
     let service = SkillService::new(root.clone(), config)
         .with_credential_resolver(Arc::new(resolve_skill_credential))
+        .with_ssrf_options(skills_registry_ssrf_options())
         .with_agent_produce_runner(Arc::new(CliAgentProduceRunner {
             root: root.clone(),
             non_interactive: true,
@@ -621,6 +623,24 @@ fn resolve_skill_credential(name: &str) -> std::result::Result<Option<String>, S
             message: format!("resolve credential `{name}`: {error}"),
         }),
     }
+}
+
+fn skills_registry_ssrf_options() -> SsrfOptions {
+    let mut options = SsrfOptions::default();
+    if env_flag("AGENTENV_SKILLS_ALLOW_LOOPBACK_REGISTRIES") {
+        options.allow_loopback = true;
+    }
+    if env_flag("AGENTENV_SKILLS_ALLOW_PRIVATE_REGISTRIES") {
+        options.allow_private = true;
+    }
+    options
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 fn selector(name: String, version: Option<String>) -> InstalledSkillSelector {

@@ -61,6 +61,7 @@ dependencies = [
  "agentenv-core",
  "agentenv-credstore",
  "agentenv-events",
+ "agentenv-mcp",
  "agentenv-plugin",
  "agentenv-policy",
  "agentenv-proto",
@@ -102,6 +103,7 @@ dependencies = [
  "tracing-subscriber",
  "tui",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -210,6 +212,10 @@ version = "0.0.1-alpha0"
 dependencies = [
  "agentenv-core",
  "agentenv-proto",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
  "url",
 ]
 
@@ -249,6 +255,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
 ]
 

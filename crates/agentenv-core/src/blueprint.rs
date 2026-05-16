@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, env};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
+use thiserror::Error;
+use url::Url;
 
 use crate::error::BlueprintError;
 
@@ -18,6 +20,8 @@ pub struct Blueprint {
     pub policy: PolicySection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<StateSection>,
+    #[serde(default, skip_serializing_if = "SkillsSection::is_empty")]
+    pub skills: SkillsSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -93,6 +97,76 @@ pub struct StateSection {
     #[schemars(with = "BTreeMap<String, serde_json::Value>")]
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkillsSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_discovery: Option<SkillRuntimeDiscoverySection>,
+}
+
+impl SkillsSection {
+    pub fn is_empty(&self) -> bool {
+        self.runtime_discovery.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRuntimeDiscoverySection {
+    pub mcp_endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SkillRuntimeDiscoveryEndpointError {
+    #[error("mcp_endpoint must not be empty")]
+    Empty,
+    #[error("mcp_endpoint must use the mcp+http or mcp+https scheme")]
+    MissingMcpScheme,
+    #[error("mcp_endpoint uses unsupported inner scheme `{scheme}`")]
+    UnsupportedScheme { scheme: String },
+    #[error("mcp_endpoint must be a valid URL")]
+    Malformed,
+    #[error("mcp_endpoint must include a host")]
+    MissingHost,
+}
+
+impl SkillRuntimeDiscoverySection {
+    pub fn mcp_endpoint(
+        &self,
+    ) -> Result<agentenv_proto::McpEndpoint, SkillRuntimeDiscoveryEndpointError> {
+        let url = normalize_runtime_discovery_mcp_endpoint(&self.mcp_endpoint)?;
+        Ok(agentenv_proto::McpEndpoint {
+            url,
+            transport: agentenv_proto::McpTransport::Http,
+            headers: BTreeMap::new(),
+        })
+    }
+}
+
+fn normalize_runtime_discovery_mcp_endpoint(
+    raw: &str,
+) -> Result<String, SkillRuntimeDiscoveryEndpointError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SkillRuntimeDiscoveryEndpointError::Empty);
+    }
+    let inner = trimmed
+        .strip_prefix("mcp+")
+        .ok_or(SkillRuntimeDiscoveryEndpointError::MissingMcpScheme)?;
+    let parsed = Url::parse(inner).map_err(|_| SkillRuntimeDiscoveryEndpointError::Malformed)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(SkillRuntimeDiscoveryEndpointError::UnsupportedScheme {
+            scheme: parsed.scheme().to_owned(),
+        });
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(SkillRuntimeDiscoveryEndpointError::MissingHost);
+    }
+
+    Ok(parsed.to_string())
 }
 
 pub trait InterpolationResolver {

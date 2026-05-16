@@ -39,6 +39,7 @@ use tracing_subscriber::EnvFilter;
 mod builtin_factory;
 mod bundle_cli;
 mod credentials_runtime;
+mod mcp_guard_cli;
 mod proxy_cli;
 mod render;
 mod skills_cli;
@@ -87,6 +88,8 @@ enum Commands {
     Drivers(DriversArgs),
     Skills(skills_cli::SkillsArgs),
     Bundle(bundle_cli::BundleArgs),
+    #[command(hide = true, name = "mcp-guard")]
+    McpGuard(McpGuardArgs),
     #[command(hide = true)]
     Proxy(ProxyArgs),
     VerifyBlueprint {
@@ -122,6 +125,29 @@ pub(crate) struct ProxyRunArgs {
     config: PathBuf,
     #[arg(long = "events-db")]
     events_db: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct McpGuardArgs {
+    #[command(subcommand)]
+    command: McpGuardCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum McpGuardCommand {
+    Run(McpGuardRunArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct McpGuardRunArgs {
+    #[arg(long)]
+    env: String,
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long = "events-db")]
+    events_db: PathBuf,
+    #[arg(long = "stdio-upstream")]
+    stdio_upstream: String,
 }
 
 #[derive(Debug, Args)]
@@ -620,6 +646,7 @@ async fn run() -> Result<()> {
         Some(Commands::Drivers(command)) => run_drivers(command),
         Some(Commands::Skills(args)) => skills_cli::run_skills(args).await,
         Some(Commands::Bundle(args)) => bundle_cli::run_bundle(args),
+        Some(Commands::McpGuard(args)) => mcp_guard_cli::run(args).await,
         Some(Commands::Proxy(args)) => proxy_cli::run(args).await,
         Some(Commands::VerifyBlueprint { file }) => verify_blueprint(&file),
         Some(Commands::Verify { lockfile }) => verify_lockfile(&lockfile),
@@ -3860,6 +3887,36 @@ mod tests {
                 assert_eq!(args.env, "demo");
                 assert_eq!(args.config, PathBuf::from("/tmp/config.json"));
                 assert_eq!(args.events_db, PathBuf::from("/tmp/events.sqlite"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_guard_command_parses() {
+        let cli = Cli::try_parse_from([
+            "agentenv",
+            "mcp-guard",
+            "run",
+            "--env",
+            "demo",
+            "--config",
+            "/tmp/mcp-guard.json",
+            "--events-db",
+            "/tmp/events.db",
+            "--stdio-upstream",
+            "agentenv-fs-mcp --root /tmp",
+        ])
+        .expect("mcp guard command parses");
+
+        match cli.command {
+            Some(Commands::McpGuard(McpGuardArgs {
+                command: McpGuardCommand::Run(args),
+            })) => {
+                assert_eq!(args.env, "demo");
+                assert_eq!(args.config, PathBuf::from("/tmp/mcp-guard.json"));
+                assert_eq!(args.events_db, PathBuf::from("/tmp/events.db"));
+                assert_eq!(args.stdio_upstream, "agentenv-fs-mcp --root /tmp");
             }
             other => panic!("unexpected command: {other:?}"),
         }

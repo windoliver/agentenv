@@ -217,6 +217,61 @@ fn roundtrip_missing_digest_blueprint_is_rejected() {
 }
 
 #[test]
+fn verify_blueprint_accepts_mcp_guard_policy_extra() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: none
+policy:
+  tier: restricted
+  mcp:
+    confused_deputy_guards:
+      enabled: true
+      default_approval: per-call
+      tool_policies:
+        "*.write":
+          approval: per-session
+"#;
+
+    let resolved = agentenv_core::lifecycle::verify_blueprint_yaml(yaml)
+        .expect("MCP guard config should verify");
+
+    assert_eq!(resolved.blueprint.policy.tier, "restricted");
+}
+
+#[test]
+fn verify_blueprint_rejects_invalid_mcp_guard_policy_extra() {
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: none
+policy:
+  tier: restricted
+  mcp:
+    confused_deputy_guards:
+      enabled: true
+      default_approval: always
+"#;
+
+    let err = agentenv_core::lifecycle::verify_blueprint_yaml(yaml)
+        .expect_err("invalid MCP guard config should fail");
+
+    assert!(err
+        .to_string()
+        .contains("policy.mcp.confused_deputy_guards"));
+}
+
+#[test]
 fn roundtrip_byo_sandbox_image_allows_omitted_expected_digest() {
     let yaml = r#"
 version: 0.1.0

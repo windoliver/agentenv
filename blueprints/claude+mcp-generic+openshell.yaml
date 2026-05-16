@@ -42,6 +42,18 @@ policy:
   presets: []
   overrides:
     - allow: "${MCP_URL}"
+  # mcp:
+  #   confused_deputy_guards:
+  #     enabled: true
+  #     default_approval: per-call
+  #     tool_policies:
+  #       "web.fetch":
+  #         approval: per-call
+  #         url_allowlist:
+  #           - api.github.com
+  #         redact_args: true
+  #     cross_tool_flows:
+  #       forbid_read_to_write_turns: 5
 
 state:
   persist_home: true

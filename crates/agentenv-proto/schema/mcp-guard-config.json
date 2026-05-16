@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpGuardConfig",
+  "type": "object",
+  "properties": {
+    "cross_tool_flows": {
+      "default": {
+        "forbid_read_to_write_turns": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpCrossToolFlowPolicy"
+        }
+      ]
+    },
+    "default_approval": {
+      "default": "never",
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpApprovalMode"
+        }
+      ]
+    },
+    "enabled": {
+      "default": false,
+      "type": "boolean"
+    },
+    "tool_policies": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/McpToolPolicy"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "McpApprovalMode": {
+      "type": "string",
+      "enum": [
+        "never",
+        "per-call",
+        "per-session"
+      ]
+    },
+    "McpCrossToolFlowPolicy": {
+      "type": "object",
+      "properties": {
+        "forbid_read_to_write_turns": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "McpSessionRateLimit": {
+      "type": "object",
+      "required": [
+        "calls"
+      ],
+      "properties": {
+        "calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "McpToolPolicy": {
+      "type": "object",
+      "properties": {
+        "approval": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpApprovalMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rate_limit": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpSessionRateLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "redact_args": {
+          "default": false,
+          "type": "boolean"
+        },
+        "url_allowlist": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

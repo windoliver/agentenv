@@ -128,6 +128,110 @@ policy:
 }
 
 #[test]
+fn blueprint_verification_accepts_skill_runtime_discovery_mcp_endpoint() {
+    let _guard = with_env_lock();
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+skills:
+  runtime_discovery:
+    mcp_endpoint: mcp+https://93.184.216.34/mcp
+    scopes: ["search", "get_manifest"]
+"#;
+
+    let verified = verify_blueprint_yaml(yaml).unwrap();
+    let runtime_discovery = verified
+        .blueprint
+        .skills
+        .runtime_discovery
+        .expect("runtime discovery config is parsed");
+
+    assert_eq!(
+        runtime_discovery.mcp_endpoint,
+        "mcp+https://93.184.216.34/mcp"
+    );
+    assert_eq!(runtime_discovery.scopes, vec!["search", "get_manifest"]);
+}
+
+#[test]
+fn blueprint_verification_rejects_metadata_skill_runtime_discovery_mcp_endpoint() {
+    let _guard = with_env_lock();
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+skills:
+  runtime_discovery:
+    mcp_endpoint: mcp+http://169.254.169.254/latest/meta-data/
+    scopes: ["search"]
+"#;
+
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::SsrfBlocked { path, .. } => {
+            assert_eq!(path, "skills.runtime_discovery.mcp_endpoint");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn blueprint_verification_rejects_publish_skill_runtime_discovery_scope() {
+    let _guard = with_env_lock();
+
+    let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  presets: []
+skills:
+  runtime_discovery:
+    mcp_endpoint: mcp+https://93.184.216.34/mcp
+    scopes: ["search", "publish"]
+"#;
+
+    let err = verify_blueprint_yaml(yaml).unwrap_err();
+
+    match err {
+        LifecycleError::InvalidSkillRuntimeDiscoveryScope { path, scope } => {
+            assert_eq!(path, "skills.runtime_discovery.scopes[1]");
+            assert_eq!(scope, "publish");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn blueprint_verification_rejects_unsupported_scheme_in_context_endpoint_url() {
     let _guard = with_env_lock();
 
