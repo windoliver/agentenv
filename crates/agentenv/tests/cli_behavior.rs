@@ -2536,6 +2536,46 @@ fn skills_ci_json_passes_valid_bundle() {
 }
 
 #[test]
+fn skills_ci_summary_reports_valid_bundle_tiers() {
+    let temp_dir = make_temp_dir("skills-ci-summary-pass");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(&bundle, "ci-cli-summary", "0.1.0", "CI summary fixture");
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status: passed"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("candidate: ci-cli-summary 0.1.0 sha256:"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("static_lint passed 0"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("agent_review passed 0"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("semantic_dedup passed 0"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("functional_regression passed 0"),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
 fn skills_ci_json_exits_one_for_invalid_bundle() {
     let temp_dir = make_temp_dir("skills-ci-json-invalid");
     let bundle = temp_dir.join("bundle");
@@ -2561,6 +2601,9 @@ fn skills_ci_json_exits_one_for_invalid_bundle() {
         .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
     assert_eq!(report["status"], "failed");
     assert_ci_tier_status(&report, "static_lint", "failed");
+    assert_ci_tier_status(&report, "agent_review", "skipped");
+    assert_ci_tier_status(&report, "semantic_dedup", "skipped");
+    assert_ci_tier_status(&report, "functional_regression", "skipped");
     assert_ci_findings_include(
         &report,
         "static_lint",
@@ -2569,10 +2612,47 @@ fn skills_ci_json_exits_one_for_invalid_bundle() {
 }
 
 #[test]
+fn skills_ci_no_fail_fast_continues_after_static_failure() {
+    let temp_dir = make_temp_dir("skills-ci-no-fail-fast-static");
+    let bundle = temp_dir.join("bundle");
+    write_signed_ci_skill_bundle(
+        &bundle,
+        "ci-cli-no-fail-fast-static",
+        "0.1.0",
+        "CI no fail-fast fixture",
+    );
+    fs::write(
+        bundle.join("SKILL.md"),
+        "# Invalid but reviewable\n\nUse this skill safely.\n\n```rust\nfn main() {}\n",
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("skills")
+        .arg("ci")
+        .arg(&bundle)
+        .arg("--no-fail-fast")
+        .arg("--json")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}\n{}", output_summary(&output)));
+    assert_eq!(report["status"], "failed");
+    assert_ci_tier_status(&report, "static_lint", "failed");
+    assert_ci_tier_status(&report, "agent_review", "passed");
+    assert_ci_tier_status(&report, "semantic_dedup", "passed");
+    assert_ci_tier_status(&report, "functional_regression", "skipped");
+}
+
+#[test]
 fn skills_ci_writes_sarif_file() {
     let temp_dir = make_temp_dir("skills-ci-sarif");
     let bundle = temp_dir.join("bundle");
-    let sarif_path = temp_dir.join("skill-ci.sarif");
+    let sarif_path = temp_dir.join("reports/nested/skill-ci.sarif");
     write_signed_ci_skill_bundle(&bundle, "ci-cli-sarif", "0.1.0", "CI SARIF fixture");
     fs::write(
         bundle.join("SKILL.md"),
