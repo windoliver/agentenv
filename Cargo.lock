@@ -211,6 +211,7 @@ name = "agentenv-mcp"
 version = "0.0.1-alpha0"
 dependencies = [
  "agentenv-core",
+ "agentenv-policy",
  "agentenv-proto",
  "serde",
  "serde_json",
