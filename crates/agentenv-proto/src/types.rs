@@ -143,6 +143,84 @@ pub enum McpApprovalMode {
     PerSession,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceTag {
+    Trusted,
+    Tenant,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceSourceKind {
+    Operator,
+    SignedBlueprint,
+    LocalFile,
+    LocalRepo,
+    Web,
+    GithubIssue,
+    RemoteMcp,
+    ToolResult,
+    Approval,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceSummary {
+    pub tag: ProvenanceTag,
+    pub source_kind: ProvenanceSourceKind,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCapability {
+    ReadFs,
+    WriteFs,
+    Exec,
+    GitRead,
+    GitWrite,
+    Network,
+    McpTool,
+    CredentialBroker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolArgumentPolicy {
+    pub pointer: String,
+    pub max_input_taint: ProvenanceTag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCapabilityDeclaration {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<ToolCapability>,
+    pub max_input_taint: ProvenanceTag,
+    #[serde(default = "default_mcp_approval")]
+    pub approval: McpApprovalMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argument_policies: Vec<ToolArgumentPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpProvenanceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default = "default_unannotated_source")]
+    pub default_unannotated_source: ProvenanceTag,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpGuardConfig {
@@ -154,6 +232,10 @@ pub struct McpGuardConfig {
     pub tool_policies: BTreeMap<String, McpToolPolicy>,
     #[serde(default)]
     pub cross_tool_flows: McpCrossToolFlowPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<McpProvenanceConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_capabilities: BTreeMap<String, ToolCapabilityDeclaration>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -183,6 +265,10 @@ pub struct McpSessionRateLimit {
 
 fn default_mcp_approval() -> McpApprovalMode {
     McpApprovalMode::Never
+}
+
+fn default_unannotated_source() -> ProvenanceTag {
+    ProvenanceTag::Untrusted
 }
 
 fn deserialize_mcp_rate_limit<'de, D>(
@@ -916,6 +1002,22 @@ mod tests {
     }
 
     #[test]
+    fn provenance_tag_serializes_stable_values() {
+        assert_eq!(
+            serde_json::to_value(ProvenanceTag::Trusted).unwrap(),
+            serde_json::json!("trusted")
+        );
+        assert_eq!(
+            serde_json::to_value(ProvenanceTag::Tenant).unwrap(),
+            serde_json::json!("tenant")
+        );
+        assert_eq!(
+            serde_json::to_value(ProvenanceTag::Untrusted).unwrap(),
+            serde_json::json!("untrusted")
+        );
+    }
+
+    #[test]
     fn mcp_guard_config_parses_full_yaml() {
         let yaml = r#"
 enabled: true
@@ -964,5 +1066,60 @@ surprise: true
             .expect_err("unknown fields must fail closed");
 
         assert!(error.to_string().contains("surprise"));
+    }
+
+    #[test]
+    fn mcp_guard_config_parses_provenance_and_tool_capabilities() {
+        let yaml = r#"
+enabled: true
+default_approval: per-call
+provenance:
+  enabled: true
+  required: true
+  default_unannotated_source: untrusted
+tool_capabilities:
+  git.commit:
+    caps: [git_write]
+    max_input_taint: trusted
+    approval: per-call
+    argument_policies:
+      - pointer: /message
+        max_input_taint: trusted
+  filesystem.read:
+    caps: [read_fs]
+    max_input_taint: tenant
+    approval: never
+"#;
+
+        let config: McpGuardConfig = serde_yaml::from_str(yaml).expect("config parses");
+
+        let provenance = config.provenance.expect("provenance config");
+        assert!(provenance.enabled);
+        assert!(provenance.required);
+        assert_eq!(
+            provenance.default_unannotated_source,
+            ProvenanceTag::Untrusted
+        );
+
+        let git = config
+            .tool_capabilities
+            .get("git.commit")
+            .expect("git.commit declaration");
+        assert_eq!(git.caps, vec![ToolCapability::GitWrite]);
+        assert_eq!(git.max_input_taint, ProvenanceTag::Trusted);
+        assert_eq!(git.approval, McpApprovalMode::PerCall);
+        assert_eq!(git.argument_policies[0].pointer, "/message");
+        assert_eq!(
+            git.argument_policies[0].max_input_taint,
+            ProvenanceTag::Trusted
+        );
+    }
+
+    #[test]
+    fn mcp_guard_config_defaults_provenance_to_disabled() {
+        let config: McpGuardConfig = serde_yaml::from_str("enabled: true\n").unwrap();
+
+        assert!(config.provenance.is_none());
+        assert!(config.tool_capabilities.is_empty());
     }
 }
