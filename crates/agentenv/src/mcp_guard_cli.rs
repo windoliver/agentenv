@@ -43,16 +43,18 @@ fn run_blocking(args: crate::McpGuardRunArgs) -> Result<()> {
     let mut state = GuardSessionState::default();
 
     while let Some(body) = read_lsp_message(&mut stdin)? {
-        let decision = evaluate_client_message(&config, &mut state, &body);
-        match decision.action {
+        let evaluation = evaluate_client_message(&config, &mut state, &body);
+        match evaluation.decision.action {
             GuardAction::Deny | GuardAction::RequestApproval => {
                 let id = json_rpc_id(&body);
-                let response = json_rpc_error_response(id, -32004, "MCP tool call denied by guard");
+                let response = guarded_error_response(id, &evaluation.decision);
                 write_lsp_message(&mut stdout, &response)?;
                 stdout.flush().context("flush guarded MCP response")?;
             }
             GuardAction::Forward | GuardAction::NotToolCall => {
-                write_lsp_message(&mut child_stdin, &body)?;
+                let forwarded = serde_json::to_vec(&evaluation.forwarded_request)
+                    .context("serialize guarded MCP request")?;
+                write_lsp_message(&mut child_stdin, &forwarded)?;
                 child_stdin.flush().context("flush upstream MCP request")?;
                 let Some(response) = read_lsp_message(&mut child_stdout)? else {
                     break;
@@ -113,32 +115,75 @@ pub(crate) fn evaluate_client_message(
     config: &McpGuardConfig,
     state: &mut GuardSessionState,
     body: &[u8],
-) -> GuardDecision {
+) -> agentenv_mcp::guard::GuardEvaluation {
     let request = match serde_json::from_slice::<Value>(body) {
         Ok(request) => request,
         Err(error) => {
-            return malformed_decision(format!("invalid JSON-RPC body: {error}"));
+            let decision = malformed_decision(format!("invalid JSON-RPC body: {error}"));
+            return agentenv_mcp::guard::GuardEvaluation {
+                decision,
+                forwarded_request: Value::Null,
+            };
         }
     };
-    match agentenv_mcp::guard::evaluate_json_rpc_request(config, state, &request) {
-        Ok(decision) => decision,
-        Err(error) => malformed_decision(error.to_string()),
+    match agentenv_mcp::guard::evaluate_json_rpc_request_with_forwarding(config, state, &request) {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            let decision = malformed_decision(error.to_string());
+            agentenv_mcp::guard::GuardEvaluation {
+                decision,
+                forwarded_request: request,
+            }
+        }
     }
 }
 
-pub(crate) fn json_rpc_error_response(id: Value, code: i64, message: &str) -> Vec<u8> {
+pub(crate) fn guarded_error_response(id: Value, decision: &GuardDecision) -> Vec<u8> {
+    let reason = guard_reason_code(decision.reason);
+    let provenance = decision.redacted_event_context.get("provenance");
+    let observed_taint = provenance
+        .and_then(|value| value.get("observed_taint"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let max_input_taint = provenance
+        .and_then(|value| value.get("max_input_taint"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
     serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
-            "code": code,
-            "message": message,
+            "code": -32004,
+            "message": "MCP tool call blocked by guard",
+            "data": {
+                "reason": reason,
+                "tool_name": decision.tool_name,
+                "observed_taint": observed_taint,
+                "max_input_taint": max_input_taint,
+            }
         }
     }))
     .unwrap_or_else(|_| {
         b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"internal error\"}}"
             .to_vec()
     })
+}
+
+fn guard_reason_code(reason: GuardReason) -> &'static str {
+    match reason {
+        GuardReason::Disabled => "mcp_guard_disabled",
+        GuardReason::NotToolCall => "mcp_not_tool_call",
+        GuardReason::AllowedByPolicy => "mcp_allowed_by_policy",
+        GuardReason::ApprovalRequired => "mcp_approval_required",
+        GuardReason::UrlAllowlistViolation => "mcp_url_allowlist_violation",
+        GuardReason::CredentialLikeArgument => "mcp_credential_like_argument",
+        GuardReason::EnvVarLikeArgument => "mcp_env_var_like_argument",
+        GuardReason::RateLimited => "mcp_rate_limited",
+        GuardReason::CrossToolFlow => "mcp_cross_tool_flow",
+        GuardReason::MalformedToolCall => "mcp_malformed_tool_call",
+        GuardReason::ProvenanceTaint => "mcp_provenance_taint",
+    }
 }
 
 fn malformed_decision(message: String) -> GuardDecision {
@@ -174,5 +219,87 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn provenance_denial_returns_structured_json_rpc_error() {
+        let decision = GuardDecision {
+            action: GuardAction::Deny,
+            reason: GuardReason::ProvenanceTaint,
+            tool_name: Some("git.commit".to_owned()),
+            matched_policy: Some("git.commit".to_owned()),
+            approval_mode: McpApprovalMode::PerCall,
+            redacted_event_context: json!({
+                "provenance": {
+                    "observed_taint": "untrusted",
+                    "max_input_taint": "trusted"
+                }
+            }),
+        };
+
+        let body = guarded_error_response(json!(1), &decision);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["error"]["code"], json!(-32004));
+        assert_eq!(
+            value["error"]["data"]["reason"],
+            json!("mcp_provenance_taint")
+        );
+        assert_eq!(value["error"]["data"]["tool_name"], json!("git.commit"));
+        assert_eq!(value["error"]["data"]["observed_taint"], json!("untrusted"));
+    }
+
+    #[test]
+    fn evaluate_client_message_returns_sanitized_forwarded_request_for_allowed_provenance() {
+        let config = McpGuardConfig {
+            enabled: true,
+            provenance: Some(agentenv_proto::McpProvenanceConfig {
+                enabled: true,
+                required: true,
+                default_unannotated_source: agentenv_proto::ProvenanceTag::Untrusted,
+            }),
+            tool_capabilities: [(
+                "filesystem.read".to_owned(),
+                agentenv_proto::ToolCapabilityDeclaration {
+                    caps: vec![agentenv_proto::ToolCapability::ReadFs],
+                    max_input_taint: agentenv_proto::ProvenanceTag::Tenant,
+                    approval: McpApprovalMode::Never,
+                    argument_policies: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..McpGuardConfig::default()
+        };
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "filesystem.read",
+                "arguments": {
+                    "path": "src/lib.rs"
+                },
+                "_agentenv_provenance": {
+                    "/path": {
+                        "tag": "tenant",
+                        "source_kind": "local_repo",
+                        "source_id": "workspace",
+                        "summary": "repo path"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let mut state = GuardSessionState::default();
+
+        let evaluation = evaluate_client_message(&config, &mut state, &body);
+
+        assert_eq!(evaluation.decision.action, GuardAction::Forward);
+        assert!(evaluation
+            .forwarded_request
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(|params| !params.contains_key("_agentenv_provenance")));
     }
 }
