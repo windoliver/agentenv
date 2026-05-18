@@ -326,29 +326,40 @@ fn evaluate_json_rpc_request_without_provenance(
 }
 
 fn provenance_from_request(request: &Value, default_tag: ProvenanceTag) -> Vec<ProvenanceSummary> {
-    request
+    let Some(provenance_metadata) = request
         .get("params")
         .and_then(Value::as_object)
         .and_then(|params| params.get("_agentenv_provenance"))
-        .and_then(Value::as_object)
-        .map(|entries| {
-            entries
-                .values()
-                .map(|value| {
-                    serde_json::from_value::<ProvenanceSummary>(value.clone())
-                        .unwrap_or_else(|_| malformed_provenance_summary())
-                })
-                .collect::<Vec<_>>()
+    else {
+        return unannotated_provenance_summary(default_tag);
+    };
+
+    let Some(entries) = provenance_metadata.as_object() else {
+        return vec![malformed_provenance_summary()];
+    };
+
+    let provenance = entries
+        .values()
+        .map(|value| {
+            serde_json::from_value::<ProvenanceSummary>(value.clone())
+                .unwrap_or_else(|_| malformed_provenance_summary())
         })
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| {
-            vec![ProvenanceSummary {
-                tag: default_tag,
-                source_kind: agentenv_proto::ProvenanceSourceKind::Unknown,
-                source_id: "unannotated".to_owned(),
-                summary: Some("unannotated MCP tool argument".to_owned()),
-            }]
-        })
+        .collect::<Vec<_>>();
+
+    if provenance.is_empty() {
+        unannotated_provenance_summary(default_tag)
+    } else {
+        provenance
+    }
+}
+
+fn unannotated_provenance_summary(default_tag: ProvenanceTag) -> Vec<ProvenanceSummary> {
+    vec![ProvenanceSummary {
+        tag: default_tag,
+        source_kind: agentenv_proto::ProvenanceSourceKind::Unknown,
+        source_id: "unannotated".to_owned(),
+        summary: Some("unannotated MCP tool argument".to_owned()),
+    }]
 }
 
 fn malformed_provenance_summary() -> ProvenanceSummary {
@@ -975,6 +986,53 @@ mod tests {
                         "tag": "trusted"
                     }
                 }
+            }
+        });
+        let mut state = GuardSessionState::default();
+
+        let evaluation = evaluate_json_rpc_request_with_forwarding(&config, &mut state, &request)
+            .expect("evaluation succeeds");
+
+        assert_eq!(evaluation.decision.action, GuardAction::RequestApproval);
+        assert_eq!(evaluation.decision.reason, GuardReason::ProvenanceTaint);
+        assert_eq!(
+            evaluation.decision.redacted_event_context["provenance"]["observed_taint"],
+            json!("untrusted")
+        );
+    }
+
+    #[test]
+    fn non_object_provenance_metadata_fails_closed_to_untrusted() {
+        let config = McpGuardConfig {
+            enabled: true,
+            provenance: Some(agentenv_proto::McpProvenanceConfig {
+                enabled: true,
+                required: true,
+                default_unannotated_source: agentenv_proto::ProvenanceTag::Trusted,
+            }),
+            tool_capabilities: [(
+                "git.commit".to_owned(),
+                agentenv_proto::ToolCapabilityDeclaration {
+                    caps: vec![agentenv_proto::ToolCapability::GitWrite],
+                    max_input_taint: agentenv_proto::ProvenanceTag::Trusted,
+                    approval: McpApprovalMode::PerCall,
+                    argument_policies: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..McpGuardConfig::default()
+        };
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "git.commit",
+                "arguments": {
+                    "message": "commit this text"
+                },
+                "_agentenv_provenance": "not provenance metadata"
             }
         });
         let mut state = GuardSessionState::default();
