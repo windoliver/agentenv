@@ -10,6 +10,29 @@ pub const LATENCY_BUCKET_LABELS: [&str; 12] = [
     "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
 ];
 
+pub const GENAI_TOKEN_BUCKET_LABELS: [&str; 15] = [
+    "1", "4", "16", "64", "256", "1024", "4096", "16384", "65536", "262144", "1048576", "4194304",
+    "16777216", "67108864", "+Inf",
+];
+
+const GENAI_TOKEN_BUCKET_LIMITS: [Option<u64>; 15] = [
+    Some(1),
+    Some(4),
+    Some(16),
+    Some(64),
+    Some(256),
+    Some(1024),
+    Some(4096),
+    Some(16_384),
+    Some(65_536),
+    Some(262_144),
+    Some(1_048_576),
+    Some(4_194_304),
+    Some(16_777_216),
+    Some(67_108_864),
+    None,
+];
+
 const LATENCY_BUCKET_MILLIS: [Option<u64>; 12] = [
     Some(5),
     Some(10),
@@ -71,6 +94,76 @@ pub struct LatencySummaryMetric {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiTokenUsageBucketMetric {
+    pub provider_name: Option<String>,
+    pub operation_name: String,
+    pub token_type: String,
+    pub request_model: Option<String>,
+    pub env: Option<String>,
+    pub result: String,
+    pub le: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiTokenUsageSummaryMetric {
+    pub provider_name: Option<String>,
+    pub operation_name: String,
+    pub token_type: String,
+    pub request_model: Option<String>,
+    pub env: Option<String>,
+    pub result: String,
+    pub sum: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiOperationDurationBucketMetric {
+    pub provider_name: Option<String>,
+    pub operation_name: String,
+    pub request_model: Option<String>,
+    pub env: Option<String>,
+    pub result: String,
+    pub le: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenAiOperationDurationSummaryMetric {
+    pub provider_name: Option<String>,
+    pub operation_name: String,
+    pub request_model: Option<String>,
+    pub env: Option<String>,
+    pub result: String,
+    pub sum_seconds: f64,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiToolCallMetric {
+    pub tool: String,
+    pub env: Option<String>,
+    pub result: String,
+    pub count: u64,
+}
+
+type GenAiTokenUsageKey = (
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+type GenAiOperationDurationKey = (
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkCounterMetric {
     pub sink: String,
     pub count: u64,
@@ -84,6 +177,11 @@ pub struct MetricsSnapshot {
     pub mcp_tool_calls_total: Vec<McpToolMetric>,
     pub sandbox_latency: Vec<LatencyBucketMetric>,
     pub sandbox_latency_summary: Vec<LatencySummaryMetric>,
+    pub genai_token_usage: Vec<GenAiTokenUsageBucketMetric>,
+    pub genai_token_usage_summary: Vec<GenAiTokenUsageSummaryMetric>,
+    pub genai_operation_duration: Vec<GenAiOperationDurationBucketMetric>,
+    pub genai_operation_duration_summary: Vec<GenAiOperationDurationSummaryMetric>,
+    pub genai_tool_calls_total: Vec<GenAiToolCallMetric>,
     pub approvals_pending_total: u64,
     pub build_oneflight_hits_total: u64,
     pub build_oneflight_misses_total: u64,
@@ -128,6 +226,20 @@ impl MetricsSnapshot {
             .collect();
         let (sandbox_latency, sandbox_latency_summary) =
             latency_metrics(store.sandbox_latency_rows()?);
+        let (genai_token_usage, genai_token_usage_summary) =
+            genai_token_usage_metrics(store.genai_token_usage_rows()?);
+        let (genai_operation_duration, genai_operation_duration_summary) =
+            genai_operation_duration_metrics(store.genai_operation_duration_rows()?);
+        let genai_tool_calls_total = store
+            .genai_tool_calls_by_tool_env_result()?
+            .into_iter()
+            .map(|row| GenAiToolCallMetric {
+                tool: row.tool,
+                env: row.env,
+                result: activity_result_label(row.result),
+                count: row.count,
+            })
+            .collect();
         let approvals_pending_total = store.approvals_pending_count()?;
         let build_oneflight_hits_total =
             store.count_events_by_kind(ActivityKind::BuildOneflightHit)?;
@@ -142,6 +254,11 @@ impl MetricsSnapshot {
             mcp_tool_calls_total,
             sandbox_latency,
             sandbox_latency_summary,
+            genai_token_usage,
+            genai_token_usage_summary,
+            genai_operation_duration,
+            genai_operation_duration_summary,
+            genai_tool_calls_total,
             approvals_pending_total,
             build_oneflight_hits_total,
             build_oneflight_misses_total,
@@ -240,6 +357,124 @@ pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
             "agentenv_mcp_tool_calls_total",
             &[
                 ("tool", Some(row.tool.as_str())),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+            ],
+            row.count,
+        );
+    }
+
+    render_help_type(
+        &mut output,
+        "gen_ai_client_token_usage",
+        "GenAI client token usage.",
+        "histogram",
+    );
+    for row in &snapshot.genai_token_usage {
+        render_sample(
+            &mut output,
+            "gen_ai_client_token_usage_bucket",
+            &[
+                ("gen_ai_provider_name", row.provider_name.as_deref()),
+                ("gen_ai_operation_name", Some(row.operation_name.as_str())),
+                ("gen_ai_token_type", Some(row.token_type.as_str())),
+                ("gen_ai_request_model", row.request_model.as_deref()),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+                ("le", Some(row.le.as_str())),
+            ],
+            row.count,
+        );
+    }
+    for row in &snapshot.genai_token_usage_summary {
+        render_sample(
+            &mut output,
+            "gen_ai_client_token_usage_sum",
+            &[
+                ("gen_ai_provider_name", row.provider_name.as_deref()),
+                ("gen_ai_operation_name", Some(row.operation_name.as_str())),
+                ("gen_ai_token_type", Some(row.token_type.as_str())),
+                ("gen_ai_request_model", row.request_model.as_deref()),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+            ],
+            row.sum,
+        );
+        render_sample(
+            &mut output,
+            "gen_ai_client_token_usage_count",
+            &[
+                ("gen_ai_provider_name", row.provider_name.as_deref()),
+                ("gen_ai_operation_name", Some(row.operation_name.as_str())),
+                ("gen_ai_token_type", Some(row.token_type.as_str())),
+                ("gen_ai_request_model", row.request_model.as_deref()),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+            ],
+            row.count,
+        );
+    }
+
+    render_help_type(
+        &mut output,
+        "gen_ai_client_operation_duration",
+        "GenAI client operation duration in seconds.",
+        "histogram",
+    );
+    for row in &snapshot.genai_operation_duration {
+        render_sample(
+            &mut output,
+            "gen_ai_client_operation_duration_bucket",
+            &[
+                ("gen_ai_provider_name", row.provider_name.as_deref()),
+                ("gen_ai_operation_name", Some(row.operation_name.as_str())),
+                ("gen_ai_request_model", row.request_model.as_deref()),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+                ("le", Some(row.le.as_str())),
+            ],
+            row.count,
+        );
+    }
+    for row in &snapshot.genai_operation_duration_summary {
+        render_sample_float(
+            &mut output,
+            "gen_ai_client_operation_duration_sum",
+            &[
+                ("gen_ai_provider_name", row.provider_name.as_deref()),
+                ("gen_ai_operation_name", Some(row.operation_name.as_str())),
+                ("gen_ai_request_model", row.request_model.as_deref()),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+            ],
+            row.sum_seconds,
+        );
+        render_sample(
+            &mut output,
+            "gen_ai_client_operation_duration_count",
+            &[
+                ("gen_ai_provider_name", row.provider_name.as_deref()),
+                ("gen_ai_operation_name", Some(row.operation_name.as_str())),
+                ("gen_ai_request_model", row.request_model.as_deref()),
+                ("env", row.env.as_deref()),
+                ("result", Some(row.result.as_str())),
+            ],
+            row.count,
+        );
+    }
+
+    render_help_type(
+        &mut output,
+        "agentenv_gen_ai_tool_calls_total",
+        "Total GenAI tool calls by tool, environment, and result.",
+        "counter",
+    );
+    for row in &snapshot.genai_tool_calls_total {
+        render_sample(
+            &mut output,
+            "agentenv_gen_ai_tool_calls_total",
+            &[
+                ("gen_ai_tool_name", Some(row.tool.as_str())),
                 ("env", row.env.as_deref()),
                 ("result", Some(row.result.as_str())),
             ],
@@ -380,6 +615,127 @@ fn latency_metrics(
             buckets.push(LatencyBucketMetric {
                 op: op.clone(),
                 driver: driver.clone(),
+                le: (*label).to_owned(),
+                count,
+            });
+        }
+    }
+    (buckets, summaries)
+}
+
+fn genai_token_usage_metrics(
+    rows: Vec<crate::store::GenAiTokenUsageRow>,
+) -> (
+    Vec<GenAiTokenUsageBucketMetric>,
+    Vec<GenAiTokenUsageSummaryMetric>,
+) {
+    let mut grouped: BTreeMap<GenAiTokenUsageKey, Vec<u64>> = BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry((
+                row.provider_name,
+                row.operation_name,
+                row.token_type,
+                row.request_model,
+                row.env,
+                activity_result_label(row.result),
+            ))
+            .or_default()
+            .push(row.tokens);
+    }
+
+    let mut buckets = Vec::new();
+    let mut summaries = Vec::new();
+    for ((provider_name, operation_name, token_type, request_model, env, result), tokens) in grouped
+    {
+        let count = tokens.len() as u64;
+        let sum = tokens.iter().sum::<u64>();
+        summaries.push(GenAiTokenUsageSummaryMetric {
+            provider_name: provider_name.clone(),
+            operation_name: operation_name.clone(),
+            token_type: token_type.clone(),
+            request_model: request_model.clone(),
+            env: env.clone(),
+            result: result.clone(),
+            sum,
+            count,
+        });
+
+        for (label, limit) in GENAI_TOKEN_BUCKET_LABELS
+            .iter()
+            .zip(GENAI_TOKEN_BUCKET_LIMITS)
+        {
+            let count = tokens
+                .iter()
+                .filter(|tokens| match limit {
+                    Some(limit) => **tokens <= limit,
+                    None => true,
+                })
+                .count() as u64;
+            buckets.push(GenAiTokenUsageBucketMetric {
+                provider_name: provider_name.clone(),
+                operation_name: operation_name.clone(),
+                token_type: token_type.clone(),
+                request_model: request_model.clone(),
+                env: env.clone(),
+                result: result.clone(),
+                le: (*label).to_owned(),
+                count,
+            });
+        }
+    }
+    (buckets, summaries)
+}
+
+fn genai_operation_duration_metrics(
+    rows: Vec<crate::store::GenAiOperationDurationRow>,
+) -> (
+    Vec<GenAiOperationDurationBucketMetric>,
+    Vec<GenAiOperationDurationSummaryMetric>,
+) {
+    let mut grouped: BTreeMap<GenAiOperationDurationKey, Vec<u64>> = BTreeMap::new();
+    for row in rows {
+        grouped
+            .entry((
+                row.provider_name,
+                row.operation_name,
+                row.request_model,
+                row.env,
+                activity_result_label(row.result),
+            ))
+            .or_default()
+            .push(row.latency_ms);
+    }
+
+    let mut buckets = Vec::new();
+    let mut summaries = Vec::new();
+    for ((provider_name, operation_name, request_model, env, result), latencies) in grouped {
+        let count = latencies.len() as u64;
+        let sum_seconds = latencies.iter().sum::<u64>() as f64 / 1000.0;
+        summaries.push(GenAiOperationDurationSummaryMetric {
+            provider_name: provider_name.clone(),
+            operation_name: operation_name.clone(),
+            request_model: request_model.clone(),
+            env: env.clone(),
+            result: result.clone(),
+            sum_seconds,
+            count,
+        });
+
+        for (label, limit_ms) in LATENCY_BUCKET_LABELS.iter().zip(LATENCY_BUCKET_MILLIS) {
+            let count = latencies
+                .iter()
+                .filter(|latency_ms| match limit_ms {
+                    Some(limit_ms) => **latency_ms <= limit_ms,
+                    None => true,
+                })
+                .count() as u64;
+            buckets.push(GenAiOperationDurationBucketMetric {
+                provider_name: provider_name.clone(),
+                operation_name: operation_name.clone(),
+                request_model: request_model.clone(),
+                env: env.clone(),
+                result: result.clone(),
                 le: (*label).to_owned(),
                 count,
             });
@@ -575,6 +931,82 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_render_includes_genai_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        store
+            .append_many(&[event(
+                "2026-05-18T12:00:00Z",
+                ActivityKind::GenAiModelCall,
+                ActivityResult::Ok,
+            )
+            .with_env("demo")
+            .with_extra("gen_ai.system", serde_json::json!("openai"))
+            .with_extra("gen_ai.request.model", serde_json::json!("gpt-4.1"))
+            .with_extra("gen_ai.usage.input_tokens", serde_json::json!(300))
+            .with_extra("gen_ai.usage.output_tokens", serde_json::json!(20))
+            .with_extra("prompt", serde_json::json!("private prompt text"))
+            .with_extra("api_key", serde_json::json!("sk-secret"))
+            .with_latency_ms(250)])
+            .unwrap();
+
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+        let rendered = render_prometheus(&snapshot);
+
+        assert!(rendered.contains("# HELP gen_ai_client_token_usage "));
+        assert!(rendered.contains("# TYPE gen_ai_client_token_usage histogram"));
+        assert!(rendered.contains("# HELP gen_ai_client_operation_duration "));
+        assert!(rendered.contains("# TYPE gen_ai_client_operation_duration histogram"));
+        assert!(rendered.contains(
+            "gen_ai_client_token_usage_bucket{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_token_type=\"input\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\",le=\"256\"} 0"
+        ));
+        assert!(rendered.contains(
+            "gen_ai_client_token_usage_bucket{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_token_type=\"input\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\",le=\"1024\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gen_ai_client_token_usage_sum{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_token_type=\"input\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\"} 300"
+        ));
+        assert!(rendered.contains(
+            "gen_ai_client_token_usage_count{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_token_type=\"input\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gen_ai_client_operation_duration_bucket{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\",le=\"0.25\"} 1"
+        ));
+        assert!(rendered.contains(
+            "gen_ai_client_operation_duration_sum{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\"} 0.25"
+        ));
+        assert!(rendered.contains(
+            "gen_ai_client_operation_duration_count{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\"} 1"
+        ));
+        assert!(!rendered.contains("private prompt text"));
+        assert!(!rendered.contains("sk-secret"));
+    }
+
+    #[test]
+    fn prometheus_render_includes_genai_tool_calls_total_with_escaped_labels() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        store
+            .append_many(&[event(
+                "2026-05-18T12:00:00Z",
+                ActivityKind::McpToolCall,
+                ActivityResult::Ok,
+            )
+            .with_env("demo")
+            .with_subject_value("name", serde_json::json!("repo\\search\n\"tool"))])
+            .unwrap();
+
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+        let rendered = render_prometheus(&snapshot);
+
+        assert!(rendered.contains("# HELP agentenv_gen_ai_tool_calls_total "));
+        assert!(rendered.contains("# TYPE agentenv_gen_ai_tool_calls_total counter"));
+        assert!(rendered.contains(
+            "agentenv_gen_ai_tool_calls_total{gen_ai_tool_name=\"repo\\\\search\\n\\\"tool\",env=\"demo\",result=\"ok\"} 1"
+        ));
+    }
+
+    #[test]
     fn prometheus_render_includes_build_oneflight_metrics() {
         let temp = tempfile::tempdir().unwrap();
         let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
@@ -646,6 +1078,11 @@ mod tests {
             mcp_tool_calls_total: Vec::new(),
             sandbox_latency: Vec::new(),
             sandbox_latency_summary: Vec::new(),
+            genai_token_usage: Vec::new(),
+            genai_token_usage_summary: Vec::new(),
+            genai_operation_duration: Vec::new(),
+            genai_operation_duration_summary: Vec::new(),
+            genai_tool_calls_total: Vec::new(),
             approvals_pending_total: 0,
             build_oneflight_hits_total: 0,
             build_oneflight_misses_total: 0,
