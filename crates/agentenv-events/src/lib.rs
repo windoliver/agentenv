@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod audit;
 pub mod dispatcher;
+pub mod genai;
 pub mod local_ops;
 pub mod metrics;
 #[cfg(feature = "otel")]
@@ -15,6 +16,10 @@ pub mod webhook;
 
 pub use activity::{ActivityEvent, ActivityKind, ActivityResult, ActorKind};
 pub use dispatcher::{EventDispatcher, EventEmitter, NoopEventEmitter, RecordingEventEmitter};
+pub use genai::{
+    map_event_to_genai_signal, OtelAttributeValue, OtelGenAiSignal, OtelGenAiSignalKind,
+    OtelSignalStatus, OtelSpanKindHint,
+};
 pub use local_ops::{
     default_store_path, EventImportReport, EventStoreError, EventStoreResult, LocalEventStore,
     StoredEvent, StoredEventKind,
