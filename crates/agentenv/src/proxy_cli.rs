@@ -777,6 +777,7 @@ fn mcp_guard_reason_code(reason: agentenv_mcp::guard::GuardReason) -> &'static s
         agentenv_mcp::guard::GuardReason::RateLimited => "mcp_rate_limited",
         agentenv_mcp::guard::GuardReason::CrossToolFlow => "mcp_cross_tool_flow",
         agentenv_mcp::guard::GuardReason::MalformedToolCall => "mcp_malformed_tool_call",
+        agentenv_mcp::guard::GuardReason::ProvenanceTaint => "mcp_provenance_taint",
     }
 }
 

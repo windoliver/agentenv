@@ -334,7 +334,10 @@ fn provenance_from_request(request: &Value, default_tag: ProvenanceTag) -> Vec<P
         .map(|entries| {
             entries
                 .values()
-                .filter_map(|value| serde_json::from_value::<ProvenanceSummary>(value.clone()).ok())
+                .map(|value| {
+                    serde_json::from_value::<ProvenanceSummary>(value.clone())
+                        .unwrap_or_else(|_| malformed_provenance_summary())
+                })
                 .collect::<Vec<_>>()
         })
         .filter(|items| !items.is_empty())
@@ -346,6 +349,15 @@ fn provenance_from_request(request: &Value, default_tag: ProvenanceTag) -> Vec<P
                 summary: Some("unannotated MCP tool argument".to_owned()),
             }]
         })
+}
+
+fn malformed_provenance_summary() -> ProvenanceSummary {
+    ProvenanceSummary {
+        tag: ProvenanceTag::Untrusted,
+        source_kind: agentenv_proto::ProvenanceSourceKind::Unknown,
+        source_id: "malformed".to_owned(),
+        summary: Some("malformed MCP provenance metadata".to_owned()),
+    }
 }
 
 fn strip_agentenv_provenance(request: &Value) -> Value {
@@ -919,5 +931,62 @@ mod tests {
             .get("params")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|params| !params.contains_key("_agentenv_provenance")));
+    }
+
+    #[test]
+    fn malformed_provenance_entry_fails_closed_to_untrusted() {
+        let config = McpGuardConfig {
+            enabled: true,
+            provenance: Some(agentenv_proto::McpProvenanceConfig {
+                enabled: true,
+                required: true,
+                default_unannotated_source: agentenv_proto::ProvenanceTag::Untrusted,
+            }),
+            tool_capabilities: [(
+                "git.commit".to_owned(),
+                agentenv_proto::ToolCapabilityDeclaration {
+                    caps: vec![agentenv_proto::ToolCapability::GitWrite],
+                    max_input_taint: agentenv_proto::ProvenanceTag::Trusted,
+                    approval: McpApprovalMode::PerCall,
+                    argument_policies: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..McpGuardConfig::default()
+        };
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "git.commit",
+                "arguments": {
+                    "message": "commit this text"
+                },
+                "_agentenv_provenance": {
+                    "/message": {
+                        "tag": "trusted",
+                        "source_kind": "operator",
+                        "source_id": "operator",
+                        "summary": "operator-provided message"
+                    },
+                    "/message/extra": {
+                        "tag": "trusted"
+                    }
+                }
+            }
+        });
+        let mut state = GuardSessionState::default();
+
+        let evaluation = evaluate_json_rpc_request_with_forwarding(&config, &mut state, &request)
+            .expect("evaluation succeeds");
+
+        assert_eq!(evaluation.decision.action, GuardAction::RequestApproval);
+        assert_eq!(evaluation.decision.reason, GuardReason::ProvenanceTaint);
+        assert_eq!(
+            evaluation.decision.redacted_event_context["provenance"]["observed_taint"],
+            json!("untrusted")
+        );
     }
 }
