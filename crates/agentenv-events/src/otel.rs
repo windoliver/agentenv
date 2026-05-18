@@ -2,13 +2,19 @@ use std::collections::BTreeMap;
 
 use opentelemetry::{
     logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity},
-    Key,
+    trace::{Span as _, SpanKind, Status, Tracer as _, TracerProvider as _},
+    Array, Key, KeyValue, Value,
 };
 use opentelemetry_otlp::{ExportConfig, Protocol, WithExportConfig};
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider, SimpleLogProcessor};
+use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 
 use crate::{
     activity::{ActivityEvent, ActivityKind, ActivityResult},
+    genai::{
+        map_event_to_genai_signal, OtelAttributeValue, OtelGenAiSignalKind, OtelSignalStatus,
+        OtelSpanKindHint,
+    },
     sink::{EventSink, SinkError},
 };
 
@@ -42,30 +48,46 @@ pub fn map_event_to_otel_fields(event: &ActivityEvent) -> BTreeMap<String, Strin
 pub struct OtelSink {
     endpoint: String,
     logger: SdkLogger,
-    provider: SdkLoggerProvider,
+    log_provider: SdkLoggerProvider,
+    tracer: SdkTracer,
+    trace_provider: SdkTracerProvider,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct OtelSpanExportPlan {
+    name: String,
+    kind: SpanKind,
+    status: Status,
+    attributes: Vec<KeyValue>,
 }
 
 impl OtelSink {
     pub fn new(endpoint: impl Into<String>) -> Result<Self, SinkError> {
         let endpoint = endpoint.into();
-        let exporter_config = ExportConfig {
-            endpoint: Some(normalize_grpc_endpoint(&endpoint)),
-            protocol: Protocol::Grpc,
-            timeout: None,
-        };
         let exporter = opentelemetry_otlp::LogExporter::builder()
             .with_tonic()
-            .with_export_config(exporter_config)
+            .with_export_config(export_config(&endpoint))
             .build()?;
-        let provider = SdkLoggerProvider::builder()
+        let log_provider = SdkLoggerProvider::builder()
             .with_log_processor(SimpleLogProcessor::new(exporter))
             .build();
-        let logger = provider.logger("agentenv-events");
+        let logger = log_provider.logger("agentenv-events");
+
+        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_export_config(export_config(&endpoint))
+            .build()?;
+        let trace_provider = SdkTracerProvider::builder()
+            .with_simple_exporter(span_exporter)
+            .build();
+        let tracer = trace_provider.tracer("agentenv-events");
 
         Ok(Self {
             endpoint,
             logger,
-            provider,
+            log_provider,
+            tracer,
+            trace_provider,
         })
     }
 
@@ -93,10 +115,111 @@ impl EventSink for OtelSink {
                     .into_iter()
                     .map(|(key, value)| (Key::new(key), AnyValue::from(value))),
             );
+            record.add_attributes(
+                genai_log_attributes(&event)
+                    .into_iter()
+                    .map(|(key, value)| (Key::new(key), otel_attribute_value_to_any_value(value))),
+            );
             self.logger.emit(record);
+
+            if let Some(plan) = genai_span_export_plan(&event) {
+                let mut span = self
+                    .tracer
+                    .span_builder(plan.name)
+                    .with_kind(plan.kind)
+                    .with_status(plan.status)
+                    .with_attributes(plan.attributes)
+                    .start(&self.tracer);
+                span.end();
+            }
         }
-        let _ = &self.provider;
+        let _ = (&self.log_provider, &self.trace_provider);
         Ok(())
+    }
+}
+
+fn export_config(endpoint: &str) -> ExportConfig {
+    ExportConfig {
+        endpoint: Some(normalize_grpc_endpoint(endpoint)),
+        protocol: Protocol::Grpc,
+        timeout: None,
+    }
+}
+
+fn genai_span_export_plan(event: &ActivityEvent) -> Option<OtelSpanExportPlan> {
+    let signal = map_event_to_genai_signal(event);
+    if signal.kind != OtelGenAiSignalKind::Span {
+        return None;
+    }
+
+    Some(OtelSpanExportPlan {
+        name: signal.name,
+        kind: span_kind(signal.span_kind),
+        status: span_status(signal.status),
+        attributes: signal
+            .attributes
+            .into_iter()
+            .map(|(key, value)| otel_attribute_value_to_key_value(key, value))
+            .collect(),
+    })
+}
+
+fn genai_log_attributes(event: &ActivityEvent) -> BTreeMap<String, OtelAttributeValue> {
+    let signal = map_event_to_genai_signal(event);
+    match signal.kind {
+        OtelGenAiSignalKind::Span => BTreeMap::new(),
+        OtelGenAiSignalKind::SpanEvent | OtelGenAiSignalKind::LogRecord => {
+            let legacy_fields = map_event_to_otel_fields(event);
+            signal
+                .attributes
+                .into_iter()
+                .filter(|(key, _)| !legacy_fields.contains_key(key))
+                .collect()
+        }
+    }
+}
+
+fn span_kind(kind: Option<OtelSpanKindHint>) -> SpanKind {
+    match kind {
+        Some(OtelSpanKindHint::Client) => SpanKind::Client,
+        Some(OtelSpanKindHint::Internal) | None => SpanKind::Internal,
+    }
+}
+
+fn span_status(status: OtelSignalStatus) -> Status {
+    match status {
+        OtelSignalStatus::Ok => Status::Ok,
+        OtelSignalStatus::Error => Status::error("error"),
+        OtelSignalStatus::Denied => Status::error("denied"),
+        OtelSignalStatus::PendingApproval => Status::Unset,
+    }
+}
+
+fn otel_attribute_value_to_key_value(key: String, value: OtelAttributeValue) -> KeyValue {
+    KeyValue::new(key, otel_attribute_value_to_value(value))
+}
+
+fn otel_attribute_value_to_value(value: OtelAttributeValue) -> Value {
+    match value {
+        OtelAttributeValue::String(value) => Value::String(value.into()),
+        OtelAttributeValue::I64(value) => Value::I64(value),
+        OtelAttributeValue::F64(value) => Value::F64(value),
+        OtelAttributeValue::Bool(value) => Value::Bool(value),
+        OtelAttributeValue::StringArray(values) => {
+            Value::Array(Array::String(values.into_iter().map(Into::into).collect()))
+        }
+    }
+}
+
+fn otel_attribute_value_to_any_value(value: OtelAttributeValue) -> AnyValue {
+    match value {
+        OtelAttributeValue::String(value) => AnyValue::from(value),
+        OtelAttributeValue::I64(value) => AnyValue::from(value),
+        OtelAttributeValue::F64(value) => AnyValue::from(value),
+        OtelAttributeValue::Bool(value) => AnyValue::from(value),
+        OtelAttributeValue::StringArray(values) => {
+            values.into_iter().map(AnyValue::from).collect::<AnyValue>()
+        }
     }
 }
 
@@ -166,6 +289,9 @@ fn activity_kind_name(kind: ActivityKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
+    use crate::genai::OtelAttributeValue;
+    use opentelemetry::{trace::SpanKind, Value};
+    use serde_json::json;
 
     #[test]
     fn maps_activity_event_to_otel_log_fields() {
@@ -202,6 +328,100 @@ mod tests {
         assert_eq!(
             activity_kind_name(ActivityKind::BuildQueueDepth),
             "build_queue_depth"
+        );
+    }
+
+    #[test]
+    fn plans_model_call_genai_span_export() {
+        let event = ActivityEvent::new(
+            "2026-05-18T12:00:00Z",
+            ActivityKind::GenAiModelCall,
+            ActivityResult::Ok,
+            "trace-model",
+        )
+        .with_extra("gen_ai.request.model", json!("gpt-4.1"))
+        .with_extra("gen_ai.usage.input_tokens", json!(123))
+        .with_extra("gen_ai.usage.output_tokens", json!(45));
+
+        let plan = genai_span_export_plan(&event).expect("model call should be a span");
+
+        assert_eq!(plan.name, "chat gpt-4.1");
+        assert_eq!(plan.kind, SpanKind::Client);
+        assert_span_attr(
+            &plan.attributes,
+            "gen_ai.operation.name",
+            Value::String("chat".to_owned().into()),
+        );
+        assert_span_attr(
+            &plan.attributes,
+            "gen_ai.request.model",
+            Value::String("gpt-4.1".to_owned().into()),
+        );
+        assert_span_attr(
+            &plan.attributes,
+            "gen_ai.usage.input_tokens",
+            Value::I64(123),
+        );
+        assert_span_attr(
+            &plan.attributes,
+            "gen_ai.usage.output_tokens",
+            Value::I64(45),
+        );
+    }
+
+    #[test]
+    fn plans_mcp_tool_call_genai_span_export() {
+        let event = ActivityEvent::new(
+            "2026-05-18T12:00:00Z",
+            ActivityKind::McpToolCall,
+            ActivityResult::Ok,
+            "trace-tool",
+        )
+        .with_subject_value("name", json!("repo.search"));
+
+        let plan = genai_span_export_plan(&event).expect("tool call should be a span");
+
+        assert_eq!(plan.name, "execute_tool repo.search");
+        assert_eq!(plan.kind, SpanKind::Internal);
+        assert_span_attr(
+            &plan.attributes,
+            "gen_ai.operation.name",
+            Value::String("execute_tool".to_owned().into()),
+        );
+        assert_span_attr(
+            &plan.attributes,
+            "gen_ai.tool.name",
+            Value::String("repo.search".to_owned().into()),
+        );
+    }
+
+    #[test]
+    fn maps_non_span_genai_semantic_attributes_for_logs() {
+        let event = ActivityEvent::new(
+            "2026-05-18T12:00:00Z",
+            ActivityKind::EgressDenied,
+            ActivityResult::Denied,
+            "trace-denied",
+        )
+        .with_latency_ms(42);
+
+        let attributes = genai_log_attributes(&event);
+
+        assert_eq!(
+            attributes.get("agentenv.egress.denied"),
+            Some(&OtelAttributeValue::Bool(true))
+        );
+        assert!(!attributes.contains_key("agentenv.trace_id"));
+        assert!(!attributes.contains_key("agentenv.latency_ms"));
+    }
+
+    fn assert_span_attr(attributes: &[opentelemetry::KeyValue], key: &str, value: Value) {
+        assert_eq!(
+            attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map(|attribute| &attribute.value),
+            Some(&value)
         );
     }
 }
