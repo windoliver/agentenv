@@ -238,6 +238,19 @@ pub struct McpGuardConfig {
     pub tool_capabilities: BTreeMap<String, ToolCapabilityDeclaration>,
 }
 
+impl Default for McpGuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_approval: McpApprovalMode::Never,
+            tool_policies: BTreeMap::new(),
+            cross_tool_flows: McpCrossToolFlowPolicy::default(),
+            provenance: None,
+            tool_capabilities: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpToolPolicy {

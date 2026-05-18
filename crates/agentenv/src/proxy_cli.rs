@@ -1254,6 +1254,7 @@ mod tests {
             .into_iter()
             .collect(),
             cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+            ..agentenv_proto::McpGuardConfig::default()
         });
         let policy = policy_with_rules(&["93.184.216.34"], &[]);
         let state = Arc::new(test_state(&root, route, policy.clone(), BTreeMap::new()));
@@ -1301,6 +1302,7 @@ mod tests {
             default_approval: agentenv_proto::McpApprovalMode::PerCall,
             tool_policies: BTreeMap::new(),
             cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+            ..agentenv_proto::McpGuardConfig::default()
         });
         let policy = policy_with_rules(&["93.184.216.34"], &[]);
         let approval_db = root.join("events.db");

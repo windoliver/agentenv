@@ -7252,6 +7252,7 @@ fn mcp_guard_config_for_cli_e2e() -> McpGuardConfig {
             ),
         ]),
         cross_tool_flows: McpCrossToolFlowPolicy::default(),
+        ..McpGuardConfig::default()
     }
 }
 

@@ -560,6 +560,7 @@ mod tests {
             .into_iter()
             .collect(),
             cross_tool_flows: McpCrossToolFlowPolicy::default(),
+            ..McpGuardConfig::default()
         };
 
         let matched = match_policy(&config, "filesystem.write");
@@ -583,6 +584,7 @@ mod tests {
             .into_iter()
             .collect(),
             cross_tool_flows: McpCrossToolFlowPolicy::default(),
+            ..McpGuardConfig::default()
         };
         let mut state = GuardSessionState::default();
         let request = json!({
@@ -621,6 +623,7 @@ mod tests {
             .into_iter()
             .collect(),
             cross_tool_flows: McpCrossToolFlowPolicy::default(),
+            ..McpGuardConfig::default()
         };
         let mut state = GuardSessionState::default();
         let request = json!({
@@ -650,6 +653,7 @@ mod tests {
             cross_tool_flows: McpCrossToolFlowPolicy {
                 forbid_read_to_write_turns: Some(5),
             },
+            ..McpGuardConfig::default()
         };
         let mut state = GuardSessionState::default();
         let read = json!({
