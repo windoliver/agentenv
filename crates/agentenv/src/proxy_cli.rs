@@ -593,7 +593,7 @@ async fn maybe_handle_mcp_guard(
         return Ok((None, request));
     }
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let bytes = body
         .collect()
         .await
@@ -636,6 +636,7 @@ async fn maybe_handle_mcp_guard(
     let action = evaluation.decision.action;
     let forwarded_bytes = serde_json::to_vec(&evaluation.forwarded_request)
         .context("serialize guarded MCP request")?;
+    parts.headers.remove(header::CONTENT_LENGTH);
     let request = Request::from_parts(parts, Body::from(forwarded_bytes));
     match action {
         agentenv_mcp::guard::GuardAction::Deny => Ok((
@@ -1424,7 +1425,7 @@ mod tests {
             serde_json::to_vec(&policy).expect("policy should serialize"),
         )
         .expect("policy should be written");
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("/v1/mcp/primary")
             .header("content-type", "application/json")
@@ -1451,12 +1452,16 @@ mod tests {
                 .expect("request body should serialize"),
             ))
             .expect("request should build");
+        request
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("9999"));
 
         let (response, request) = maybe_handle_mcp_guard(&state, &route, request)
             .await
             .expect("MCP guard should evaluate");
 
         assert!(response.is_none());
+        assert!(!request.headers().contains_key(header::CONTENT_LENGTH));
         let bytes = request
             .into_body()
             .collect()
