@@ -398,20 +398,22 @@ mod tests {
     #[tokio::test]
     async fn claude_renders_mediated_endpoint_supplied_by_core() {
         let driver = ClaudeDriver;
+        let mediated_command = "agentenv mcp-guard run --env demo --config /sandbox/.agentenv/mcp-guard/context.json --events-db /sandbox/.agentenv/mcp-guard/events.db --stdio-upstream agentenv-fs-mcp";
         let rendered = driver
             .render_mcp_config(RenderMcpConfigParams {
                 endpoints: vec![McpEndpoint {
                     transport: McpTransport::Stdio,
-                    url: "agentenv mcp-guard run --env demo --config /sandbox/.agentenv/mcp-guard/context.json --events-db /sandbox/.agentenv/mcp-guard/events.db --stdio-upstream agentenv-fs-mcp".to_owned(),
+                    url: mediated_command.to_owned(),
                     headers: BTreeMap::new(),
                 }],
             })
             .await
             .unwrap();
 
-        assert!(rendered.content.contains("agentenv mcp-guard run"));
-        assert!(rendered
-            .content
-            .contains("/sandbox/.agentenv/mcp-guard/context.json"));
+        let parsed: Value = serde_json::from_str(&rendered.content).unwrap();
+        assert_eq!(
+            parsed["mcpServers"]["endpoint_0"]["command"],
+            serde_json::json!(mediated_command)
+        );
     }
 }
