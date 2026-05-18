@@ -140,6 +140,8 @@ fn activity_kind_name(kind: ActivityKind) -> &'static str {
         ActivityKind::EgressAllowed => "egress_allowed",
         ActivityKind::EgressDenied => "egress_denied",
         ActivityKind::McpToolCall => "mcp_tool_call",
+        ActivityKind::AgentTurn => "agent_turn",
+        ActivityKind::GenAiModelCall => "gen_ai_model_call",
         ActivityKind::PolicyApplied => "policy_applied",
         ActivityKind::CredentialInjected => "credential_injected",
         ActivityKind::CredentialSet => "credential_set",
