@@ -66,7 +66,10 @@ fn freeze_persisted_env_writes_default_lockfile() {
     );
 
     let rendered = fs::read_to_string(temp_dir.join("agentenv.lock")).unwrap();
-    assert!(rendered.contains("version: 0.2.0"));
+    assert!(rendered.contains(&format!(
+        "version: {}",
+        agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION
+    )));
     assert!(rendered.contains("name: demo"));
 }
 
@@ -6230,7 +6233,13 @@ fn freeze_persisted_env_output_dash_prints_lockfile_without_dash_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("version: 0.2.0"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "version: {}",
+            agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION
+        )),
+        "stdout was: {stdout}"
+    );
     assert!(stdout.contains("name: demo"), "stdout was: {stdout}");
     assert!(
         !temp_dir.join("-").exists(),

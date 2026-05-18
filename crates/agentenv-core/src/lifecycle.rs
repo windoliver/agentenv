@@ -83,6 +83,8 @@ struct CanonicalBlueprint {
     state: Option<StateSection>,
     #[serde(default, skip_serializing_if = "SkillsSection::is_empty")]
     skills: SkillsSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observability: Option<crate::blueprint::ObservabilitySection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,6 +576,7 @@ fn canonical_blueprint(resolved: &ResolvedBlueprint) -> Result<CanonicalBlueprin
         policy: blueprint.policy.clone(),
         state: blueprint.state.clone(),
         skills: blueprint.skills.clone(),
+        observability: blueprint.observability.clone(),
     })
 }
 
@@ -612,6 +615,7 @@ pub(crate) fn portable_canonical_blueprint(
         policy: canonical.policy,
         state: canonical.state,
         skills: canonical.skills,
+        observability: canonical.observability,
     })
 }
 

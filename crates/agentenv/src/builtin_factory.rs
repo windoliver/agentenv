@@ -1191,6 +1191,7 @@ mod tests {
                 },
                 state: None,
                 skills: agentenv_core::blueprint::SkillsSection::default(),
+                observability: None,
             },
             policy: PortablePolicy {
                 declared: agentenv_core::blueprint::PolicySection {

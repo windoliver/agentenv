@@ -1,7 +1,7 @@
 use agentenv_core::{
     driver_artifact::DriverArtifact,
     driver_catalog::DriverSource,
-    lockfile::{DriverSourcePin, LockfileDocument, SkillPin},
+    lockfile::{DriverSourcePin, LockfileDocument, SkillPin, PORTABLE_LOCKFILE_VERSION},
     portable_lockfile::{
         build_portable_lockfile, verify_portable_lockfile_yaml, PortableLockfileError,
         PortableLockfileInput, PortableVerifyIssueKind,
@@ -32,7 +32,7 @@ fn portable_lockfile_builder_is_byte_identical_for_repeated_calls() {
         .expect("render second lockfile");
 
     assert_eq!(first, second);
-    assert!(first.contains("version: 0.2.0"));
+    assert!(first.contains(&format!("version: {PORTABLE_LOCKFILE_VERSION}")));
     let expected_single_quoted = format!("driver_protocol_version: '{SCHEMA_VERSION}'");
     let expected_double_quoted = format!("driver_protocol_version: \"{SCHEMA_VERSION}\"");
     assert!(
@@ -103,6 +103,38 @@ fn portable_lockfile_builder_preserves_skill_runtime_discovery() {
     let report = verify_portable_lockfile_yaml(&rendered, &built_in_artifacts())
         .expect("verify portable lockfile");
     assert!(report.is_clean());
+}
+
+#[test]
+fn portable_lockfile_builder_preserves_observability_otel_endpoint() {
+    let lockfile = build_portable_lockfile(PortableLockfileInput {
+        name: "demo".to_owned(),
+        blueprint_yaml: observability_yaml(),
+        driver_artifacts: built_in_artifacts(),
+    })
+    .expect("build lockfile");
+
+    assert_eq!(
+        lockfile
+            .composition
+            .observability
+            .as_ref()
+            .and_then(|observability| observability.otel.as_ref())
+            .and_then(|otel| otel.endpoint.as_deref()),
+        Some("grpc://collector:4317")
+    );
+
+    let rendered = lockfile
+        .to_yaml_deterministic()
+        .expect("render portable lockfile");
+    assert!(
+        rendered.contains("observability:"),
+        "lockfile should preserve observability: {rendered}"
+    );
+    assert!(
+        rendered.contains("endpoint: grpc://collector:4317"),
+        "lockfile should preserve OTEL endpoint: {rendered}"
+    );
 }
 
 #[test]
@@ -262,6 +294,34 @@ fn portable_lockfile_document_round_trips_builder_output() {
 
     let parsed = LockfileDocument::from_yaml(&rendered).expect("parse rendered lockfile");
     assert!(matches!(parsed, LockfileDocument::Portable(_)));
+}
+
+#[test]
+fn portable_lockfile_serialization_normalizes_v2_to_current_version() {
+    let rendered_v3 = reference_portable_lockfile_yaml();
+    let rendered_v2 = rendered_v3.replacen(
+        &format!("version: {PORTABLE_LOCKFILE_VERSION}"),
+        "version: 0.2.0",
+        1,
+    );
+
+    let LockfileDocument::Portable(lockfile) =
+        LockfileDocument::from_yaml(&rendered_v2).expect("parse v2 portable lockfile")
+    else {
+        panic!("expected portable lockfile");
+    };
+    let normalized = lockfile
+        .to_yaml_deterministic()
+        .expect("serialize normalized portable lockfile");
+
+    assert!(
+        normalized.contains(&format!("version: {PORTABLE_LOCKFILE_VERSION}")),
+        "normalized lockfile should use current portable version: {normalized}"
+    );
+    assert!(
+        !normalized.contains("version: 0.2.0"),
+        "normalized lockfile should not keep old portable version: {normalized}"
+    );
 }
 
 #[test]
@@ -944,6 +1004,18 @@ skills:
     scopes: ["search", "get_manifest"]
 "#
     .to_owned()
+}
+
+fn observability_yaml() -> String {
+    let mut yaml = reference_yaml();
+    yaml.push_str(
+        r#"
+observability:
+  otel:
+    endpoint: grpc://collector:4317
+"#,
+    );
+    yaml
 }
 
 fn image_yaml() -> String {

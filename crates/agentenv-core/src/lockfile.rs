@@ -9,7 +9,8 @@ use crate::digest::{parse_sha256_digest, parse_sha256_hex, DigestError};
 
 const SUPPORTED_LOCKFILE_VERSION: &str = "0.1.0";
 const SUPPORTED_PROTOCOL_VERSION: &str = "0.1";
-pub const PORTABLE_LOCKFILE_VERSION: &str = "0.2.0";
+const PORTABLE_LOCKFILE_V2_VERSION: &str = "0.2.0";
+pub const PORTABLE_LOCKFILE_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
@@ -85,6 +86,8 @@ pub struct PortableComposition {
         skip_serializing_if = "crate::blueprint::SkillsSection::is_empty"
     )]
     pub skills: crate::blueprint::SkillsSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<crate::blueprint::ObservabilitySection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,7 +272,7 @@ impl LockfileDocument {
 
         match version {
             SUPPORTED_LOCKFILE_VERSION => Ok(Self::Legacy(Lockfile::from_yaml(yaml)?)),
-            PORTABLE_LOCKFILE_VERSION => {
+            version if is_supported_portable_lockfile_version(version) => {
                 let lockfile: PortableLockfile =
                     serde_yaml::from_value(value).map_err(LockfileError::Deserialize)?;
                 lockfile.validate()?;
@@ -285,6 +288,7 @@ impl LockfileDocument {
 impl PortableLockfile {
     pub fn to_yaml_deterministic(&self) -> Result<String, LockfileError> {
         let mut lockfile = self.clone();
+        lockfile.version = PORTABLE_LOCKFILE_VERSION.to_owned();
         lockfile.skills.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
@@ -296,7 +300,7 @@ impl PortableLockfile {
     }
 
     pub fn validate(&self) -> Result<(), LockfileError> {
-        if self.version != PORTABLE_LOCKFILE_VERSION {
+        if !is_supported_portable_lockfile_version(&self.version) {
             return Err(LockfileError::UnsupportedVersion {
                 version: self.version.clone(),
             });
@@ -346,6 +350,13 @@ impl PortableLockfile {
 
         validate_credentials(&self.credentials)
     }
+}
+
+fn is_supported_portable_lockfile_version(version: &str) -> bool {
+    matches!(
+        version,
+        PORTABLE_LOCKFILE_V2_VERSION | PORTABLE_LOCKFILE_VERSION
+    )
 }
 
 fn validate_skill_pins(skills: &[SkillPin]) -> Result<(), LockfileError> {
