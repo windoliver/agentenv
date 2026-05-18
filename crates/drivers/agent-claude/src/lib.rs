@@ -394,4 +394,24 @@ mod tests {
             "{\n  \"mcpServers\": {\n    \"endpoint_0\": {\n      \"command\": \"agentenv-context\"\n    },\n    \"endpoint_1\": {\n      \"headers\": {\n        \"Authorization\": \"Bearer test\",\n        \"X-Agentenv\": \"true\"\n      },\n      \"type\": \"sse\",\n      \"url\": \"https://context.example.test/mcp\"\n    }\n  }\n}"
         );
     }
+
+    #[tokio::test]
+    async fn claude_renders_mediated_endpoint_supplied_by_core() {
+        let driver = ClaudeDriver;
+        let rendered = driver
+            .render_mcp_config(RenderMcpConfigParams {
+                endpoints: vec![McpEndpoint {
+                    transport: McpTransport::Stdio,
+                    url: "agentenv mcp-guard run --env demo --config /sandbox/.agentenv/mcp-guard/context.json --events-db /sandbox/.agentenv/mcp-guard/events.db --stdio-upstream agentenv-fs-mcp".to_owned(),
+                    headers: BTreeMap::new(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert!(rendered.content.contains("agentenv mcp-guard run"));
+        assert!(rendered
+            .content
+            .contains("/sandbox/.agentenv/mcp-guard/context.json"));
+    }
 }
