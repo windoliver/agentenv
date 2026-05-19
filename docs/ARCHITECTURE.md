@@ -188,6 +188,18 @@ guarded in the host egress proxy; stdio endpoints are guarded by an
 `agentenv mcp-guard run` wrapper. Context drivers still return ordinary
 `McpEndpoint` values and agent drivers still render ordinary MCP config.
 
+Core can also mediate MCP tool calls with provenance-aware capability policy.
+Values are tagged as `trusted`, `tenant`, or `untrusted`; tool declarations
+state the capabilities a tool can exercise and the maximum input taint it
+accepts. Before a mediated `tools/call` is forwarded, core evaluates argument
+provenance against the declaration and either forwards, denies, or routes the
+request to approvals.
+
+This is core-owned security infrastructure, not a fifth pluggable axis. Context
+and agent drivers continue to speak MCP. Core rewrites MCP endpoints through the
+stdio guard or host egress proxy when a blueprint enables
+`policy.mcp.confused_deputy_guards`.
+
 ---
 
 ## Driver architecture
