@@ -1308,6 +1308,7 @@ mod tests {
                 default_approval: agentenv_proto::McpApprovalMode::PerCall,
                 tool_policies: BTreeMap::new(),
                 cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+                ..agentenv_proto::McpGuardConfig::default()
             }),
         };
 

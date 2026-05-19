@@ -1244,6 +1244,11 @@ async fn create_env_with_input(
 
         let mcp_guard_config =
             mcp_guard_config_from_policy_extra(&resolved.blueprint.policy.extra)?;
+        ensure_required_mcp_provenance_mediation(
+            mcp_guard_config.as_ref(),
+            &context_endpoint,
+            &sandbox_init.capabilities,
+        )?;
         let egress_proxy_plan = build_runtime_egress_proxy_plan(RuntimeEgressProxyPlanInput {
             env_name: name,
             requirements: &requirements,
@@ -2674,6 +2679,35 @@ fn build_runtime_egress_proxy_plan(
     })?;
     plan.listen_url = urls.listen_url;
     Ok(plan)
+}
+
+fn ensure_required_mcp_provenance_mediation(
+    guard_config: Option<&agentenv_proto::McpGuardConfig>,
+    endpoint: &agentenv_proto::McpEndpoint,
+    sandbox_capabilities: &agentenv_proto::Capabilities,
+) -> RuntimeResult<()> {
+    let Some(_provenance) = guard_config
+        .and_then(|config| config.provenance.as_ref())
+        .filter(|provenance| provenance.enabled && provenance.required)
+    else {
+        return Ok(());
+    };
+
+    let enforceable = match endpoint.transport {
+        agentenv_proto::McpTransport::Stdio => true,
+        agentenv_proto::McpTransport::Http | agentenv_proto::McpTransport::HttpSse => {
+            supports_host_egress_proxy(sandbox_capabilities)
+        }
+        agentenv_proto::McpTransport::SshHttp => false,
+    };
+
+    if enforceable {
+        Ok(())
+    } else {
+        Err(RuntimeError::Driver(DriverError::CapabilityMissing {
+            capability: "required MCP provenance guard mediation".to_owned(),
+        }))
+    }
 }
 
 struct RuntimeEgressProxyUrls {
@@ -9575,6 +9609,109 @@ policy:
             endpoint_batches[0][0].transport,
             agentenv_proto::McpTransport::Stdio
         );
+    }
+
+    #[tokio::test]
+    async fn create_env_accepts_required_provenance_for_stdio_guarded_context() {
+        let root = unique_root("agentenv-required-provenance-stdio");
+        let options = RuntimeOptions {
+            root,
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+  mount: .
+policy:
+  tier: restricted
+  mcp:
+    confused_deputy_guards:
+      enabled: true
+      provenance:
+        enabled: true
+        required: true
+        default_unannotated_source: untrusted
+      tool_capabilities:
+        git.commit:
+          caps: [git_write]
+          max_input_taint: trusted
+          approval: per-call
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        let factory = AgentSetupFactory {
+            tracker: Arc::clone(&tracker),
+        };
+        let mut credentials = super::tests_support::EmptyCredentialProvider;
+
+        super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect("required stdio provenance guard is mediated");
+
+        let endpoint_batches = tracker
+            .mcp_config_endpoints
+            .lock()
+            .expect("mcp config endpoint tracker");
+        assert_eq!(endpoint_batches.len(), 1);
+        assert!(endpoint_batches[0][0]
+            .url
+            .contains("agentenv mcp-guard run"));
+        assert!(endpoint_batches[0][0].url.contains("--config"));
+        assert_eq!(
+            endpoint_batches[0][0].transport,
+            agentenv_proto::McpTransport::Stdio
+        );
+    }
+
+    #[tokio::test]
+    async fn create_env_rejects_required_provenance_for_ssh_http_context() {
+        let root = unique_root("agentenv-required-provenance-ssh-http");
+        let options = RuntimeOptions {
+            root: root.clone(),
+            log_level: LogLevel::Info,
+            non_interactive: true,
+        };
+        let yaml = r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: mcp-generic
+policy:
+  tier: restricted
+  presets: []
+  mcp:
+    confused_deputy_guards:
+      enabled: true
+      provenance:
+        enabled: true
+        required: true
+"#;
+        let tracker = Arc::new(AgentSetupTracker::default());
+        tracker
+            .supports_host_egress_proxy
+            .store(true, Ordering::SeqCst);
+        let factory = HttpMcpContextFactory {
+            tracker: Arc::clone(&tracker),
+            transport: agentenv_proto::McpTransport::SshHttp,
+        };
+        let mut credentials =
+            ResolvingCredentialProvider::with_value("MCP_TOKEN", "mcp-real-provider-secret");
+
+        let err = super::create_env(&options, &factory, &mut credentials, "demo", yaml)
+            .await
+            .expect_err("required provenance mediation rejects ssh-http");
+
+        assert!(err.to_string().contains("required MCP provenance guard"));
     }
 
     #[cfg(unix)]

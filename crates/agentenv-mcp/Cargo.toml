@@ -12,6 +12,7 @@ description = "MCP integration scaffolding for agentenv"
 
 [dependencies]
 agentenv-core = { path = "../agentenv-core" }
+agentenv-policy = { path = "../agentenv-policy" }
 agentenv-proto = { path = "../agentenv-proto" }
 serde.workspace = true
 serde_json.workspace = true

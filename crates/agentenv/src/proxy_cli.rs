@@ -593,7 +593,7 @@ async fn maybe_handle_mcp_guard(
         return Ok((None, request));
     }
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let bytes = body
         .collect()
         .await
@@ -611,16 +611,16 @@ async fn maybe_handle_mcp_guard(
         }
     };
 
-    let decision = {
+    let evaluation = {
         let mut states = state
             .mcp_guard_states
             .lock()
             .map_err(|_| anyhow::anyhow!("MCP guard state lock poisoned"))?;
         let guard_state = states.entry(route.id.clone()).or_default();
-        agentenv_mcp::guard::evaluate_json_rpc_request(config, guard_state, &json)
+        agentenv_mcp::guard::evaluate_json_rpc_request_with_forwarding(config, guard_state, &json)
     };
-    let decision = match decision {
-        Ok(decision) => decision,
+    let evaluation = match evaluation {
+        Ok(evaluation) => evaluation,
         Err(error) => {
             tracing::warn!(%error, route_id = %route.id, "egress proxy rejected malformed MCP tool call");
             let request = Request::from_parts(parts, Body::from(bytes));
@@ -631,17 +631,21 @@ async fn maybe_handle_mcp_guard(
         }
     };
 
-    emit_mcp_guard_event(state, route, &decision);
+    emit_mcp_guard_event(state, route, &evaluation.decision);
 
-    let action = decision.action;
-    let request = Request::from_parts(parts, Body::from(bytes));
+    let action = evaluation.decision.action;
+    let forwarded_bytes = serde_json::to_vec(&evaluation.forwarded_request)
+        .context("serialize guarded MCP request")?;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let request = Request::from_parts(parts, Body::from(forwarded_bytes));
     match action {
         agentenv_mcp::guard::GuardAction::Deny => Ok((
             Some(text_response(StatusCode::FORBIDDEN, "mcp tool denied\n")),
             request,
         )),
         agentenv_mcp::guard::GuardAction::RequestApproval => {
-            let response = response_for_mcp_approval_request(state, route, &decision).await?;
+            let response =
+                response_for_mcp_approval_request(state, route, &evaluation.decision).await?;
             Ok((response, request))
         }
         agentenv_mcp::guard::GuardAction::Forward
@@ -777,6 +781,7 @@ fn mcp_guard_reason_code(reason: agentenv_mcp::guard::GuardReason) -> &'static s
         agentenv_mcp::guard::GuardReason::RateLimited => "mcp_rate_limited",
         agentenv_mcp::guard::GuardReason::CrossToolFlow => "mcp_cross_tool_flow",
         agentenv_mcp::guard::GuardReason::MalformedToolCall => "mcp_malformed_tool_call",
+        agentenv_mcp::guard::GuardReason::ProvenanceTaint => "mcp_provenance_taint",
     }
 }
 
@@ -1254,6 +1259,7 @@ mod tests {
             .into_iter()
             .collect(),
             cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+            ..agentenv_proto::McpGuardConfig::default()
         });
         let policy = policy_with_rules(&["93.184.216.34"], &[]);
         let state = Arc::new(test_state(&root, route, policy.clone(), BTreeMap::new()));
@@ -1301,6 +1307,7 @@ mod tests {
             default_approval: agentenv_proto::McpApprovalMode::PerCall,
             tool_policies: BTreeMap::new(),
             cross_tool_flows: agentenv_proto::McpCrossToolFlowPolicy::default(),
+            ..agentenv_proto::McpGuardConfig::default()
         });
         let policy = policy_with_rules(&["93.184.216.34"], &[]);
         let approval_db = root.join("events.db");
@@ -1374,6 +1381,99 @@ mod tests {
             .expect("decider task should finish");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_guard_reason_code_includes_provenance_taint() {
+        assert_eq!(
+            mcp_guard_reason_code(agentenv_mcp::guard::GuardReason::ProvenanceTaint),
+            "mcp_provenance_taint"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_handle_mcp_guard_strips_provenance_on_forwarded_requests() {
+        let root = temp_dir("agentenv-proxy-mcp-guard-provenance-forward");
+        fs::create_dir_all(&root).expect("temp dir should be created");
+        let mut route = test_mcp_route();
+        route.mcp_guard = Some(agentenv_proto::McpGuardConfig {
+            enabled: true,
+            provenance: Some(agentenv_proto::McpProvenanceConfig {
+                enabled: true,
+                required: true,
+                default_unannotated_source: agentenv_proto::ProvenanceTag::Untrusted,
+            }),
+            tool_capabilities: [(
+                "filesystem.read".to_owned(),
+                agentenv_proto::ToolCapabilityDeclaration {
+                    caps: vec![agentenv_proto::ToolCapability::ReadFs],
+                    max_input_taint: agentenv_proto::ProvenanceTag::Tenant,
+                    approval: agentenv_proto::McpApprovalMode::Never,
+                    argument_policies: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..agentenv_proto::McpGuardConfig::default()
+        });
+        let policy = policy_with_rules(&["mcp.example.test"], &[]);
+        let state = test_state(&root, route.clone(), policy.clone(), BTreeMap::new());
+        fs::write(
+            &state.config.policy_path,
+            serde_json::to_vec(&policy).expect("policy should serialize"),
+        )
+        .expect("policy should be written");
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/mcp/primary")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "filesystem.read",
+                        "arguments": {
+                            "path": "src/lib.rs"
+                        },
+                        "_agentenv_provenance": {
+                            "/path": {
+                                "tag": "tenant",
+                                "source_kind": "local_repo",
+                                "source_id": "workspace",
+                                "summary": "repo path"
+                            }
+                        }
+                    }
+                }))
+                .expect("request body should serialize"),
+            ))
+            .expect("request should build");
+        request
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("9999"));
+
+        let (response, request) = maybe_handle_mcp_guard(&state, &route, request)
+            .await
+            .expect("MCP guard should evaluate");
+
+        assert!(response.is_none());
+        assert!(!request.headers().contains_key(header::CONTENT_LENGTH));
+        let bytes = request
+            .into_body()
+            .collect()
+            .await
+            .expect("request body should collect")
+            .to_bytes();
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("forwarded request should be JSON");
+        assert!(value
+            .get("params")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|params| !params.contains_key("_agentenv_provenance")));
 
         let _ = fs::remove_dir_all(root);
     }

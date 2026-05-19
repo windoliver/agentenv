@@ -83,6 +83,15 @@ policy:
     confused_deputy_guards:
       enabled: true
       default_approval: per-call
+      provenance:
+        enabled: true
+        required: true
+        default_unannotated_source: untrusted
+      tool_capabilities:
+        git.commit:
+          caps: [git_write]
+          max_input_taint: trusted
+          approval: per-call
       tool_policies:
         "filesystem.read":
           approval: never
@@ -102,6 +111,11 @@ policy:
 When enabled, HTTP and HTTP+SSE MCP endpoints are guarded in the host egress
 proxy. Stdio MCP endpoints are wrapped with `agentenv mcp-guard run` before the
 agent driver renders MCP config.
+
+When provenance is enabled, guarded MCP calls carry redacted source evidence. A
+write-capable tool such as `git.commit` can be configured to accept only
+`trusted` input, so content from web fetches, GitHub issues, or remote MCP
+results is blocked or approval-routed before the tool executes.
 
 ## Getting-Started Filesystem Blueprints
 

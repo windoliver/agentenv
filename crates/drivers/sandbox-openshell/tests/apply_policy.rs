@@ -253,6 +253,10 @@ fn default_translation_skips_non_executable_shadow_paths() {
 fn translated_policy_is_accepted_by_real_openshell_cli() {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    if !openshell_gateway_available() {
+        return;
+    }
+
     let registry = agentenv_policy::PresetRegistry::load_builtin().expect("load presets");
     let policy =
         agentenv_policy::compose_policy(agentenv_policy::Tier::Balanced, &[], None, &registry)
@@ -327,6 +331,29 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
     );
 
     std::fs::remove_dir_all(&tempdir).expect("remove tempdir");
+}
+
+fn openshell_gateway_available() -> bool {
+    match std::process::Command::new("openshell")
+        .arg("status")
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "skipping real OpenShell policy test: `openshell status` failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            false
+        }
+        Err(err) => {
+            eprintln!(
+                "skipping real OpenShell policy test: could not run `openshell status`: {err}"
+            );
+            false
+        }
+    }
 }
 
 fn write_fake_binary(dir: &Path, binary: &str, executable: bool) {

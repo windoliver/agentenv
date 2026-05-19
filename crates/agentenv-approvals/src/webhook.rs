@@ -578,8 +578,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires AGENTENV_EXTERNAL_APPROVAL_WEBHOOK_URL"]
     async fn live_external_approval_webhook_delivery() {
-        let url = std::env::var("AGENTENV_EXTERNAL_APPROVAL_WEBHOOK_URL")
-            .expect("AGENTENV_EXTERNAL_APPROVAL_WEBHOOK_URL must be set");
+        let Ok(url) = std::env::var("AGENTENV_EXTERNAL_APPROVAL_WEBHOOK_URL") else {
+            eprintln!(
+                "skipping live external approval webhook test: set AGENTENV_EXTERNAL_APPROVAL_WEBHOOK_URL"
+            );
+            return;
+        };
+        if url.trim().is_empty() {
+            eprintln!(
+                "skipping live external approval webhook test: AGENTENV_EXTERNAL_APPROVAL_WEBHOOK_URL is empty"
+            );
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let store = ApprovalStore::open(temp.path().join("events.db")).unwrap();
         let coordinator = ApprovalCoordinator::new(ApprovalCoordinatorConfig {

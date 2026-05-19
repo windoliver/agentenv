@@ -5,6 +5,7 @@ pub mod error;
 pub mod hardening;
 pub mod model;
 pub mod presets;
+pub mod provenance;
 pub mod translate;
 
 pub use crate::engine::{compose_policy, Tier};

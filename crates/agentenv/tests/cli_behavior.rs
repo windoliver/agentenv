@@ -5318,6 +5318,73 @@ fn mcp_guard_stdio_cli_denies_blocked_tool_call_e2e() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_guard_stdio_cli_denies_untrusted_git_commit_e2e() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("mcp-guard.json");
+    let events_db = temp.path().join("events.db");
+    let upstream = temp.path().join("upstream.sh");
+    let marker = temp.path().join("forwarded.marker");
+    let mut config = mcp_guard_config_for_cli_e2e();
+    config.provenance = Some(agentenv_proto::McpProvenanceConfig {
+        enabled: true,
+        required: true,
+        default_unannotated_source: agentenv_proto::ProvenanceTag::Untrusted,
+    });
+    config.tool_capabilities = BTreeMap::from([(
+        "git.commit".to_owned(),
+        agentenv_proto::ToolCapabilityDeclaration {
+            caps: vec![agentenv_proto::ToolCapability::GitWrite],
+            max_input_taint: agentenv_proto::ProvenanceTag::Trusted,
+            approval: McpApprovalMode::PerCall,
+            argument_policies: Vec::new(),
+        },
+    )]);
+    write_mcp_guard_config(&config_path, config);
+    write_mcp_upstream_script(&upstream);
+
+    let mut child = Command::new(agentenv_bin())
+        .args([
+            "mcp-guard",
+            "run",
+            "--env",
+            "demo",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--events-db",
+            events_db.to_str().unwrap(),
+            "--stdio-upstream",
+            &format!("{} {}", shell_quote(&upstream), shell_quote(&marker)),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let response_rx = spawn_mcp_frame_reader(child.stdout.take().unwrap());
+    write_mcp_frame(
+        child.stdin.as_mut().unwrap(),
+        br#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"git.commit","arguments":{"message":"commit text from issue"},"_agentenv_provenance":{"/message":{"tag":"untrusted","source_kind":"github_issue","source_id":"windoliver/agentenv#43","summary":"GitHub issue body"}}}}"#,
+    );
+    drop(child.stdin.take());
+
+    let response = response_rx.recv_timeout(LOCAL_HTTP_TEST_TIMEOUT).unwrap();
+    wait_for_child_exit(&mut child, "mcp-guard provenance denied stdio e2e");
+    let response_json: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response_json["id"], json!(43));
+    assert_eq!(response_json["error"]["code"], json!(-32004));
+    assert_eq!(
+        response_json["error"]["data"]["reason"],
+        json!("mcp_provenance_taint")
+    );
+    assert!(
+        !marker.exists(),
+        "denied provenance call must not be forwarded to upstream"
+    );
+}
+
 #[test]
 fn proxy_cli_enforces_mcp_guard_policy_e2e() {
     let temp = tempfile::tempdir().unwrap();
@@ -7603,6 +7670,7 @@ fn mcp_guard_config_for_cli_e2e() -> McpGuardConfig {
             ),
         ]),
         cross_tool_flows: McpCrossToolFlowPolicy::default(),
+        ..McpGuardConfig::default()
     }
 }
 

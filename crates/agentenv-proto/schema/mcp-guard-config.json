@@ -25,6 +25,22 @@
       "default": false,
       "type": "boolean"
     },
+    "provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/McpProvenanceConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tool_capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ToolCapabilityDeclaration"
+      }
+    },
     "tool_policies": {
       "default": {},
       "type": "object",
@@ -54,6 +70,28 @@
           ],
           "format": "uint",
           "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "McpProvenanceConfig": {
+      "type": "object",
+      "properties": {
+        "default_unannotated_source": {
+          "default": "untrusted",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProvenanceTag"
+            }
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -106,6 +144,75 @@
           "items": {
             "type": "string"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProvenanceTag": {
+      "type": "string",
+      "enum": [
+        "trusted",
+        "tenant",
+        "untrusted"
+      ]
+    },
+    "ToolArgumentPolicy": {
+      "type": "object",
+      "required": [
+        "max_input_taint",
+        "pointer"
+      ],
+      "properties": {
+        "max_input_taint": {
+          "$ref": "#/definitions/ProvenanceTag"
+        },
+        "pointer": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToolCapability": {
+      "type": "string",
+      "enum": [
+        "read_fs",
+        "write_fs",
+        "exec",
+        "git_read",
+        "git_write",
+        "network",
+        "mcp_tool",
+        "credential_broker"
+      ]
+    },
+    "ToolCapabilityDeclaration": {
+      "type": "object",
+      "required": [
+        "max_input_taint"
+      ],
+      "properties": {
+        "approval": {
+          "default": "never",
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpApprovalMode"
+            }
+          ]
+        },
+        "argument_policies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ToolArgumentPolicy"
+          }
+        },
+        "caps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ToolCapability"
+          }
+        },
+        "max_input_taint": {
+          "$ref": "#/definitions/ProvenanceTag"
         }
       },
       "additionalProperties": false

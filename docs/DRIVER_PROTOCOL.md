@@ -236,6 +236,13 @@ Core may rewrite an `McpEndpoint` for guard mediation before passing it to an
 agent driver. This is not a driver protocol change; context drivers continue to
 report the unmediated endpoint they provision.
 
+MCP guard mediation may also attach provenance and capability policy. This is
+additive to the driver protocol: context drivers still return ordinary
+`McpEndpoint` values, while core synthesizes conservative tool capability
+declarations when a driver does not provide stronger metadata. If a blueprint
+marks provenance mediation as required, core fails before sandbox creation when
+the selected endpoint transport cannot be mediated.
+
 #### `InferenceDriver`
 
 | Method | Params | Result |
