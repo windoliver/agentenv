@@ -23,7 +23,7 @@ use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
 use agentenv_events::{
     audit::{AuditPolicy, AuditSigningKey, AuditStore},
     metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot},
-    sink::{JsonlSink, SqliteSink},
+    sink::{JsonlSink, SinkError, SqliteSink},
     store::{parse_legacy_jsonl_activity_event, EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
     SinkConfig, WebhookConfig, WebhookSink,
@@ -964,8 +964,16 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
             Err(error) => Err(error.into()),
         }
     } else {
-        let sink_args = combined_create_sink_args(&blueprint_yaml, event_sink_args)?;
-        let dispatcher = build_event_dispatcher(&options, Some(&args.name), &sink_args)?;
+        let sink_args = match combined_create_sink_args(&blueprint_yaml, event_sink_args) {
+            Ok(sink_args) => sink_args,
+            Err(error) if args.json => exit_json_error(reason_for_sink_setup_error(&error), error),
+            Err(error) => return Err(error),
+        };
+        let dispatcher = match build_event_dispatcher(&options, Some(&args.name), &sink_args) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) if args.json => exit_json_error(reason_for_sink_setup_error(&error), error),
+            Err(error) => return Err(error),
+        };
         let emitter = Arc::new(AuditingEventEmitter::new(
             dispatcher.emitter(),
             audit_signing_key_path(&options),
@@ -3031,6 +3039,9 @@ fn build_event_dispatcher_with_otel_validator(
     let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
     add_default_event_sinks(&mut sinks, options, env)?;
     for raw in sink_args {
+        if let Some(endpoint) = raw.strip_prefix("otel:") {
+            validate_otel_endpoint(endpoint)?;
+        }
         match SinkConfig::parse(raw)? {
             SinkConfig::DefaultSqlite => {}
             SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
@@ -3079,6 +3090,17 @@ fn blueprint_otel_sink_args(blueprint_yaml: &str) -> Result<Vec<String>> {
 
     otel_sink_validation_url(endpoint)?;
     Ok(vec![format!("otel:{endpoint}")])
+}
+
+fn reason_for_sink_setup_error(error: &anyhow::Error) -> ReasonCode {
+    if matches!(
+        error.downcast_ref::<SinkError>(),
+        Some(SinkError::UnsupportedFeature { .. })
+    ) {
+        ReasonCode::CapabilityMissing
+    } else {
+        ReasonCode::InvalidBlueprint
+    }
 }
 
 fn combined_create_sink_args(
