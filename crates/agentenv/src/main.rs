@@ -22,7 +22,7 @@ use agentenv_core::hardening::HardeningLintSeverity;
 use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
 use agentenv_events::{
     audit::{AuditPolicy, AuditSigningKey, AuditStore},
-    metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric},
+    metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot},
     sink::{JsonlSink, SqliteSink},
     store::{parse_legacy_jsonl_activity_event, EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
@@ -2393,10 +2393,8 @@ fn render_metrics_body(options: &agentenv_core::runtime::RuntimeOptions) -> Resu
     let store = SqliteEventStore::open(global_events_db_path(options))
         .context("open global activity database")?;
     let env_rows = env_status_metrics(options)?;
-    let mut snapshot =
+    let snapshot =
         MetricsSnapshot::from_store(&store, &env_rows).context("build metrics snapshot")?;
-    snapshot.event_drops_total = Vec::<SinkCounterMetric>::new();
-    snapshot.event_sink_errors_total = Vec::<SinkCounterMetric>::new();
     Ok(render_prometheus(&snapshot))
 }
 

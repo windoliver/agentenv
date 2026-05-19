@@ -61,6 +61,18 @@ default. Additional sinks can be attached with repeated `--events-sink` flags:
 - `webhook:https://example.test/events?kinds=egress_denied`
 - `otel:grpc://collector:4317` when `agentenv-events/otel` is enabled
 
+Blueprints can configure a create/reproduce-time OTEL sink:
+
+```yaml
+observability:
+  otel:
+    endpoint: grpc://collector:4317
+```
+
+This is resolved into the environment's event dispatcher when the blueprint is
+applied. `--events-sink otel:grpc://collector:4317` remains additive and scoped
+to the CLI command where it is passed; it does not rewrite the blueprint.
+
 Audit-sensitive events are signed synchronously before command success or
 failure is reported, so audit write failures are surfaced instead of being hidden
 behind the original operation result.

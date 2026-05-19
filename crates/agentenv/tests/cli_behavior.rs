@@ -36,9 +36,122 @@ use time::OffsetDateTime;
 const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVALS_SERVER_START_TIMEOUT: Duration = Duration::from_secs(60);
 const PTY_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
+const DASHBOARD_PATH: &str = "../../contrib/grafana/dashboards/agentenv-otel.json";
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
+}
+
+fn dashboard_prometheus_expressions(value: &serde_json::Value) -> Vec<String> {
+    let mut expressions = Vec::new();
+    collect_dashboard_expressions(value, &mut expressions);
+    expressions
+}
+
+fn collect_dashboard_expressions(value: &serde_json::Value, expressions: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(expr) = map.get("expr").and_then(serde_json::Value::as_str) {
+                expressions.push(expr.to_owned());
+            }
+            for child in map.values() {
+                collect_dashboard_expressions(child, expressions);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_dashboard_expressions(child, expressions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dashboard_metric_identifiers(expressions: &[String]) -> BTreeSet<String> {
+    let mut metrics = BTreeSet::new();
+    for expr in expressions {
+        for token in expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')) {
+            if token.starts_with("agentenv_") || token.starts_with("gen_ai_client_") {
+                metrics.insert(token.to_owned());
+            }
+        }
+    }
+    metrics
+}
+
+#[test]
+fn dashboard_json_references_only_emitted_metrics() {
+    let dashboard_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DASHBOARD_PATH);
+    let dashboard = fs::read_to_string(&dashboard_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read dashboard {}: {err}",
+            dashboard_path.display()
+        )
+    });
+    let dashboard: serde_json::Value =
+        serde_json::from_str(&dashboard).expect("dashboard JSON parses");
+    assert!(
+        dashboard_has_prometheus_datasource_variable(&dashboard),
+        "dashboard should include a Prometheus datasource variable"
+    );
+
+    let expressions = dashboard_prometheus_expressions(&dashboard);
+    assert!(
+        !expressions.is_empty(),
+        "dashboard should contain Prometheus target expressions"
+    );
+
+    let required_metrics = [
+        "agentenv_envs_total",
+        "agentenv_events_total",
+        "gen_ai_client_operation_duration_bucket",
+        "gen_ai_client_token_usage_sum",
+        "agentenv_gen_ai_tool_calls_total",
+        "agentenv_policy_blocks_total",
+        "agentenv_approvals_pending_total",
+        "agentenv_event_drops_total",
+        "agentenv_event_sink_errors_total",
+    ];
+    for metric in required_metrics {
+        assert!(
+            expressions.iter().any(|expr| expr.contains(metric)),
+            "dashboard does not reference required metric `{metric}`; expressions: {expressions:?}"
+        );
+    }
+
+    let allowed_metrics = [
+        "agentenv_approvals_pending_total",
+        "agentenv_envs_total",
+        "agentenv_event_drops_total",
+        "agentenv_event_sink_errors_total",
+        "agentenv_events_total",
+        "agentenv_gen_ai_tool_calls_total",
+        "agentenv_policy_blocks_total",
+        "gen_ai_client_operation_duration_bucket",
+        "gen_ai_client_token_usage_sum",
+    ];
+    let allowed_metrics = allowed_metrics.into_iter().collect::<BTreeSet<_>>();
+    let referenced_metrics = dashboard_metric_identifiers(&expressions);
+    for metric in &referenced_metrics {
+        assert!(
+            allowed_metrics.contains(metric.as_str()),
+            "dashboard references non-emitted or unapproved metric `{metric}`; expressions: {expressions:?}"
+        );
+    }
+}
+
+fn dashboard_has_prometheus_datasource_variable(dashboard: &serde_json::Value) -> bool {
+    dashboard["templating"]["list"]
+        .as_array()
+        .is_some_and(|variables| {
+            variables.iter().any(|variable| {
+                variable["type"] == "datasource"
+                    && variable["query"] == "prometheus"
+                    && variable["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty())
+            })
+        })
 }
 
 #[test]

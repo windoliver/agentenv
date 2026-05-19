@@ -263,10 +263,17 @@ impl MetricsSnapshot {
             build_oneflight_hits_total,
             build_oneflight_misses_total,
             build_queue_depth,
-            event_drops_total: Vec::new(),
-            event_sink_errors_total: Vec::new(),
+            event_drops_total: default_sink_counter_metrics(),
+            event_sink_errors_total: default_sink_counter_metrics(),
         })
     }
+}
+
+fn default_sink_counter_metrics() -> Vec<SinkCounterMetric> {
+    vec![SinkCounterMetric {
+        sink: "sqlite".to_owned(),
+        count: 0,
+    }]
 }
 
 pub fn render_prometheus(snapshot: &MetricsSnapshot) -> String {
@@ -1064,6 +1071,17 @@ mod tests {
         let rendered = render_prometheus(&snapshot);
 
         assert!(rendered.contains("agentenv_build_queue_depth 0"));
+    }
+
+    #[test]
+    fn event_drops_total_includes_default_zero_sink_health_samples() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        let snapshot = MetricsSnapshot::from_store(&store, &[]).unwrap();
+        let rendered = render_prometheus(&snapshot);
+
+        assert!(rendered.contains("agentenv_event_drops_total{sink=\"sqlite\"} 0"));
+        assert!(rendered.contains("agentenv_event_sink_errors_total{sink=\"sqlite\"} 0"));
     }
 
     #[test]
