@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::{
@@ -36,9 +37,195 @@ use time::OffsetDateTime;
 const LOCAL_HTTP_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVALS_SERVER_START_TIMEOUT: Duration = Duration::from_secs(60);
 const PTY_QUIT_TIMEOUT: Duration = Duration::from_secs(15);
+const DASHBOARD_PATH: &str = "../../contrib/grafana/dashboards/agentenv-otel.json";
 
 fn agentenv_bin() -> &'static str {
     env!("CARGO_BIN_EXE_agentenv")
+}
+
+fn dashboard_prometheus_expressions(value: &serde_json::Value) -> Vec<String> {
+    let mut expressions = Vec::new();
+    collect_dashboard_expressions(value, &mut expressions);
+    expressions
+}
+
+fn collect_dashboard_expressions(value: &serde_json::Value, expressions: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(expr) = map.get("expr").and_then(serde_json::Value::as_str) {
+                expressions.push(expr.to_owned());
+            }
+            for child in map.values() {
+                collect_dashboard_expressions(child, expressions);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                collect_dashboard_expressions(child, expressions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dashboard_metric_identifiers(expressions: &[String]) -> BTreeSet<String> {
+    let mut metrics = BTreeSet::new();
+    for expr in expressions {
+        for token in expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')) {
+            if token.starts_with("agentenv_") || token.starts_with("gen_ai_client_") {
+                metrics.insert(token.to_owned());
+            }
+        }
+    }
+    metrics
+}
+
+#[test]
+fn dashboard_json_references_only_emitted_metrics() {
+    let dashboard_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DASHBOARD_PATH);
+    let dashboard = fs::read_to_string(&dashboard_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read dashboard {}: {err}",
+            dashboard_path.display()
+        )
+    });
+    let dashboard: serde_json::Value =
+        serde_json::from_str(&dashboard).expect("dashboard JSON parses");
+    assert!(
+        dashboard_has_prometheus_datasource_variable(&dashboard),
+        "dashboard should include a Prometheus datasource variable"
+    );
+
+    let expressions = dashboard_prometheus_expressions(&dashboard);
+    assert!(
+        !expressions.is_empty(),
+        "dashboard should contain Prometheus target expressions"
+    );
+
+    let required_metrics = [
+        "agentenv_envs_total",
+        "agentenv_events_total",
+        "gen_ai_client_operation_duration_bucket",
+        "gen_ai_client_token_usage_sum",
+        "agentenv_gen_ai_tool_calls_total",
+        "agentenv_policy_blocks_total",
+        "agentenv_approvals_pending_total",
+        "agentenv_event_drops_total",
+        "agentenv_event_sink_errors_total",
+    ];
+    for metric in required_metrics {
+        assert!(
+            expressions.iter().any(|expr| expr.contains(metric)),
+            "dashboard does not reference required metric `{metric}`; expressions: {expressions:?}"
+        );
+    }
+
+    let allowed_metrics = [
+        "agentenv_approvals_pending_total",
+        "agentenv_envs_total",
+        "agentenv_event_drops_total",
+        "agentenv_event_sink_errors_total",
+        "agentenv_events_total",
+        "agentenv_gen_ai_tool_calls_total",
+        "agentenv_policy_blocks_total",
+        "gen_ai_client_operation_duration_bucket",
+        "gen_ai_client_token_usage_sum",
+    ];
+    let allowed_metrics = allowed_metrics.into_iter().collect::<BTreeSet<_>>();
+    let referenced_metrics = dashboard_metric_identifiers(&expressions);
+    for metric in &referenced_metrics {
+        assert!(
+            allowed_metrics.contains(metric.as_str()),
+            "dashboard references non-emitted or unapproved metric `{metric}`; expressions: {expressions:?}"
+        );
+    }
+}
+
+fn dashboard_has_prometheus_datasource_variable(dashboard: &serde_json::Value) -> bool {
+    dashboard["templating"]["list"]
+        .as_array()
+        .is_some_and(|variables| {
+            variables.iter().any(|variable| {
+                variable["type"] == "datasource"
+                    && variable["query"] == "prometheus"
+                    && variable["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty())
+            })
+        })
+}
+
+#[test]
+fn metrics_serve_exposes_genai_metrics_over_http() {
+    let temp_dir = make_temp_dir("metrics-serve-genai");
+    write_minimal_env_state(&temp_dir, "demo");
+    seed_global_activity_db(
+        &temp_dir,
+        &[
+            activity_event(
+                "2026-05-18T00:00:00Z",
+                ActivityKind::GenAiModelCall,
+                ActivityResult::Ok,
+                "trace-model-call",
+            )
+            .with_latency_ms(250)
+            .with_extra("gen_ai.provider.name", json!("openai"))
+            .with_extra("gen_ai.operation.name", json!("chat"))
+            .with_extra("gen_ai.request.model", json!("gpt-4.1"))
+            .with_extra("gen_ai.usage.input_tokens", json!(12))
+            .with_extra("gen_ai.usage.output_tokens", json!(5)),
+            activity_event(
+                "2026-05-18T00:00:01Z",
+                ActivityKind::McpToolCall,
+                ActivityResult::Ok,
+                "trace-tool-call",
+            )
+            .with_latency_ms(10)
+            .with_subject_value("gen_ai.tool.name", json!("fs_read")),
+        ],
+    );
+    let port = free_tcp_port();
+    let mut child = Command::new(agentenv_bin())
+        .arg("metrics")
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .env("HOME", &temp_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let body = wait_for_metrics_body(&mut child, port);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        body.contains("agentenv_envs_total{status=\"running\"} 1"),
+        "metrics body was:\n{body}"
+    );
+    assert!(
+        body.contains("agentenv_event_drops_total{sink=\"sqlite\"} 0"),
+        "metrics body was:\n{body}"
+    );
+    assert!(
+        body.contains("agentenv_event_sink_errors_total{sink=\"sqlite\"} 0"),
+        "metrics body was:\n{body}"
+    );
+    assert!(
+        body.contains("gen_ai_client_token_usage_sum{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_token_type=\"input\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\"} 12"),
+        "metrics body was:\n{body}"
+    );
+    assert!(
+        body.contains("gen_ai_client_operation_duration_count{gen_ai_provider_name=\"openai\",gen_ai_operation_name=\"chat\",gen_ai_request_model=\"gpt-4.1\",env=\"demo\",result=\"ok\"} 1"),
+        "metrics body was:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "agentenv_gen_ai_tool_calls_total{gen_ai_tool_name=\"fs_read\",env=\"demo\",result=\"ok\"} 1"
+        ),
+        "metrics body was:\n{body}"
+    );
 }
 
 #[test]
@@ -66,7 +253,10 @@ fn freeze_persisted_env_writes_default_lockfile() {
     );
 
     let rendered = fs::read_to_string(temp_dir.join("agentenv.lock")).unwrap();
-    assert!(rendered.contains("version: 0.2.0"));
+    assert!(rendered.contains(&format!(
+        "version: {}",
+        agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION
+    )));
     assert!(rendered.contains("name: demo"));
 }
 
@@ -3894,6 +4084,64 @@ fn create_preflight_json_invalid_blueprint_uses_stable_error() {
 }
 
 #[test]
+fn create_json_rejects_unsafe_blueprint_otel_endpoint_before_env_creation() {
+    let temp_dir = make_temp_dir("create-json-unsafe-blueprint-otel");
+    let blueprint = temp_dir.join("agentenv.yaml");
+    fs::write(
+        &blueprint,
+        r#"
+version: 0.1.0
+min_agentenv_version: 0.0.1-alpha0
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: none
+policy:
+  tier: balanced
+  presets: []
+observability:
+  otel:
+    endpoint: grpc://127.0.0.1:4317
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(agentenv_bin())
+        .arg("create")
+        .arg("demo")
+        .arg("--blueprint")
+        .arg(&blueprint)
+        .arg("--json")
+        .arg("--non-interactive")
+        .env("HOME", &temp_dir)
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
+        panic!("stderr was not JSON ({error}): {}", output_summary(&output))
+    });
+    assert_eq!(json["reason_code"], "invalid_blueprint");
+    let message = json["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("OTEL events sink failed SSRF validation"),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !temp_dir
+            .join(".agentenv")
+            .join("envs")
+            .join("demo")
+            .exists(),
+        "create wrote env state before rejecting the unsafe OTEL endpoint"
+    );
+}
+
+#[test]
 fn list_json_returns_empty_rows_when_registry_missing() {
     let temp_dir = make_temp_dir("list-json-empty");
 
@@ -5771,6 +6019,12 @@ fn logs_env_kind_follow_polls_empty_sqlite_activity_store() {
         .stderr(process::Stdio::piped())
         .spawn()
         .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let stdout_reader = spawn_line_reader(stdout, Arc::clone(&stdout_buffer));
+    let stderr_reader = spawn_line_reader(stderr, Arc::clone(&stderr_buffer));
 
     thread::sleep(Duration::from_millis(500));
     assert!(
@@ -5788,15 +6042,22 @@ fn logs_env_kind_follow_polls_empty_sqlite_activity_store() {
         .with_subject_value("target", serde_json::json!("api.example.test:443"))])
         .unwrap();
 
-    thread::sleep(Duration::from_millis(600));
+    wait_for_buffer_contains(
+        &mut child,
+        &stdout_buffer,
+        "trace-follow-sqlite",
+        Duration::from_secs(5),
+    );
     let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
+    let _ = child.wait();
+    stdout_reader.join().unwrap();
+    stderr_reader.join().unwrap();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout_buffer.lock().unwrap();
     assert!(
         stdout.contains("trace-follow-sqlite"),
         "stdout was: {stdout}\nstderr was: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr_buffer.lock().unwrap()
     );
 }
 
@@ -6230,7 +6491,13 @@ fn freeze_persisted_env_output_dash_prints_lockfile_without_dash_file() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("version: 0.2.0"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "version: {}",
+            agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION
+        )),
+        "stdout was: {stdout}"
+    );
     assert!(stdout.contains("name: demo"), "stdout was: {stdout}");
     assert!(
         !temp_dir.join("-").exists(),
@@ -6698,6 +6965,90 @@ fn make_temp_dir(prefix: &str) -> PathBuf {
     let path = std::env::temp_dir().join(unique);
     fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn free_tcp_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn wait_for_metrics_body(child: &mut process::Child, port: u16) -> String {
+    let url = format!("http://127.0.0.1:{port}/metrics");
+    let deadline = Instant::now() + LOCAL_HTTP_TEST_TIMEOUT;
+    loop {
+        let last_error = match reqwest::blocking::get(&url) {
+            Ok(response) if response.status().is_success() => {
+                return response.text().unwrap();
+            }
+            Ok(response) => {
+                format!("HTTP {}", response.status())
+            }
+            Err(error) => error.to_string(),
+        };
+
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "metrics server exited before serving /metrics: {status}; last error: {last_error}"
+            );
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "metrics server did not serve /metrics before timeout; last error: {last_error}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn spawn_line_reader<R>(reader: R, buffer: Arc<Mutex<String>>) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let mut buffer = buffer.lock().unwrap();
+            buffer.push_str(&line);
+            buffer.push('\n');
+        }
+    })
+}
+
+fn wait_for_buffer_contains(
+    child: &mut process::Child,
+    buffer: &Arc<Mutex<String>>,
+    needle: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let buffer = buffer.lock().unwrap();
+            if buffer.contains(needle) {
+                return;
+            }
+        }
+
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "process exited before output contained `{needle}`: {status}; stdout was: {}",
+                buffer.lock().unwrap()
+            );
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for output to contain `{needle}`; stdout was: {}",
+                buffer.lock().unwrap()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn make_executable(path: &Path) {

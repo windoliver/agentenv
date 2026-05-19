@@ -296,7 +296,9 @@ shape. The legacy `ActivityEventParams` shape remains valid for compatibility:
 ```
 
 Rich `DriverActivityEventParams` include typed kind/result fields plus structured
-actor, subject, and extras maps:
+actor, subject, and extras maps. Rich `kind` values include lifecycle,
+policy, approval, MCP, and GenAI activity such as `agent_turn` and
+`gen_ai_model_call`:
 
 ```json
 {
@@ -316,6 +318,26 @@ actor, subject, and extras maps:
   }
 }
 ```
+
+GenAI events may carry OTEL GenAI semantic-convention attributes in `subject`
+or `extras`. The accepted fields are:
+
+- `gen_ai.provider.name` for the provider. Current canonical output uses this
+  field; `gen_ai.system` is accepted only as an input alias and is not emitted
+  as the canonical OTEL attribute.
+- `gen_ai.operation.name` for the model operation. If omitted on
+  `gen_ai_model_call`, core defaults to `chat`.
+- `gen_ai.request.model` and `gen_ai.response.model` for model identity.
+- `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens`, with
+  `gen_ai.usage.prompt_tokens` and `gen_ai.usage.completion_tokens` accepted as
+  input aliases.
+- `gen_ai.response.finish_reasons` or `gen_ai.response.finish_reason`.
+- `gen_ai.tool.name` and `gen_ai.tool.call.id` for MCP/tool activity.
+- `gen_ai.agent.name` for agent-turn spans.
+
+Prompt text, response bodies, credentials, raw headers, and other
+high-cardinality payloads should not be sent as GenAI attributes. Core redacts
+credential-looking and prompt/response-like fields before OTEL GenAI export.
 
 ### `event/approval_requested`
 

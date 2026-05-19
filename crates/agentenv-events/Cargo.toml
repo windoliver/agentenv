@@ -19,9 +19,9 @@ agentenv-proto = { path = "../agentenv-proto" }
 async-trait.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true, features = ["grpc-tonic", "logs"] }
+opentelemetry = { workspace = true, optional = true, features = ["logs", "trace"] }
+opentelemetry_sdk = { workspace = true, optional = true, features = ["logs", "trace"] }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["grpc-tonic", "logs", "trace"] }
 rand_core = { workspace = true, features = ["getrandom"] }
 reqwest.workspace = true
 rusqlite.workspace = true

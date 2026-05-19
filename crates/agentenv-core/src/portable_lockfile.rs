@@ -626,6 +626,7 @@ fn blueprint_yaml_from_portable_composition(
         policy: composition.policy.clone(),
         state: composition.state.clone(),
         skills: composition.skills.clone(),
+        observability: composition.observability.clone(),
     };
 
     serde_yaml::to_string(&blueprint)

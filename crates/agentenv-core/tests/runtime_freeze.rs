@@ -29,7 +29,10 @@ fn runtime_freeze_reads_persisted_env_and_returns_portable_lockfile() {
     )
     .unwrap();
 
-    assert!(rendered.contains("version: 0.2.0"));
+    assert!(rendered.contains(&format!(
+        "version: {}",
+        agentenv_core::lockfile::PORTABLE_LOCKFILE_VERSION
+    )));
     assert!(rendered.contains("name: demo"));
     assert!(rendered.contains("sandbox:"));
     assert!(rendered.contains("name: openshell"));

@@ -12,6 +12,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::activity::{ActivityEvent, ActivityKind, ActivityResult};
+use crate::genai::{map_event_to_genai_signal, OtelAttributeValue, OtelGenAiSignalKind};
 use crate::trace::{
     event_arguments, event_blueprint_id, event_request_id, event_tool_name, TraceQuery, TraceRun,
     TraceToolCall,
@@ -73,6 +74,35 @@ pub struct PolicyBlockCount {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpToolCount {
+    pub tool: String,
+    pub env: Option<String>,
+    pub result: ActivityResult,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiTokenUsageRow {
+    pub provider_name: Option<String>,
+    pub operation_name: String,
+    pub token_type: String,
+    pub request_model: Option<String>,
+    pub env: Option<String>,
+    pub result: ActivityResult,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiOperationDurationRow {
+    pub provider_name: Option<String>,
+    pub operation_name: String,
+    pub request_model: Option<String>,
+    pub env: Option<String>,
+    pub result: ActivityResult,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiToolCallCount {
     pub tool: String,
     pub env: Option<String>,
     pub result: ActivityResult,
@@ -522,6 +552,130 @@ impl SqliteEventStore {
         Ok(rows)
     }
 
+    pub fn genai_token_usage_rows(&self) -> StoreResult<Vec<GenAiTokenUsageRow>> {
+        let events = self.genai_metric_events(&[ActivityKind::GenAiModelCall])?;
+        let mut rows = Vec::new();
+
+        for event in events {
+            let signal = map_event_to_genai_signal(&event);
+            let provider_name = string_attribute(&signal.attributes, "gen_ai.provider.name");
+            let request_model = string_attribute(&signal.attributes, "gen_ai.request.model");
+
+            for (attribute, token_type) in [
+                ("gen_ai.usage.input_tokens", "input"),
+                ("gen_ai.usage.output_tokens", "output"),
+            ] {
+                let Some(tokens) = positive_u64_attribute(&signal.attributes, attribute) else {
+                    continue;
+                };
+                rows.push(GenAiTokenUsageRow {
+                    provider_name: provider_name.clone(),
+                    operation_name: signal.operation_name.clone(),
+                    token_type: token_type.to_owned(),
+                    request_model: request_model.clone(),
+                    env: event.env.clone(),
+                    result: event.result,
+                    tokens,
+                });
+            }
+        }
+
+        rows.sort_by(|left, right| {
+            (
+                &left.provider_name,
+                &left.operation_name,
+                &left.token_type,
+                &left.request_model,
+                &left.env,
+                enum_to_sort_label(left.result),
+                left.tokens,
+            )
+                .cmp(&(
+                    &right.provider_name,
+                    &right.operation_name,
+                    &right.token_type,
+                    &right.request_model,
+                    &right.env,
+                    enum_to_sort_label(right.result),
+                    right.tokens,
+                ))
+        });
+        Ok(rows)
+    }
+
+    pub fn genai_operation_duration_rows(&self) -> StoreResult<Vec<GenAiOperationDurationRow>> {
+        let events = self.genai_metric_events(&[
+            ActivityKind::AgentTurn,
+            ActivityKind::McpToolCall,
+            ActivityKind::GenAiModelCall,
+        ])?;
+        let mut rows = Vec::new();
+
+        for event in events {
+            let Some(latency_ms) = event.latency_ms else {
+                continue;
+            };
+            let signal = map_event_to_genai_signal(&event);
+            if signal.kind != OtelGenAiSignalKind::Span {
+                continue;
+            }
+            rows.push(GenAiOperationDurationRow {
+                provider_name: string_attribute(&signal.attributes, "gen_ai.provider.name"),
+                operation_name: signal.operation_name,
+                request_model: string_attribute(&signal.attributes, "gen_ai.request.model"),
+                env: event.env,
+                result: event.result,
+                latency_ms,
+            });
+        }
+
+        rows.sort_by(|left, right| {
+            (
+                &left.provider_name,
+                &left.operation_name,
+                &left.request_model,
+                &left.env,
+                enum_to_sort_label(left.result),
+                left.latency_ms,
+            )
+                .cmp(&(
+                    &right.provider_name,
+                    &right.operation_name,
+                    &right.request_model,
+                    &right.env,
+                    enum_to_sort_label(right.result),
+                    right.latency_ms,
+                ))
+        });
+        Ok(rows)
+    }
+
+    pub fn genai_tool_calls_by_tool_env_result(&self) -> StoreResult<Vec<GenAiToolCallCount>> {
+        let events = self.genai_metric_events(&[ActivityKind::McpToolCall])?;
+        let mut grouped: BTreeMap<(String, Option<String>, String), (ActivityResult, u64)> =
+            BTreeMap::new();
+
+        for event in events {
+            let signal = map_event_to_genai_signal(&event);
+            let tool = string_attribute(&signal.attributes, "gen_ai.tool.name")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let result = event.result;
+            let key = (tool, event.env, enum_to_sort_label(result));
+            let (_, count) = grouped.entry(key).or_insert((result, 0));
+            *count = count.saturating_add(1);
+        }
+
+        Ok(grouped
+            .into_iter()
+            .map(|((tool, env, _), (result, count))| GenAiToolCallCount {
+                tool,
+                env,
+                result,
+                count,
+            })
+            .collect())
+    }
+
     pub fn sandbox_latency_rows(&self) -> StoreResult<Vec<SandboxLatencyRow>> {
         self.sandbox_latency_rows_for_env(None)
     }
@@ -608,6 +762,57 @@ impl SqliteEventStore {
         let conn = Connection::open_with_flags(path, database_open_flags())?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(conn)
+    }
+
+    fn genai_metric_events(&self, kinds: &[ActivityKind]) -> StoreResult<Vec<ActivityEvent>> {
+        let conn = self.connection()?;
+        let mut sql = String::from(
+            r#"
+            SELECT
+                id,
+                ts,
+                kind,
+                env,
+                actor_json,
+                subject_json,
+                result,
+                latency_ms,
+                trace_id,
+                reason_code,
+                extras_json
+            FROM activity_events
+            WHERE kind IN (
+            "#,
+        );
+        sql.push_str(
+            &std::iter::repeat_n("?", kinds.len())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        sql.push_str(
+            r#"
+            )
+            ORDER BY id ASC
+            "#,
+        );
+        let query_params = kinds
+            .iter()
+            .map(|kind| enum_to_db_string(*kind, "kind").map(SqlValue::Text))
+            .collect::<StoreResult<Vec<_>>>()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let raw_rows = stmt.query_map(params_from_iter(query_params), raw_event_from_row)?;
+
+        let mut events = Vec::new();
+        for raw in raw_rows {
+            let raw = match raw {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            if let Ok(stored) = raw.try_into_stored_event() {
+                events.push(stored.event);
+            }
+        }
+        Ok(events)
     }
 }
 
@@ -1093,6 +1298,33 @@ fn count_to_u64(count: i64) -> StoreResult<u64> {
     u64::try_from(count).map_err(|_| StoreError::CountOutOfRange(count))
 }
 
+fn string_attribute(
+    attributes: &BTreeMap<String, OtelAttributeValue>,
+    key: &str,
+) -> Option<String> {
+    match attributes.get(key) {
+        Some(OtelAttributeValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn positive_u64_attribute(
+    attributes: &BTreeMap<String, OtelAttributeValue>,
+    key: &str,
+) -> Option<u64> {
+    match attributes.get(key) {
+        Some(OtelAttributeValue::I64(value)) if *value > 0 => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn enum_to_sort_label<T>(value: T) -> String
+where
+    T: Serialize,
+{
+    enum_to_db_string(value, "sort").unwrap_or_else(|_| String::new())
+}
+
 fn sandbox_op_from_kind(kind: ActivityKind) -> Option<&'static str> {
     match kind {
         ActivityKind::SandboxCreate => Some("create"),
@@ -1435,6 +1667,167 @@ mod tests {
                 && count.env.as_deref() == Some("other")
                 && count.result == ActivityResult::Ok
                 && count.count == 1));
+    }
+
+    #[test]
+    fn genai_token_usage_rows_derives_model_call_tokens_with_provider_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-05-18T12:00:00Z",
+                    ActivityKind::GenAiModelCall,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_extra("gen_ai.system", serde_json::json!("openai"))
+                .with_extra("gen_ai.request.model", serde_json::json!("gpt-4.1"))
+                .with_extra("gen_ai.usage.input_tokens", serde_json::json!(123))
+                .with_extra("gen_ai.usage.output_tokens", serde_json::json!(45))
+                .with_extra("prompt", serde_json::json!("private prompt text"))
+                .with_extra("api_key", serde_json::json!("sk-secret")),
+                event(
+                    "2026-05-18T12:00:01Z",
+                    ActivityKind::GenAiModelCall,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_extra("gen_ai.system", serde_json::json!("openai"))
+                .with_extra("gen_ai.request.model", serde_json::json!("gpt-4.1"))
+                .with_extra("gen_ai.usage.input_tokens", serde_json::json!(0))
+                .with_extra("gen_ai.usage.output_tokens", serde_json::json!(-1)),
+            ])
+            .unwrap();
+
+        let rows = store.genai_token_usage_rows().unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.provider_name.as_deref() == Some("openai")
+                && row.operation_name == "chat"
+                && row.token_type == "input"
+                && row.request_model.as_deref() == Some("gpt-4.1")
+                && row.env.as_deref() == Some("demo")
+                && row.result == ActivityResult::Ok
+                && row.tokens == 123
+        }));
+        assert!(rows.iter().any(|row| {
+            row.provider_name.as_deref() == Some("openai")
+                && row.operation_name == "chat"
+                && row.token_type == "output"
+                && row.request_model.as_deref() == Some("gpt-4.1")
+                && row.env.as_deref() == Some("demo")
+                && row.result == ActivityResult::Ok
+                && row.tokens == 45
+        }));
+    }
+
+    #[test]
+    fn genai_metric_rows_skip_malformed_persisted_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO activity_events (
+                ts,
+                kind,
+                env,
+                actor_json,
+                subject_json,
+                result,
+                latency_ms,
+                trace_id,
+                reason_code,
+                extras_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                "2026-05-18T12:00:00Z",
+                enum_to_db_string(ActivityKind::GenAiModelCall, "kind").unwrap(),
+                "demo",
+                "{}",
+                "{}",
+                enum_to_db_string(ActivityResult::Ok, "result").unwrap(),
+                Option::<i64>::None,
+                "trace-malformed",
+                Option::<String>::None,
+                "{not-valid-json",
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        store
+            .append_many(&[event(
+                "2026-05-18T12:00:01Z",
+                ActivityKind::GenAiModelCall,
+                "demo",
+                ActivityResult::Ok,
+            )
+            .with_extra("gen_ai.system", serde_json::json!("openai"))
+            .with_extra("gen_ai.request.model", serde_json::json!("gpt-4.1"))
+            .with_extra("gen_ai.usage.input_tokens", serde_json::json!(123))])
+            .unwrap();
+
+        let rows = store.genai_token_usage_rows().unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_name.as_deref(), Some("openai"));
+        assert_eq!(rows[0].operation_name, "chat");
+        assert_eq!(rows[0].token_type, "input");
+        assert_eq!(rows[0].request_model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(rows[0].env.as_deref(), Some("demo"));
+        assert_eq!(rows[0].result, ActivityResult::Ok);
+        assert_eq!(rows[0].tokens, 123);
+    }
+
+    #[test]
+    fn genai_tool_calls_by_tool_env_result_counts_mapped_subject_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(temp.path().join("events.db")).unwrap();
+
+        store
+            .append_many(&[
+                event(
+                    "2026-05-18T12:00:00Z",
+                    ActivityKind::McpToolCall,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("name", serde_json::json!("repo.search")),
+                event(
+                    "2026-05-18T12:00:01Z",
+                    ActivityKind::McpToolCall,
+                    "demo",
+                    ActivityResult::Ok,
+                )
+                .with_subject_value("gen_ai.tool.name", serde_json::json!("repo.search")),
+                event(
+                    "2026-05-18T12:00:02Z",
+                    ActivityKind::McpToolCall,
+                    "demo",
+                    ActivityResult::Error,
+                ),
+            ])
+            .unwrap();
+
+        let rows = store.genai_tool_calls_by_tool_env_result().unwrap();
+
+        assert!(rows.iter().any(|row| {
+            row.tool == "repo.search"
+                && row.env.as_deref() == Some("demo")
+                && row.result == ActivityResult::Ok
+                && row.count == 2
+        }));
+        assert!(rows.iter().any(|row| {
+            row.tool == "unknown"
+                && row.env.as_deref() == Some("demo")
+                && row.result == ActivityResult::Error
+                && row.count == 1
+        }));
     }
 
     #[test]

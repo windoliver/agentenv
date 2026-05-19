@@ -514,6 +514,8 @@ fn rich_activity_kind_to_event_kind(kind: agentenv_proto::RichActivityKind) -> E
         agentenv_proto::RichActivityKind::EgressAllowed => EventActivityKind::EgressAllowed,
         agentenv_proto::RichActivityKind::EgressDenied => EventActivityKind::EgressDenied,
         agentenv_proto::RichActivityKind::McpToolCall => EventActivityKind::McpToolCall,
+        agentenv_proto::RichActivityKind::AgentTurn => EventActivityKind::AgentTurn,
+        agentenv_proto::RichActivityKind::GenAiModelCall => EventActivityKind::GenAiModelCall,
         agentenv_proto::RichActivityKind::PolicyApplied => EventActivityKind::PolicyApplied,
         agentenv_proto::RichActivityKind::CredentialInjected => {
             EventActivityKind::CredentialInjected
@@ -1246,6 +1248,30 @@ mod tests {
 
         assert_eq!(event.kind, agentenv_events::ActivityKind::McpToolCall);
         assert_eq!(event.subject["tool"], json!("search"));
+    }
+
+    #[test]
+    fn rich_genai_activity_notification_converts_new_kinds() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "method": "event/activity",
+            "params": {
+                "ts": "2026-04-26T12:00:00Z",
+                "kind": "gen_ai_model_call",
+                "env": "demo",
+                "actor": {"driver": "codex"},
+                "subject": {"model": "gpt-5"},
+                "result": "ok",
+                "trace_id": "trace-plugin",
+                "extras": {}
+            }
+        });
+
+        let notification: RpcNotificationEnvelope = serde_json::from_value(raw).unwrap();
+        let event = notification_to_activity_event(notification, "fallback-trace").unwrap();
+
+        assert_eq!(event.kind, agentenv_events::ActivityKind::GenAiModelCall);
+        assert_eq!(event.subject["model"], json!("gpt-5"));
     }
 
     #[test]

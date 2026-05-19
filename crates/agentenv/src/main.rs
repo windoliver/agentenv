@@ -22,8 +22,8 @@ use agentenv_core::hardening::HardeningLintSeverity;
 use agentenv_credstore::{CredentialStore, CredentialStoreError, SecretString};
 use agentenv_events::{
     audit::{AuditPolicy, AuditSigningKey, AuditStore},
-    metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot, SinkCounterMetric},
-    sink::{JsonlSink, SqliteSink},
+    metrics::{render_prometheus, EnvMetricRow, MetricsSnapshot},
+    sink::{JsonlSink, SinkError, SqliteSink},
     store::{parse_legacy_jsonl_activity_event, EventQuery, SqliteEventStore, StoredEvent},
     ActivityEvent, ActivityKind, ActivityResult, EventDispatcher, EventEmitter, EventSink,
     SinkConfig, WebhookConfig, WebhookSink,
@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
+use url::{Host, Url};
 
 mod builtin_factory;
 mod bundle_cli;
@@ -963,7 +964,16 @@ async fn run_create(args: CreateArgs, event_sink_args: &[String]) -> Result<()> 
             Err(error) => Err(error.into()),
         }
     } else {
-        let dispatcher = build_event_dispatcher(&options, Some(&args.name), event_sink_args)?;
+        let sink_args = match combined_create_sink_args(&blueprint_yaml, event_sink_args) {
+            Ok(sink_args) => sink_args,
+            Err(error) if args.json => exit_json_error(reason_for_sink_setup_error(&error), error),
+            Err(error) => return Err(error),
+        };
+        let dispatcher = match build_event_dispatcher(&options, Some(&args.name), &sink_args) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) if args.json => exit_json_error(reason_for_sink_setup_error(&error), error),
+            Err(error) => return Err(error),
+        };
         let emitter = Arc::new(AuditingEventEmitter::new(
             dispatcher.emitter(),
             audit_signing_key_path(&options),
@@ -2391,10 +2401,8 @@ fn render_metrics_body(options: &agentenv_core::runtime::RuntimeOptions) -> Resu
     let store = SqliteEventStore::open(global_events_db_path(options))
         .context("open global activity database")?;
     let env_rows = env_status_metrics(options)?;
-    let mut snapshot =
+    let snapshot =
         MetricsSnapshot::from_store(&store, &env_rows).context("build metrics snapshot")?;
-    snapshot.event_drops_total = Vec::<SinkCounterMetric>::new();
-    snapshot.event_sink_errors_total = Vec::<SinkCounterMetric>::new();
     Ok(render_prometheus(&snapshot))
 }
 
@@ -3019,14 +3027,27 @@ fn build_event_dispatcher(
     env: Option<&str>,
     sink_args: &[String],
 ) -> Result<EventDispatcher> {
+    build_event_dispatcher_with_otel_validator(options, env, sink_args, validate_otel_sink_endpoint)
+}
+
+fn build_event_dispatcher_with_otel_validator(
+    options: &agentenv_core::runtime::RuntimeOptions,
+    env: Option<&str>,
+    sink_args: &[String],
+    validate_otel_endpoint: impl Fn(&str) -> Result<()>,
+) -> Result<EventDispatcher> {
     let mut sinks: Vec<Box<dyn EventSink>> = Vec::new();
     add_default_event_sinks(&mut sinks, options, env)?;
     for raw in sink_args {
+        if let Some(endpoint) = raw.strip_prefix("otel:") {
+            validate_otel_endpoint(endpoint)?;
+        }
         match SinkConfig::parse(raw)? {
             SinkConfig::DefaultSqlite => {}
             SinkConfig::Sqlite { path } => sinks.push(Box::new(SqliteSink::new(path))),
             SinkConfig::Jsonl { path } => sinks.push(Box::new(JsonlSink::new(path))),
             SinkConfig::OtelGrpc { endpoint } => {
+                validate_otel_endpoint(&endpoint)?;
                 sinks.push(agentenv_events::sink::otel_grpc_sink(endpoint)?);
             }
             SinkConfig::Webhook { config } => {
@@ -3053,6 +3074,44 @@ fn build_event_dispatcher(
     Ok(EventDispatcher::with_sinks(1024, sinks))
 }
 
+fn blueprint_otel_sink_args(blueprint_yaml: &str) -> Result<Vec<String>> {
+    let blueprint = agentenv_core::blueprint::Blueprint::from_yaml(blueprint_yaml)
+        .context("failed to parse blueprint observability configuration")?;
+    let Some(endpoint) = blueprint
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.otel.as_ref())
+        .and_then(|otel| otel.endpoint.as_deref())
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+
+    otel_sink_validation_url(endpoint)?;
+    Ok(vec![format!("otel:{endpoint}")])
+}
+
+fn reason_for_sink_setup_error(error: &anyhow::Error) -> ReasonCode {
+    if matches!(
+        error.downcast_ref::<SinkError>(),
+        Some(SinkError::UnsupportedFeature { .. })
+    ) {
+        ReasonCode::CapabilityMissing
+    } else {
+        ReasonCode::InvalidBlueprint
+    }
+}
+
+fn combined_create_sink_args(
+    blueprint_yaml: &str,
+    cli_sink_args: &[String],
+) -> Result<Vec<String>> {
+    let mut sink_args = blueprint_otel_sink_args(blueprint_yaml)?;
+    sink_args.extend(cli_sink_args.iter().cloned());
+    Ok(sink_args)
+}
+
 fn build_destroy_event_dispatcher(
     options: &agentenv_core::runtime::RuntimeOptions,
     sink_args: &[String],
@@ -3072,6 +3131,49 @@ fn validate_webhook_sink_url(config: &WebhookConfig) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+fn validate_otel_sink_endpoint(endpoint: &str) -> Result<()> {
+    let validation_url = otel_sink_validation_url(endpoint)?;
+    let sanitized = agentenv_core::security::ssrf::sanitize_untrusted_url_text(endpoint);
+    agentenv_core::security::ssrf::validate_outbound(
+        &validation_url,
+        agentenv_core::security::ssrf::SsrfOptions::default(),
+    )
+    .with_context(|| format!("OTEL events sink failed SSRF validation for `{sanitized}`"))?;
+    Ok(())
+}
+
+fn otel_sink_validation_url(endpoint: &str) -> Result<Url> {
+    let sanitized = agentenv_core::security::ssrf::sanitize_untrusted_url_text(endpoint);
+    let grpc_url = Url::parse(endpoint)
+        .with_context(|| format!("invalid OTEL events sink endpoint `{sanitized}`"))?;
+    if grpc_url.scheme() != "grpc" || grpc_url.host().is_none() {
+        bail!("invalid OTEL events sink endpoint `{sanitized}`");
+    }
+    if !grpc_url.username().is_empty() || grpc_url.password().is_some() {
+        bail!("invalid OTEL events sink endpoint `{sanitized}`");
+    }
+    if !["", "/"].contains(&grpc_url.path())
+        || grpc_url.query().is_some()
+        || grpc_url.fragment().is_some()
+    {
+        bail!("invalid OTEL events sink endpoint `{sanitized}`");
+    }
+
+    let host = match grpc_url.host().expect("host was checked above") {
+        Host::Domain(host) => host.to_owned(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => format!("[{ip}]"),
+    };
+    let port = grpc_url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+
+    Url::parse(&format!("https://{host}{port}")).with_context(|| {
+        format!("failed to prepare OTEL events sink endpoint `{sanitized}` for SSRF validation")
+    })
 }
 
 fn add_default_event_sinks(
@@ -4128,6 +4230,111 @@ policy:
         );
     }
 
+    #[test]
+    fn blueprint_otel_sink_args_returns_configured_endpoint() {
+        let yaml = r#"
+version: "0.1"
+min_agentenv_version: "0.0.1"
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+policy:
+  tier: restricted
+observability:
+  otel:
+    endpoint: grpc://collector:4317
+"#;
+
+        let sink_args = blueprint_otel_sink_args(yaml).expect("blueprint sink args");
+
+        assert_eq!(sink_args, vec!["otel:grpc://collector:4317"]);
+    }
+
+    #[test]
+    fn blueprint_otel_sink_args_rejects_invalid_endpoint_without_leaking_credentials() {
+        let yaml = r#"
+version: "0.1"
+min_agentenv_version: "0.0.1"
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+policy:
+  tier: restricted
+observability:
+  otel:
+    endpoint: https://token@example.com:4317
+"#;
+
+        let error = blueprint_otel_sink_args(yaml)
+            .expect_err("invalid credential-bearing endpoint must fail");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("token@") && !rendered.contains("token"),
+            "blueprint OTEL endpoint error leaked credentials: {rendered}"
+        );
+    }
+
+    #[test]
+    fn combined_create_sink_args_includes_blueprint_and_cli_sinks() {
+        let yaml = r#"
+version: "0.1"
+min_agentenv_version: "0.0.1"
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+policy:
+  tier: restricted
+observability:
+  otel:
+    endpoint: grpc://collector:4317
+"#;
+        let cli_sinks = vec!["file:/tmp/agentenv-events.jsonl".to_owned()];
+
+        let sink_args = combined_create_sink_args(yaml, &cli_sinks).expect("combined sink args");
+
+        assert_eq!(
+            sink_args,
+            vec![
+                "otel:grpc://collector:4317".to_owned(),
+                "file:/tmp/agentenv-events.jsonl".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn unsafe_blueprint_otel_endpoint_is_rejected() {
+        let error = validate_otel_sink_endpoint("grpc://127.0.0.1:4317")
+            .expect_err("loopback OTEL endpoint must be rejected");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("OTEL events sink failed SSRF validation"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unsafe_blueprint_otel_endpoint_error_redacts_credentials() {
+        let error = validate_otel_sink_endpoint("grpc://token@127.0.0.1:4317")
+            .expect_err("credential-bearing OTEL endpoint must be rejected");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains("token@"),
+            "OTEL endpoint error leaked credentials: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn create_time_events_do_not_materialize_final_env_dir() {
         let root = make_temp_dir("create-time-events-global-only");
@@ -4223,17 +4430,18 @@ policy:
         };
         let sinks = vec!["otel:grpc://collector:4317".to_owned()];
 
-        let dispatcher = match build_event_dispatcher(&options, None, &sinks) {
-            Ok(dispatcher) => dispatcher,
-            Err(error) => {
-                let rendered = format!("{error:#}");
-                assert!(
-                    rendered.contains("events sink requires feature `otel`"),
-                    "unexpected error: {rendered}"
-                );
-                return;
-            }
-        };
+        let dispatcher =
+            match build_event_dispatcher_with_otel_validator(&options, None, &sinks, |_| Ok(())) {
+                Ok(dispatcher) => dispatcher,
+                Err(error) => {
+                    let rendered = format!("{error:#}");
+                    assert!(
+                        rendered.contains("events sink requires feature `otel`"),
+                        "unexpected error: {rendered}"
+                    );
+                    return;
+                }
+            };
 
         let sink_names = dispatcher
             .counters()
