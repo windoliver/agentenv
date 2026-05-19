@@ -2114,7 +2114,7 @@ fn verify_snapshot_lockfile(lock_yaml: &str) -> RuntimeResult<crate::lockfile::P
     let document = crate::lockfile::LockfileDocument::from_yaml(lock_yaml)?;
     let crate::lockfile::LockfileDocument::Portable(lockfile) = document else {
         return Err(RuntimeError::PortableLockfileVerification {
-            details: "snapshot lock.yaml must be a portable 0.2.0 lockfile".to_owned(),
+            details: "snapshot lock.yaml must be a supported portable lockfile".to_owned(),
         });
     };
 
@@ -3184,6 +3184,7 @@ fn blueprint_yaml_from_portable_lockfile(
         policy: composition.policy.clone(),
         state: composition.state.clone(),
         skills: composition.skills.clone(),
+        observability: composition.observability.clone(),
     };
 
     serde_yaml::to_string(&blueprint).map_err(RuntimeError::lockfile_serialize)
@@ -12861,7 +12862,10 @@ policy:
         let persisted_lock =
             fs::read_to_string(root.join("envs").join("renamed-demo").join("lock.yaml"))
                 .expect("read persisted lockfile");
-        assert!(persisted_lock.contains("version: 0.2.0"));
+        assert!(persisted_lock.contains(&format!(
+            "version: {}",
+            crate::lockfile::PORTABLE_LOCKFILE_VERSION
+        )));
         assert!(persisted_lock.contains("name: renamed-demo"));
         assert!(!persisted_lock.contains("name: source-demo"));
         assert!(persisted_lock.contains("frozen-pinned.example"));

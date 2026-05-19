@@ -22,6 +22,8 @@ pub struct Blueprint {
     pub state: Option<StateSection>,
     #[serde(default, skip_serializing_if = "SkillsSection::is_empty")]
     pub skills: SkillsSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<ObservabilitySection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -169,6 +171,24 @@ fn normalize_runtime_discovery_mcp_endpoint(
     Ok(parsed.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ObservabilitySection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel: Option<OtelObservabilitySection>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OtelObservabilitySection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 pub trait InterpolationResolver {
     fn resolve_env(&self, name: &str) -> Result<String, BlueprintError>;
     fn resolve_credstore(&self, name: &str) -> Result<String, BlueprintError>;
@@ -302,5 +322,47 @@ fn yaml_path_segment(value: &Value) -> String {
             Ok(rendered) => rendered.trim().to_string(),
             Err(_) => "<non-string-key>".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observability_otel_endpoint_parses_and_roundtrips() {
+        let yaml = r#"
+version: "0.1"
+min_agentenv_version: "0.0.1"
+sandbox:
+  driver: openshell
+agent:
+  driver: codex
+context:
+  driver: filesystem
+policy:
+  tier: restricted
+observability:
+  otel:
+    endpoint: grpc://collector:4317
+"#;
+
+        let blueprint = Blueprint::from_yaml(yaml).expect("parse blueprint");
+        let endpoint = blueprint
+            .observability
+            .as_ref()
+            .and_then(|section| section.otel.as_ref())
+            .and_then(|otel| otel.endpoint.as_deref());
+        assert_eq!(endpoint, Some("grpc://collector:4317"));
+
+        let rendered = serde_yaml::to_string(&blueprint).expect("serialize blueprint");
+        assert!(
+            rendered.contains("observability:"),
+            "rendered blueprint did not preserve observability: {rendered}"
+        );
+        assert!(
+            rendered.contains("endpoint: grpc://collector:4317"),
+            "rendered blueprint did not preserve OTEL endpoint: {rendered}"
+        );
     }
 }

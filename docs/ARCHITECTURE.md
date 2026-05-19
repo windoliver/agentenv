@@ -372,7 +372,34 @@ This matters for agents running long tasks: closing your laptop doesn't kill the
 
 ### Activity event stream
 
-Every core operation emits a structured event (append-only JSONL). Sinks: SQLite (default), OTEL export, file, webhook. Used by:
+`ActivityEvent` is the native source of truth for operational history. Core and
+drivers emit typed activity events for sandbox lifecycle, policy decisions,
+approvals, MCP tool calls, agent turns, and GenAI model calls. The default sink
+persists those events to SQLite; file, webhook, and OTEL sinks are additive.
+
+OTEL export maps the same native activity events into OpenTelemetry log records
+and, for GenAI activity, semantic-convention spans. `gen_ai_model_call` events
+become client spans with GenAI attributes such as `gen_ai.provider.name`,
+`gen_ai.operation.name`, request/response model names, token counts, finish
+reasons, and status. `agent_turn` and MCP tool activity are exported as internal
+GenAI spans or span events where applicable. The mapper accepts
+`gen_ai.system` as an input alias, but canonical output uses
+`gen_ai.provider.name`.
+
+`agentenv metrics serve` renders a Prometheus-compatible view derived from the
+activity store and approval state. The GenAI series follow OTEL GenAI metric
+names for model-call duration and token usage, and agentenv-specific counters
+track tool calls, policy blocks, approval backlog, event drops, and sink write
+errors. Sink health counters expose zero-valued default samples for the default
+SQLite sink when no drops or write errors have been observed.
+
+Redaction happens before OTEL GenAI export for prompt-like, response-like, and
+credential-looking fields. Metrics intentionally keep label cardinality bounded:
+environment, result, event kind, provider, operation, request model, token type,
+tool name, driver, and sink are labels; prompt content, raw URLs, credentials,
+request bodies, and response bodies are not labels.
+
+Used by:
 
 - `agentenv logs --follow` — streaming view
 - `agentenv term` — ratatui-based operator TUI (k9s/openshell-term style)

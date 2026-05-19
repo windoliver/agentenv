@@ -74,6 +74,8 @@ impl AuditPolicy {
             ActivityKind::SandboxDestroy
             | ActivityKind::EgressAllowed
             | ActivityKind::McpToolCall
+            | ActivityKind::AgentTurn
+            | ActivityKind::GenAiModelCall
             | ActivityKind::SpawnRequested
             | ActivityKind::SpawnQueued
             | ActivityKind::SpawnAdmitted

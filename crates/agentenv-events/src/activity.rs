@@ -14,6 +14,8 @@ pub enum ActivityKind {
     EgressAllowed,
     EgressDenied,
     McpToolCall,
+    AgentTurn,
+    GenAiModelCall,
     PolicyApplied,
     CredentialInjected,
     CredentialSet,
@@ -196,6 +198,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ActivityKind::BuildQueueDepth).unwrap(),
             serde_json::json!("build_queue_depth")
+        );
+    }
+
+    #[test]
+    fn genai_activity_kinds_serialize_to_stable_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ActivityKind::AgentTurn).unwrap(),
+            serde_json::json!("agent_turn")
+        );
+        assert_eq!(
+            serde_json::to_value(ActivityKind::GenAiModelCall).unwrap(),
+            serde_json::json!("gen_ai_model_call")
         );
     }
 

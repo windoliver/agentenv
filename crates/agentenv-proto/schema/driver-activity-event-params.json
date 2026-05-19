@@ -113,6 +113,8 @@
         "egress_allowed",
         "egress_denied",
         "mcp_tool_call",
+        "agent_turn",
+        "gen_ai_model_call",
         "policy_applied",
         "credential_injected",
         "credential_set",

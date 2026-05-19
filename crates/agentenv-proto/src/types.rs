@@ -70,6 +70,8 @@ pub enum RichActivityKind {
     EgressAllowed,
     EgressDenied,
     McpToolCall,
+    AgentTurn,
+    GenAiModelCall,
     PolicyApplied,
     CredentialInjected,
     CredentialSet,
@@ -1134,5 +1136,18 @@ tool_capabilities:
 
         assert!(config.provenance.is_none());
         assert!(config.tool_capabilities.is_empty());
+    }
+
+    #[test]
+    fn rich_activity_genai_kinds_round_trip() {
+        for (kind, wire_value) in [
+            (RichActivityKind::AgentTurn, "agent_turn"),
+            (RichActivityKind::GenAiModelCall, "gen_ai_model_call"),
+        ] {
+            let encoded = serde_json::to_value(&kind).unwrap();
+            assert_eq!(encoded, serde_json::json!(wire_value));
+            let decoded: RichActivityKind = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, kind);
+        }
     }
 }
