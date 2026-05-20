@@ -1547,6 +1547,131 @@ runners:
 
 #[cfg(unix)]
 #[test]
+fn eval_runner_env_is_allowlisted() {
+    let temp_dir = make_temp_dir("eval-runner-env-allowlist");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo_env_allowlist_probe(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+    env:
+      AGENTENV_EVAL_MODE: headless
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .env("AGENTENV_EVAL_LEAK_TEST_SECRET", "host-secret")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    let artifact = PathBuf::from(
+        stdout["runners"][0]["artifact"]
+            .as_str()
+            .expect("runner artifact is present"),
+    );
+    let artifact_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).unwrap()).unwrap();
+
+    assert_eq!(artifact_json["suite_env"], "headless");
+    assert_eq!(artifact_json["host_secret"], "");
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_runner_logs_are_bounded() {
+    const EXPECTED_LOG_LIMIT: u64 = 1024 * 1024;
+
+    let temp_dir = make_temp_dir("eval-runner-log-bound");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo_noisy(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let stdout_log = temp_dir.join(".agentenv/evals/logs/promptfoo-stdout.log");
+    let stderr_log = temp_dir.join(".agentenv/evals/logs/promptfoo-stderr.log");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg("logs/report.json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    for path in [&stdout_log, &stderr_log] {
+        let len = fs::metadata(path).unwrap().len();
+        assert!(
+            len <= EXPECTED_LOG_LIMIT + 128,
+            "{} should be capped, got {len} bytes",
+            path.display()
+        );
+        let log = fs::read_to_string(path).unwrap();
+        assert!(
+            log.contains("[agentenv log truncated"),
+            "{} should contain truncation marker",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn eval_sanitizes_promptfoo_runner_id_for_log_paths() {
     let root_dir = make_temp_dir("eval-promptfoo-runner-id-log-path");
     let temp_dir = root_dir.join("home");
@@ -1741,6 +1866,72 @@ while [ "$#" -gt 0 ]; do
 done
 mkdir -p "$(dirname "$output")"
 printf '{{"args":"%s","env":{{"AGENTENV_EVAL_ENV":"%s","AGENTENV_EVAL_RUN_DIR":"%s","AGENTENV_EVAL_BLUEPRINT":"%s"}}}}\n' "$args" "$AGENTENV_EVAL_ENV" "$AGENTENV_EVAL_RUN_DIR" "$AGENTENV_EVAL_BLUEPRINT" > "$output"
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo_env_allowlist_probe(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+mkdir -p "$(dirname "$output")"
+printf '{{"suite_env":"%s","host_secret":"%s"}}\n' "$AGENTENV_EVAL_MODE" "$AGENTENV_EVAL_LEAK_TEST_SECRET" > "$output"
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo_noisy(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+mkdir -p "$(dirname "$output")"
+printf '{{"fake":true}}\n' > "$output"
+i=0
+while [ "$i" -lt 1200 ]; do
+  printf '%1000s\n' stdout
+  printf '%1000s\n' stderr >&2
+  i=$((i + 1))
+done
 exit {exit_code}
 "#
         ),

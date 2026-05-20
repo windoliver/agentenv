@@ -1,7 +1,9 @@
 use std::{
     fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -40,6 +42,9 @@ struct EvalErrorJson {
     status: &'static str,
     error: String,
 }
+
+const EVAL_RUNNER_LOG_LIMIT_BYTES: usize = 1024 * 1024;
+const EVAL_RUNNER_LOG_TRUNCATED_MARKER: &[u8] = b"\n[agentenv log truncated]\n";
 
 pub(crate) async fn run_eval(args: EvalArgs) -> Result<()> {
     match run_eval_inner(args).await {
@@ -160,24 +165,6 @@ fn run_promptfoo_runner(
     let log_slug = safe_runner_log_slug(&runner.id);
     let stdout_path = plan.run_dir.join(format!("{log_slug}-stdout.log"));
     let stderr_path = plan.run_dir.join(format!("{log_slug}-stderr.log"));
-    let stdout_file = fs::File::create(&stdout_path).map_err(|error| {
-        EvalCliError::new(
-            format!(
-                "failed to create runner stdout log `{}`: {error}",
-                stdout_path.display()
-            ),
-            json,
-        )
-    })?;
-    let stderr_file = fs::File::create(&stderr_path).map_err(|error| {
-        EvalCliError::new(
-            format!(
-                "failed to create runner stderr log `{}`: {error}",
-                stderr_path.display()
-            ),
-            json,
-        )
-    })?;
     let config = runner.config.as_ref().ok_or_else(|| {
         EvalCliError::new(
             format!("runner `{}` has no Promptfoo config", runner.id),
@@ -191,8 +178,9 @@ fn run_promptfoo_runner(
         .arg(config)
         .arg("--output")
         .arg(&runner.output)
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_minimal_runner_process_env(&mut command);
     for (name, value) in &runner.env {
         command.env(name, value);
     }
@@ -201,12 +189,35 @@ fn run_promptfoo_runner(
         .env("AGENTENV_EVAL_RUN_DIR", &plan.run_dir)
         .env("AGENTENV_EVAL_BLUEPRINT", &plan.blueprint_path);
 
-    let status = command.status().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         EvalCliError::new(
             format!("failed to start runner `{}`: {error}", runner.id),
             json,
         )
     })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        EvalCliError::new(
+            format!("failed to capture runner `{}` stdout", runner.id),
+            json,
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        EvalCliError::new(
+            format!("failed to capture runner `{}` stderr", runner.id),
+            json,
+        )
+    })?;
+    let stdout_capture = spawn_bounded_log_capture(&runner.id, "stdout", stdout_path, stdout, json);
+    let stderr_capture = spawn_bounded_log_capture(&runner.id, "stderr", stderr_path, stderr, json);
+    let status_result = child.wait().map_err(|error| {
+        EvalCliError::new(
+            format!("failed to wait for runner `{}`: {error}", runner.id),
+            json,
+        )
+    });
+    join_log_capture(stdout_capture, &runner.id, "stdout", json)?;
+    join_log_capture(stderr_capture, &runner.id, "stderr", json)?;
+    let status = status_result?;
     let exit_code = status.code();
     let runner_status = if status.success() {
         EvalRunnerStatus::Passed
@@ -220,6 +231,93 @@ fn run_promptfoo_runner(
         exit_code,
         artifact: runner.output.clone(),
     })
+}
+
+fn apply_minimal_runner_process_env(command: &mut Command) {
+    command.env_clear();
+    for name in minimal_runner_process_env_names() {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn minimal_runner_process_env_names() -> &'static [&'static str] {
+    &["PATH", "PATHEXT", "SystemRoot", "WINDIR", "ComSpec"]
+}
+
+#[cfg(not(windows))]
+fn minimal_runner_process_env_names() -> &'static [&'static str] {
+    &["PATH"]
+}
+
+fn spawn_bounded_log_capture<R>(
+    runner_id: &str,
+    stream_name: &'static str,
+    path: PathBuf,
+    reader: R,
+    json: bool,
+) -> thread::JoinHandle<Result<(), EvalCliError>>
+where
+    R: Read + Send + 'static,
+{
+    let runner_id = runner_id.to_owned();
+    thread::spawn(move || {
+        capture_bounded_log(reader, &path).map_err(|error| {
+            EvalCliError::new(
+                format!(
+                    "failed to capture runner `{runner_id}` {stream_name} log `{}`: {error}",
+                    path.display()
+                ),
+                json,
+            )
+        })
+    })
+}
+
+fn capture_bounded_log<R: Read>(mut reader: R, path: &Path) -> io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    let mut written = 0usize;
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let allowed = EVAL_RUNNER_LOG_LIMIT_BYTES
+            .saturating_sub(written)
+            .min(read);
+        if allowed > 0 {
+            file.write_all(&buffer[..allowed])?;
+            written += allowed;
+        }
+        if allowed < read {
+            truncated = true;
+        }
+    }
+
+    if truncated {
+        file.write_all(EVAL_RUNNER_LOG_TRUNCATED_MARKER)?;
+    }
+    file.flush()
+}
+
+fn join_log_capture(
+    handle: thread::JoinHandle<Result<(), EvalCliError>>,
+    runner_id: &str,
+    stream_name: &str,
+    json: bool,
+) -> Result<(), EvalCliError> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(EvalCliError::new(
+            format!("runner `{runner_id}` {stream_name} log capture thread panicked"),
+            json,
+        )),
+    }
 }
 
 fn safe_runner_log_slug(id: &str) -> String {
