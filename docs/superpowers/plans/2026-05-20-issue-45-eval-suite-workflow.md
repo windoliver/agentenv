@@ -46,7 +46,7 @@ This plan implements the first issue #45 slice only:
 - stable report output
 - docs
 
-Ephemeral environment creation is represented in the suite model and rejected with a clear unsupported error in this first implementation unless the caller targets an existing environment with `--env` or `target.lifecycle: existing`. This keeps the PR testable without requiring real OpenShell, credentials, or provider tools in normal CI. A later PR can wire ephemeral create/destroy through the existing runtime.
+Ephemeral environment creation is represented in the suite model and rejected with a clear unsupported error in this first implementation unless the caller targets an existing environment with `--env` or `target.lifecycle: existing` plus `target.env_name`. This keeps the PR testable without requiring real OpenShell, credentials, or provider tools in normal CI. A later PR can wire ephemeral create/destroy through the existing runtime.
 
 ## Task 1: Add Core Eval Suite Model
 

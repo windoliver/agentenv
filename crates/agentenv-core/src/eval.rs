@@ -190,6 +190,16 @@ pub enum EvalPlanError {
     InvalidSuiteName { name: String },
     #[error("runner `{runner}` must declare config for promptfoo")]
     MissingPromptfooConfig { runner: String },
+    #[error("target.lifecycle: existing requires target.env_name or --env <name>")]
+    MissingExistingEnvTarget,
+    #[error(
+        "runner output path collision: runners `{first_runner}` and `{second_runner}` both resolve to `{path}`"
+    )]
+    DuplicateRunnerOutput {
+        first_runner: String,
+        second_runner: String,
+        path: String,
+    },
     #[error(
         "target lifecycle `ephemeral` is not wired yet; pass `--env <name>` or use `target.lifecycle: existing`"
     )]
@@ -207,8 +217,22 @@ pub struct EvalPlanInput<'a> {
 }
 
 pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanError> {
-    if input.suite.target.lifecycle == EvalLifecycle::Ephemeral && input.env_override.is_none() {
-        return Err(EvalPlanError::EphemeralUnsupported);
+    match input.suite.target.lifecycle {
+        EvalLifecycle::Existing
+            if input.env_override.is_none()
+                && input
+                    .suite
+                    .target
+                    .env_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty()) =>
+        {
+            return Err(EvalPlanError::MissingExistingEnvTarget);
+        }
+        EvalLifecycle::Ephemeral if input.env_override.is_none() => {
+            return Err(EvalPlanError::EphemeralUnsupported);
+        }
+        EvalLifecycle::Existing | EvalLifecycle::Ephemeral => {}
     }
 
     let suite_root = input
@@ -252,6 +276,7 @@ pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanErr
         .unwrap_or_else(|| format!("eval-{}-{}", sanitize_name(&suite_name), input.run_id));
 
     let mut runners = Vec::new();
+    let mut output_paths = BTreeMap::new();
     for runner in input.suite.runners {
         let command = runner
             .command
@@ -275,8 +300,19 @@ pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanErr
         };
         let output = match runner.output.as_deref() {
             Some(path) => resolve_run_relative_path("runner.output", &run_dir, path)?,
-            None => run_dir.join("promptfoo-results.json"),
+            None => match runner.runner_type {
+                EvalRunnerType::Promptfoo => {
+                    run_dir.join(default_promptfoo_output_filename(&runner.id))
+                }
+            },
         };
+        if let Some(first_runner) = output_paths.insert(output.clone(), runner.id.clone()) {
+            return Err(EvalPlanError::DuplicateRunnerOutput {
+                first_runner,
+                second_runner: runner.id,
+                path: output.display().to_string(),
+            });
+        }
         runners.push(EvalRunnerPlan {
             id: runner.id,
             runner_type: runner.runner_type,
@@ -364,6 +400,12 @@ fn sanitize_name(name: &str) -> String {
         }
     }
     sanitized.trim_matches('-').to_owned()
+}
+
+fn default_promptfoo_output_filename(runner_id: &str) -> String {
+    let slug = sanitize_name(runner_id);
+    let slug = if slug.is_empty() { "runner" } else { &slug };
+    format!("{slug}-promptfoo-results.json")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

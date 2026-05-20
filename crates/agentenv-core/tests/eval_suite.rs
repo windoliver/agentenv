@@ -188,8 +188,132 @@ runners:
     );
     assert_eq!(
         plan.runners[0].output,
-        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-results.json")
+        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-promptfoo-results.json")
     );
+}
+
+#[test]
+fn eval_plan_rejects_existing_target_without_env_name_or_override() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let error = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: None,
+        run_id: "run-1",
+    })
+    .expect_err("existing target requires an explicit environment");
+
+    assert!(
+        error
+            .to_string()
+            .contains("target.lifecycle: existing requires target.env_name or --env <name>"),
+        "error was: {error}"
+    );
+}
+
+#[test]
+fn eval_plan_defaults_promptfoo_outputs_per_runner_slug() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo baseline
+    type: promptfoo
+    config: ./promptfoo-baseline.yaml
+  - id: promptfoo/regression
+    type: promptfoo
+    config: ./promptfoo-regression.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let plan = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: None,
+        run_id: "run-1",
+    })
+    .expect("plan builds");
+
+    assert_eq!(plan.runners[0].id, "promptfoo baseline");
+    assert_eq!(plan.runners[1].id, "promptfoo/regression");
+    assert_eq!(
+        plan.runners[0].output,
+        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-baseline-promptfoo-results.json")
+    );
+    assert_eq!(
+        plan.runners[1].output,
+        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-regression-promptfoo-results.json")
+    );
+}
+
+#[test]
+fn eval_plan_rejects_duplicate_runner_output_paths() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo-a
+    type: promptfoo
+    config: ./promptfoo-a.yaml
+    output: shared-results.json
+  - id: promptfoo-b
+    type: promptfoo
+    config: ./promptfoo-b.yaml
+    output: shared-results.json
+"#,
+    )
+    .expect("suite parses");
+
+    let error = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: None,
+        run_id: "run-1",
+    })
+    .expect_err("duplicate output paths are rejected");
+
+    assert!(
+        error.to_string().contains("runner output path collision"),
+        "error was: {error}"
+    );
+    assert!(error.to_string().contains("shared-results.json"));
 }
 
 #[test]
@@ -268,7 +392,7 @@ runners:
     );
     assert_eq!(
         plan.runners[0].output,
-        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-results.json")
+        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-promptfoo-results.json")
     );
 }
 
@@ -309,7 +433,7 @@ runners:
     );
     assert_eq!(
         plan.runners[0].output,
-        Path::new("/tmp/agentenv/evals/custom/promptfoo-results.json")
+        Path::new("/tmp/agentenv/evals/custom/promptfoo-promptfoo-results.json")
     );
 }
 

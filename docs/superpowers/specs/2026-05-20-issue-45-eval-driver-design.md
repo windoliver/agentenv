@@ -67,7 +67,7 @@ around prompts, providers, tests, and assertions:
 8. Keep external eval tools as optional runtime tools, not build-time
    dependencies of the core binary.
 9. Support clear failure modes for missing runners, invalid suites, rejected
-   blueprints, failed assertions, and unsupported agent capabilities.
+   blueprints, failed assertions, and reserved capability requirements.
 10. Keep reports deterministic enough for CI and regression comparison.
 
 ## Non-Goals
@@ -194,8 +194,9 @@ target:
   is implemented, suites that rely on implicit ephemeral creation are rejected
   unless `--env <name>` explicitly selects an existing environment.
 - `requires.agent_capabilities` lists agent capabilities needed by the suite.
-  Core rejects the run before runner execution when the resolved agent driver
-  cannot satisfy the declared capability.
+  The current implementation parses this field and reserves it for later
+  enforcement. It does not yet inspect the resolved agent driver or reject runs
+  for unsupported capabilities before runner execution.
 
 The schema default remains `ephemeral`, but this first implementation requires
 an existing environment target.
@@ -218,7 +219,9 @@ Promptfoo runner rules:
 
 - `config` is required for the first implementation.
 - `command` defaults to `promptfoo`.
-- `output` defaults to `promptfoo-results.json` under the eval run directory.
+- `output` defaults to `<safe-runner-id>-promptfoo-results.json` under the eval
+  run directory, with `runner-promptfoo-results.json` as the fallback when the
+  runner ID has no safe slug.
 - The runner invokes:
 
 ```text
@@ -309,7 +312,7 @@ JSON output:
       "type": "promptfoo",
       "status": "failed",
       "exit_code": 1,
-      "artifact": "promptfoo-results.json"
+      "artifact": "promptfoo-baseline-promptfoo-results.json"
     }
   ]
 }
@@ -319,8 +322,9 @@ Exit codes:
 
 - `0`: suite passed.
 - `1`: suite executed and one or more assertions failed.
-- `2`: invalid suite, invalid blueprint, missing runner command, unsupported
-  capability, or infrastructure error.
+- `2`: invalid suite, invalid blueprint, missing runner command, or
+  infrastructure error. Parsed capability requirements are reserved for later
+  enforcement.
 
 ## Core Model
 
