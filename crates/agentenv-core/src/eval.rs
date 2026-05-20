@@ -87,17 +87,12 @@ impl Default for EvalTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EvalLifecycle {
+    #[default]
     Ephemeral,
     Existing,
-}
-
-impl Default for EvalLifecycle {
-    fn default() -> Self {
-        Self::Ephemeral
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
