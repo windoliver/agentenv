@@ -193,6 +193,118 @@ runners:
 }
 
 #[test]
+fn eval_plan_rejects_suite_names_that_escape_run_root() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: ../outside
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let error = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: None,
+        run_id: "run-1",
+    })
+    .expect_err("unsafe suite name is rejected");
+
+    assert!(
+        error.to_string().contains("metadata.name") || error.to_string().contains("suite name"),
+        "error was: {error}"
+    );
+}
+
+#[test]
+fn eval_plan_uses_default_run_dir_for_bare_output_override_file() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let plan = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: Some(Path::new("report.json")),
+        run_id: "run-1",
+    })
+    .expect("plan builds");
+
+    assert_eq!(
+        plan.run_dir,
+        Path::new("/tmp/agentenv/evals/baseline/run-1")
+    );
+    assert_eq!(
+        plan.runners[0].output,
+        Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-results.json")
+    );
+}
+
+#[test]
+fn eval_plan_rejects_runner_output_escape_with_run_dir_diagnostic() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+    output: ../out.json
+"#,
+    )
+    .expect("suite parses");
+
+    let error = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: None,
+        run_id: "run-1",
+    })
+    .expect_err("unsafe runner output is rejected");
+
+    let message = error.to_string();
+    assert!(message.contains("runner.output"), "error was: {error}");
+    assert!(!message.contains("suite root"), "error was: {error}");
+}
+
+#[test]
 fn eval_status_aggregates_runner_statuses() {
     assert_eq!(eval_status_from_runners(&[]), EvalRunnerStatus::Passed);
     assert_eq!(

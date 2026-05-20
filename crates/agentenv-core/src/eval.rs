@@ -179,8 +179,14 @@ pub struct EvalRunnerPlan {
 pub enum EvalPlanError {
     #[error("{field} path `{path}` must be relative")]
     AbsolutePath { field: &'static str, path: String },
-    #[error("{field} path `{path}` escapes suite root")]
-    EscapesSuiteRoot { field: &'static str, path: String },
+    #[error("{field} path `{path}` escapes {base}")]
+    EscapesBaseDirectory {
+        field: &'static str,
+        path: String,
+        base: &'static str,
+    },
+    #[error("metadata.name `{name}` must be a safe directory name")]
+    InvalidSuiteName { name: String },
     #[error("runner `{runner}` must declare config for promptfoo")]
     MissingPromptfooConfig { runner: String },
     #[error(
@@ -210,9 +216,11 @@ pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanErr
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let suite_name = input.suite.metadata.name.clone();
+    validate_suite_directory_name(&suite_name)?;
     let run_dir = input
         .output_override
         .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| input.run_root.join(&suite_name).join(input.run_id));
     let env_name = input
@@ -271,7 +279,7 @@ fn resolve_suite_relative_path(
     root: &Path,
     raw: &str,
 ) -> Result<PathBuf, EvalPlanError> {
-    reject_unsafe_relative(field, raw)?;
+    reject_unsafe_relative(field, raw, "suite root")?;
     Ok(root.join(raw))
 }
 
@@ -280,11 +288,15 @@ fn resolve_run_relative_path(
     run_dir: &Path,
     raw: &str,
 ) -> Result<PathBuf, EvalPlanError> {
-    reject_unsafe_relative(field, raw)?;
+    reject_unsafe_relative(field, raw, "run dir")?;
     Ok(run_dir.join(raw))
 }
 
-fn reject_unsafe_relative(field: &'static str, raw: &str) -> Result<(), EvalPlanError> {
+fn reject_unsafe_relative(
+    field: &'static str,
+    raw: &str,
+    base: &'static str,
+) -> Result<(), EvalPlanError> {
     let path = Path::new(raw);
     if path.is_absolute() {
         return Err(EvalPlanError::AbsolutePath {
@@ -298,9 +310,23 @@ fn reject_unsafe_relative(field: &'static str, raw: &str) -> Result<(), EvalPlan
             Component::ParentDir | Component::Prefix(_) | Component::RootDir
         )
     }) {
-        return Err(EvalPlanError::EscapesSuiteRoot {
+        return Err(EvalPlanError::EscapesBaseDirectory {
             field,
             path: raw.to_owned(),
+            base,
+        });
+    }
+    Ok(())
+}
+
+fn validate_suite_directory_name(name: &str) -> Result<(), EvalPlanError> {
+    let path = Path::new(name);
+    let mut components = path.components();
+    let is_single_normal_component =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    if !is_single_normal_component || name.contains('/') || name.contains('\\') {
+        return Err(EvalPlanError::InvalidSuiteName {
+            name: name.to_owned(),
         });
     }
     Ok(())
