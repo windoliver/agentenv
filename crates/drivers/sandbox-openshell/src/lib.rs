@@ -4,14 +4,16 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io,
+    io::Read,
     io::Write,
     net::{IpAddr, SocketAddr},
+    os::unix::process::CommandExt,
     path::Component,
     path::{Path, PathBuf},
-    process::{Child, Command},
-    sync::{Arc, Mutex},
+    process::{Child, Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -85,6 +87,9 @@ const DNS_GUARD_FALLBACK_NAMESERVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 const DNS_GUARD_PIDFILE: &str = "/etc/agentenv/dns-guard.pid";
 const DNS_GUARD_LOG_PATH: &str = "/var/log/agentenv-openshell-dns-guard.log";
 const DNS_GUARD_RESOLV_BACKUP_PATH: &str = "/etc/agentenv/resolv.conf.pre-agentenv-dns-guard";
+const OPEN_SHELL_COMMAND_TIMEOUT_ENV: &str = "AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS";
+const DEFAULT_OPEN_SHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(900);
+const PROCESS_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDisposition {
@@ -131,11 +136,25 @@ trait SpawnedCommand: Send {
     fn terminate(&mut self) -> io::Result<()>;
 }
 
-#[derive(Debug, Default)]
-struct ProcessCommandRunner;
+#[derive(Debug, Clone)]
+struct ProcessCommandRunner {
+    timeout: Duration,
+}
+
+impl Default for ProcessCommandRunner {
+    fn default() -> Self {
+        Self {
+            timeout: configured_openshell_command_timeout(),
+        }
+    }
+}
 
 struct ProcessSpawnedCommand {
     child: Child,
+}
+
+struct ProcessOutputReader {
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
 }
 
 impl CommandRunner for ProcessCommandRunner {
@@ -144,15 +163,59 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     fn run(&self, program: &str, request: &CommandRequest) -> io::Result<CommandOutput> {
-        let output = Command::new(program)
+        let command = command_string(program, &request.args);
+        let mut child_command = Command::new(program);
+        child_command
             .args(&request.args)
             .envs(&request.env)
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = child_command.spawn()?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other(format!("failed to capture stdout for `{command}`")))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other(format!("failed to capture stderr for `{command}`")))?;
+        let stdout_reader = read_process_output(stdout);
+        let stderr_reader = read_process_output(stderr);
+        let started = Instant::now();
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+
+            if started.elapsed() >= self.timeout {
+                terminate_timed_out_process(&mut child);
+                return Err(command_timeout_error(&command, self.timeout));
+            }
+
+            let remaining = self.timeout.saturating_sub(started.elapsed());
+            thread::sleep(PROCESS_COMMAND_POLL_INTERVAL.min(remaining));
+        };
+
+        let Some(stdout) =
+            collect_process_output_before_timeout(stdout_reader, started, self.timeout)?
+        else {
+            terminate_timed_out_process(&mut child);
+            return Err(command_timeout_error(&command, self.timeout));
+        };
+        let Some(stderr) =
+            collect_process_output_before_timeout(stderr_reader, started, self.timeout)?
+        else {
+            terminate_timed_out_process(&mut child);
+            return Err(command_timeout_error(&command, self.timeout));
+        };
 
         Ok(CommandOutput {
-            status: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 
@@ -192,6 +255,69 @@ impl SpawnedCommand for ProcessSpawnedCommand {
         let _ = self.child.wait();
         Ok(())
     }
+}
+
+fn read_process_output<R>(mut reader: R) -> ProcessOutputReader
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = reader.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    ProcessOutputReader { receiver }
+}
+
+fn collect_process_output_before_timeout(
+    reader: ProcessOutputReader,
+    started: Instant,
+    timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+        return Ok(None);
+    };
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+
+    match reader.receiver.recv_timeout(remaining) {
+        Ok(result) => result.map(Some),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "command output reader thread stopped early",
+        )),
+    }
+}
+
+fn terminate_timed_out_process(child: &mut Child) {
+    let process_group_id = child.id() as i32;
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{process_group_id}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn command_timeout_error(command: &str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("command `{command}` timed out after {timeout:?}"),
+    )
+}
+
+fn configured_openshell_command_timeout() -> Duration {
+    std::env::var(OPEN_SHELL_COMMAND_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OPEN_SHELL_COMMAND_TIMEOUT)
 }
 
 #[cfg(test)]
@@ -432,7 +558,7 @@ impl Default for OpenShellDriver {
     fn default() -> Self {
         Self {
             binary: OPEN_SHELL_BINARY.to_owned(),
-            runner: Arc::new(ProcessCommandRunner),
+            runner: Arc::new(ProcessCommandRunner::default()),
             host_bootstrap: true,
             runtime_app_override: None,
             workdir: Mutex::new(default_agentenv_workdir()),
@@ -1704,6 +1830,10 @@ impl OpenShellDriver {
     }
 
     fn create_command_failure_may_have_created_sandbox(err: &DriverError) -> bool {
+        if let DriverError::CommandSpawn { source, .. } = err {
+            return source.kind() == io::ErrorKind::TimedOut;
+        }
+
         let DriverError::CommandFailed { stdout, stderr, .. } = err else {
             return false;
         };
@@ -3599,7 +3729,7 @@ mod driver_tests {
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc, Mutex,
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use agentenv_core::{driver::SandboxDriver, security::ssrf::StaticDnsResolver};
@@ -3618,8 +3748,8 @@ mod driver_tests {
     use super::{
         command_request, command_request_with_env, command_string, extract_semver_token,
         shell_quote, CommandCall, CommandOutput, CommandRunner, CommandScript, CommandScriptResult,
-        OpenShellDriver, RecordingCommandRunner, OPEN_SHELL_INSTALL_URL, SANDBOX_WORKING_DIR,
-        TMUX_AGENTENV_COMMAND_OPTION, TMUX_AGENTENV_HANDLE_OPTION,
+        OpenShellDriver, ProcessCommandRunner, RecordingCommandRunner, OPEN_SHELL_INSTALL_URL,
+        SANDBOX_WORKING_DIR, TMUX_AGENTENV_COMMAND_OPTION, TMUX_AGENTENV_HANDLE_OPTION,
         TMUX_AGENTENV_SESSION_NAME_OPTION, TMUX_SESSION_FORMAT,
     };
 
@@ -3630,6 +3760,7 @@ mod driver_tests {
     }
 
     static PATH_LOCK: Mutex<()> = Mutex::new(());
+    static COMMAND_TIMEOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct PathRestoreGuard {
         original: Option<OsString>,
@@ -3641,6 +3772,90 @@ mod driver_tests {
                 std::env::set_var("PATH", original);
             } else {
                 std::env::remove_var("PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn process_command_runner_times_out_hung_commands() {
+        let _env_lock = COMMAND_TIMEOUT_ENV_LOCK.lock().expect("lock timeout env");
+        let original = std::env::var_os("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS");
+        std::env::set_var("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS", "50");
+        let _restore = TimeoutEnvRestoreGuard { original };
+
+        let started = Instant::now();
+        let err = ProcessCommandRunner::default()
+            .run("/bin/sh", &command_request(&["-c", "/bin/sleep 2"]))
+            .expect_err("hung command should time out");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout did not stop the subprocess promptly: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected timeout error: {err}"
+        );
+    }
+
+    #[test]
+    fn process_command_runner_timeout_does_not_wait_for_descendant_stdout() {
+        let _env_lock = COMMAND_TIMEOUT_ENV_LOCK.lock().expect("lock timeout env");
+        let original = std::env::var_os("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS");
+        std::env::set_var("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS", "50");
+        let _restore = TimeoutEnvRestoreGuard { original };
+
+        let started = Instant::now();
+        let err = ProcessCommandRunner::default()
+            .run(
+                "/bin/sh",
+                &command_request(&["-c", "(/bin/sleep 2) & /bin/sleep 2"]),
+            )
+            .expect_err("hung command should time out");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout waited for descendant stdout to close: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn process_command_runner_timeout_covers_output_drain_after_child_exit() {
+        let _env_lock = COMMAND_TIMEOUT_ENV_LOCK.lock().expect("lock timeout env");
+        let original = std::env::var_os("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS");
+        std::env::set_var("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS", "50");
+        let _restore = TimeoutEnvRestoreGuard { original };
+
+        let started = Instant::now();
+        let err = ProcessCommandRunner::default()
+            .run(
+                "/bin/sh",
+                &command_request(&["-c", "(/bin/sleep 2) & true"]),
+            )
+            .expect_err("inherited stdout should keep the command bounded");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout did not cover output drain: {:?}",
+            started.elapsed()
+        );
+    }
+
+    struct TimeoutEnvRestoreGuard {
+        original: Option<OsString>,
+    }
+
+    impl Drop for TimeoutEnvRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                std::env::set_var("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS", original);
+            } else {
+                std::env::remove_var("AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS");
             }
         }
     }
@@ -7836,6 +8051,88 @@ mod driver_tests {
                 CommandCall {
                     program: "openshell".to_owned(),
                     request: command_request(&["sandbox", "delete", "leaked-sandbox"]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn create_rolls_back_when_timed_out_create_left_sandbox() {
+        let runner = Arc::new(RecordingCommandRunner::new(vec![
+            CommandScript::failure(
+                "openshell",
+                &[
+                    "sandbox",
+                    "create",
+                    "--name",
+                    "timed-out-sandbox",
+                    "--no-auto-providers",
+                    "--from",
+                    "openclaw",
+                    "--",
+                    "true",
+                ],
+                io::ErrorKind::TimedOut,
+                "timed out after 2s",
+            ),
+            CommandScript::output(
+                "openshell",
+                &["sandbox", "get", "timed-out-sandbox"],
+                Some(0),
+                "NAME timed-out-sandbox\n",
+                "",
+            ),
+            CommandScript::success(
+                "openshell",
+                &["sandbox", "delete", "timed-out-sandbox"],
+                "",
+                "",
+            ),
+        ]));
+        let driver = OpenShellDriver::with_command_runner(runner.clone());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err = runtime
+            .block_on(async {
+                driver
+                    .create(SandboxSpec {
+                        image: None,
+                        env: BTreeMap::new(),
+                        policy: None,
+                        metadata: BTreeMap::from([("name".to_owned(), json!("timed-out-sandbox"))]),
+                    })
+                    .await
+            })
+            .expect_err("timeout should be returned after rollback");
+
+        assert!(err.to_string().contains("timed out"));
+        assert_eq!(
+            runner.calls(),
+            vec![
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&[
+                        "sandbox",
+                        "create",
+                        "--name",
+                        "timed-out-sandbox",
+                        "--no-auto-providers",
+                        "--from",
+                        "openclaw",
+                        "--",
+                        "true",
+                    ]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "get", "timed-out-sandbox"]),
+                },
+                CommandCall {
+                    program: "openshell".to_owned(),
+                    request: command_request(&["sandbox", "delete", "timed-out-sandbox"]),
                 },
             ]
         );

@@ -3,10 +3,24 @@ use sandbox_openshell::{
     classify_policy_update, translate_for_openshell, translate_for_openshell_with_binaries,
     UpdateDisposition,
 };
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::{
+    io::{self, Read},
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    sync::{mpsc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 static PATH_LOCK: Mutex<()> = Mutex::new(());
+const OPEN_SHELL_COMMAND_TIMEOUT_ENV: &str = "AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS";
+const DEFAULT_LIVE_CLI_TIMEOUT: Duration = Duration::from_secs(300);
+const PROCESS_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+struct ProcessOutputReader {
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+}
 
 #[test]
 fn filesystem_or_process_changes_require_recreate() {
@@ -277,7 +291,8 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
     std::fs::write(&policy_path, translated.policy_yaml).expect("write policy");
 
     let sandbox = format!("agentenv-policy-test-{suffix}");
-    let create_output = std::process::Command::new("openshell")
+    let mut create_command = Command::new("openshell");
+    create_command
         .args([
             "sandbox",
             "create",
@@ -289,14 +304,17 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
             "--policy",
         ])
         .arg(&policy_path)
-        .args(["--", "true"])
-        .output()
-        .expect("create openshell sandbox");
+        .args(["--", "true"]);
+    let create_output = match run_command_with_timeout(create_command) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = delete_sandbox(&sandbox);
+            panic!("create openshell sandbox: {error}");
+        }
+    };
 
     if !create_output.status.success() {
-        let _ = std::process::Command::new("openshell")
-            .args(["sandbox", "delete", &sandbox])
-            .output();
+        let _ = delete_sandbox(&sandbox);
     }
     assert!(
         create_output.status.success(),
@@ -305,17 +323,14 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
         String::from_utf8_lossy(&create_output.stderr)
     );
 
-    let output = std::process::Command::new("openshell")
+    let mut policy_command = Command::new("openshell");
+    policy_command
         .args(["policy", "set", &sandbox, "--policy"])
         .arg(&policy_path)
-        .arg("--wait")
-        .output()
-        .expect("run openshell");
+        .arg("--wait");
+    let output = run_command_with_timeout(policy_command);
 
-    let cleanup_output = std::process::Command::new("openshell")
-        .args(["sandbox", "delete", &sandbox])
-        .output()
-        .expect("delete openshell sandbox");
+    let cleanup_output = delete_sandbox(&sandbox).expect("delete openshell sandbox");
     assert!(
         cleanup_output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -323,6 +338,7 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
         String::from_utf8_lossy(&cleanup_output.stderr)
     );
 
+    let output = output.expect("run openshell");
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -334,10 +350,9 @@ fn translated_policy_is_accepted_by_real_openshell_cli() {
 }
 
 fn openshell_gateway_available() -> bool {
-    match std::process::Command::new("openshell")
-        .arg("status")
-        .output()
-    {
+    let mut command = Command::new("openshell");
+    command.arg("status");
+    match run_command_with_timeout(command) {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
             eprintln!(
@@ -354,6 +369,128 @@ fn openshell_gateway_available() -> bool {
             false
         }
     }
+}
+
+fn delete_sandbox(sandbox: &str) -> io::Result<Output> {
+    let mut command = Command::new("openshell");
+    command.args(["sandbox", "delete", sandbox]);
+    run_command_with_timeout(command)
+}
+
+fn run_command_with_timeout(mut command: Command) -> io::Result<Output> {
+    let timeout = live_cli_timeout();
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture stdout for live OpenShell command"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture stderr for live OpenShell command"))?;
+    let stdout_reader = read_process_output(stdout);
+    let stderr_reader = read_process_output(stderr);
+    let started = Instant::now();
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+
+        if started.elapsed() >= timeout {
+            terminate_timed_out_process(&mut child);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("live OpenShell command timed out after {timeout:?}"),
+            ));
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(PROCESS_COMMAND_POLL_INTERVAL.min(remaining));
+    };
+
+    let Some(stdout) = collect_process_output_before_timeout(stdout_reader, started, timeout)?
+    else {
+        terminate_timed_out_process(&mut child);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("live OpenShell command timed out after {timeout:?}"),
+        ));
+    };
+    let Some(stderr) = collect_process_output_before_timeout(stderr_reader, started, timeout)?
+    else {
+        terminate_timed_out_process(&mut child);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("live OpenShell command timed out after {timeout:?}"),
+        ));
+    };
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_process_output<R>(mut reader: R) -> ProcessOutputReader
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = reader.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    ProcessOutputReader { receiver }
+}
+
+fn collect_process_output_before_timeout(
+    reader: ProcessOutputReader,
+    started: Instant,
+    timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+        return Ok(None);
+    };
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+
+    match reader.receiver.recv_timeout(remaining) {
+        Ok(result) => result.map(Some),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "command output reader thread stopped early",
+        )),
+    }
+}
+
+fn terminate_timed_out_process(child: &mut std::process::Child) {
+    let process_group_id = child.id() as i32;
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{process_group_id}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn live_cli_timeout() -> Duration {
+    std::env::var(OPEN_SHELL_COMMAND_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_LIVE_CLI_TIMEOUT)
 }
 
 fn write_fake_binary(dir: &Path, binary: &str, executable: bool) {
