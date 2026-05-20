@@ -9,7 +9,7 @@ use agentenv_core::eval::{
     build_eval_plan, load_eval_suite_from_yaml, EvalPlan, EvalPlanInput, EvalReport,
     EvalRunnerStatus,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args;
 use serde::Serialize;
 
@@ -72,7 +72,7 @@ impl EvalCliError {
 }
 
 async fn run_eval_inner(args: EvalArgs) -> Result<EvalReport, EvalCliError> {
-    let options = runtime_options(args.non_interactive)
+    let options = crate::runtime_options(args.non_interactive)
         .map_err(|error| EvalCliError::new(format!("{error:#}"), args.json))?;
     let suite_yaml = fs::read_to_string(&args.suite).map_err(|error| {
         EvalCliError::new(
@@ -151,14 +151,19 @@ fn ensure_existing_env(
     plan: &EvalPlan,
     json: bool,
 ) -> Result<(), EvalCliError> {
-    agentenv_core::runtime::describe_env(options, &plan.env_name)
-        .map(|_| ())
-        .map_err(|_| {
-            EvalCliError::new(
-                format!("environment `{}` was not found", plan.env_name),
-                json,
-            )
-        })
+    match agentenv_core::runtime::describe_env(options, &plan.env_name) {
+        Ok(_) => Ok(()),
+        Err(agentenv_core::runtime::RuntimeError::Env(
+            agentenv_core::env::EnvError::NotFound { .. },
+        )) => Err(EvalCliError::new(
+            format!("environment `{}` was not found", plan.env_name),
+            json,
+        )),
+        Err(error) => Err(EvalCliError::new(
+            format!("failed to inspect environment `{}`: {error}", plan.env_name),
+            json,
+        )),
+    }
 }
 
 fn write_report(path: &Path, report: &EvalReport, json: bool) -> Result<(), EvalCliError> {
@@ -223,13 +228,4 @@ fn new_eval_run_id() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     format!("eval-{}-{nanos}", process::id())
-}
-
-fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::RuntimeOptions> {
-    let home = dirs::home_dir().context("home directory is unavailable")?;
-    Ok(agentenv_core::runtime::RuntimeOptions {
-        root: home.join(".agentenv"),
-        log_level: agentenv_proto::LogLevel::Info,
-        non_interactive,
-    })
 }

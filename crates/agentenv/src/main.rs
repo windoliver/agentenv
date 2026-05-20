@@ -3016,7 +3016,9 @@ fn format_event_log(event: &serde_json::Value) -> Option<String> {
     Some(format!("{ts} {level} {driver} {msg}"))
 }
 
-fn runtime_options(non_interactive: bool) -> Result<agentenv_core::runtime::RuntimeOptions> {
+pub(crate) fn runtime_options(
+    non_interactive: bool,
+) -> Result<agentenv_core::runtime::RuntimeOptions> {
     let home = dirs::home_dir().context("home directory is unavailable")?;
     Ok(agentenv_core::runtime::RuntimeOptions {
         root: home.join(".agentenv"),

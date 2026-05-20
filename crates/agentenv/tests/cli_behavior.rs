@@ -1247,6 +1247,55 @@ runners:
 }
 
 #[test]
+fn eval_json_output_reports_corrupt_existing_env_state() {
+    let temp_dir = make_temp_dir("eval-json-corrupt-env");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: valid-suite
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let env_dir = temp_dir.join(".agentenv").join("envs").join("demo");
+    fs::create_dir_all(&env_dir).unwrap();
+    fs::write(env_dir.join("state.json"), "not valid json").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("failed to inspect environment `demo`"),
+        "json was: {value}"
+    );
+    assert!(
+        !error.contains("environment `demo` was not found"),
+        "json was: {value}"
+    );
+}
+
+#[test]
 fn skills_help_lists_lifecycle_subcommands() {
     let output = Command::new(agentenv_bin())
         .arg("skills")
