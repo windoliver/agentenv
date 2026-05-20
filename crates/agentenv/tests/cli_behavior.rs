@@ -1129,7 +1129,10 @@ fn eval_help_lists_expected_flags() {
         "--keep-env",
         "--non-interactive",
     ] {
-        assert!(stdout.contains(text), "missing {text}; stdout was: {stdout}");
+        assert!(
+            stdout.contains(text),
+            "missing {text}; stdout was: {stdout}"
+        );
     }
 }
 
