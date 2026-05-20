@@ -161,6 +161,7 @@ pub struct EvalPlan {
     pub suite_name: String,
     pub blueprint_path: PathBuf,
     pub run_dir: PathBuf,
+    pub report_path: PathBuf,
     pub env_name: String,
     pub runners: Vec<EvalRunnerPlan>,
 }
@@ -217,12 +218,33 @@ pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanErr
         .unwrap_or_else(|| Path::new("."));
     let suite_name = input.suite.metadata.name.clone();
     validate_suite_directory_name(&suite_name)?;
-    let run_dir = input
-        .output_override
-        .and_then(Path::parent)
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| input.run_root.join(&suite_name).join(input.run_id));
+    let default_run_dir = input.run_root.join(&suite_name).join(input.run_id);
+    let (run_dir, report_path) = match input.output_override {
+        Some(output_override) => {
+            let output_override = safe_relative_path("output", output_override, "eval run root")?;
+            let parent = output_override.parent().filter(|path| {
+                !path.as_os_str().is_empty()
+                    && path
+                        .components()
+                        .any(|component| matches!(component, Component::Normal(_)))
+            });
+            match parent {
+                Some(parent) => {
+                    let run_dir = input.run_root.join(parent);
+                    let report_path = input.run_root.join(output_override);
+                    (run_dir, report_path)
+                }
+                None => {
+                    let report_path = default_run_dir.join(output_override);
+                    (default_run_dir.clone(), report_path)
+                }
+            }
+        }
+        None => {
+            let report_path = default_run_dir.join("report.json");
+            (default_run_dir, report_path)
+        }
+    };
     let env_name = input
         .env_override
         .map(ToOwned::to_owned)
@@ -269,6 +291,7 @@ pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanErr
         suite_name,
         blueprint_path: input.blueprint_path.to_path_buf(),
         run_dir,
+        report_path,
         env_name,
         runners,
     })
@@ -279,8 +302,7 @@ fn resolve_suite_relative_path(
     root: &Path,
     raw: &str,
 ) -> Result<PathBuf, EvalPlanError> {
-    reject_unsafe_relative(field, raw, "suite root")?;
-    Ok(root.join(raw))
+    Ok(root.join(safe_relative_path(field, Path::new(raw), "suite root")?))
 }
 
 fn resolve_run_relative_path(
@@ -288,35 +310,35 @@ fn resolve_run_relative_path(
     run_dir: &Path,
     raw: &str,
 ) -> Result<PathBuf, EvalPlanError> {
-    reject_unsafe_relative(field, raw, "run dir")?;
-    Ok(run_dir.join(raw))
+    Ok(run_dir.join(safe_relative_path(field, Path::new(raw), "run dir")?))
 }
 
-fn reject_unsafe_relative(
+fn safe_relative_path(
     field: &'static str,
-    raw: &str,
+    path: &Path,
     base: &'static str,
-) -> Result<(), EvalPlanError> {
-    let path = Path::new(raw);
+) -> Result<PathBuf, EvalPlanError> {
     if path.is_absolute() {
         return Err(EvalPlanError::AbsolutePath {
             field,
-            path: raw.to_owned(),
+            path: path.display().to_string(),
         });
     }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir
-        )
-    }) {
-        return Err(EvalPlanError::EscapesBaseDirectory {
-            field,
-            path: raw.to_owned(),
-            base,
-        });
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) => safe.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(EvalPlanError::EscapesBaseDirectory {
+                    field,
+                    path: path.display().to_string(),
+                    base,
+                });
+            }
+        }
     }
-    Ok(())
+    Ok(safe)
 }
 
 fn validate_suite_directory_name(name: &str) -> Result<(), EvalPlanError> {

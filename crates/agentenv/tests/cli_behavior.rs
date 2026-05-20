@@ -1369,7 +1369,7 @@ runners:
     )
     .unwrap();
     fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
-    let report_path = temp_dir.join("report.json");
+    let report_path = temp_dir.join(".agentenv/evals/reports/report.json");
 
     let output = agentenv_with_home(&temp_dir)
         .arg("eval")
@@ -1377,8 +1377,9 @@ runners:
         .arg("--suite")
         .arg(&suite_path)
         .arg("--output")
-        .arg(&report_path)
+        .arg("reports/report.json")
         .arg("--json")
+        .current_dir(&temp_dir)
         .output()
         .unwrap();
 
@@ -1386,6 +1387,10 @@ runners:
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
     assert_eq!(stdout["suite"], "baseline");
     assert_eq!(stdout["status"], "passed");
+    assert_eq!(
+        stdout["report_path"].as_str(),
+        Some(report_path.to_str().unwrap())
+    );
     assert_eq!(stdout["runners"][0]["id"], "promptfoo");
     assert_eq!(stdout["runners"][0]["status"], "passed");
 
@@ -1396,6 +1401,148 @@ runners:
     assert!(report["runners"][0]["artifact"]
         .as_str()
         .is_some_and(|path| path.ends_with("promptfoo-results.json")));
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_output_override_is_contained_under_eval_run_root() {
+    let temp_dir = make_temp_dir("eval-output-contained");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let expected_report = temp_dir.join(".agentenv/evals/custom/report.json");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg("custom/report.json")
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(
+        stdout["report_path"].as_str(),
+        Some(expected_report.to_str().unwrap()),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        expected_report.is_file(),
+        "report should be written under eval root; {}",
+        output_summary(&output)
+    );
+    assert!(
+        !temp_dir.join("custom/report.json").exists(),
+        "raw relative output path escaped eval run root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_suite_env_cannot_override_reserved_promptfoo_env() {
+    let temp_dir = make_temp_dir("eval-reserved-env");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo_env_probe(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+    env:
+      AGENTENV_EVAL_ENV: spoof-env
+      AGENTENV_EVAL_RUN_DIR: /spoof/run-dir
+      AGENTENV_EVAL_BLUEPRINT: /spoof/blueprint.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    let promptfoo_config = temp_dir.join("promptfooconfig.yaml");
+    fs::write(&promptfoo_config, "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    let artifact = PathBuf::from(
+        stdout["runners"][0]["artifact"]
+            .as_str()
+            .expect("runner artifact is present"),
+    );
+    let artifact_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).unwrap()).unwrap();
+
+    assert_eq!(artifact_json["env"]["AGENTENV_EVAL_ENV"], "demo");
+    assert_eq!(
+        artifact_json["env"]["AGENTENV_EVAL_RUN_DIR"],
+        artifact.parent().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        artifact_json["env"]["AGENTENV_EVAL_BLUEPRINT"],
+        fixture_blueprint().to_str().unwrap()
+    );
+    assert_eq!(
+        artifact_json["args"],
+        format!(
+            "eval --config {} --output {}",
+            promptfoo_config.display(),
+            artifact.display()
+        )
+    );
 }
 
 #[cfg(unix)]
@@ -1413,11 +1560,15 @@ fn eval_sanitizes_promptfoo_runner_id_for_log_paths() {
     let escaped_stderr_log = root_dir.join("outside-stderr.log");
     let evals_escaped_stdout_log = temp_dir.join(".agentenv/evals/outside-stdout.log");
     let evals_escaped_stderr_log = temp_dir.join(".agentenv/evals/outside-stderr.log");
+    let expected_stdout_log = temp_dir.join(".agentenv/evals/logs/outside-stdout.log");
+    let expected_stderr_log = temp_dir.join(".agentenv/evals/logs/outside-stderr.log");
     for path in [
         &escaped_stdout_log,
         &escaped_stderr_log,
         &evals_escaped_stdout_log,
         &evals_escaped_stderr_log,
+        &expected_stdout_log,
+        &expected_stderr_log,
     ] {
         let _ = fs::remove_file(path);
     }
@@ -1444,7 +1595,7 @@ runners:
     )
     .unwrap();
     fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
-    let report_path = temp_dir.join("report.json");
+    let report_path = temp_dir.join(".agentenv/evals/logs/report.json");
 
     let output = agentenv_with_home(&temp_dir)
         .arg("eval")
@@ -1452,7 +1603,8 @@ runners:
         .arg("--suite")
         .arg(&suite_path)
         .arg("--output")
-        .arg(&report_path)
+        .arg("logs/report.json")
+        .current_dir(&temp_dir)
         .output()
         .unwrap();
 
@@ -1477,16 +1629,8 @@ runners:
         "escaped stderr log was created at {}",
         evals_escaped_stderr_log.display()
     );
-    assert!(
-        temp_dir.join("outside-stdout.log").exists(),
-        "{}",
-        output_summary(&output)
-    );
-    assert!(
-        temp_dir.join("outside-stderr.log").exists(),
-        "{}",
-        output_summary(&output)
-    );
+    assert!(expected_stdout_log.exists(), "{}", output_summary(&output));
+    assert!(expected_stderr_log.exists(), "{}", output_summary(&output));
 
     let report: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
@@ -1552,6 +1696,7 @@ fn write_fake_promptfoo(path: &Path, exit_code: i32) {
         format!(
             r#"#!/bin/sh
 output=""
+args="$*"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output)
@@ -1565,6 +1710,37 @@ if [ -n "$output" ]; then
   mkdir -p "$(dirname "$output")"
   printf '{{"fake":true}}\n' > "$output"
 fi
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo_env_probe(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+args="$*"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+mkdir -p "$(dirname "$output")"
+printf '{{"args":"%s","env":{{"AGENTENV_EVAL_ENV":"%s","AGENTENV_EVAL_RUN_DIR":"%s","AGENTENV_EVAL_BLUEPRINT":"%s"}}}}\n' "$args" "$AGENTENV_EVAL_ENV" "$AGENTENV_EVAL_RUN_DIR" "$AGENTENV_EVAL_BLUEPRINT" > "$output"
 exit {exit_code}
 "#
         ),

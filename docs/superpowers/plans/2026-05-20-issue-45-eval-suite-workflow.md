@@ -1595,11 +1595,11 @@ Prompt-injection tests, guardrail assertions, and red-team scenarios are
 core-managed eval suites, not a fifth pluggable axis. An eval suite is a static
 YAML artifact that targets a blueprint and declares one or more runner adapters.
 
-`agentenv eval <blueprint.yaml> --suite <agentenv-eval.yaml>` verifies the
-blueprint, validates the suite, targets or materializes an environment, runs the
-declared suite runners, and writes a report. Promptfoo is the first reference
-runner; Garak, Lakera, Virtue AI, and OWASP suite packs can integrate as suite
-content or runner adapters without changing the driver graph.
+`agentenv eval <blueprint.yaml> --suite <agentenv-eval.yaml> --env <env-id>`
+verifies the blueprint, validates the suite, targets an existing environment,
+runs the declared suite runners, and writes a report. Promptfoo is the first
+reference runner; Garak, Lakera, Virtue AI, and OWASP suite packs can integrate
+as suite content or runner adapters without changing the driver graph.
 
 Drivers still own runtime components only. Eval runners do not have JSON-RPC
 handshakes, durable handles, or driver protocol methods. Credentials continue to

@@ -139,19 +139,15 @@ async fn run_eval_inner(args: EvalArgs) -> Result<EvalReport, EvalCliError> {
         .map(|runner| runner.status)
         .collect::<Vec<_>>();
     let status = eval_status_from_runners(&statuses);
-    let report_path = args
-        .output
-        .clone()
-        .unwrap_or_else(|| plan.run_dir.join("report.json"));
     let report = EvalReport {
         suite: plan.suite_name.clone(),
         blueprint: plan.blueprint_path.clone(),
         status,
         run_id,
-        report_path: report_path.clone(),
+        report_path: plan.report_path.clone(),
         runners: runner_reports,
     };
-    write_report(&report_path, &report, args.json)?;
+    write_report(&plan.report_path, &report, args.json)?;
     render_report(&report, args.json)?;
     Ok(report)
 }
@@ -195,14 +191,15 @@ fn run_promptfoo_runner(
         .arg(config)
         .arg("--output")
         .arg(&runner.output)
-        .env("AGENTENV_EVAL_ENV", &plan.env_name)
-        .env("AGENTENV_EVAL_RUN_DIR", &plan.run_dir)
-        .env("AGENTENV_EVAL_BLUEPRINT", &plan.blueprint_path)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     for (name, value) in &runner.env {
         command.env(name, value);
     }
+    command
+        .env("AGENTENV_EVAL_ENV", &plan.env_name)
+        .env("AGENTENV_EVAL_RUN_DIR", &plan.run_dir)
+        .env("AGENTENV_EVAL_BLUEPRINT", &plan.blueprint_path);
 
     let status = command.status().map_err(|error| {
         EvalCliError::new(

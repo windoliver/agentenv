@@ -263,8 +263,126 @@ runners:
         Path::new("/tmp/agentenv/evals/baseline/run-1")
     );
     assert_eq!(
+        plan.report_path,
+        Path::new("/tmp/agentenv/evals/baseline/run-1/report.json")
+    );
+    assert_eq!(
         plan.runners[0].output,
         Path::new("/tmp/agentenv/evals/baseline/run-1/promptfoo-results.json")
+    );
+}
+
+#[test]
+fn eval_plan_resolves_safe_relative_output_override_under_run_root() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let plan = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: Some(Path::new("custom/report.json")),
+        run_id: "run-1",
+    })
+    .expect("plan builds");
+
+    assert_eq!(plan.run_dir, Path::new("/tmp/agentenv/evals/custom"));
+    assert_eq!(
+        plan.report_path,
+        Path::new("/tmp/agentenv/evals/custom/report.json")
+    );
+    assert_eq!(
+        plan.runners[0].output,
+        Path::new("/tmp/agentenv/evals/custom/promptfoo-results.json")
+    );
+}
+
+#[test]
+fn eval_plan_rejects_absolute_output_override() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let error = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: Some(Path::new("/tmp/report.json")),
+        run_id: "run-1",
+    })
+    .expect_err("absolute output override is rejected");
+
+    let message = error.to_string();
+    assert!(message.contains("output"), "error was: {error}");
+    assert!(message.contains("must be relative"), "error was: {error}");
+}
+
+#[test]
+fn eval_plan_rejects_parent_traversal_output_override() {
+    let suite = load_eval_suite_from_yaml(
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .expect("suite parses");
+
+    let error = build_eval_plan(EvalPlanInput {
+        suite,
+        suite_path: Path::new("/tmp/project/evals/agentenv-eval.yaml"),
+        blueprint_path: Path::new("/tmp/project/agentenv.yaml"),
+        run_root: Path::new("/tmp/agentenv/evals"),
+        env_override: None,
+        output_override: Some(Path::new("../report.json")),
+        run_id: "run-1",
+    })
+    .expect_err("escaping output override is rejected");
+
+    let message = error.to_string();
+    assert!(message.contains("output"), "error was: {error}");
+    assert!(
+        message.contains("escapes eval run root"),
+        "error was: {error}"
     );
 }
 

@@ -20,12 +20,11 @@ The user-facing command is:
 agentenv eval <blueprint.yaml> --suite <suite-path>
 ```
 
-The command verifies the blueprint, loads an eval suite, materializes or targets
-an environment according to that suite, invokes one or more declared suite
-runners, and writes a stable report. Eval providers such as Promptfoo, Garak,
-Lakera, Virtue AI, or OWASP suite packs integrate as suite runners or suite
-content. They are not fifth-axis drivers and do not speak the core driver
-protocol.
+The command verifies the blueprint, loads an eval suite, targets an existing
+environment, invokes one or more declared suite runners, and writes a stable
+report. Eval providers such as Promptfoo, Garak, Lakera, Virtue AI, or OWASP
+suite packs integrate as suite runners or suite content. They are not
+fifth-axis drivers and do not speak the core driver protocol.
 
 The GitHub app available in this workspace could not post the required approach
 comment on issue #45 because GitHub returned `403 Resource not accessible by
@@ -95,10 +94,9 @@ agentenv eval
         |
         +-- verify blueprint
         +-- validate suite
-        +-- create or target env
+        +-- target existing env
         +-- run suite runners
         +-- collect reports
-        +-- destroy disposable env unless retained
 ```
 
 Eval suites are declarative artifacts. They may be checked into a project, kept
@@ -142,8 +140,8 @@ metadata:
   name: prompt-injection-baseline
   description: Baseline guardrail tests for repository agents
 target:
-  lifecycle: ephemeral
-  env_name: prompt-injection-baseline
+  lifecycle: existing
+  env_name: demo
   requires:
     agent_capabilities:
       - supports_headless
@@ -183,22 +181,24 @@ cases:
 
 ```yaml
 target:
-  lifecycle: ephemeral
+  lifecycle: existing
   env_name: optional-stable-name
   requires:
     agent_capabilities:
       - supports_headless
 ```
 
-- `lifecycle: ephemeral` creates a disposable environment from the blueprint and
-  destroys it at the end unless `--keep-env` is supplied.
-- `lifecycle: existing` targets an existing environment supplied by
-  `--env <name>` or `target.env_name`.
+- Current implementation targets an existing environment supplied by
+  `--env <name>` or by `target.lifecycle: existing` with `target.env_name`.
+- `lifecycle: ephemeral` is reserved for a later lifecycle-wiring PR. Until that
+  is implemented, suites that rely on implicit ephemeral creation are rejected
+  unless `--env <name>` explicitly selects an existing environment.
 - `requires.agent_capabilities` lists agent capabilities needed by the suite.
   Core rejects the run before runner execution when the resolved agent driver
   cannot satisfy the declared capability.
 
-The default lifecycle is `ephemeral`.
+The schema default remains `ephemeral`, but this first implementation requires
+an existing environment target.
 
 ### Runners
 
@@ -274,12 +274,12 @@ Arguments:
 
 - `<blueprint.yaml>`: blueprint to verify and evaluate.
 - `--suite <suite-path>`: eval suite path.
-- `--env <name>`: target an existing env or override the generated ephemeral
-  name.
+- `--env <name>`: target an existing env.
 - `--output <path>`: report path. Defaults to
   `~/.agentenv/evals/<suite-name>/<run-id>/report.json`.
 - `--json`: print the final report summary as JSON.
-- `--keep-env`: keep an ephemeral environment for debugging.
+- `--keep-env`: reserved for future ephemeral lifecycle support; no-op in this
+  first implementation because eval does not create or destroy environments.
 - `--non-interactive`: fail instead of prompting for missing credentials or
   approvals.
 
@@ -386,26 +386,28 @@ Promptfoo CLI.
 
 ## Environment Lifecycle
 
-For `target.lifecycle: ephemeral`, `agentenv eval` uses the same create and
-destroy paths as normal environments. The env name is deterministic enough for
-diagnostics and unique enough for concurrent CI runs:
+This first implementation only runs against an existing environment. The target
+environment is selected by `--env <name>` or by `target.lifecycle: existing`
+with `target.env_name` in the suite. The command validates the named env exists
+before running any runner, then leaves it untouched after the run.
+
+For a later lifecycle-wiring PR, `target.lifecycle: ephemeral` can use the same
+create and destroy paths as normal environments. The env name should be
+deterministic enough for diagnostics and unique enough for concurrent CI runs:
 
 ```text
 eval-<suite-name>-<short-run-id>
 ```
 
-The command destroys the env at the end unless:
+That later implementation should destroy the env at the end unless:
 
 - the user passes `--keep-env`,
 - environment creation succeeded but runner execution hit an infrastructure
   error and cleanup fails, or
 - the process is interrupted before cleanup can complete.
 
-Cleanup failures are reported after the original runner result and produce exit
-code `2`.
-
-For `target.lifecycle: existing`, the command does not create or destroy an env.
-It validates the named env exists before running any runner.
+Cleanup failures should be reported after the original runner result and produce
+exit code `2`.
 
 ## Security And Policy
 
@@ -418,10 +420,10 @@ It validates the named env exists before running any runner.
 - Runner environment variables are allowlisted from the suite; host credentials
   are not blindly forwarded.
 - Reports may contain prompts, model responses, and guardrail failures. The
-  default report location is under the agentenv data root rather than the
-  project tree. Users opt into project-local output with `--output`.
-- Disposable env creation uses existing credential handling. Credentials still
-  do not flow through driver generic RPC.
+  report location is under the agentenv eval run root. `--output` accepts only
+  safe relative paths and resolves them under that eval run root.
+- Future disposable env creation must use existing credential handling.
+  Credentials still do not flow through driver generic RPC.
 
 ## Documentation Updates
 
@@ -430,7 +432,8 @@ skills/resource discussion:
 
 - Eval suites are core-managed workflow inputs.
 - Eval providers are runner adapters, not drivers.
-- `agentenv eval` operates on blueprints and may materialize disposable envs.
+- Current `agentenv eval` operates on blueprints and targets existing envs;
+  disposable env materialization is reserved for a later lifecycle-wiring PR.
 - No fifth axis is added.
 
 Update `docs/ROADMAP.md` by adding H-9 to the Post-MVP hardening list and
