@@ -1400,6 +1400,101 @@ runners:
 
 #[cfg(unix)]
 #[test]
+fn eval_sanitizes_promptfoo_runner_id_for_log_paths() {
+    let root_dir = make_temp_dir("eval-promptfoo-runner-id-log-path");
+    let temp_dir = root_dir.join("home");
+    fs::create_dir_all(&temp_dir).unwrap();
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 0);
+    let escaped_stdout_log = root_dir.join("outside-stdout.log");
+    let escaped_stderr_log = root_dir.join("outside-stderr.log");
+    let evals_escaped_stdout_log = temp_dir.join(".agentenv/evals/outside-stdout.log");
+    let evals_escaped_stderr_log = temp_dir.join(".agentenv/evals/outside-stderr.log");
+    for path in [
+        &escaped_stdout_log,
+        &escaped_stderr_log,
+        &evals_escaped_stdout_log,
+        &evals_escaped_stderr_log,
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: ../outside
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let report_path = temp_dir.join("report.json");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg(&report_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(
+        !escaped_stdout_log.exists(),
+        "escaped stdout log was created at {}",
+        escaped_stdout_log.display()
+    );
+    assert!(
+        !escaped_stderr_log.exists(),
+        "escaped stderr log was created at {}",
+        escaped_stderr_log.display()
+    );
+    assert!(
+        !evals_escaped_stdout_log.exists(),
+        "escaped stdout log was created at {}",
+        evals_escaped_stdout_log.display()
+    );
+    assert!(
+        !evals_escaped_stderr_log.exists(),
+        "escaped stderr log was created at {}",
+        evals_escaped_stderr_log.display()
+    );
+    assert!(
+        temp_dir.join("outside-stdout.log").exists(),
+        "{}",
+        output_summary(&output)
+    );
+    assert!(
+        temp_dir.join("outside-stderr.log").exists(),
+        "{}",
+        output_summary(&output)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["runners"][0]["id"], "../outside");
+}
+
+#[cfg(unix)]
+#[test]
 fn eval_fake_promptfoo_failure_exits_one() {
     let temp_dir = make_temp_dir("eval-fake-promptfoo-fail");
     write_minimal_env_state(&temp_dir, "demo");

@@ -161,8 +161,9 @@ fn run_promptfoo_runner(
     plan: &EvalPlan,
     json: bool,
 ) -> Result<EvalRunnerReport, EvalCliError> {
-    let stdout_path = plan.run_dir.join(format!("{}-stdout.log", runner.id));
-    let stderr_path = plan.run_dir.join(format!("{}-stderr.log", runner.id));
+    let log_slug = safe_runner_log_slug(&runner.id);
+    let stdout_path = plan.run_dir.join(format!("{log_slug}-stdout.log"));
+    let stderr_path = plan.run_dir.join(format!("{log_slug}-stderr.log"));
     let stdout_file = fs::File::create(&stdout_path).map_err(|error| {
         EvalCliError::new(
             format!(
@@ -222,6 +223,26 @@ fn run_promptfoo_runner(
         exit_code,
         artifact: runner.output.clone(),
     })
+}
+
+fn safe_runner_log_slug(id: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_separator = false;
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            slug.push(ch);
+            last_was_separator = false;
+        } else if !last_was_separator {
+            slug.push('-');
+            last_was_separator = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        "runner".to_owned()
+    } else {
+        slug
+    }
 }
 
 fn ensure_existing_env(
