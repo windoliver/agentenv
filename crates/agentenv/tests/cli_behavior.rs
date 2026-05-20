@@ -1137,6 +1137,116 @@ fn eval_help_lists_expected_flags() {
 }
 
 #[test]
+fn eval_missing_suite_reports_read_error() {
+    let temp_dir = make_temp_dir("eval-missing-suite");
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(temp_dir.join("missing-agentenv-eval.yaml"))
+        .arg("--env")
+        .arg("demo")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to read eval suite file"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[test]
+fn eval_blueprint_verification_happens_before_runner_execution() {
+    let temp_dir = make_temp_dir("eval-invalid-blueprint");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let bad_blueprint = temp_dir.join("bad-agentenv.yaml");
+    fs::write(&bad_blueprint, "not: a-valid-agentenv-blueprint\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(&bad_blueprint)
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--env")
+        .arg("demo")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to verify blueprint"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[test]
+fn eval_json_output_reports_missing_existing_env() {
+    let temp_dir = make_temp_dir("eval-json-missing-env");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: missing
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(value["status"], "infrastructure-error");
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("environment `missing` was not found")),
+        "json was: {value}"
+    );
+}
+
+#[test]
 fn skills_help_lists_lifecycle_subcommands() {
     let output = Command::new(agentenv_bin())
         .arg("skills")
