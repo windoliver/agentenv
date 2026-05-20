@@ -82,6 +82,7 @@ Exit criterion: an operator can observe live activity, approve unlisted egress r
 
 ## Post-MVP
 
+- H-9 — Prompt-injection and guardrail eval suites (`agentenv eval`)
 - Docker sandbox driver
 - E2B sandbox driver
 - Community catalog (`agentenv-community` repo)
