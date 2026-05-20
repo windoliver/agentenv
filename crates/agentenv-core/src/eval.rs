@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -170,4 +173,185 @@ pub struct EvalRunnerPlan {
     pub config: Option<PathBuf>,
     pub output: PathBuf,
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Error)]
+pub enum EvalPlanError {
+    #[error("{field} path `{path}` must be relative")]
+    AbsolutePath { field: &'static str, path: String },
+    #[error("{field} path `{path}` escapes suite root")]
+    EscapesSuiteRoot { field: &'static str, path: String },
+    #[error("runner `{runner}` must declare config for promptfoo")]
+    MissingPromptfooConfig { runner: String },
+    #[error(
+        "target lifecycle `ephemeral` is not wired yet; pass `--env <name>` or use `target.lifecycle: existing`"
+    )]
+    EphemeralUnsupported,
+}
+
+pub struct EvalPlanInput<'a> {
+    pub suite: EvalSuite,
+    pub suite_path: &'a Path,
+    pub blueprint_path: &'a Path,
+    pub run_root: &'a Path,
+    pub env_override: Option<&'a str>,
+    pub output_override: Option<&'a Path>,
+    pub run_id: &'a str,
+}
+
+pub fn build_eval_plan(input: EvalPlanInput<'_>) -> Result<EvalPlan, EvalPlanError> {
+    if input.suite.target.lifecycle == EvalLifecycle::Ephemeral && input.env_override.is_none() {
+        return Err(EvalPlanError::EphemeralUnsupported);
+    }
+
+    let suite_root = input
+        .suite_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let suite_name = input.suite.metadata.name.clone();
+    let run_dir = input
+        .output_override
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| input.run_root.join(&suite_name).join(input.run_id));
+    let env_name = input
+        .env_override
+        .map(ToOwned::to_owned)
+        .or_else(|| input.suite.target.env_name.clone())
+        .unwrap_or_else(|| format!("eval-{}-{}", sanitize_name(&suite_name), input.run_id));
+
+    let mut runners = Vec::new();
+    for runner in input.suite.runners {
+        let command = runner
+            .command
+            .clone()
+            .unwrap_or_else(|| match runner.runner_type {
+                EvalRunnerType::Promptfoo => "promptfoo".to_owned(),
+            });
+        let config = match runner.runner_type {
+            EvalRunnerType::Promptfoo => {
+                let config = runner.config.as_deref().ok_or_else(|| {
+                    EvalPlanError::MissingPromptfooConfig {
+                        runner: runner.id.clone(),
+                    }
+                })?;
+                Some(resolve_suite_relative_path(
+                    "runner.config",
+                    suite_root,
+                    config,
+                )?)
+            }
+        };
+        let output = match runner.output.as_deref() {
+            Some(path) => resolve_run_relative_path("runner.output", &run_dir, path)?,
+            None => run_dir.join("promptfoo-results.json"),
+        };
+        runners.push(EvalRunnerPlan {
+            id: runner.id,
+            runner_type: runner.runner_type,
+            command,
+            config,
+            output,
+            env: runner.env,
+        });
+    }
+
+    Ok(EvalPlan {
+        suite_name,
+        blueprint_path: input.blueprint_path.to_path_buf(),
+        run_dir,
+        env_name,
+        runners,
+    })
+}
+
+fn resolve_suite_relative_path(
+    field: &'static str,
+    root: &Path,
+    raw: &str,
+) -> Result<PathBuf, EvalPlanError> {
+    reject_unsafe_relative(field, raw)?;
+    Ok(root.join(raw))
+}
+
+fn resolve_run_relative_path(
+    field: &'static str,
+    run_dir: &Path,
+    raw: &str,
+) -> Result<PathBuf, EvalPlanError> {
+    reject_unsafe_relative(field, raw)?;
+    Ok(run_dir.join(raw))
+}
+
+fn reject_unsafe_relative(field: &'static str, raw: &str) -> Result<(), EvalPlanError> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err(EvalPlanError::AbsolutePath {
+            field,
+            path: raw.to_owned(),
+        });
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    }) {
+        return Err(EvalPlanError::EscapesSuiteRoot {
+            field,
+            path: raw.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn sanitize_name(name: &str) -> String {
+    let mut sanitized = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('-');
+        }
+    }
+    sanitized.trim_matches('-').to_owned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvalRunnerStatus {
+    Passed,
+    Failed,
+    InfrastructureError,
+}
+
+pub fn eval_status_from_runners(statuses: &[EvalRunnerStatus]) -> EvalRunnerStatus {
+    if statuses.contains(&EvalRunnerStatus::InfrastructureError) {
+        return EvalRunnerStatus::InfrastructureError;
+    }
+    if statuses.contains(&EvalRunnerStatus::Failed) {
+        return EvalRunnerStatus::Failed;
+    }
+    EvalRunnerStatus::Passed
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalReport {
+    pub suite: String,
+    pub blueprint: PathBuf,
+    pub status: EvalRunnerStatus,
+    pub run_id: String,
+    pub report_path: PathBuf,
+    pub runners: Vec<EvalRunnerReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalRunnerReport {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub runner_type: EvalRunnerType,
+    pub status: EvalRunnerStatus,
+    pub exit_code: Option<i32>,
+    pub artifact: PathBuf,
 }
