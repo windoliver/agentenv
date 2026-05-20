@@ -1111,6 +1111,838 @@ fn cli_help_includes_skills_command() {
 }
 
 #[test]
+fn eval_help_lists_expected_flags() {
+    let output = Command::new(agentenv_bin())
+        .arg("eval")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for text in [
+        "Usage:",
+        "--suite",
+        "--env",
+        "--output",
+        "--json",
+        "--keep-env",
+        "--non-interactive",
+    ] {
+        assert!(
+            stdout.contains(text),
+            "missing {text}; stdout was: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn eval_missing_suite_reports_read_error() {
+    let temp_dir = make_temp_dir("eval-missing-suite");
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(temp_dir.join("missing-agentenv-eval.yaml"))
+        .arg("--env")
+        .arg("demo")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to read eval suite file"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[test]
+fn eval_blueprint_verification_happens_before_runner_execution() {
+    let temp_dir = make_temp_dir("eval-invalid-blueprint");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let bad_blueprint = temp_dir.join("bad-agentenv.yaml");
+    fs::write(&bad_blueprint, "not: a-valid-agentenv-blueprint\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(&bad_blueprint)
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--env")
+        .arg("demo")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to verify blueprint"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[test]
+fn eval_json_output_reports_missing_existing_env() {
+    let temp_dir = make_temp_dir("eval-json-missing-env");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: missing
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(value["status"], "infrastructure-error");
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("environment `missing` was not found")),
+        "json was: {value}"
+    );
+}
+
+#[test]
+fn eval_json_output_reports_corrupt_existing_env_state() {
+    let temp_dir = make_temp_dir("eval-json-corrupt-env");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: valid-suite
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let env_dir = temp_dir.join(".agentenv").join("envs").join("demo");
+    fs::create_dir_all(&env_dir).unwrap();
+    fs::write(env_dir.join("state.json"), "not valid json").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("failed to inspect environment `demo`"),
+        "json was: {value}"
+    );
+    assert!(
+        !error.contains("environment `demo` was not found"),
+        "json was: {value}"
+    );
+}
+
+#[test]
+fn eval_reports_missing_promptfoo_command() {
+    let temp_dir = make_temp_dir("eval-missing-promptfoo");
+    write_minimal_env_state(&temp_dir, "demo");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: definitely-not-a-real-promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to start runner `promptfoo`"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_runs_fake_promptfoo_and_writes_json_report() {
+    let temp_dir = make_temp_dir("eval-fake-promptfoo");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let report_path = temp_dir.join(".agentenv/evals/reports/report.json");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg("reports/report.json")
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(stdout["suite"], "baseline");
+    assert_eq!(stdout["status"], "passed");
+    assert_eq!(
+        stdout["report_path"].as_str(),
+        Some(report_path.to_str().unwrap())
+    );
+    assert_eq!(stdout["runners"][0]["id"], "promptfoo");
+    assert_eq!(stdout["runners"][0]["status"], "passed");
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["suite"], "baseline");
+    assert_eq!(report["status"], "passed");
+    assert!(report["runners"][0]["artifact"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("promptfoo-results.json")));
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_output_override_is_contained_under_eval_run_root() {
+    let temp_dir = make_temp_dir("eval-output-contained");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let expected_report = temp_dir.join(".agentenv/evals/custom/report.json");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg("custom/report.json")
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(
+        stdout["report_path"].as_str(),
+        Some(expected_report.to_str().unwrap()),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        expected_report.is_file(),
+        "report should be written under eval root; {}",
+        output_summary(&output)
+    );
+    assert!(
+        !temp_dir.join("custom/report.json").exists(),
+        "raw relative output path escaped eval run root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_suite_env_cannot_override_reserved_promptfoo_env() {
+    let temp_dir = make_temp_dir("eval-reserved-env");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo_env_probe(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+    env:
+      AGENTENV_EVAL_ENV: spoof-env
+      AGENTENV_EVAL_RUN_DIR: /spoof/run-dir
+      AGENTENV_EVAL_BLUEPRINT: /spoof/blueprint.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    let promptfoo_config = temp_dir.join("promptfooconfig.yaml");
+    fs::write(&promptfoo_config, "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    let artifact = PathBuf::from(
+        stdout["runners"][0]["artifact"]
+            .as_str()
+            .expect("runner artifact is present"),
+    );
+    let artifact_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).unwrap()).unwrap();
+
+    assert_eq!(artifact_json["env"]["AGENTENV_EVAL_ENV"], "demo");
+    assert_eq!(
+        artifact_json["env"]["AGENTENV_EVAL_RUN_DIR"],
+        artifact.parent().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        artifact_json["env"]["AGENTENV_EVAL_BLUEPRINT"],
+        fixture_blueprint().to_str().unwrap()
+    );
+    assert_eq!(
+        artifact_json["args"],
+        format!(
+            "eval --config {} --output {}",
+            promptfoo_config.display(),
+            artifact.display()
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_runner_env_is_allowlisted() {
+    let temp_dir = make_temp_dir("eval-runner-env-allowlist");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo_env_allowlist_probe(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+    env:
+      AGENTENV_EVAL_MODE: headless
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--json")
+        .env("AGENTENV_EVAL_LEAK_TEST_SECRET", "host-secret")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    let artifact = PathBuf::from(
+        stdout["runners"][0]["artifact"]
+            .as_str()
+            .expect("runner artifact is present"),
+    );
+    let artifact_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).unwrap()).unwrap();
+
+    assert_eq!(artifact_json["suite_env"], "headless");
+    assert_eq!(artifact_json["host_secret"], "");
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_runner_logs_are_bounded() {
+    const EXPECTED_LOG_LIMIT: u64 = 1024 * 1024;
+
+    let temp_dir = make_temp_dir("eval-runner-log-bound");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo_noisy(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let stdout_log = temp_dir.join(".agentenv/evals/logs/promptfoo-stdout.log");
+    let stderr_log = temp_dir.join(".agentenv/evals/logs/promptfoo-stderr.log");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg("logs/report.json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    for path in [&stdout_log, &stderr_log] {
+        let len = fs::metadata(path).unwrap().len();
+        assert!(
+            len <= EXPECTED_LOG_LIMIT + 128,
+            "{} should be capped, got {len} bytes",
+            path.display()
+        );
+        let log = fs::read_to_string(path).unwrap();
+        assert!(
+            log.contains("[agentenv log truncated"),
+            "{} should contain truncation marker",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_sanitizes_promptfoo_runner_id_for_log_paths() {
+    let root_dir = make_temp_dir("eval-promptfoo-runner-id-log-path");
+    let temp_dir = root_dir.join("home");
+    fs::create_dir_all(&temp_dir).unwrap();
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 0);
+    let escaped_stdout_log = root_dir.join("outside-stdout.log");
+    let escaped_stderr_log = root_dir.join("outside-stderr.log");
+    let evals_escaped_stdout_log = temp_dir.join(".agentenv/evals/outside-stdout.log");
+    let evals_escaped_stderr_log = temp_dir.join(".agentenv/evals/outside-stderr.log");
+    let expected_stdout_log = temp_dir.join(".agentenv/evals/logs/outside-stdout.log");
+    let expected_stderr_log = temp_dir.join(".agentenv/evals/logs/outside-stderr.log");
+    for path in [
+        &escaped_stdout_log,
+        &escaped_stderr_log,
+        &evals_escaped_stdout_log,
+        &evals_escaped_stderr_log,
+        &expected_stdout_log,
+        &expected_stderr_log,
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: ../outside
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let report_path = temp_dir.join(".agentenv/evals/logs/report.json");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg("logs/report.json")
+        .current_dir(&temp_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    assert!(
+        !escaped_stdout_log.exists(),
+        "escaped stdout log was created at {}",
+        escaped_stdout_log.display()
+    );
+    assert!(
+        !escaped_stderr_log.exists(),
+        "escaped stderr log was created at {}",
+        escaped_stderr_log.display()
+    );
+    assert!(
+        !evals_escaped_stdout_log.exists(),
+        "escaped stdout log was created at {}",
+        evals_escaped_stdout_log.display()
+    );
+    assert!(
+        !evals_escaped_stderr_log.exists(),
+        "escaped stderr log was created at {}",
+        evals_escaped_stderr_log.display()
+    );
+    assert!(expected_stdout_log.exists(), "{}", output_summary(&output));
+    assert!(expected_stderr_log.exists(), "{}", output_summary(&output));
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["runners"][0]["id"], "../outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_fake_promptfoo_failure_exits_one() {
+    let temp_dir = make_temp_dir("eval-fake-promptfoo-fail");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 1);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("status: failed"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+args="$*"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+if [ -n "$output" ]; then
+  mkdir -p "$(dirname "$output")"
+  printf '{{"fake":true}}\n' > "$output"
+fi
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo_env_probe(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+args="$*"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+mkdir -p "$(dirname "$output")"
+printf '{{"args":"%s","env":{{"AGENTENV_EVAL_ENV":"%s","AGENTENV_EVAL_RUN_DIR":"%s","AGENTENV_EVAL_BLUEPRINT":"%s"}}}}\n' "$args" "$AGENTENV_EVAL_ENV" "$AGENTENV_EVAL_RUN_DIR" "$AGENTENV_EVAL_BLUEPRINT" > "$output"
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo_env_allowlist_probe(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+mkdir -p "$(dirname "$output")"
+printf '{{"suite_env":"%s","host_secret":"%s"}}\n' "$AGENTENV_EVAL_MODE" "$AGENTENV_EVAL_LEAK_TEST_SECRET" > "$output"
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo_noisy(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+mkdir -p "$(dirname "$output")"
+printf '{{"fake":true}}\n' > "$output"
+i=0
+while [ "$i" -lt 1200 ]; do
+  printf '%1000s\n' stdout
+  printf '%1000s\n' stderr >&2
+  i=$((i + 1))
+done
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[test]
 fn skills_help_lists_lifecycle_subcommands() {
     let output = Command::new(agentenv_bin())
         .arg("skills")

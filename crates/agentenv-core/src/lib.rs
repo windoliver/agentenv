@@ -12,6 +12,7 @@ pub mod driver_catalog;
 pub mod egress_proxy;
 pub mod env;
 pub mod error;
+pub mod eval;
 pub mod hardening;
 pub mod inference;
 pub mod lifecycle;

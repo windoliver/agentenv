@@ -7,15 +7,16 @@
 1. [Design principles](#design-principles)
 2. [The four pluggable axes](#the-four-pluggable-axes)
 3. [Skills as a core-managed resource](#skills-as-a-core-managed-resource)
-4. [The narrow waist: MCP](#the-narrow-waist-mcp)
-5. [Driver architecture](#driver-architecture)
-6. [Blueprint lifecycle](#blueprint-lifecycle)
-7. [Policy model](#policy-model)
-8. [Credential store](#credential-store)
-9. [Sessions vs. sandboxes](#sessions-vs-sandboxes)
-10. [Observability & approvals](#observability--approvals)
-11. [Crate layout](#crate-layout)
-12. [Prior art & what we borrowed](#prior-art--what-we-borrowed)
+4. [Evaluation suites as a core workflow](#evaluation-suites-as-a-core-workflow)
+5. [The narrow waist: MCP](#the-narrow-waist-mcp)
+6. [Driver architecture](#driver-architecture)
+7. [Blueprint lifecycle](#blueprint-lifecycle)
+8. [Policy model](#policy-model)
+9. [Credential store](#credential-store)
+10. [Sessions vs. sandboxes](#sessions-vs-sandboxes)
+11. [Observability & approvals](#observability--approvals)
+12. [Crate layout](#crate-layout)
+13. [Prior art & what we borrowed](#prior-art--what-we-borrowed)
 
 ---
 
@@ -147,6 +148,23 @@ supports. Agent drivers may render config or install steps that point the agent
 at injected skill directories, but they do not resolve trust, fetch artifacts,
 or verify signatures themselves. `ContextDriver` remains the MCP
 knowledge-backend axis.
+
+## Evaluation suites as a core workflow
+
+Prompt-injection tests, guardrail assertions, and red-team scenarios are
+core-managed eval suites, not a fifth pluggable axis. An eval suite is a static
+YAML artifact that targets a blueprint and declares one or more runner adapters.
+
+`agentenv eval <blueprint.yaml> --suite <agentenv-eval.yaml> --env <env-id>`
+verifies the blueprint, validates the suite, targets an existing environment,
+runs the declared suite runners, and writes a report. Promptfoo is the first
+reference runner; Garak, Lakera, Virtue AI, and OWASP suite packs can integrate
+as suite content or runner adapters without changing the driver graph.
+
+Drivers still own runtime components only. Eval runners do not have JSON-RPC
+handshakes, durable handles, or driver protocol methods. Credentials continue to
+flow through the existing core credential path and never through generic driver
+RPC.
 
 ---
 
