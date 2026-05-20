@@ -1296,6 +1296,191 @@ runners:
 }
 
 #[test]
+fn eval_reports_missing_promptfoo_command() {
+    let temp_dir = make_temp_dir("eval-missing-promptfoo");
+    write_minimal_env_state(&temp_dir, "demo");
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: definitely-not-a-real-promptfoo
+    config: ./promptfooconfig.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to start runner `promptfoo`"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_runs_fake_promptfoo_and_writes_json_report() {
+    let temp_dir = make_temp_dir("eval-fake-promptfoo");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 0);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+    let report_path = temp_dir.join("report.json");
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .arg("--output")
+        .arg(&report_path)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stdout is json");
+    assert_eq!(stdout["suite"], "baseline");
+    assert_eq!(stdout["status"], "passed");
+    assert_eq!(stdout["runners"][0]["id"], "promptfoo");
+    assert_eq!(stdout["runners"][0]["status"], "passed");
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["suite"], "baseline");
+    assert_eq!(report["status"], "passed");
+    assert!(report["runners"][0]["artifact"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("promptfoo-results.json")));
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_fake_promptfoo_failure_exits_one() {
+    let temp_dir = make_temp_dir("eval-fake-promptfoo-fail");
+    write_minimal_env_state(&temp_dir, "demo");
+    let bin_dir = temp_dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_promptfoo = bin_dir.join("fake-promptfoo");
+    write_fake_promptfoo(&fake_promptfoo, 1);
+    let suite_path = temp_dir.join("agentenv-eval.yaml");
+    fs::write(
+        &suite_path,
+        format!(
+            r#"
+version: "0.1"
+kind: eval-suite
+metadata:
+  name: baseline
+target:
+  lifecycle: existing
+  env_name: demo
+runners:
+  - id: promptfoo
+    type: promptfoo
+    command: {}
+    config: ./promptfooconfig.yaml
+"#,
+            fake_promptfoo.display()
+        ),
+    )
+    .unwrap();
+    fs::write(temp_dir.join("promptfooconfig.yaml"), "prompts: []\n").unwrap();
+
+    let output = agentenv_with_home(&temp_dir)
+        .arg("eval")
+        .arg(fixture_blueprint())
+        .arg("--suite")
+        .arg(&suite_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{}", output_summary(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", output_summary(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("status: failed"),
+        "{}",
+        output_summary(&output)
+    );
+}
+
+#[cfg(unix)]
+fn write_fake_promptfoo(path: &Path, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      shift
+      output="$1"
+      ;;
+  esac
+  shift
+done
+if [ -n "$output" ]; then
+  mkdir -p "$(dirname "$output")"
+  printf '{{"fake":true}}\n' > "$output"
+fi
+exit {exit_code}
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[test]
 fn skills_help_lists_lifecycle_subcommands() {
     let output = Command::new(agentenv_bin())
         .arg("skills")

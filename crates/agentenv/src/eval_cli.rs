@@ -1,13 +1,13 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process,
+    process::{self, Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use agentenv_core::eval::{
-    build_eval_plan, load_eval_suite_from_yaml, EvalPlan, EvalPlanInput, EvalReport,
-    EvalRunnerStatus,
+    build_eval_plan, eval_status_from_runners, load_eval_suite_from_yaml, EvalPlan, EvalPlanInput,
+    EvalReport, EvalRunnerReport, EvalRunnerStatus,
 };
 use anyhow::Result;
 use clap::Args;
@@ -129,6 +129,16 @@ async fn run_eval_inner(args: EvalArgs) -> Result<EvalReport, EvalCliError> {
         )
     })?;
 
+    let mut runner_reports = Vec::new();
+    for runner in &plan.runners {
+        let report = run_promptfoo_runner(runner, &plan, args.json)?;
+        runner_reports.push(report);
+    }
+    let statuses = runner_reports
+        .iter()
+        .map(|runner| runner.status)
+        .collect::<Vec<_>>();
+    let status = eval_status_from_runners(&statuses);
     let report_path = args
         .output
         .clone()
@@ -136,14 +146,82 @@ async fn run_eval_inner(args: EvalArgs) -> Result<EvalReport, EvalCliError> {
     let report = EvalReport {
         suite: plan.suite_name.clone(),
         blueprint: plan.blueprint_path.clone(),
-        status: EvalRunnerStatus::Passed,
+        status,
         run_id,
         report_path: report_path.clone(),
-        runners: Vec::new(),
+        runners: runner_reports,
     };
     write_report(&report_path, &report, args.json)?;
     render_report(&report, args.json)?;
     Ok(report)
+}
+
+fn run_promptfoo_runner(
+    runner: &agentenv_core::eval::EvalRunnerPlan,
+    plan: &EvalPlan,
+    json: bool,
+) -> Result<EvalRunnerReport, EvalCliError> {
+    let stdout_path = plan.run_dir.join(format!("{}-stdout.log", runner.id));
+    let stderr_path = plan.run_dir.join(format!("{}-stderr.log", runner.id));
+    let stdout_file = fs::File::create(&stdout_path).map_err(|error| {
+        EvalCliError::new(
+            format!(
+                "failed to create runner stdout log `{}`: {error}",
+                stdout_path.display()
+            ),
+            json,
+        )
+    })?;
+    let stderr_file = fs::File::create(&stderr_path).map_err(|error| {
+        EvalCliError::new(
+            format!(
+                "failed to create runner stderr log `{}`: {error}",
+                stderr_path.display()
+            ),
+            json,
+        )
+    })?;
+    let config = runner.config.as_ref().ok_or_else(|| {
+        EvalCliError::new(
+            format!("runner `{}` has no Promptfoo config", runner.id),
+            json,
+        )
+    })?;
+    let mut command = Command::new(&runner.command);
+    command
+        .arg("eval")
+        .arg("--config")
+        .arg(config)
+        .arg("--output")
+        .arg(&runner.output)
+        .env("AGENTENV_EVAL_ENV", &plan.env_name)
+        .env("AGENTENV_EVAL_RUN_DIR", &plan.run_dir)
+        .env("AGENTENV_EVAL_BLUEPRINT", &plan.blueprint_path)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    for (name, value) in &runner.env {
+        command.env(name, value);
+    }
+
+    let status = command.status().map_err(|error| {
+        EvalCliError::new(
+            format!("failed to start runner `{}`: {error}", runner.id),
+            json,
+        )
+    })?;
+    let exit_code = status.code();
+    let runner_status = if status.success() {
+        EvalRunnerStatus::Passed
+    } else {
+        EvalRunnerStatus::Failed
+    };
+    Ok(EvalRunnerReport {
+        id: runner.id.clone(),
+        runner_type: runner.runner_type.clone(),
+        status: runner_status,
+        exit_code,
+        artifact: runner.output.clone(),
+    })
 }
 
 fn ensure_existing_env(
@@ -197,6 +275,10 @@ fn render_report(report: &EvalReport, json: bool) -> Result<(), EvalCliError> {
         println!("blueprint: {}", report.blueprint.display());
         println!("status: {}", status_label(report.status));
         println!("report: {}", report.report_path.display());
+        println!("runners:");
+        for runner in &report.runners {
+            println!("  {} {}", runner.id, status_label(runner.status));
+        }
     }
     Ok(())
 }
