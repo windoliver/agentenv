@@ -1111,6 +1111,29 @@ fn cli_help_includes_skills_command() {
 }
 
 #[test]
+fn eval_help_lists_expected_flags() {
+    let output = Command::new(agentenv_bin())
+        .arg("eval")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_summary(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for text in [
+        "Usage:",
+        "--suite",
+        "--env",
+        "--output",
+        "--json",
+        "--keep-env",
+        "--non-interactive",
+    ] {
+        assert!(stdout.contains(text), "missing {text}; stdout was: {stdout}");
+    }
+}
+
+#[test]
 fn skills_help_lists_lifecycle_subcommands() {
     let output = Command::new(agentenv_bin())
         .arg("skills")

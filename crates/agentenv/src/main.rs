@@ -40,6 +40,7 @@ use url::{Host, Url};
 mod builtin_factory;
 mod bundle_cli;
 mod credentials_runtime;
+mod eval_cli;
 mod mcp_guard_cli;
 mod proxy_cli;
 mod render;
@@ -84,6 +85,7 @@ enum Commands {
     Snapshot(SnapshotArgs),
     Fork(ForkArgs),
     Exec(ExecArgs),
+    Eval(eval_cli::EvalArgs),
     Blueprint(BlueprintArgs),
     Credentials(CredentialsArgs),
     Drivers(DriversArgs),
@@ -641,6 +643,7 @@ async fn run() -> Result<()> {
         Some(Commands::Snapshot(args)) => run_snapshot(args).await,
         Some(Commands::Fork(args)) => run_fork(args).await,
         Some(Commands::Exec(args)) => run_exec(args, &cli.events_sink).await,
+        Some(Commands::Eval(args)) => eval_cli::run_eval(args).await,
         Some(Commands::Term(args)) => run_term(args).await,
         Some(Commands::Blueprint(command)) => run_blueprint(command),
         Some(Commands::Credentials(command)) => run_credentials(command, &cli.events_sink).await,
@@ -3954,6 +3957,7 @@ mod tests {
                 "snapshot".to_string(),
                 "fork".to_string(),
                 "exec".to_string(),
+                "eval".to_string(),
                 "blueprint".to_string(),
                 "credentials".to_string(),
                 "drivers".to_string(),
