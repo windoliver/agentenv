@@ -55,3 +55,8 @@ Integration test command:
 ```bash
 AGENTENV_RUN_OPENSHELL_INTEGRATION=1 cargo test -p sandbox-openshell --features integration -- --ignored
 ```
+
+Long-running non-interactive OpenShell subprocesses are bounded by
+`AGENTENV_OPENSHELL_COMMAND_TIMEOUT_MS`, defaulting to 15 minutes. Lower this
+value when diagnosing a stuck local gateway so integration tests fail quickly
+instead of waiting indefinitely.
